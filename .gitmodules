@@ -1,6 +1,6 @@
 [submodule "debian"]
 	path = debian
-	url = git://thekelleys.org.uk/dnsmasq-debian.git
+	url = https://github.com/blitzy-public-samples/blitzy-debian-dnsmasq.git
 [submodule "submodules/dnsmasq-debian"]
 	path = submodules/dnsmasq-debian
-	url = https://thekelleys.org.uk/git/dnsmasq-debian
+	url = https://github.com/blitzy-public-samples/blitzy-debian-dnsmasq.git
