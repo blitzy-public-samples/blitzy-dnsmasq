@@ -501,6 +501,49 @@ static DBusMessage* dbus_read_servers(DBusMessage *message)
 }
 
 #ifdef HAVE_LOOP
+/**
+ * @brief Retrieve list of upstream DNS servers detected in forwarding loops
+ * 
+ * @detailed Generates D-Bus method return containing IP addresses of upstream DNS servers
+ * that have been detected as part of a forwarding loop. Loop detection (enabled via HAVE_LOOP
+ * compile flag) identifies servers that respond to test queries with answers that indicate
+ * the query was forwarded back to dnsmasq, creating a circular forwarding path. These servers
+ * are marked with SERV_LOOP flag and excluded from normal query forwarding to prevent infinite
+ * forwarding loops. This method exposes the list of detected loop servers for monitoring and
+ * diagnostic purposes, enabling administrators to identify and correct misconfigurations.
+ * 
+ * The method returns an array of string representations of IP addresses (both IPv4 and IPv6)
+ * for each server flagged as causing forwarding loops. IP addresses are formatted using
+ * prettyprint_addr() for human-readable output. Empty array indicates no loops detected.
+ * 
+ * @param message Incoming D-Bus method call message for GetLoopServers method
+ * 
+ * @return D-Bus method return message containing array of loop server IP address strings,
+ *         or NULL on error (memory allocation failure for reply message)
+ * 
+ * @note Only available when HAVE_LOOP compile flag enabled (loop detection feature compiled in)
+ * @note Loop detection monitors daemon->servers list checking SERV_LOOP flag on each entry
+ * 
+ * @see daemon->servers - Global server list containing all upstream servers with flags
+ * @see SERV_LOOP - Server flag indicating detected forwarding loop
+ * @see prettyprint_addr() in util.c - IP address formatting for display
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // D-Bus client invoking GetLoopServers method
+ * DBusMessage *method_call = dbus_message_new_method_call(
+ *     "uk.org.thekelleys.dnsmasq", "/uk/org/thekelleys/dnsmasq",
+ *     "uk.org.thekelleys.dnsmasq", "GetLoopServers");
+ * DBusMessage *reply = dbus_reply_server_loop(method_call);
+ * // Extract array of loop server IP addresses from reply
+ * @endcode
+ * 
+ * D-BUS METHOD: GetLoopServers
+ * RETURN TYPE: Array of strings (DBUS_TYPE_ARRAY of DBUS_TYPE_STRING)
+ * 
+ * SIDE EFFECTS: Iterates through global daemon->servers list; formats addresses into daemon->addrbuff
+ * THREAD SAFETY: Single-threaded; accesses global daemon state
+ */
 static DBusMessage *dbus_reply_server_loop(DBusMessage *message)
 {
   DBusMessageIter args, args_iter;
@@ -1312,6 +1355,47 @@ static DBusMessage *dbus_get_metrics(DBusMessage* message)
   return reply;
 }
 
+/**
+ * @brief Add string key-value pair to D-Bus dictionary container
+ * 
+ * @detailed Helper function for constructing D-Bus dictionary (DICT_ENTRY) structures containing
+ *           string-to-string mappings. Opens a new DICT_ENTRY container within the provided parent
+ *           container, appends the key as a string, appends the value as a string, and closes the
+ *           DICT_ENTRY container. This utility simplifies the repetitive task of marshalling
+ *           dictionary entries into D-Bus reply messages, particularly for methods like
+ *           GetServerMetrics that return arrays of dictionaries containing server statistics.
+ * 
+ *           D-Bus dictionary entries have type signature "{ss}" for string-to-string mappings.
+ *           The function handles all D-Bus iterator operations required to construct the entry,
+ *           including container opening, basic type appending, and container closing.
+ * 
+ * @param container Pointer to parent D-Bus message iterator (typically an ARRAY container)
+ *                  that will contain the new dictionary entry. Must not be NULL.
+ * @param key Dictionary key string. Must not be NULL. Passed by pointer for D-Bus API.
+ * @param val Dictionary value string. Must not be NULL. Passed by pointer for D-Bus API.
+ * 
+ * @return void
+ * 
+ * @note Function is static - internal helper not exposed outside dbus.c module
+ * @warning Both key and val must be valid null-terminated strings; no validation performed
+ * 
+ * @see add_dict_int() - Related helper for adding integer values (as strings)
+ * @see dbus_get_server_metrics() - Primary user of this helper function
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * DBusMessageIter array, container;
+ * dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{ss}", &array);
+ * add_dict_entry(&array, "server", "8.8.8.8");
+ * add_dict_entry(&array, "queries_sent", "1234");
+ * dbus_message_iter_close_container(&iter, &array);
+ * @endcode
+ * 
+ * D-BUS TYPE SIGNATURE: {ss} (dictionary entry mapping string to string)
+ * 
+ * SIDE EFFECTS: Modifies D-Bus message iterator state by appending dictionary entry
+ * THREAD SAFETY: Single-threaded; relies on D-Bus library iterator state
+ */
 static void add_dict_entry(DBusMessageIter *container, const char *key, const char *val)
 {
   DBusMessageIter dict;
@@ -1322,6 +1406,56 @@ static void add_dict_entry(DBusMessageIter *container, const char *key, const ch
   dbus_message_iter_close_container(container, &dict);
 }
 
+/**
+ * @brief Add string key to unsigned integer value pair to D-Bus dictionary container
+ * 
+ * @detailed Helper function for constructing D-Bus dictionary (DICT_ENTRY) structures containing
+ *           string-to-unsigned-integer mappings. Converts the unsigned integer value to a string
+ *           representation using snprintf(), then delegates to add_dict_entry() to marshall the
+ *           string key-value pair into the D-Bus message. This approach ensures consistent string
+ *           formatting for all numeric values returned via D-Bus, using daemon->namebuff as a
+ *           temporary buffer for the conversion. The function simplifies marshalling numeric
+ *           metrics and statistics into D-Bus reply messages, used extensively by GetMetrics and
+ *           GetServerMetrics methods to return cache hit counters, query rates, and server-specific
+ *           statistics.
+ * 
+ *           While D-Bus supports native unsigned integer types (DBUS_TYPE_UINT32), this implementation
+ *           chooses string representation for consistency with other string-based dictionary entries
+ *           and to simplify client-side parsing. The function handles all formatting and marshalling,
+ *           ensuring decimal string representation of the unsigned integer value.
+ * 
+ * @param container Pointer to parent D-Bus message iterator (typically an ARRAY container)
+ *                  that will contain the new dictionary entry. Must not be NULL.
+ * @param key Dictionary key string. Must not be NULL. Passed by pointer for D-Bus API.
+ * @param val Unsigned integer value to be converted to string and stored in dictionary.
+ *            Formatted as decimal string using snprintf() with "%u" format specifier.
+ * 
+ * @return void
+ * 
+ * @note Function is static - internal helper not exposed outside dbus.c module
+ * @note Uses daemon->namebuff as temporary buffer (size MAXDNAME) for string conversion
+ * @warning Key must be valid null-terminated string; no validation performed
+ * @warning Assumes daemon->namebuff is available and MAXDNAME is sufficient for uint32 string representation
+ * 
+ * @see add_dict_entry() - Underlying helper that performs actual D-Bus marshalling
+ * @see dbus_get_metrics() - Primary user of this helper for cache statistics
+ * @see dbus_get_server_metrics() - Uses this helper for per-server query counters
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * DBusMessageIter array, container;
+ * dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{ss}", &array);
+ * add_dict_int(&array, "cache_hits", daemon->metrics[METRIC_DNS_CACHE_HITS]);
+ * add_dict_int(&array, "cache_misses", daemon->metrics[METRIC_DNS_CACHE_MISSES]);
+ * add_dict_int(&array, "queries_forwarded", 5678);
+ * dbus_message_iter_close_container(&iter, &array);
+ * @endcode
+ * 
+ * D-BUS TYPE SIGNATURE: {ss} (dictionary entry mapping string to string, with value being decimal representation of integer)
+ * 
+ * SIDE EFFECTS: Temporarily modifies daemon->namebuff for string conversion; modifies D-Bus message iterator state
+ * THREAD SAFETY: Single-threaded; uses global daemon->namebuff buffer and D-Bus library iterator state
+ */
 static void add_dict_int(DBusMessageIter *container, const char *key, const unsigned int val)
 {
   snprintf(daemon->namebuff, MAXDNAME, "%u", val);
