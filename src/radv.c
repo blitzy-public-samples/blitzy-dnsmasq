@@ -103,14 +103,115 @@
 
 #include <netinet/icmp6.h>
 
+/**
+ * @struct ra_param
+ * @brief Router Advertisement construction state parameters
+ * 
+ * This structure accumulates state during the Router Advertisement construction
+ * process, tracking interface details, discovered addresses, timing parameters,
+ * and DHCPv6 context associations. Passed to callback functions during address
+ * enumeration to build complete RA packets with appropriate prefix options.
+ * 
+ * LIFECYCLE:
+ * Creation: Stack-allocated in send_ra() and send_ra_alias()
+ * Initialization: Zero-initialized, then populated during address enumeration
+ * Destruction: Automatic (stack-allocated structure)
+ * Ownership: Local to RA construction functions
+ * 
+ * MEMORY LAYOUT:
+ * Size: ~80-100 bytes (includes time_t, integers, pointer, struct in6_addr x3)
+ * Alignment: Natural alignment for contained types
+ * 
+ * USAGE PATTERNS:
+ * - Allocated on stack in send_ra() before calling iface_enumerate()
+ * - Passed as void* parameter to add_prefixes() callback during enumeration
+ * - Accumulates link-local, global, and ULA addresses found on interface
+ * - Tracks preferred/valid times for each address scope
+ * - Records managed/other flags, advertisement interval, router priority
+ * - Links to found DHCPv6 context for lease time coordination
+ */
 struct ra_param {
-  time_t now;
-  int ind, managed, other, first, adv_router;
-  char *if_name;
-  struct dhcp_netid *tags;
-  struct in6_addr link_local, link_global, ula;
-  unsigned int glob_pref_time, link_pref_time, ula_pref_time, adv_interval, prio;
-  struct dhcp_context *found_context;
+  time_t now;                         /**< Current time for lease calculations */
+  int ind;                            /**< Interface index for this RA */
+  int managed;                        /**< M flag: 1=use DHCPv6 for addresses */
+  int other;                          /**< O flag: 1=use DHCPv6 for config */
+  int first;                          /**< First prefix flag for RA construction */
+  int adv_router;                     /**< Advertisement router flag */
+  char *if_name;                      /**< Interface name (e.g., "eth0") */
+  struct dhcp_netid *tags;            /**< DHCP network tags for this interface */
+  struct in6_addr link_local;         /**< Link-local address (fe80::/10) */
+  struct in6_addr link_global;        /**< Global unicast address (2000::/3) */
+  struct in6_addr ula;                /**< Unique local address (fc00::/7) */
+  unsigned int glob_pref_time;        /**< Preferred lifetime for global address */
+  unsigned int link_pref_time;        /**< Preferred lifetime for link-local */
+  unsigned int ula_pref_time;         /**< Preferred lifetime for ULA */
+  unsigned int adv_interval;          /**< Advertisement interval in seconds */
+  unsigned int prio;                  /**< Router priority (low/medium/high) */
+  struct dhcp_context *found_context; /**< Associated DHCPv6 context or NULL */
+};
+
+/**
+ * @struct search_param
+ * @brief Interface search parameters for Router Advertisement processing
+ * 
+ * Lightweight structure used to search for specific interfaces during packet
+ * reception and processing. Primarily used to match received ICMPv6 packets
+ * to configured interfaces by index and retrieve interface name for logging
+ * and context lookup.
+ * 
+ * LIFECYCLE:
+ * Creation: Stack-allocated in icmp6_packet() during packet processing
+ * Initialization: Populated with current time, interface index from packet
+ * Destruction: Automatic (stack-allocated structure)
+ * Ownership: Local to packet reception functions
+ * 
+ * MEMORY LAYOUT:
+ * Size: ~24 bytes (time_t + int + IF_NAMESIZE+1 char array)
+ * Alignment: Natural alignment for time_t
+ * 
+ * USAGE PATTERNS:
+ * - Allocated in icmp6_packet() when Router Solicitation received
+ * - Passed to iface_search() callback to match interface index
+ * - Interface name populated during enumeration for subsequent processing
+ */
+struct search_param {
+  time_t now;                  /**< Current time for RA scheduling */
+  int iface;                   /**< Interface index to search for */
+  char name[IF_NAMESIZE+1];    /**< Interface name output (null-terminated) */
+};
+
+/**
+ * @struct alias_param
+ * @brief Bridge alias interface tracking for Router Advertisement
+ * 
+ * Manages the set of bridge alias interfaces that require Router Advertisement
+ * transmission. Used to send identical RA packets across multiple related
+ * interfaces (e.g., bridge members) to ensure consistent configuration across
+ * a bridged network segment.
+ * 
+ * LIFECYCLE:
+ * Creation: Stack-allocated in send_ra_to_aliases()
+ * Initialization: Zero-initialized, dynamically grows alias_ifs array
+ * Destruction: alias_ifs array freed with free() before function return
+ * Ownership: Local to send_ra_to_aliases() function
+ * 
+ * MEMORY LAYOUT:
+ * Size: ~32 bytes base + dynamically allocated array
+ * Alignment: Natural alignment for pointers and integers
+ * 
+ * USAGE PATTERNS:
+ * - Allocated when sending RA to bridge with aliases
+ * - alias_ifs array dynamically allocated and grown as aliases discovered
+ * - Each alias interface index added to array during enumeration
+ * - Array traversed after enumeration to send RA to each alias
+ * - Memory freed after all RAs transmitted
+ */
+struct alias_param {
+  int iface;                   /**< Primary interface index */
+  struct dhcp_bridge *bridge;  /**< Bridge configuration or NULL */
+  int num_alias_ifs;           /**< Current count of alias interfaces */
+  int max_alias_ifs;           /**< Allocated capacity of alias_ifs array */
+  int *alias_ifs;              /**< Dynamically allocated array of alias indices */
 };
 
 struct search_param {
@@ -969,6 +1070,356 @@ static void send_ra(time_t now, int iface, char *iface_name, struct in6_addr *de
  * 
  * THREAD SAFETY: Single-threaded event loop, not reentrant, modifies shared daemon->outpacket buffer
  */
+
+/**
+ * @brief Send Router Advertisement to bridged alias interfaces
+ * 
+ * Callback function invoked during interface enumeration to transmit Router
+ * Advertisements to alias interfaces that are bridged to the primary interface.
+ * This enables RA distribution across complex network topologies with bridge
+ * configurations, ensuring all connected network segments receive RA messages.
+ * 
+ * @param index Interface index being enumerated
+ * @param type Interface type (unused - accepts any interface type)
+ * @param mac MAC address of interface (unused)
+ * @param maclen Length of MAC address (unused)
+ * @param parm Pointer to struct alias_param containing bridge configuration and interface list
+ * 
+ * @return Always returns 1 to continue interface enumeration
+ * 
+ * @note This function is used as a callback for iface_enumerate() to process all interfaces.
+ *       It checks if the enumerated interface is an alias of a bridged interface and sends
+ *       RA via send_ra_alias() if a bridge relationship is found.
+ * 
+ * @see send_ra_alias() for actual RA transmission to alias interface
+ * @see iface_enumerate() in network.c for enumeration mechanism
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * struct alias_param aparm = {
+ *   .iface = primary_if_index,
+ *   .bridge = daemon->bridges,
+ *   .num_alias_ifs = 5,
+ *   .alias_ifs = alias_array
+ * };
+ * iface_enumerate(AF_UNSPEC, &aparm, send_ra_to_aliases);
+ * @endcode
+ * 
+ * SIDE EFFECTS: Sends Router Advertisement packets to discovered alias interfaces
+ * THREAD SAFETY: Single-threaded architecture - uses global daemon structure
+ */
+static int send_ra_to_aliases(int index, unsigned int type, char *mac, size_t maclen, void *parm)
+{
+  struct alias_param *aparm = (struct alias_param *)parm;
+  char ifrn_name[IF_NAMESIZE+1];
+  struct dhcp_bridge *bridge;
+  int i; 
+  
+  (void)type;
+  (void)mac;
+  (void)maclen;
+
+  if (index == aparm->iface)
+    return 1;
+
+  for (bridge = aparm->bridge; bridge; bridge = bridge->next)
+    for (i = 0; i < aparm->num_alias_ifs; i++)
+      if ((int)if_nametoindex(bridge->iface) == aparm->alias_ifs[i] &&
+	  bridge->alias && (int)if_nametoindex(bridge->alias->iface) == index &&
+	  indextoname(daemon->icmp6fd, index, ifrn_name))
+	{
+	  send_ra_alias(dnsmasq_time(), aparm->iface, ifrn_name, NULL, if_nametoindex(bridge->iface));
+	  break;
+	}
+  
+  return 1;
+}
+
+/**
+ * @brief Search for link-local IPv6 address on specified interface
+ * 
+ * Callback function invoked during IPv6 address enumeration to locate a link-local
+ * address (/128 host address) on a specific interface. When a matching link-local
+ * address is found, it is converted to string format and stored in daemon->addrbuff,
+ * and the search parameter's interface index is set to -1 to signal discovery.
+ * This function is used during Router Advertisement initialization to verify the
+ * presence of link-local addresses required for RA transmission.
+ * 
+ * @param local IPv6 address being examined during enumeration
+ * @param prefix Prefix length of the address (must be 128 for host addresses)
+ * @param scope Address scope (unused - filtering done via address inspection)
+ * @param if_index Interface index for this address
+ * @param flags Address flags (unused)
+ * @param preferred Preferred lifetime for the address (unused)
+ * @param valid Valid lifetime for the address (unused)
+ * @param vparam Pointer to struct search_param containing target interface index and name
+ * 
+ * @return Always returns 1 to continue enumeration through all addresses
+ * 
+ * @note When a link-local address is found, param->iface is set to -1 to signal
+ *       successful discovery. The address is converted to string format in
+ *       daemon->addrbuff for logging or further processing.
+ * @warning This function modifies vparam (sets iface to -1) and daemon->addrbuff
+ *          (stores address string) when a match is found.
+ * 
+ * @see iface_enumerate() in network.c for enumeration mechanism
+ * @see ra_init() which uses this to detect link-local addresses
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * struct search_param param = {
+ *   .now = current_time,
+ *   .iface = eth0_index,
+ * };
+ * strcpy(param.name, "eth0");
+ * iface_enumerate(AF_INET6, &param, iface_search);
+ * if (param.iface == -1) {
+ *   // Link-local address found and stored in daemon->addrbuff
+ * }
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 4861 Section 6.1.1 - Validates link-local address presence
+ * SIDE EFFECTS: Modifies param->iface to -1 and populates daemon->addrbuff on match
+ * THREAD SAFETY: Single-threaded architecture - safe for callback use
+ */
+static int iface_search(struct in6_addr *local,  int prefix,
+			int scope, int if_index, int flags, 
+			unsigned int preferred, unsigned int valid, void *vparam)
+{
+  struct search_param *param = vparam;
+  
+  (void)scope;
+  (void)preferred;
+  (void)valid;
+  (void)flags;
+
+  if (prefix == 128 &&
+      IN6_IS_ADDR_LINKLOCAL(local) &&
+      param->iface == if_index)
+    {
+      /* Check to see if there's another link-local address */
+      inet_ntop(AF_INET6, local, daemon->addrbuff, ADDRSTRLEN);
+      param->iface = -1;
+    }
+  
+  return 1;
+}
+
+/**
+ * @brief Calculate and set next Router Advertisement transmission time
+ * 
+ * Determines the next scheduled RA transmission time for a DHCP context based on
+ * RFC 4861 timing requirements. During the initial 60-second "short period" after
+ * context activation, RAs are transmitted more frequently (5-20 seconds) to ensure
+ * rapid network configuration for newly connected clients. After the short period,
+ * transmission intervals are randomized between 3/4 and 1 times MaxRtrAdvInterval
+ * to prevent synchronization and reduce network congestion.
+ * 
+ * The randomization formula during normal operation calculates:
+ *   next_time = now + (3 * MaxRtrAdvInterval / 4) + random_component
+ * where random_component ranges from 0 to MaxRtrAdvInterval/4, ensuring the
+ * interval stays within RFC-mandated bounds.
+ * 
+ * @param context DHCP context containing RA state and timing information
+ * @param iface_name Interface name for looking up RA parameters
+ * @param now Current time in seconds since epoch
+ * 
+ * @note The short period duration is fixed at 60 seconds per RFC 4861 recommendation.
+ * @note Random intervals prevent synchronized RA transmission from multiple routers.
+ * @warning context->ra_time is modified to schedule next transmission; must be checked
+ *          in main event loop to trigger actual RA sending.
+ * 
+ * @see calc_interval() in radv.c for MaxRtrAdvInterval calculation
+ * @see find_iface_param() in radv.c for interface parameter lookup
+ * @see ra_start_unsolicited() which initializes ra_short_period_start
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * struct dhcp_context *ctx = ...;
+ * char *iface = "eth0";
+ * time_t now = time(NULL);
+ * new_timeout(ctx, iface, now);
+ * // ctx->ra_time now contains next scheduled transmission time
+ * // Main loop will send RA when (now >= ctx->ra_time)
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 4861 Section 6.2.1 - Router Advertisement timing
+ *                 Short period: 3-16 seconds (relaxed to 5-20 for implementation)
+ *                 Normal period: MinRtrAdvInterval to MaxRtrAdvInterval
+ * SIDE EFFECTS: Modifies context->ra_time to schedule next RA transmission
+ * THREAD SAFETY: Single-threaded architecture - safe for sequential use
+ */
+static void new_timeout(struct dhcp_context *context, char *iface_name, time_t now)
+{
+  if (difftime(now, context->ra_short_period_start) < 60.0)
+    /* range 5 - 20 */
+    context->ra_time = now + 5 + (rand16()/4400);
+  else
+    {
+      /* range 3/4 - 1 times MaxRtrAdvInterval */
+      unsigned int adv_interval = calc_interval(find_iface_param(iface_name));
+      context->ra_time = now + (3 * adv_interval)/4 + ((adv_interval * (unsigned int)rand16()) >> 18);
+    }
+}
+
+/**
+ * @brief Find Router Advertisement parameters for specified interface
+ * 
+ * Searches the global linked list of configured RA interfaces to locate parameters
+ * for the specified interface name. The search supports wildcard matching, allowing
+ * configuration patterns like "eth*" to match multiple physical interfaces. This
+ * function is used throughout the RA subsystem to retrieve interface-specific
+ * configuration such as advertisement intervals, router lifetime, and router priority.
+ * 
+ * The function iterates through daemon->ra_interfaces (populated during configuration
+ * parsing) and returns the first entry whose name pattern matches the provided
+ * interface name. If no match is found, NULL is returned and the caller typically
+ * falls back to default RA behavior or skips RA transmission for that interface.
+ * 
+ * @param iface Interface name to search for (e.g., "eth0", "wlan0")
+ * 
+ * @return Pointer to struct ra_interface containing RA parameters for the interface,
+ *         or NULL if no matching configuration found
+ * @retval non-NULL Matching RA interface configuration found
+ * @retval NULL No configuration matches the specified interface name
+ * 
+ * @note Wildcard patterns in configuration (e.g., "eth*") are supported via
+ *       wildcard_match() function for flexible interface matching.
+ * @note Returns the FIRST matching entry if multiple patterns match the interface.
+ * @warning Caller must handle NULL return gracefully; many callers use default
+ *          values or skip RA operations when NULL is returned.
+ * 
+ * @see calc_interval() which uses this to retrieve MaxRtrAdvInterval
+ * @see calc_lifetime() which uses this to retrieve router lifetime
+ * @see calc_prio() which uses this to retrieve router priority
+ * @see wildcard_match() in util.c for pattern matching implementation
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * char *interface = "eth0";
+ * struct ra_interface *ra_params = find_iface_param(interface);
+ * if (ra_params) {
+ *   // Use ra_params->interval, ra_params->lifetime, ra_params->prio
+ *   unsigned int interval = calc_interval(ra_params);
+ * } else {
+ *   // Use default RA parameters
+ *   interval = DEFAULT_RA_INTERVAL;
+ * }
+ * @endcode
+ * 
+ * RFC COMPLIANCE: Configuration lookup supporting RFC 4861 RA parameters
+ * SIDE EFFECTS: None - read-only traversal of daemon->ra_interfaces list
+ * THREAD SAFETY: Single-threaded architecture - safe for sequential access
+ */
+static struct ra_interface *find_iface_param(char *iface)
+{
+  struct ra_interface *ra;
+  
+  for (ra = daemon->ra_interfaces; ra; ra = ra->next)
+    if (wildcard_match(ra->name, iface))
+      return ra;
+  
+  return NULL;
+}
+
+/**
+ * @brief Process IPv6 addresses and construct Router Advertisement prefix information options
+ * 
+ * @detailed Callback function invoked by iface_enumerate() during RA packet construction to process
+ *           each IPv6 address assigned to an interface. The function matches addresses against
+ *           configured DHCPv6 contexts, determines SLAAC and managed configuration flags, calculates
+ *           appropriate lifetimes, and constructs ICMP6_OPT_PREFIX options for inclusion in the RA.
+ *           This implements the core logic for IPv6 prefix advertisement per RFC 4861, including
+ *           support for router address advertisement (RFC 3775 Section 7.2), ULA (Unique Local
+ *           Address) tracking for RDNSS, and coordination with stateful/stateless DHCPv6.
+ * 
+ *           The function processes three categories of addresses:
+ *           - Link-local addresses: Stored in param->link_local for RDNSS source selection
+ *           - Loopback/multicast: Skipped (not advertised)
+ *           - Global/ULA unicast: Matched against dhcp6 contexts and advertised as prefixes
+ * 
+ *           For each matching context, the function:
+ *           - Sets M (managed) flag if stateful DHCPv6 address assignment is configured
+ *           - Sets O (other) flag if DHCPv6 is providing configuration parameters
+ *           - Determines autonomous (SLAAC) flag based on CONTEXT_RA presence
+ *           - Calculates floor lifetimes (minimum 3 * RA interval) from lease times
+ *           - Handles deprecation (preferred lifetime = 0) when CONTEXT_DEPRECATE set
+ *           - Tracks highest preferred lifetime addresses for ULA and global scopes
+ *           - Constructs prefix options with proper flags and zero network bits
+ * 
+ * @param local Pointer to IPv6 address on the interface being enumerated
+ * @param prefix Prefix length (0-128) for this address, typically 64 for SLAAC prefixes
+ * @param scope Address scope from kernel (unused in current implementation, cast to void)
+ * @param if_index Interface index from kernel (unused, interface already identified in param)
+ * @param flags Interface flags from kernel, checked for IFACE_DEPRECATED to set preferred=0
+ * @param preferred Preferred lifetime in seconds from kernel (may be adjusted based on config)
+ * @param valid Valid lifetime in seconds from kernel (may be adjusted based on config)
+ * @param vparam Opaque pointer to struct ra_param containing RA construction context
+ * 
+ * @return Always returns 1 to continue interface enumeration
+ * @retval 1 Continue processing additional addresses on interface
+ * 
+ * @note Link-local addresses (fe80::/10) are stored in param->link_local but not advertised
+ *       as prefixes; they are used later for RDNSS source address selection.
+ * 
+ * @note The function implements RFC 3775 Section 7.2 "Home Agent Information Option" behavior
+ *       when CONTEXT_RA_ROUTER flag is set: advertises individual router IPv6 addresses with
+ *       the R (router address) flag (0x20) instead of network prefixes with zeroed host bits.
+ * 
+ * @note Lifetime calculations enforce a floor of 3 * adv_interval to prevent thrashing, but
+ *       only if CONTEXT_SETLEASE is present (explicit lease time configuration). Default
+ *       lease times don't impose a floor.
+ * 
+ * @note ULA (fd00::/8) and global addresses are tracked separately in param->ula and
+ *       param->link_global with their respective preferred lifetimes for RDNSS option
+ *       construction, which requires a valid IPv6 source address.
+ * 
+ * @note The autonomous flag (0x40) enables SLAAC address autoconfiguration per RFC 4862.
+ *       The on-link flag (0x80) indicates the prefix is on-link (default) unless
+ *       CONTEXT_RA_OFF_LINK is set. Both flags are independent of M/O flag settings.
+ * 
+ * @warning expand() may fail if outpacket buffer is exhausted, silently dropping the prefix
+ *          option. Callers should ensure adequate buffer space via expand_buf() before RA
+ *          construction. Current buffer size is sizeof(struct dhcp_packet) minimum.
+ * 
+ * @warning Modifies param->managed and param->other flags as side effects based on context
+ *          matching. These flags accumulate across all prefixes and are used to set M/O bits
+ *          in the RA header by send_ra()/send_ra_alias().
+ * 
+ * @warning Sets CONTEXT_RA_DONE flag on contexts to prevent duplicate prefix advertisements
+ *          for the same network. This flag persists across RA transmissions and is cleared
+ *          only during configuration reload.
+ * 
+ * @see iface_enumerate() which invokes this callback for each IPv6 address
+ * @see send_ra() which calls iface_enumerate() with this callback during RA construction
+ * @see send_ra_alias() which also uses this for bridge alias interfaces
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * struct ra_param param;
+ * memset(&param, 0, sizeof(param));
+ * param.now = dnsmasq_time();
+ * param.if_name = "eth0";
+ * param.ind = if_nametoindex("eth0");
+ * param.adv_interval = calc_interval(find_iface_param("eth0"));
+ * // Enumerate IPv6 addresses on eth0, calling add_prefixes for each
+ * iface_enumerate(AF_INET6, &param, add_prefixes);
+ * // After enumeration, param.managed and param.other contain accumulated flags
+ * // and outpacket contains constructed prefix options
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 4861 Section 4.6.2 (Prefix Information option format)
+ * RFC COMPLIANCE: RFC 4862 Section 5.5.3 (Autonomous address configuration)
+ * RFC COMPLIANCE: RFC 3775 Section 7.2 (Router address advertisement for mobile IPv6)
+ * RFC COMPLIANCE: RFC 4193 (Unique Local IPv6 Unicast Addresses - ULA handling)
+ * 
+ * SIDE EFFECTS: Modifies param->managed, param->other, param->link_local, param->ula,
+ *               param->link_global, param->ula_pref_time, param->glob_pref_time,
+ *               param->found_context, param->first, param->tags, and marks contexts with
+ *               CONTEXT_RA_DONE flag. Appends prefix options to outpacket buffer via expand().
+ * 
+ * THREAD SAFETY: Single-threaded architecture; not thread-safe (modifies global daemon state).
+ */
 static int add_prefixes(struct in6_addr *local,  int prefix,
 			int scope, int if_index, int flags, 
 			unsigned int preferred, unsigned int valid, void *vparam)
@@ -1438,287 +1889,6 @@ time_t periodic_ra(time_t now)
 }
 
 /**
- * @brief Callback function to identify bridge alias interfaces matching configured patterns
- * 
- * @detailed This callback is invoked by iface_enumerate() for each network interface to determine if the
- *           interface matches any alias patterns configured in a bridge-interface directive. When a match
- *           is found, the interface index is recorded for subsequent Router Advertisement transmission.
- *           The function is called twice per bridge: first to count matching aliases, then to populate
- *           the alias interface index array. This two-pass approach allows dynamic memory allocation
- *           based on the actual number of matching interfaces.
- * 
- * @param index Interface index of the candidate interface being evaluated
- * @param type Interface type (unused - marked with (void) cast to suppress warnings)
- * @param mac MAC address of the interface (unused - marked with (void) cast)
- * @param maclen Length of MAC address (unused - marked with (void) cast)
- * @param parm Pointer to struct alias_param containing bridge configuration and result storage
- * 
- * @return Always returns 1 to continue enumeration of remaining interfaces
- * @retval 1 Continue interface enumeration
- * 
- * @note This function is designed as a callback for iface_enumerate() and should not be called directly.
- * @note On the first pass, alias_ifs is NULL and num_alias_ifs counts matches without storing indices.
- * @note On the second pass, alias_ifs points to allocated array and indices are stored.
- * 
- * @warning Assumes alias_param structure is properly initialized before iface_enumerate() invocation.
- * @warning Array bounds checking uses max_alias_ifs to prevent buffer overflow.
- * 
- * @see iface_enumerate() - Iterates through all network interfaces invoking this callback
- * @see send_ra_alias() - Transmits RA to discovered alias interfaces
- * @see wildcard_matchn() - Performs pattern matching for alias interface names
- * 
- * EXAMPLE USAGE:
- * @code
- * struct alias_param aparam = { .iface = base_iface, .bridge = bridge_config,
- *                                .num_alias_ifs = 0, .alias_ifs = NULL };
- * // First pass: count matching aliases
- * iface_enumerate(AF_LOCAL, &aparam, (callback_t){.af_local=send_ra_to_aliases});
- * // Second pass: populate alias indices
- * aparam.alias_ifs = malloc(aparam.num_alias_ifs * sizeof(int));
- * iface_enumerate(AF_LOCAL, &aparam, (callback_t){.af_local=send_ra_to_aliases});
- * @endcode
- * 
- * RFC COMPLIANCE: N/A (internal implementation detail for bridge support)
- * SIDE EFFECTS: Increments num_alias_ifs counter, populates alias_ifs array when non-NULL
- * THREAD SAFETY: Single-threaded architecture, not thread-safe (modifies aparam state)
- */
-/**
- * @brief Enumerate interfaces matching bridge alias patterns for RA transmission
- * 
- * @detailed Callback function invoked by iface_enumerate() to identify network interfaces
- * that match wildcard patterns defined as aliases of a DHCP bridge, enabling Router
- * Advertisement transmission to all members of a bridge group. This function supports
- * the bridge functionality where a single DHCPv6/RA configuration applies to multiple
- * related interfaces (e.g., bridge members, VLAN interfaces, virtual interfaces). The
- * callback pattern-matches each enumerated interface name against configured alias patterns
- * and accumulates matching interface indices for subsequent RA transmission.
- * 
- * The function converts the enumerated interface index to its name string using if_indextoname,
- * then iterates through all alias patterns configured for the bridge structure contained in
- * the aparam parameter. Each alias pattern is compared against the interface name using
- * wildcard_matchn(), which supports glob-style wildcards (* for any characters, ? for single
- * character). When a match is found, the interface index is stored in the aparam->alias_ifs
- * array (if space available) and the counter aparam->num_alias_ifs is incremented. This
- * accumulation enables the caller to subsequently send RAs to all matching interfaces.
- * 
- * The function handles array bounds checking: if aparam->alias_ifs is non-NULL and the
- * array has not reached capacity (num_alias_ifs < max_alias_ifs), the interface index is
- * stored at the next available position. If the array is NULL or full, num_alias_ifs is
- * still incremented to track the total number of matches (allowing detection of insufficient
- * array size). This two-pass approach (first count, then allocate and populate) enables
- * dynamic array sizing.
- * 
- * @param index Interface index being enumerated by iface_enumerate()
- * @param type Interface type from netlink/BPF: ARPHRD_ETHER, ARPHRD_IEEE80211, etc. (unused)
- * @param mac MAC address of interface in binary format (unused)
- * @param maclen Length of MAC address in bytes, typically 6 for Ethernet (unused)
- * @param parm Void pointer to struct alias_param containing bridge alias configuration
- * 
- * @return 1 to continue interface enumeration (always continues, never aborts)
- * 
- * @note Function ignores type, mac, maclen parameters (marked with (void) to suppress warnings)
- * @note Wildcard patterns support * (match any characters) and ? (match single character)
- * @note If alias_ifs array is NULL, function only counts matches without storing indices
- * @note If alias_ifs array is full, function continues counting but doesn't store additional indices
- * @note Always returns 1 to ensure complete enumeration of all system interfaces
- * @note Called via iface_enumerate() which iterates through all network interfaces
- * 
- * @warning Requires aparam->bridge->alias to be valid pointer or NULL
- * @warning Interface name buffer ifrn_name limited to IFNAMSIZ (typically 16 bytes)
- * @warning Caller must ensure aparam->max_alias_ifs accurately reflects alias_ifs array size
- * @warning if_indextoname may fail if interface disappeared; function silently skips such cases
- * 
- * @see send_ra() for RA transmission to primary interface
- * @see send_ra_alias() for RA transmission to discovered alias interfaces
- * @see iface_enumerate() for system-wide interface enumeration mechanism
- * @see wildcard_matchn() for glob-style pattern matching with * and ? wildcards
- * @see struct dhcp_bridge in dnsmasq.h for bridge alias configuration structure
- * 
- * EXAMPLE USAGE:
- * @code
- * // Invoked automatically by iface_enumerate in icmp6_packet for bridge handling:
- * struct alias_param aparam;
- * aparam.iface = primary_interface_index;
- * aparam.bridge = configured_bridge;  // Contains alias patterns like "eth*", "vlan?"
- * aparam.num_alias_ifs = 0;
- * aparam.max_alias_ifs = 10;
- * aparam.alias_ifs = malloc(10 * sizeof(int));
- * // send_ra_to_aliases called for each interface on system:
- * iface_enumerate(AF_UNSPEC, &aparam, send_ra_to_aliases);
- * // After enumeration, aparam.alias_ifs contains indices of matching interfaces
- * // and aparam.num_alias_ifs contains count (may exceed max_alias_ifs if insufficient space)
- * for (int i = 0; i < aparam.num_alias_ifs && i < aparam.max_alias_ifs; i++) {
- *   send_ra_alias(now, aparam.iface, iface_name, dest, aparam.alias_ifs[i]);
- * }
- * @endcode
- * 
- * RFC COMPLIANCE: RFC 4861 (Router Advertisement applies to all bridge member interfaces)
- * RFC COMPLIANCE: Bridge forwarding of ICMPv6 RAs per IEEE 802.1D bridge standards
- * 
- * SIDE EFFECTS: Increments aparam->num_alias_ifs for each matching interface
- * SIDE EFFECTS: Stores interface indices in aparam->alias_ifs array (if space available)
- * SIDE EFFECTS: May leave num_alias_ifs > max_alias_ifs indicating insufficient array space
- * 
- * THREAD SAFETY: Single-threaded event loop, modifies only aparam structure passed as parameter
- */
-static int send_ra_to_aliases(int index, unsigned int type, char *mac, size_t maclen, void *parm)
-{
-  struct alias_param *aparam = (struct alias_param *)parm;
-  char ifrn_name[IFNAMSIZ];
-  struct dhcp_bridge *alias;
-
-  (void)type;
-  (void)mac;
-  (void)maclen;
-
-  if (if_indextoname(index, ifrn_name))
-    for (alias = aparam->bridge->alias; alias; alias = alias->next)
-      if (wildcard_matchn(alias->iface, ifrn_name, IFNAMSIZ))
-        {
-          if (aparam->alias_ifs && (aparam->num_alias_ifs < aparam->max_alias_ifs))
-            aparam->alias_ifs[aparam->num_alias_ifs] = index;
-          aparam->num_alias_ifs++;
-        }
-
-  return 1;
-}
-
-/**
- * @brief Search for interfaces requiring Router Advertisement transmission
- * 
- * @detailed Callback function invoked by iface_enumerate() to identify network interfaces
- * that are overdue for periodic Router Advertisement transmission. This function implements
- * the RA scheduling mechanism by scanning all IPv6 addresses on the system, matching them
- * against configured DHCPv6 contexts, and determining which interfaces require immediate
- * RA transmission based on context->ra_time timeout values. The function enforces interface
- * filtering (only interfaces with DHCPv6 enabled), validates prefix containment, checks for
- * Duplicate Address Detection (DAD) completion, and coordinates timeout values across
- * multiple contexts on the same subnet to prevent redundant transmissions.
- * 
- * The search algorithm first validates that the interface is eligible for DHCP operation
- * by checking interface name resolution and iface_check() filter. It then excludes interfaces
- * explicitly listed in daemon->dhcp_except with INAME_6 flag. For eligible interfaces, the
- * function iterates through all DHCPv6 contexts searching for one that:
- * 1. Is active (not CONTEXT_TEMPLATE or CONTEXT_OLD)
- * 2. Has prefix length <= enumerated address prefix (allows broader context to match)
- * 3. Contains the enumerated address within context start6-end6 range (is_same_net6 check)
- * 4. Has non-zero ra_time (RA scheduling enabled for this context)
- * 5. Is overdue: difftime(context->ra_time, now) <= 0 (scheduled time has passed)
- * 
- * Upon finding an overdue context, the function verifies the interface is not in tentative
- * state (IFACE_TENTATIVE flag), which would indicate Duplicate Address Detection is still
- * in progress. If DAD is complete, the interface index is stored in param->iface for RA
- * transmission by the caller. The function then calls new_timeout() to calculate and set
- * the next RA transmission time for this context. To prevent multiple RAs on the same
- * subnet, the function zeros ra_time for all subsequent contexts matching the same network
- * prefix, ensuring only one timeout fires per subnet.
- * 
- * @param local Pointer to IPv6 address being enumerated from interface
- * @param prefix Prefix length (bits) for this address, typically 64 for network addresses
- * @param scope Address scope: link-local, global, site-local (unused - marked with (void))
- * @param if_index Interface index from which this address originates
- * @param flags Address flags from kernel: IFACE_TENTATIVE indicates DAD in progress
- * @param preferred Preferred lifetime in seconds from kernel (unused - marked with (void))
- * @param valid Valid lifetime in seconds from kernel (unused - marked with (void))
- * @param vparam Void pointer to struct search_param containing search state
- * 
- * @return 0 to abort enumeration (interface found requiring RA), 1 to continue searching
- * 
- * @note Only processes interfaces passing iface_check() filter and not in dhcp_except list
- * @note Prefix matching uses <= comparison: context prefix can be broader than address prefix
- * @note IFACE_TENTATIVE flag prevents RA on addresses undergoing Duplicate Address Detection
- * @note Multiple contexts on same subnet synchronized: first match schedules, others zeroed
- * @note Function called repeatedly by iface_enumerate() for every IPv6 address on system
- * @note Interface index stored in param->iface signals caller to send RA
- * 
- * @warning Must not use DHCP buffers except outpacket (may be called during DHCPv4 transaction)
- * @warning Requires valid context->ra_time field for timeout comparison
- * @warning Modifies context->ra_time for multiple contexts (timeout synchronization)
- * 
- * @see ra_start_unsolicited() for the caller that invokes this via iface_enumerate()
- * @see new_timeout() for RA timeout calculation and scheduling logic
- * @see iface_enumerate() for system-wide IPv6 address enumeration mechanism
- * @see is_same_net6() for IPv6 prefix containment testing
- * @see indextoname() for interface index to name resolution
- * @see iface_check() for interface filtering based on --interface/--except-interface
- * 
- * EXAMPLE USAGE:
- * @code
- * // Invoked automatically by iface_enumerate in ra_start_unsolicited:
- * struct search_param param;
- * param.now = dnsmasq_time();
- * param.iface = 0;  // Will be set if interface found requiring RA
- * // iface_search called for each IPv6 address on system:
- * iface_enumerate(AF_INET6, &param, iface_search);
- * if (param.iface != 0) {
- *   // Interface param.iface requires RA transmission
- *   send_ra(param.now, param.iface, param.name, NULL);
- * }
- * @endcode
- * 
- * RFC COMPLIANCE: RFC 4861 Section 6.2.4 (Sending Unsolicited Router Advertisements)
- * RFC COMPLIANCE: RFC 4862 Section 5.4.2 (Stateless address autoconfiguration timing)
- * 
- * SIDE EFFECTS: Sets param->iface to interface index requiring RA transmission
- * SIDE EFFECTS: Calls new_timeout() which modifies context->ra_time for matched context
- * SIDE EFFECTS: Zeros context->ra_time for subsequent contexts on same subnet
- * SIDE EFFECTS: Stores interface name in param->name via indextoname()
- * 
- * THREAD SAFETY: Single-threaded event loop, modifies shared context structures
- */
-static int iface_search(struct in6_addr *local,  int prefix,
-			int scope, int if_index, int flags, 
-			unsigned int preferred, unsigned int valid, void *vparam)
-{
-  struct search_param *param = vparam;
-  struct dhcp_context *context;
-  struct iname *tmp;
-  
-  (void)scope;
-  (void)preferred;
-  (void)valid;
-
-  /* ignore interfaces we're not doing DHCP on. */
-  if (!indextoname(daemon->icmp6fd, if_index, param->name) ||
-      !iface_check(AF_LOCAL, NULL, param->name, NULL))
-    return 1;
-
-  for (tmp = daemon->dhcp_except; tmp; tmp = tmp->next)
-    if (tmp->name && (tmp->flags & INAME_6) &&
-	wildcard_match(tmp->name, param->name))
-      return 1;
-
-  for (context = daemon->dhcp6; context; context = context->next)
-    if (!(context->flags & (CONTEXT_TEMPLATE | CONTEXT_OLD)) &&
-	prefix <= context->prefix &&
-	is_same_net6(local, &context->start6, context->prefix) &&
-	is_same_net6(local, &context->end6, context->prefix) &&
-	context->ra_time != 0 && 
-	difftime(context->ra_time, param->now) <= 0.0)
-      {
-	/* found an interface that's overdue for RA determine new 
-	   timeout value and arrange for RA to be sent unless interface is
-	   still doing DAD.*/
-	if (!(flags & IFACE_TENTATIVE))
-	  param->iface = if_index;
-	
-	new_timeout(context, param->name, param->now);
-	
-	/* zero timers for other contexts on the same subnet, so they don't timeout 
-	   independently */
-	for (context = context->next; context; context = context->next)
-	  if (prefix <= context->prefix &&
-	      is_same_net6(local, &context->start6, context->prefix) &&
-	      is_same_net6(local, &context->end6, context->prefix))
-	    context->ra_time = 0;
-	
-	return 0; /* found, abort */
-      }
-  
-  return 1; /* keep searching */
-}
- 
-/**
  * @brief Calculate and set next Router Advertisement transmission timeout for DHCP context
  * 
  * @detailed Implements RFC 4861 Section 6.2.4 timing requirements for Router Advertisement
@@ -1770,165 +1940,9 @@ static int iface_search(struct in6_addr *local,  int prefix,
  * @note Multiple routers on same link MUST use randomized intervals per RFC 4861
  * @note context->ra_time is absolute time (seconds since epoch), not relative offset
  * @note Subsequent calls to periodic_ra() check if now >= context->ra_time to trigger transmission
- * 
- * @warning Requires context->ra_short_period_start to be initialized before first call
- * @warning iface_name must be valid null-terminated string (passed to find_iface_param)
- * @warning Assumes context pointer is valid and points to initialized dhcp_context
- * @warning Does not validate MaxRtrAdvInterval is >= MIN_RTR_ADV_INTERVAL (600s per RFC)
- * @warning Randomization assumes rand16() provides sufficient entropy for security
- * 
- * @see ra_start_unsolicited() for initialization of context->ra_short_period_start
- * @see periodic_ra() for periodic check of context->ra_time and RA transmission
- * @see calc_interval() for retrieval of MaxRtrAdvInterval from configuration
- * @see find_iface_param() for interface-specific RA configuration lookup
- * @see rand16() in util.c for cryptographically secure random number generation
- * @see send_ra() for actual Router Advertisement transmission when timeout expires
- * 
- * EXAMPLE USAGE:
- * @code
- * struct dhcp_context *ctx = daemon->dhcp6;
- * time_t now = dnsmasq_time();
- * ctx->ra_short_period_start = now; // Start short period
- * new_timeout(ctx, "eth0", now);
- * // ctx->ra_time now set to now + 5-20 seconds (short period)
- * 
- * // After 60+ seconds, next call uses normal period:
- * now = dnsmasq_time(); // 70 seconds later
- * new_timeout(ctx, "eth0", now);
- * // ctx->ra_time now set to now + 450-600 seconds (default interval)
- * @endcode
- * 
- * RFC COMPLIANCE: RFC 4861 Section 6.2.4 (Sending Router Advertisements)
- * RFC COMPLIANCE: RFC 4861 Section 6.2.1 (Router Configuration Variables - MaxRtrAdvInterval)
- * RFC COMPLIANCE: RFC 4861 requires interval randomization to prevent router synchronization
- * 
- * SIDE EFFECTS: Modifies context->ra_time to schedule next RA transmission
- * SIDE EFFECTS: Calls find_iface_param() which searches daemon->ra_interfaces list
- * SIDE EFFECTS: Calls calc_interval() which may return default or configured interval
- * SIDE EFFECTS: Invokes rand16() which updates internal PRNG state
- * 
- * THREAD SAFETY: Single-threaded event loop, modifies shared context structure
  */
-static void new_timeout(struct dhcp_context *context, char *iface_name, time_t now)
-{
-  if (difftime(now, context->ra_short_period_start) < 60.0)
-    /* range 5 - 20 */
-    context->ra_time = now + 5 + (rand16()/4400);
-  else
-    {
-      /* range 3/4 - 1 times MaxRtrAdvInterval */
-      unsigned int adv_interval = calc_interval(find_iface_param(iface_name));
-      context->ra_time = now + (3 * adv_interval)/4 + ((adv_interval * (unsigned int)rand16()) >> 18);
-    }
-}
 
-/**
- * @brief Find Router Advertisement interface configuration by name
- * 
- * Searches the global list of configured RA interfaces to find the ra_interface
- * structure matching the given interface name. Supports wildcard pattern matching
- * to allow a single configuration entry to apply to multiple interfaces (e.g.,
- * "eth*" matching eth0, eth1, eth2). Used by RA transmission and lifetime
- * calculation functions to retrieve interface-specific configuration parameters.
- * 
- * @param iface Interface name to search for (e.g., "eth0", "wlan0")
- * 
- * @return Pointer to matching ra_interface structure, or NULL if not found
- * @retval ra_interface* First matching interface configuration (if found)
- * @retval NULL No matching interface configuration (uses default behavior)
- * 
- * @note Function performs linear search through daemon->ra_interfaces linked list
- * @note Wildcard matching allows patterns like "eth*" to match "eth0", "eth1", etc.
- * @note Returns first match when wildcards could match multiple entries
- * @note NULL return triggers default RA behavior (calc_lifetime, calc_interval defaults)
- * @note Interface names are case-sensitive for matching
- * @warning NULL iface parameter will cause wildcard_match to fail (returns NULL)
- * @warning Wildcard patterns should be carefully ordered in configuration (first match wins)
- * 
- * @see wildcard_match() for pattern matching algorithm (supports * and ? wildcards)
- * @see calc_lifetime() which calls this to get configured lifetime
- * @see calc_interval() which calls this to get configured interval
- * @see calc_prio() which calls this to get configured router preference
- * @see struct ra_interface in dnsmasq.h for configuration structure definition
- * 
- * EXAMPLE USAGE:
- * @code
- * struct ra_interface *ra = find_iface_param("eth0");
- * if (ra) {
- *   // Use ra->interval, ra->lifetime, ra->prio from configuration
- *   unsigned int interval = calc_interval(ra);
- * } else {
- *   // Use default behavior (no specific configuration for eth0)
- *   unsigned int interval = calc_interval(NULL);
- * }
- * @endcode
- * 
- * RFC COMPLIANCE: Not directly specified by RFC 4861 (configuration management)
- * - Enables per-interface customization of RFC 4861 parameters
- * - Supports multiple interface RA configuration as required by multi-homed routers
- * 
- * SIDE EFFECTS: None (pure read operation, no state modification)
- * THREAD SAFETY: Safe (single-threaded architecture, reads only from global linked list)
- */
-/**
- * @brief Find Router Advertisement interface configuration by name
- * 
- * Searches the configured RA interface list to locate interface-specific configuration
- * matching the provided interface name. Uses wildcard matching to support pattern-based
- * configuration (e.g., "eth*" matching "eth0", "eth1"). This lookup determines RA
- * transmission parameters (interval, lifetime, priority) for the specified interface.
- * 
- * @detailed
- * Iterates through the global linked list daemon->ra_interfaces comparing each
- * ra_interface->name against the provided interface name using wildcard_match().
- * The first matching entry is returned, with NULL indicating no explicit configuration
- * exists for this interface (defaults will be used).
- * 
- * Wildcard matching enables efficient configuration where multiple interfaces share
- * the same RA parameters (e.g., "eth*" applies to all Ethernet interfaces). The
- * search returns on first match, so more specific patterns should be configured
- * before generic wildcards if precedence control is needed.
- * 
- * @param iface Interface name to search for (e.g., "eth0", "wlan0"). Must not be NULL.
- * 
- * @return Pointer to matching ra_interface structure containing RA configuration parameters
- * @retval non-NULL Matching interface configuration found
- * @retval NULL No explicit configuration exists for this interface (use defaults)
- * 
- * @note This function is called frequently during RA transmission and should remain
- *       efficient. The wildcard matching adds minimal overhead.
- * @warning The returned pointer references global configuration data and must not be freed.
- *          The structure remains valid until configuration reload.
- * 
- * @see calc_lifetime() Uses ra_interface to calculate RA valid lifetime
- * @see calc_interval() Uses ra_interface to calculate RA transmission interval
- * @see calc_prio() Uses ra_interface to calculate router priority
- * 
- * EXAMPLE USAGE:
- * @code
- * struct ra_interface *ra = find_iface_param("eth0");
- * if (ra) {
- *   unsigned int interval = calc_interval(ra);
- *   unsigned int lifetime = calc_lifetime(ra);
- * } else {
- *   // Use system defaults for this interface
- * }
- * @endcode
- * 
- * RFC COMPLIANCE: RFC 4861 Section 6.2.1 - Router Configuration Variables per interface
- * SIDE EFFECTS: None (read-only lookup)
- * THREAD SAFETY: Safe in single-threaded architecture; reads global daemon->ra_interfaces
- */
-static struct ra_interface *find_iface_param(char *iface)
-{
-  struct ra_interface *ra;
-  
-  for (ra = daemon->ra_interfaces; ra; ra = ra->next)
-    if (wildcard_match(ra->name, iface))
-      return ra;
 
-  return NULL;
-}
 
 /**
  * @brief Calculate Router Advertisement transmission interval
@@ -1975,138 +1989,6 @@ static struct ra_interface *find_iface_param(char *iface)
  * 
  * SIDE EFFECTS: None (pure calculation, no state modification)
  * THREAD SAFETY: Safe (reads only from parameter, no global state access)
- */
-/**
- * @brief Calculate MaxRtrAdvInterval for Router Advertisement transmission timing
- * 
- * @detailed Computes the MaxRtrAdvInterval value controlling the maximum time between
- *           unsolicited Router Advertisement transmissions on this interface, as defined
- *           in RFC 4861 Section 6.2.1. This interval directly determines RA transmission
- *           frequency and impacts network convergence time when routers appear or disappear.
- *           Hosts use this interval (when communicated via future RA options) to determine
- *           how long to wait before concluding a router has become unreachable.
- * 
- * The function implements RFC 4861's mandatory constraints on MaxRtrAdvInterval with
- * dnsmasq's default policy:
- * 
- * DEFAULT INTERVAL (no configuration or interval == 0):
- * When no interface-specific interval is configured (ra parameter is NULL or ra->interval
- * is 0), the function returns the RFC 4861 recommended default of 600 seconds (10 minutes).
- * This conservative default balances network responsiveness against RA traffic overhead:
- * hosts receive topology updates within 10 minutes, while RA packets consume minimal
- * bandwidth on typical networks. Formula: interval = 600 seconds.
- * 
- * RFC 4861 states: "Default: 600 seconds" for MaxRtrAdvInterval. This value was chosen
- * by the IPv6 working group to provide reasonable convergence time for residential and
- * small office networks without excessive multicast traffic.
- * 
- * CONFIGURED INTERVAL WITH RFC 4861 VALIDATION:
- * When an administrator configures an explicit interval via --ra-param interval=<seconds>,
- * the function applies that value but enforces RFC 4861's mandatory range constraints to
- * prevent both protocol violations and operational problems:
- * 
- * MINIMUM CONSTRAINT (4 seconds):
- * RFC 4861 Section 6.2.1 mandates: "MUST be no less than 4 seconds." If the configured
- * interval is less than 4 seconds, the function raises the value to 4 seconds. This lower
- * bound prevents excessive RA traffic that could overwhelm low-bandwidth links or slow
- * embedded systems. Intervals below 4 seconds would generate 15+ multicast packets per
- * minute per router, creating unacceptable overhead on shared network segments.
- * 
- * MAXIMUM CONSTRAINT (1800 seconds):
- * RFC 4861 Section 6.2.1 mandates: "MUST be no more than 1800 seconds." If the configured
- * interval exceeds 1800 seconds (30 minutes), the function caps the value at 1800 seconds.
- * This upper bound ensures hosts detect topology changes within reasonable timeframes.
- * Without this limit, network convergence could take hours, rendering IPv6 autoconfiguration
- * impractical for environments with mobile hosts or dynamic router availability.
- * 
- * The RFC's 1800-second maximum was chosen to balance opposing concerns:
- * - Longer intervals reduce multicast overhead (important for battery-powered devices)
- * - Shorter intervals improve convergence time (important for mobile networks)
- * - 30 minutes represents the maximum acceptable delay for prefix/route updates
- * 
- * RELATIONSHIP TO MinRtrAdvInterval:
- * RFC 4861 also defines MinRtrAdvInterval = 0.33 * MaxRtrAdvInterval (with floor of 3 seconds).
- * Dnsmasq uses MinRtrAdvInterval to randomize RA transmission times, sending unsolicited RAs
- * at random intervals between MinRtrAdvInterval and MaxRtrAdvInterval. This randomization
- * prevents synchronization of RAs from multiple routers on the same link, which would cause
- * periodic bursts of multicast traffic. The calc_interval() return value feeds into this
- * randomization logic in ra_start_unsolicited().
- * 
- * RELATIONSHIP TO ROUTER LIFETIME:
- * The calc_lifetime() function uses this interval to compute default router lifetime
- * (3 * interval) and to enforce the RFC 4861 requirement that Router Lifetime must be
- * at least MaxRtrAdvInterval. This dependency ensures lifetime scaling remains consistent
- * with advertisement frequency.
- * 
- * @param ra Pointer to ra_interface structure containing interface-specific RA configuration
- *           including interval member, or NULL if no configuration exists for this interface
- * 
- * @return MaxRtrAdvInterval value in seconds controlling RA transmission timing
- * @retval 600 Default interval when ra is NULL or ra->interval == 0 (RFC 4861 default)
- * @retval 4 Configured interval was less than 4 seconds (raised to RFC 4861 minimum)
- * @retval 1800 Configured interval exceeded 1800 seconds (capped at RFC 4861 maximum)
- * @retval ra->interval Configured interval within RFC-compliant range (4 to 1800 seconds)
- * 
- * @note Default MaxRtrAdvInterval is 600 seconds per RFC 4861 Section 6.2.1
- * @note RFC 4861 mandates minimum 4 seconds and maximum 1800 seconds for MaxRtrAdvInterval
- * @note MinRtrAdvInterval is computed as max(3, 0.33 * MaxRtrAdvInterval) elsewhere in code
- * @note Actual RA transmission occurs at random times between Min and Max intervals
- * @note Lower intervals improve convergence time but increase multicast traffic overhead
- * @note Higher intervals reduce traffic but delay host awareness of topology changes
- * @note This interval affects router lifetime calculation in calc_lifetime()
- * @note Configured interval of 0 is treated as "use default" (not "disable RAs")
- * @note ra->interval values are assumed to be in seconds (no unit conversion)
- * @note Casting to unsigned int is safe since interval is clamped to [4, 1800] range
- * 
- * @warning Intervals below 4 seconds violate RFC 4861 and are automatically raised
- * @warning Intervals above 1800 seconds violate RFC 4861 and are automatically capped
- * @warning Very short intervals (<10 seconds) may cause excessive multicast traffic
- * @warning Very long intervals (>600 seconds) may delay critical prefix updates
- * @warning Requires ra->interval to be configured in seconds (not milliseconds)
- * @warning Interval affects network convergence time when routers become available/unavailable
- * 
- * @see ra_start_unsolicited() for unsolicited RA scheduling using this interval
- * @see calc_lifetime() for Router Lifetime calculation using this interval
- * @see send_ra() for actual RA transmission function
- * @see new_timeout() for timeout calculation using this interval
- * @see struct ra_interface in dnsmasq.h for interval configuration member
- * @see find_iface_param() for ra_interface structure lookup by interface name
- * 
- * EXAMPLE USAGE:
- * @code
- * // Default interval (no configuration):
- * struct ra_interface *ra = NULL;
- * unsigned int interval = calc_interval(ra);
- * // Returns: 600 seconds (10 minutes)
- * 
- * // Configured interval within valid range:
- * struct ra_interface ra_cfg = { .interval = 300 };
- * interval = calc_interval(&ra_cfg);
- * // Returns: 300 seconds (5 minutes)
- * 
- * // Configured interval too low (raised to RFC minimum):
- * ra_cfg.interval = 2;
- * interval = calc_interval(&ra_cfg);
- * // Returns: 4 seconds (raised to RFC 4861 minimum)
- * 
- * // Configured interval too high (capped at RFC maximum):
- * ra_cfg.interval = 3600;
- * interval = calc_interval(&ra_cfg);
- * // Returns: 1800 seconds (capped at RFC 4861 maximum)
- * 
- * // Using interval for timeout calculation:
- * time_t next_ra = now + calc_interval(ra);
- * // Schedule next unsolicited RA transmission
- * @endcode
- * 
- * RFC COMPLIANCE: RFC 4861 Section 6.2.1 (Router Configuration Variables - MaxRtrAdvInterval)
- * RFC COMPLIANCE: RFC 4861 requires 4 <= MaxRtrAdvInterval <= 1800 seconds
- * RFC COMPLIANCE: RFC 4861 default MaxRtrAdvInterval is 600 seconds
- * RFC COMPLIANCE: RFC 4861 defines MinRtrAdvInterval = max(3, 0.33 * MaxRtrAdvInterval)
- * 
- * SIDE EFFECTS: None (pure calculation function with no global state modifications)
- * 
- * THREAD SAFETY: Read-only access to ra structure, safe in single-threaded event loop
  */
 static unsigned int calc_interval(struct ra_interface *ra)
 {
@@ -2163,131 +2045,6 @@ static unsigned int calc_interval(struct ra_interface *ra)
  * SIDE EFFECTS: None (pure calculation, no logging in this implementation)
  * THREAD SAFETY: Single-threaded access, safe for daemon global state reads
  */
-/**
- * @brief Calculate Router Lifetime value for Router Advertisement message
- * 
- * @detailed Computes the Router Lifetime field value for inclusion in the ICMPv6 Router
- *           Advertisement message header per RFC 4861. The Router Lifetime indicates the
- *           duration in seconds that receiving hosts should consider this router as a valid
- *           default router for forwarding packets off the local network segment. This value
- *           directly impacts host routing table entries: hosts remove the router from their
- *           default router list when the lifetime expires, requiring a new RA to restore
- *           reachability.
- * 
- * The function implements a three-tier calculation strategy with RFC 4861 compliance and
- * dnsmasq-specific policy constraints:
- * 
- * TIER 1 - DEFAULT LIFETIME (no configuration or lifetime == -1):
- * When the administrator has not explicitly configured a lifetime value (ra parameter is NULL
- * or ra->lifetime == -1), the function applies RFC 4861's recommended default: 3 times the
- * MaxRtrAdvInterval. This ensures the router lifetime extends well beyond the typical RA
- * transmission interval, providing redundancy against packet loss. With default MaxRtrAdvInterval
- * of 600 seconds, this yields 1800 seconds (30 minutes) lifetime. Formula: lifetime = 3 * interval.
- * 
- * RFC 4861 Section 6.2.1 states: "AdvDefaultLifetime SHOULD be at least MaxRtrAdvInterval if the
- * router is to be used as a default router." The 3x multiplier provides comfortable margin.
- * 
- * TIER 2 - CONFIGURED LIFETIME WITH VALIDATION:
- * When the administrator has configured an explicit lifetime via --ra-param lifetime=<seconds>,
- * the function applies that value but enforces two critical constraints to prevent misconfigurations:
- * 
- * MINIMUM CONSTRAINT: If configured lifetime is less than MaxRtrAdvInterval AND is non-zero,
- * the function raises the lifetime to equal MaxRtrAdvInterval. This prevents the invalid
- * scenario where the router lifetime expires before the next RA transmission, causing hosts
- * to remove the router from their default router list despite the router continuing to advertise.
- * Special case: lifetime=0 is permitted and means "do not use as default router" (RFC 4861
- * explicitly allows 0 to signal non-default-router status for routers advertising only prefixes).
- * 
- * MAXIMUM CONSTRAINT: If configured lifetime exceeds 9000 seconds, the function caps the value
- * at 9000 seconds. While RFC 4861 allows Router Lifetime up to 65535 seconds (18.2 hours),
- * dnsmasq enforces a conservative 9000-second (2.5 hours) maximum to limit the duration hosts
- * retain stale routing information if the router becomes unreachable. This policy protects
- * against excessively long convergence times in dynamic network environments.
- * 
- * TIER 3 - INTERVAL CALCULATION DEPENDENCY:
- * All lifetime calculations depend on MaxRtrAdvInterval retrieved via calc_interval(ra), which
- * returns either the interface-specific configured interval or the default 600-second value.
- * This ensures lifetime scaling remains proportional to advertisement frequency regardless of
- * per-interface interval tuning.
- * 
- * The calculated lifetime is returned as unsigned int matching the 16-bit Router Lifetime
- * field in the ICMPv6 RA header (struct nd_router_advert), though dnsmasq's 9000-second cap
- * ensures the value never approaches the 65535 maximum.
- * 
- * @param ra Pointer to ra_interface structure containing interface-specific RA configuration,
- *           or NULL if no configuration exists for this interface
- * 
- * @return Router Lifetime value in seconds for inclusion in RA header
- * @retval 3*interval Default when ra is NULL or ra->lifetime == -1 (typically 1800 seconds)
- * @retval 0 Administrator explicitly configured lifetime=0 (non-default router mode)
- * @retval interval Configured lifetime was less than interval (raised to interval for RFC compliance)
- * @retval 9000 Configured lifetime exceeded 9000 seconds (capped at maximum)
- * @retval ra->lifetime Configured lifetime within valid range (interval to 9000 seconds)
- * 
- * @note Default lifetime is 3 times MaxRtrAdvInterval per RFC 4861 recommendation
- * @note Lifetime of 0 is valid and signals "do not use as default router" (RFC 4861)
- * @note Non-zero lifetimes are enforced to be >= MaxRtrAdvInterval for RFC compliance
- * @note Maximum enforced lifetime is 9000 seconds (dnsmasq policy, not RFC limit)
- * @note RFC 4861 permits lifetimes up to 65535 seconds, but dnsmasq caps at 9000
- * @note Lifetime affects host default router list entry expiration time
- * @note Hosts remove expired default routers from routing tables automatically
- * @note interval is calculated via calc_interval(ra) which may return default or configured value
- * @note ra->lifetime == -1 is the sentinel value meaning "use default calculation"
- * @note Casting to unsigned int is safe since lifetime is clamped to [0, 9000] range
- * 
- * @warning Requires calc_interval() to return valid MaxRtrAdvInterval value
- * @warning Lifetime < interval (except 0) violates RFC 4861 and is automatically corrected
- * @warning Lifetime > 9000 is clamped to 9000 regardless of configuration
- * @warning ra->lifetime values are assumed to be in seconds (no unit conversion)
- * @warning Lifetime = 0 is special: router advertises prefixes but not default route
- * @warning Hosts will NOT forward off-link traffic to routers with lifetime = 0
- * @warning Overly long lifetimes delay convergence when routers become unreachable
- * 
- * @see send_ra() for RA message construction using calculated lifetime in nd_router_advert header
- * @see send_ra_alias() for alias interface RA construction also using this calculation
- * @see calc_interval() for MaxRtrAdvInterval retrieval used in lifetime calculation
- * @see find_iface_param() for ra_interface structure lookup by interface name
- * @see struct nd_router_advert in radv-protocol.h for Router Lifetime field (16-bit)
- * @see struct ra_interface in dnsmasq.h for lifetime configuration member
- * 
- * EXAMPLE USAGE:
- * @code
- * // Default lifetime calculation (no configuration):
- * struct ra_interface *ra = NULL;
- * unsigned int lifetime = calc_lifetime(ra);
- * // Returns: 3 * 600 = 1800 seconds (30 minutes)
- * 
- * // Configured lifetime within valid range:
- * struct ra_interface ra_cfg = { .lifetime = 3600 };
- * lifetime = calc_lifetime(&ra_cfg);
- * // Returns: 3600 seconds (1 hour)
- * 
- * // Configured lifetime too low (raised to interval):
- * ra_cfg.lifetime = 300; // Less than default interval of 600
- * lifetime = calc_lifetime(&ra_cfg);
- * // Returns: 600 seconds (raised to interval minimum)
- * 
- * // Configured lifetime too high (capped at maximum):
- * ra_cfg.lifetime = 20000;
- * lifetime = calc_lifetime(&ra_cfg);
- * // Returns: 9000 seconds (capped at dnsmasq maximum)
- * 
- * // Special case - non-default router mode:
- * ra_cfg.lifetime = 0;
- * lifetime = calc_lifetime(&ra_cfg);
- * // Returns: 0 (router advertises prefixes only, no default route)
- * @endcode
- * 
- * RFC COMPLIANCE: RFC 4861 Section 6.2.1 (Router Configuration Variables - AdvDefaultLifetime)
- * RFC COMPLIANCE: RFC 4861 Section 4.2 (Router Advertisement Message Format - Router Lifetime field)
- * RFC COMPLIANCE: RFC 4861 requires lifetime >= MaxRtrAdvInterval (enforced by minimum constraint)
- * RFC COMPLIANCE: RFC 4861 allows lifetime = 0 for non-default-router operation
- * 
- * SIDE EFFECTS: Calls calc_interval(ra) which may search daemon->ra_interfaces configuration list
- * SIDE EFFECTS: None to global state (pure calculation function with no modifications)
- * 
- * THREAD SAFETY: Read-only access to ra structure, safe in single-threaded event loop
- */
 static unsigned int calc_lifetime(struct ra_interface *ra)
 {
   int lifetime, interval = (int)calc_interval(ra);
@@ -2337,189 +2094,6 @@ static unsigned int calc_lifetime(struct ra_interface *ra)
  * 
  * RFC COMPLIANCE: RFC 4191 Section 2.1 (Router Preference)
  * THREAD SAFETY: Single-threaded access, safe for read-only operations
- */
-/**
- * @brief Calculate Router Preference (Prf) value for Router Advertisement message
- * 
- * @detailed Retrieves the Router Preference value for inclusion in the ICMPv6 Router
- *           Advertisement message header flags field per RFC 4191 Section 2.2. The Router
- *           Preference (Prf) is a 2-bit field that indicates the preference for this router
- *           compared to other routers on the same link, helping hosts make intelligent
- *           routing decisions when multiple default routers are available. This preference
- *           influences the host's default router selection algorithm: higher-preference
- *           routers are selected preferentially for forwarding off-link packets, improving
- *           traffic distribution and enabling administrator control over routing paths.
- * 
- * The function implements a simple configuration retrieval mechanism with RFC 4191
- * compliance and dnsmasq's default policy:
- * 
- * DEFAULT PREFERENCE (no configuration):
- * When no interface-specific preference is configured (ra parameter is NULL), the
- * function returns 0, corresponding to Medium (00) preference per RFC 4191. This neutral
- * default ensures the router participates in default router selection without claiming
- * priority over peers. Formula: prio = 0 (Medium preference).
- * 
- * RFC 4191 Section 2.1 states: "Medium (00) preference is the default, and SHOULD be
- * used for routers that need not be distinguished from their peers." This value is
- * appropriate when all routers on the link have equivalent capabilities and the
- * administrator has not configured preferential routing.
- * 
- * CONFIGURED PREFERENCE:
- * When the administrator has explicitly configured a preference via --ra-param
- * priority=<value>, the function returns that configured value from the ra->prio
- * member of the ra_interface structure. The configuration parser (in option.c)
- * accepts three named values corresponding to RFC 4191 preferences:
- * 
- * - "high" (1): High (01) preference signals this router should be preferred over
- *   routers with Medium or Low preference when forwarding packets. Use for primary
- *   internet-connected routers or routers with better upstream connectivity.
- * 
- * - "medium" (0): Medium (00) preference indicates no special priority. This is the
- *   RFC default and appropriate for most scenarios where routers have equivalent
- *   capabilities and no preferential treatment is desired.
- * 
- * - "low" (3): Low (11) preference signals this router should be used only when no
- *   Higher or Medium preference routers are available. Use for backup routers, slow
- *   links, or routers with limited capabilities. Note: RFC 4191 uses 11 binary (3
- *   decimal) to encode Low preference, not 2 (which is Reserved).
- * 
- * RFC 4191 PREFERENCE ENCODING:
- * The 2-bit Prf field in the ICMPv6 RA header flags occupies bits 3-4 (counting from
- * bit 0 as LSB) with the following standardized encoding per RFC 4191 Section 2.2:
- * 
- *   00 (0 decimal): Medium preference (default)
- *   01 (1 decimal): High preference
- *   10 (2 decimal): Reserved (MUST NOT be used)
- *   11 (3 decimal): Low preference
- * 
- * The returned value is assigned to the ra_packet->flags field in send_ra() and
- * send_ra_alias(), where it is positioned in the appropriate bits of the ICMPv6
- * Router Advertisement header flags byte before transmission.
- * 
- * HOST BEHAVIOR WITH ROUTER PREFERENCE:
- * RFC 4191-compliant IPv6 hosts use Router Preference to make intelligent default
- * router selection decisions when multiple routers advertise on the same link:
- * 
- * SELECTION ALGORITHM (RFC 4191 Section 3.1):
- * 1. Hosts prefer routers with higher Router Preference over lower preference
- * 2. Among routers with equal preference, hosts may use round-robin or reachability
- * 3. Hosts may maintain multiple default routers and load-balance across equal-preference
- *    routers, with preference governing the load-balance weighting
- * 
- * FAILOVER BEHAVIOR:
- * If the highest-preference router becomes unreachable (detected via Neighbor
- * Unreachability Detection), hosts fail over to the next-highest-preference router.
- * This enables graceful degradation: traffic flows to the preferred router normally,
- * fails over to medium-preference backup routers if the primary fails, and only uses
- * low-preference routers as a last resort.
- * 
- * ADMINISTRATIVE USE CASES:
- * - DUAL-HOMED NETWORKS: Set priority=high on the primary internet-connected router,
- *   priority=medium on the secondary internet connection, and priority=low on the
- *   local-only router serving internal resources. This ensures internet traffic
- *   prefers the primary uplink while maintaining backup connectivity.
- * 
- * - ASYMMETRIC LINKS: Set priority=low on routers with slow or metered connections
- *   (e.g., cellular backup, satellite) to discourage their use except during failures
- *   of faster links.
- * 
- * - POLICY-BASED ROUTING: Use preference to guide hosts toward routers that provide
- *   access to specific resources or paths, implementing basic traffic engineering
- *   without requiring host-side route configuration.
- * 
- * RELATIONSHIP TO PREFIX PREFERENCE:
- * RFC 4191 also defines Route Information Options that can advertise specific routes
- * with preferences. The Router Preference returned by this function applies to the
- * router's role as a default router (for destinations not covered by more-specific
- * routes), while route-specific preferences apply to explicitly advertised prefixes.
- * Both mechanisms work together to provide comprehensive routing preference signaling.
- * 
- * The function's simplicity (direct return of configured or default value) reflects
- * the straightforward nature of Router Preference: it is a static configuration
- * parameter set by the administrator and does not change based on runtime conditions.
- * Dynamic preference adjustment based on link quality, load, or other factors is not
- * part of RFC 4191 and would require custom protocols.
- * 
- * @param ra Pointer to ra_interface structure containing interface-specific RA
- *           configuration including prio member, or NULL if no configuration exists
- *           for this interface
- * 
- * @return Router Preference value for encoding in ICMPv6 RA header flags field
- * @retval 0 Default Medium preference when ra is NULL or not configured (00 binary)
- * @retval 1 High preference when configured with priority=high (01 binary)
- * @retval 3 Low preference when configured with priority=low (11 binary)
- * @retval ra->prio Configured preference value from ra_interface structure
- * 
- * @note Default preference is 0 (Medium) per RFC 4191 Section 2.1
- * @note RFC 4191 defines three valid preferences: High (1), Medium (0), Low (3)
- * @note Value 2 (10 binary) is Reserved and MUST NOT be used per RFC 4191
- * @note Preference encoding: 00=Medium, 01=High, 10=Reserved, 11=Low
- * @note Return value is assigned to ra_packet->flags which maps to ICMPv6 RA header
- * @note Hosts use preference to prioritize routers when multiple are available
- * @note Higher-preference routers are selected preferentially for packet forwarding
- * @note Preference affects default router selection but not neighbor reachability
- * @note ra->prio is configured via --ra-param priority=high|medium|low option
- * @note Configuration parsing in option.c validates preference values
- * @note Preference is static per interface and does not change at runtime
- * @note This function has no side effects and performs pure configuration lookup
- * 
- * @warning Value 2 is Reserved per RFC 4191 and produces undefined host behavior
- * @warning Preference only affects RFC 4191-compliant hosts (not legacy IPv6 stacks)
- * @warning Misconfigured preferences can cause suboptimal routing or traffic imbalance
- * @warning Low preference may result in router underutilization even when idle
- * @warning High preference may overload a router if other routers have lower capacity
- * @warning Preference does not override host's manual default route configuration
- * @warning Router Preference requires Router Lifetime > 0 to be effective
- * @warning Hosts may cache preference and continue using old value after RA change
- * 
- * @see send_ra() for RA message construction using calculated preference in ra_packet flags
- * @see send_ra_alias() for alias interface RA construction also using this preference
- * @see struct ra_packet in radv-protocol.h for flags field (includes Prf bits)
- * @see struct ra_interface in dnsmasq.h for prio configuration member
- * @see find_iface_param() for ra_interface structure lookup by interface name
- * @see RFC 4191 Section 2.2 for Router Preference definition and encoding
- * @see RFC 4191 Section 3.1 for host default router selection algorithm
- * 
- * EXAMPLE USAGE:
- * @code
- * // Default preference (no configuration):
- * struct ra_interface *ra = NULL;
- * unsigned int prio = calc_prio(ra);
- * // Returns: 0 (Medium preference, 00 binary)
- * 
- * // Configured high preference (primary router):
- * struct ra_interface ra_cfg = { .prio = 1 };
- * prio = calc_prio(&ra_cfg);
- * // Returns: 1 (High preference, 01 binary)
- * // Hosts prefer this router for default gateway
- * 
- * // Configured low preference (backup router):
- * ra_cfg.prio = 3;
- * prio = calc_prio(&ra_cfg);
- * // Returns: 3 (Low preference, 11 binary)
- * // Hosts use this router only when higher-preference routers unavailable
- * 
- * // Using preference in RA construction:
- * struct ra_packet *ra_pkt = malloc(sizeof(struct ra_packet));
- * ra_pkt->flags = calc_prio(ra);
- * // RA header flags field now contains Router Preference bits
- * 
- * // Multi-homed network scenario:
- * struct ra_interface ra_primary = { .prio = 1 };    // High - main internet
- * struct ra_interface ra_backup = { .prio = 0 };     // Medium - backup internet
- * struct ra_interface ra_local = { .prio = 3 };      // Low - local only
- * // Hosts will prefer primary, fall back to backup, use local as last resort
- * @endcode
- * 
- * RFC COMPLIANCE: RFC 4191 Section 2.2 (Router Preference and Preference Values)
- * RFC COMPLIANCE: RFC 4191 Section 2.1 (Router Preference Default Router Extension)
- * RFC COMPLIANCE: RFC 4191 defines encoding: 00=Medium, 01=High, 10=Reserved, 11=Low
- * RFC COMPLIANCE: RFC 4191 Section 3.1 (Host Default Router Selection Algorithm)
- * RFC COMPLIANCE: Medium (0) is default preference per RFC 4191
- * 
- * SIDE EFFECTS: None (pure configuration retrieval with no global state modifications)
- * 
- * THREAD SAFETY: Read-only access to ra structure, safe in single-threaded event loop
  */
 static unsigned int calc_prio(struct ra_interface *ra)
 {
