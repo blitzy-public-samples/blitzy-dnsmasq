@@ -2514,6 +2514,35 @@ static void log_packet(char *type, void *addr, unsigned char *ext_mac,
 #endif
 }
 
+/**
+ * @brief Log all DHCP options present in a DHCP packet for debugging
+ * 
+ * Iterates through the DHCP options array starting from the given pointer and logs
+ * each option encountered until the OPTION_END marker is reached. For each option,
+ * logs the transaction ID, option size, option code, option name, and formatted
+ * option value. This function is used for detailed DHCP transaction logging when
+ * --log-opts is enabled.
+ * 
+ * @param start Pointer to the first DHCP option in the options array
+ * @param xid DHCP transaction ID (XID) in network byte order for correlation with the parent request/reply
+ * 
+ * @note This function modifies daemon->namebuff as a scratch buffer for formatting
+ * @warning Caller must ensure 'start' points to valid DHCP options with proper termination
+ * 
+ * @see option_string() in option.c for option value formatting
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Log all options in a DHCP packet after processing
+ * unsigned char *opts = &mess->options[0] + sizeof(u32);
+ * log_options(opts, mess->xid);
+ * // Output: "12345 sent size:  4 option: 54 server-identifier  192.168.1.1"
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 2132 (DHCP Options and BOOTP Vendor Extensions)
+ * SIDE EFFECTS: Writes log messages to syslog; modifies daemon->namebuff
+ * THREAD SAFETY: Not thread-safe (uses shared daemon->namebuff buffer)
+ */
 static void log_options(unsigned char *start, u32 xid)
 {
   while (*start != OPTION_END)
@@ -2828,6 +2857,47 @@ static unsigned int option_uint(unsigned char *opt, int offset, int size)
   return ret;
 }
 
+/**
+ * @brief Find end of DHCP option data by scanning to OPTION_END marker
+ * 
+ * @detailed Advances through DHCP option data structure, skipping over each option
+ * by reading its length field and advancing past the option header (type + length)
+ * and data. Continues scanning until reaching the OPTION_END (0x00) marker that
+ * terminates the option sequence per RFC 2131 section 4.1. This function assumes
+ * well-formed option data and does not perform validation - it's used during packet
+ * construction where option validity is guaranteed by the builder.
+ * 
+ * The DHCP option format is: [1-byte type][1-byte length][length bytes of data].
+ * OPTION_END is represented by a single 0x00 byte with no length or data fields.
+ * 
+ * @param start Pointer to beginning of DHCP option data to scan
+ *              Must point to valid option data with proper OPTION_END termination
+ *              Typically points to mess->options[0]+4 (after magic cookie)
+ * 
+ * @return Pointer to OPTION_END marker (0x00 byte) terminating option sequence
+ *         Never returns NULL - assumes OPTION_END is present
+ * 
+ * @note This function does NOT validate option structure or detect malformed data
+ * @warning Caller must ensure option data is well-formed with OPTION_END present
+ *          Using this on untrusted data without validation may cause buffer overruns
+ * 
+ * @see find_overload() Locates OPTION_OVERLOAD to identify additional option space
+ * @see option_find() Safe option search with bounds checking for packet parsing
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * struct dhcp_packet *mess = ...;
+ * unsigned char *end = dhcp_skip_opts(&mess->options[0] + sizeof(u32));
+ * // end now points to OPTION_END marker, suitable for appending new options
+ * *end++ = OPTION_HOSTNAME;
+ * *end++ = hostname_len;
+ * memcpy(end, hostname, hostname_len);
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 2131 Section 4.1 (DHCP message format and option encoding)
+ * SIDE EFFECTS: None - read-only scan of option data
+ * THREAD SAFETY: Thread-safe - no shared state, read-only operation
+ */
 static unsigned char *dhcp_skip_opts(unsigned char *start)
 {
   while (*start != 0)
@@ -2835,6 +2905,53 @@ static unsigned char *dhcp_skip_opts(unsigned char *start)
   return start;
 }
 
+/**
+ * @brief Locate OPTION_OVERLOAD option indicating file/sname field reuse
+ * 
+ * @detailed Searches DHCP packet's options field for the OPTION_OVERLOAD option
+ * that signals whether the 'file' (128 bytes) and/or 'sname' (64 bytes) fields
+ * contain additional DHCP options instead of their usual boot filename and server
+ * hostname data. Per RFC 2131 section 4.1, OPTION_OVERLOAD value indicates:
+ *   1 = 'file' field contains options
+ *   2 = 'sname' field contains options  
+ *   3 = both fields contain options
+ * 
+ * This function is used during packet CONSTRUCTION (not parsing) and assumes
+ * well-formed option data. It's called to determine whether overload is already
+ * enabled before deciding whether to activate overload for additional option space.
+ * 
+ * @param mess Pointer to DHCP packet structure to search
+ *             Packet must have options field initialized with magic cookie
+ *             Options must be well-formed with proper length fields
+ * 
+ * @return Pointer to OPTION_OVERLOAD option (pointing at option type byte) if found
+ *         NULL if OPTION_OVERLOAD is not present in options field
+ * 
+ * @note This function does NOT perform bounds checking - use only with trusted data
+ * @note Only searches main options field, not within file/sname fields themselves
+ * @warning For packet construction only - not suitable for parsing untrusted packets
+ * 
+ * @see dhcp_skip_opts() Advances through option data to find insertion points
+ * @see do_options() Main option encoding that uses overload when space exhausted
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * struct dhcp_packet *mess = ...;
+ * unsigned char *overload = find_overload(mess);
+ * if (overload)
+ *   {
+ *     unsigned char overload_val = overload[2];
+ *     if (overload_val & 1)
+ *       // file field contains options, can't use for filename
+ *     if (overload_val & 2)
+ *       // sname field contains options, can't use for server name
+ *   }
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 2131 Section 4.1 (OPTION_OVERLOAD option definition)
+ * SIDE EFFECTS: None - read-only search of existing packet data
+ * THREAD SAFETY: Thread-safe - no shared state, read-only operation
+ */
 /* only for use when building packet: doesn't check for bad data. */ 
 static unsigned char *find_overload(struct dhcp_packet *mess)
 {
@@ -4666,6 +4783,85 @@ static void apply_delay(u32 xid, time_t recvtime, struct dhcp_netid *netid)
     }
 }
 
+/**
+ * @brief Relay DHCPv4 packet upstream to configured DHCP servers
+ * 
+ * @detailed Forwards DHCPv4 client packets (DISCOVER, REQUEST, etc.) to upstream
+ * DHCP servers configured via dhcp-relay directives. Implements RFC 1542 BOOTP/DHCP
+ * relay agent functionality with extensions for RFC 3046 relay agent information
+ * option. Supports two relay modes:
+ * 
+ * 1. **Standard Mode (RFC 1542)**: Sets giaddr to relay agent's address, increments
+ *    hops field, forwards to upstream server. Traditional relay using giaddr for
+ *    return routing.
+ * 
+ * 2. **Split Mode**: Uses OPTION_AGENT_ID (82) with sub-options instead of giaddr,
+ *    enabling relay through NAT environments where giaddr modification breaks routing.
+ *    Encodes subnet selection (sub-option 5), server override (13), flags (10), and
+ *    remote ID (2, interface index) for return path identification.
+ * 
+ * The function iterates through all configured relay servers, handling broadcast vs.
+ * unicast transmission, maximum hop count enforcement (16 hops per RFC 1542), and
+ * proper restoration of original packet state for potential local reply handling.
+ * 
+ * @param iface_addr IPv4 address of receiving interface (relay agent's local address)
+ *                   Used as giaddr in standard mode or in OPTION_AGENT_ID for split mode
+ *                   Must be valid unicast address for relay operations
+ * 
+ * @param iface_index System interface index of receiving interface
+ *                    Encoded in OPTION_AGENT_ID SUBOPT_REMOTE_ID for split mode return routing
+ *                    Used to identify which interface received the original client request
+ * 
+ * @param mess Pointer to DHCP packet to relay to upstream servers
+ *             Packet is modified (giaddr, hops) during relay, then restored afterward
+ *             Must have sufficient space for OPTION_AGENT_ID addition in split mode
+ * 
+ * @param sz Size of DHCP packet in bytes
+ *           Must be within DHCP minimum/maximum packet size bounds
+ *           May be increased by up to 24 bytes for OPTION_AGENT_ID in split mode
+ * 
+ * @param unicast 1 if packet was received via unicast, 0 if broadcast
+ *                Encoded in SUBOPT_FLAGS of OPTION_AGENT_ID for split mode
+ *                Helps upstream server determine appropriate response addressing
+ * 
+ * @return void (no return value - logs errors for failed relay operations)
+ * 
+ * @note Relay only occurs if daemon->relay4 configuration exists
+ * @note Maximum hop count of 16 is enforced per RFC 1542 to prevent routing loops
+ * @warning Modifies mess->hops and mess->giaddr temporarily, restores before return
+ * @warning Split mode requires 24 bytes free space for OPTION_AGENT_ID construction
+ * 
+ * @see relay_reply4() Handles downstream relay of server responses back to clients
+ * @see send_from() Transmits relayed packet with proper source address binding
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // In DHCP packet reception handler:
+ * struct dhcp_packet *mess = daemon->dhcp_packet.iov_base;
+ * struct in_addr iface_addr = ...;  // Interface IP where packet received
+ * int iface_index = if_nametoindex("eth0");
+ * size_t sz = 300; // Packet size
+ * int unicast = (mess->giaddr.s_addr != 0);
+ * 
+ * relay_upstream4(iface_addr, iface_index, mess, sz, unicast);
+ * // Packet relayed to all configured upstream DHCP servers
+ * @endcode
+ * 
+ * RFC COMPLIANCE:
+ *   - RFC 1542 Section 4.1.1 (BOOTP relay agent operation, giaddr and hops)
+ *   - RFC 3046 (DHCP Relay Agent Information Option, option 82)
+ *   - RFC 5107 (DHCP Server Identifier Override, sub-option 11/13)
+ *   - RFC 3527 (Link Selection sub-option, sub-option 5)
+ * 
+ * SIDE EFFECTS:
+ *   - Temporarily modifies mess->hops (incremented) and mess->giaddr (set to relay address)
+ *   - May add or modify OPTION_AGENT_ID in split mode (24 additional bytes)
+ *   - Sends UDP packets to upstream DHCP servers via daemon->dhcpfd socket
+ *   - Logs relay operations to syslog if OPT_LOG_OPTS enabled
+ *   - Restores original hops and giaddr values before function return
+ * 
+ * THREAD SAFETY: Not thread-safe - modifies shared daemon state and packet buffer
+ */
 void relay_upstream4(struct in_addr iface_addr, int iface_index, struct dhcp_packet *mess, size_t sz, int unicast)
 {
   struct in_addr giaddr = mess->giaddr;
@@ -4835,6 +5031,95 @@ void relay_upstream4(struct in_addr iface_addr, int iface_index, struct dhcp_pac
     *endopt = OPTION_END;
 }
 
+/**
+ * @brief Relay DHCPv4 server reply downstream to client via appropriate interface
+ * 
+ * @detailed Processes DHCP server responses (OFFER, ACK, NAK) received from upstream
+ * servers and determines the correct local interface for forwarding back to the original
+ * DHCP client. Implements the downstream relay portion of RFC 1542 BOOTP/DHCP relay
+ * agent operation with RFC 3046 relay agent information option support.
+ * 
+ * **Return Path Determination:**
+ * 
+ * The function examines the packet's giaddr field and OPTION_AGENT_ID (in split mode)
+ * to identify the interface where the original client request was received:
+ * 
+ * 1. **Split Mode (RFC 3046 extended)**:
+ *    - Verifies giaddr matches relay->uplink.addr4 (upstream relay address)
+ *    - Extracts SUBOPT_REMOTE_ID from OPTION_AGENT_ID containing interface index
+ *    - Deletes OPTION_AGENT_ID before forwarding per RFC 3046 paragraph 2.1
+ *    - Returns extracted interface index for packet transmission
+ * 
+ * 2. **Standard Mode (RFC 1542)**:
+ *    - Matches giaddr against relay->local.addr4 (local relay address)
+ *    - Returns configured relay->iface_index for downstream transmission
+ * 
+ * **Packet Filtering:**
+ * 
+ * - Only processes BOOTREPLY packets (server responses, not client requests)
+ * - Ignores packets with giaddr=0 (not relayed, direct server-to-client)
+ * - Validates arrival interface matches relay->interface if configured (wildcard support)
+ * 
+ * **Agent Information Handling:**
+ * 
+ * In split mode, the OPTION_AGENT_ID is removed before forwarding the packet to the
+ * client network. RFC 3046 paragraph 2.1 requires relay agents to remove the relay
+ * agent information option when forwarding replies, preventing option leakage to clients
+ * and avoiding packet size growth in multi-hop scenarios.
+ * 
+ * @param mess Pointer to DHCP BOOTREPLY packet from upstream server
+ *             Must have mess->op == BOOTREPLY and mess->giaddr != 0 for relay processing
+ *             OPTION_AGENT_ID is deleted in split mode (modified in-place)
+ * 
+ * @param sz Size of DHCP packet in bytes
+ *           Used for option parsing with bounds checking
+ *           Must be at least sizeof(struct dhcp_packet)
+ * 
+ * @param arrival_interface Name of network interface where packet arrived (e.g., "eth0")
+ *                          Used to validate packet arrived on expected upstream interface
+ *                          Must match relay->interface (if configured) for relay processing
+ *                          NULL is permitted but disables interface validation
+ * 
+ * @return Interface index (non-zero) where packet should be forwarded to reach client
+ * @retval >0 Valid interface index for downstream packet transmission
+ * @retval 0 Packet should not be relayed (not a relayed reply, no matching relay config)
+ * 
+ * @note Only processes packets with giaddr set and op=BOOTREPLY
+ * @note Multiple relay configurations are checked until a match is found
+ * @warning Modifies packet by deleting OPTION_AGENT_ID in split mode
+ * @warning Caller must verify returned interface index is valid before transmission
+ * 
+ * @see relay_upstream4() Handles upstream relay of client packets to servers
+ * @see send_from() Transmits relayed reply with proper interface binding
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // In DHCP packet reception handler for server replies:
+ * struct dhcp_packet *mess = daemon->dhcp_packet.iov_base;
+ * size_t sz = 300; // Packet size from recvmsg
+ * char *iface_name = "eth1"; // Interface where reply arrived
+ * 
+ * unsigned int return_iface = relay_reply4(mess, sz, iface_name);
+ * if (return_iface) {
+ *   // Forward packet via identified interface
+ *   send_from(return_iface, 0, (char *)mess, sz, ...);
+ * } else {
+ *   // Not a relayed reply or no matching relay config
+ * }
+ * @endcode
+ * 
+ * RFC COMPLIANCE:
+ *   - RFC 1542 Section 4.1.1 (BOOTP relay agent operation with giaddr)
+ *   - RFC 3046 Paragraph 2.1 (Relay agent MUST remove option 82 before forwarding reply)
+ *   - RFC 3046 Section 2.0 (Relay Agent Information Option format and sub-options)
+ * 
+ * SIDE EFFECTS:
+ *   - Deletes OPTION_AGENT_ID from packet in split mode (writes OPTION_END, zeros data)
+ *   - Modifies packet in-place by overwriting relay agent information option
+ *   - Iterates through daemon->relay4 list to find matching relay configuration
+ * 
+ * THREAD SAFETY: Not thread-safe - modifies shared packet buffer and reads daemon state
+ */
 unsigned int relay_reply4(struct dhcp_packet *mess, size_t sz, char *arrival_interface)
 {
   struct dhcp_relay *relay;
