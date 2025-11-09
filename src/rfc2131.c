@@ -3467,6 +3467,54 @@ static int in_list(unsigned char *list, int opt)
   return 0;
 }
 
+/**
+ * @brief Find DHCP option configuration with DHOPT_TAGOK flag in global option list
+ * 
+ * @detailed Searches the daemon's global DHCP option list (daemon->dhcp_opts) for
+ *           an option configuration matching the specified option code with the
+ *           DHOPT_TAGOK flag set. This function is used to locate tag-validated
+ *           option configurations that should be included in DHCP responses based
+ *           on network tag matching. Unlike option_find1() which searches in DHCP
+ *           packets, this searches configured options for response construction.
+ * 
+ * @param opt DHCP option code to search for (OPTION_* constants from dhcp-protocol.h)
+ * 
+ * @return Pointer to matching dhcp_opt structure if found and DHOPT_TAGOK flag set
+ * @retval struct dhcp_opt* Pointer to option configuration matching opt with DHOPT_TAGOK
+ * @retval NULL No matching option found, or option found but DHOPT_TAGOK flag not set
+ * 
+ * @note This function only returns options with DHOPT_TAGOK flag set, meaning
+ *       tag-based conditional logic has already validated this option should be included
+ * @note The search is linear through the linked list; performance is O(n) where n is
+ *       number of configured DHCP options (typically <100 for most deployments)
+ * @note Multiple options with same opt code may exist in list; function returns first
+ *       matching option with DHOPT_TAGOK flag
+ * 
+ * @see do_options() for usage in option response construction
+ * @see do_encap_opts() for encapsulated option handling
+ * @see option_find1() for searching options in received DHCP packets
+ * @see struct dhcp_opt definition in dnsmasq.h for flag values
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Find router option configuration that passed tag validation
+ * struct dhcp_opt *router_opt = option_find2(OPTION_ROUTER);
+ * if (router_opt) {
+ *     // Add router option to DHCP response using configured value
+ *     add_option_to_response(mess, end, router_opt);
+ * }
+ * 
+ * // Check if NTP server option is configured and tag-validated
+ * if (option_find2(OPTION_NTP_SERVER)) {
+ *     // NTP option will be included in response
+ * }
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 2131 Section 4.3.1 - DHCP server configuration for option values
+ * RFC COMPLIANCE: RFC 2132 - DHCP Options and BOOTP Vendor Extensions (all option definitions)
+ * SIDE EFFECTS: None (read-only search of global configuration data structure)
+ * THREAD SAFETY: Thread-safe in single-threaded architecture; read-only access to daemon->dhcp_opts
+ */
 static struct dhcp_opt *option_find2(int opt)
 {
   struct dhcp_opt *opts;
