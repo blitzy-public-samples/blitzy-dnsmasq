@@ -214,19 +214,6 @@ struct alias_param {
   int *alias_ifs;              /**< Dynamically allocated array of alias indices */
 };
 
-struct search_param {
-  time_t now; int iface;
-  char name[IF_NAMESIZE+1];
-};
-
-struct alias_param {
-  int iface;
-  struct dhcp_bridge *bridge;
-  int num_alias_ifs;
-  int max_alias_ifs;
-  int *alias_ifs;
-};
-
 static void send_ra(time_t now, int iface, char *iface_name, struct in6_addr *dest);
 /**
  * @brief Send ICMPv6 Router Advertisement message on specified interface
