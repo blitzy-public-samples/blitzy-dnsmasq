@@ -630,6 +630,88 @@ void icmp6_packet(time_t now)
     }
 }
 
+/**
+ * @brief Send Router Advertisement with configurable send and content interfaces
+ * 
+ * @detailed Constructs and transmits an IPv6 Router Advertisement (ICMPv6 type 134) message
+ *           with prefix information, DNS options, and DHCPv6 coordination flags. This function
+ *           supports bridge and alias scenarios where RA content is based on one interface
+ *           (iface) but transmitted on another (send_iface), enabling complex network topologies.
+ *           
+ *           The function handles:
+ *           - Prefix information options with valid/preferred lifetimes
+ *           - M (managed address) and O (other configuration) flags for DHCPv6 coordination
+ *           - RDNSS (Recursive DNS Server) option per RFC 6106
+ *           - DNSSL (DNS Search List) option per RFC 6106
+ *           - Advertisement interval and MTU options
+ *           - Old prefix advertisement for smooth renumbering transitions
+ *           - Router lifetime calculation based on prefix validity
+ * 
+ * @param now Current timestamp for calculating prefix lifetimes and RA intervals
+ * @param iface Interface index for determining RA content (contexts, prefixes, addresses)
+ * @param iface_name Name of the interface (e.g., "eth0", "br0") for logging and context matching
+ * @param dest Destination IPv6 address for RA (NULL means all-nodes multicast ff02::1)
+ * @param send_iface Interface index for actual packet transmission (may differ from iface for bridges)
+ * 
+ * @return void
+ * 
+ * @note This function is the workhorse of Router Advertisement generation, handling all
+ *       complexity of prefix management, DNS option encoding, and DHCPv6 flag coordination.
+ * @note When send_iface differs from iface, supports bridge/alias scenarios where RA content
+ *       from one interface is transmitted on another.
+ * @note Router lifetime is set to the maximum valid lifetime of advertised prefixes, or
+ *       calculated from ra_interface configuration if no valid prefixes exist.
+ * 
+ * @warning Function may be called during DHCPv4/DHCPv6 transactions - uses only outpacket
+ *          buffer which is not shared with DHCPv4 code.
+ * @warning Expired DHCP contexts are pruned during RA construction; this modifies daemon state.
+ * @warning Invalid interface indices or missing link-local addresses cause silent failure.
+ * 
+ * @see send_ra() Simple wrapper calling send_ra_alias with matching iface and send_iface
+ * @see add_prefixes() Callback that populates prefix information options
+ * @see iface_search() Helper for finding link-local address on interface
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Send RA on eth0 to all nodes
+ * send_ra_alias(time(NULL), if_nametoindex("eth0"), "eth0", NULL, if_nametoindex("eth0"));
+ * 
+ * // Send RA with eth0 content but transmit on br0 (bridge scenario)
+ * send_ra_alias(time(NULL), if_nametoindex("eth0"), "eth0", NULL, if_nametoindex("br0"));
+ * 
+ * // Send RA to specific destination (solicited RA)
+ * struct in6_addr client_addr = ...; // From router solicitation
+ * send_ra_alias(time(NULL), if_nametoindex("eth0"), "eth0", &client_addr, if_nametoindex("eth0"));
+ * @endcode
+ * 
+ * RFC COMPLIANCE:
+ * - RFC 4861 Section 4.2: Router Advertisement Message Format
+ * - RFC 4861 Section 6.2.3: Router Advertisement processing
+ * - RFC 4861 Section 6.2.6: Prefix Information option format
+ * - RFC 6106 Section 5: RDNSS and DNSSL options
+ * - RFC 4191 Section 2.2: Route Information option
+ * 
+ * SIDE EFFECTS:
+ * - Modifies daemon->outpacket buffer for ICMPv6 packet construction
+ * - Prunes expired DHCP contexts from daemon->dhcp6 linked list
+ * - Updates context deprecation and invalidation times
+ * - Transmits ICMPv6 packet via raw socket to network
+ * - Logs RA transmission events to syslog
+ * 
+ * THREAD SAFETY: Single-threaded architecture - function modifies global daemon state
+ * 
+ * OPERATIONAL MODES:
+ * - ra-only: SLAAC addressing with stateless DHCPv6 for configuration (M=0, O=1)
+ * - ra-names: SLAAC addressing with RDNSS in RA, no DHCPv6 (M=0, O=0)
+ * - ra-stateless: SLAAC addressing with no additional configuration (M=0, O=0)
+ * - ra-stateful: Stateful DHCPv6 address assignment (M=1, O=1)
+ * 
+ * DHCPv6 FLAG COORDINATION:
+ * - M flag (managed address): When set to 1, signals clients to obtain addresses via DHCPv6
+ * - O flag (other configuration): When set to 1, signals clients to obtain DNS/domain via DHCPv6
+ * - Flags determined by CONTEXT_RA_STATELESS, CONTEXT_RA_OFF_LINK contexts
+ * - SLAAC-only mode: Both flags 0, prefix autonomous flag set
+ */
 static void send_ra_alias(time_t now, int iface, char *iface_name, struct in6_addr *dest, int send_iface)
 {
   struct ra_packet *ra;
