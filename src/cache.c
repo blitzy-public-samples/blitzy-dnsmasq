@@ -532,6 +532,42 @@ static struct crec **hash_bucket(char *name)
  * 
  * Source: /src/cache.c:506
  */
+/**
+ * @brief Insert cache record into hash table with ordering invariants
+ * 
+ * Inserts a cache record into the appropriate hash bucket while maintaining critical
+ * ordering invariants: all F_REVERSE entries at chain start, all non-reverse immortal
+ * entries at chain end, and preservation of insertion order for same-name entries.
+ * These invariants optimize reverse DNS lookups and garbage collection operations.
+ * 
+ * The hash chain ordering enables efficient operations:
+ * - Reverse DNS searches can stop at the first non-F_REVERSE entry
+ * - Garbage collection can skip immortal entries at the end of chains
+ * - Multiple entries for the same name maintain insertion order
+ * 
+ * @param crecp Cache record to insert into hash table (must not be NULL)
+ * 
+ * @note This is a static function called by cache_insert(), cache_reload(), and other
+ *       cache management operations after record creation
+ * @warning Assumes crecp is properly initialized with valid name and flags
+ * @warning Does not check for duplicate entries - caller must handle deduplication
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * struct crec *new_rec = cache_insert(...);
+ * cache_hash(new_rec);  // Insert into appropriate hash bucket
+ * @endcode
+ * 
+ * HASH CHAIN INVARIANTS:
+ * 1. All F_REVERSE entries appear first in chain (enables early-exit for forward lookups)
+ * 2. Non-reverse F_IMMORTAL entries appear last (protects from garbage collection)
+ * 3. Same-name entries with identical flags maintain insertion order (deterministic behavior)
+ * 
+ * SIDE EFFECTS: Modifies hash table structure by updating hash_next pointers
+ * THREAD SAFETY: Not thread-safe - relies on single-threaded event loop architecture
+ * 
+ * Source: /src/cache.c:535
+ */
 static void cache_hash(struct crec *crecp)
 {
   /* maintain an invariant that all entries with F_REVERSE set
