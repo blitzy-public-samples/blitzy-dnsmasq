@@ -15,6 +15,68 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+/**
+ * @file dnssec.c
+ * @brief DNSSEC validation implementation providing cryptographic verification of DNS responses
+ * 
+ * DETAILED PURPOSE:
+ * This module implements complete DNSSEC validation chain processing per RFC 4033/4034/4035,
+ * protecting against DNS cache poisoning, man-in-the-middle attacks, and domain hijacking through
+ * cryptographic signature verification. The implementation validates the entire trust chain from
+ * target domain to root zone trust anchors, verifying RRSIG signatures, validating DNSKEY records
+ * against DS records in parent zones, processing NSEC/NSEC3 denial-of-existence proofs, and
+ * enforcing resource limits to prevent denial-of-service attacks during validation.
+ * 
+ * KEY RESPONSIBILITIES:
+ * - Complete DNSSEC validation chain processing via dnssec_validate_reply() (line 1967)
+ * - RRSIG signature verification for RRsets via validate_rrset() (line 457)
+ * - DNSKEY validation against DS records via dnssec_validate_by_ds() (line 717)
+ * - Trust chain traversal from target domain to root zone trust anchors
+ * - NSEC proof validation via prove_non_existence_nsec() (line 1243)
+ * - NSEC3 proof validation with iteration limits via prove_non_existence_nsec3() (line 1547)
+ * - Resource limit enforcement preventing validation DoS attacks
+ * - Timestamp-based validation for systems with unreliable clocks via setup_timestamp() (line 68)
+ * 
+ * DEPENDENCIES:
+ * Includes: dnsmasq.h (core data structures including struct daemon, struct blockdata, struct frec)
+ * Called by: forward.c (DNS query forwarding code triggers validation for DNSSEC-signed responses)
+ * Calls: crypto.c (signature verification via verify_func pointer in nettle_hash structures)
+ * Calls: blockdata.c (variable-length data storage for DNSSEC records)
+ * Calls: rfc1035.c (DNS wire format parsing via extract_name, skip_questions, etc.)
+ * 
+ * DATA STRUCTURES:
+ * - struct rdata_state: RRset iteration state for validation processing (line 146)
+ * - struct blockdata: Variable-length storage for DNSSEC signatures and keys (dnsmasq.h:486)
+ * - struct frec: Forward query record containing validation status (dnsmasq.h:794)
+ * - Validation status constants: STAT_SECURE (757), STAT_INSECURE (758), STAT_BOGUS (759)
+ * 
+ * COMPILE-TIME OPTIONS:
+ * HAVE_DNSSEC: Master compilation flag enabling entire DNSSEC subsystem (required)
+ * DNSSEC_LIMIT_WORK: Maximum queries per validation (default 40, config.h:25)
+ * DNSSEC_LIMIT_SIG_FAIL: Maximum signature failures tolerated (default 20, config.h:26)
+ * DNSSEC_LIMIT_CRYPTO: Maximum crypto operations per query (default 200, config.h:27)
+ * DNSSEC_LIMIT_NSEC3_ITERS: Maximum NSEC3 hash iterations (default 150, config.h:29)
+ * 
+ * THREADING/CONCURRENCY:
+ * Single-threaded event-driven model. All validation occurs synchronously during query processing.
+ * No locking required. Timestamp state stored in static variable timestamp_time (line 66).
+ * Validation counters passed by reference through function call chain to track resource usage.
+ * 
+ * VALIDATION STATE MACHINE:
+ * STAT_SECURE: All signatures valid, trust chain complete to root zone
+ * STAT_INSECURE: Zone is not signed (no DS record in parent), validation not required
+ * STAT_BOGUS: Signature verification failed, trust chain broken, or resource limits exceeded
+ * 
+ * RESOURCE LIMITS (DoS PROTECTION):
+ * Validation work counter limits total queries to prevent CPU exhaustion
+ * Signature failure counter limits crypto operations on invalid signatures
+ * Crypto operation counter prevents excessive signature verification attempts
+ * NSEC3 iteration limit prevents hash computation DoS attacks
+ * 
+ * @copyright Copyright (c) 2012 Giovanni Bajo, 2012-2025 Simon Kelley
+ * @license GPL-2.0-or-later
+ */
+
 #include "dnsmasq.h"
 
 #ifdef HAVE_DNSSEC
@@ -24,7 +86,33 @@
 #define SERIAL_LT       -1
 #define SERIAL_GT        1
 
-/* Input in presentation format */
+/**
+ * @brief Count number of labels in a domain name
+ * 
+ * @detailed Counts the number of DNS labels in a domain name by counting dots plus one.
+ *           Handles both absolute (ending with '.') and relative domain names correctly.
+ *           An empty string returns 0 labels. A single dot returns 0 (empty root label).
+ * 
+ * @param name Domain name in presentation format (null-terminated string)
+ * 
+ * @return Number of labels in the domain name
+ * @retval 0 Empty name or single dot (root label)
+ * @retval >0 Number of labels found
+ * 
+ * @note Input name must be in presentation format (dotted notation), not wire format
+ * @warning Does not validate label length or total name length constraints
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * int labels = count_labels("example.com");      // returns 2
+ * int labels2 = count_labels("www.example.com"); // returns 3
+ * int labels3 = count_labels(".");               // returns 0
+ * @endcode
+ * 
+ * RFC COMPLIANCE: Label counting for DNSSEC validation per RFC 4034 Section 3.1.3
+ * SIDE EFFECTS: None (read-only operation)
+ * THREAD SAFETY: Thread-safe (no shared state)
+ */
 static int count_labels(char *name)
 {
   int i;
@@ -41,7 +129,40 @@ static int count_labels(char *name)
   return *name == '.' ? i : i+1;
 }
 
-/* Implement RFC1982 wrapped compare for 32-bit numbers */
+/**
+ * @brief Compare two 32-bit serial numbers using RFC 1982 wrapped arithmetic
+ * 
+ * @detailed Implements RFC 1982 serial number arithmetic for comparing 32-bit values
+ *           with wraparound. This is essential for comparing DNSSEC signature inception
+ *           and expiration times which use 32-bit Unix timestamps that will eventually
+ *           wrap. The comparison correctly handles the case where one value has wrapped
+ *           and the other has not, within the valid comparison window.
+ * 
+ * @param s1 First serial number to compare
+ * @param s2 Second serial number to compare
+ * 
+ * @return Comparison result
+ * @retval SERIAL_EQ (0) Serial numbers are equal
+ * @retval SERIAL_LT (-1) s1 is less than s2
+ * @retval SERIAL_GT (1) s1 is greater than s2
+ * @retval SERIAL_UNDEF (-100) Comparison undefined (numbers are exactly 2^31 apart)
+ * 
+ * @note Valid comparison window is 2^31 (half the 32-bit space)
+ * @warning Returns SERIAL_UNDEF if values differ by exactly 2^31, an edge case
+ * 
+ * @see RFC 1982 Section 3.2 for serial number comparison algorithm
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * u32 inception = 0xFFFFFF00;  // Near wraparound
+ * u32 expiration = 0x00000100; // After wraparound
+ * int result = serial_compare_32(inception, expiration); // returns SERIAL_LT
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 1982 Section 3.2 (Serial Number Arithmetic)
+ * SIDE EFFECTS: None (pure comparison function)
+ * THREAD SAFETY: Thread-safe (no shared state)
+ */
 static int serial_compare_32(u32 s1, u32 s2)
 {
   if (s1 == s2)
@@ -56,12 +177,40 @@ static int serial_compare_32(u32 s1, u32 s2)
   return SERIAL_UNDEF;
 }
 
-/* Called at startup. If the timestamp file is configured and exists, put its mtime on
-   timestamp_time. If it doesn't exist, create it, and set the mtime to 1-1-2015.
-   return -1 -> Cannot create file.
-           0 -> not using timestamp, or timestamp exists and is in past.
-           1 -> timestamp exists and is in future.
-*/
+/**
+ * @brief Initialize and verify DNSSEC timestamp file for time travel detection
+ * 
+ * @detailed Called at daemon startup to establish a reference timestamp for detecting
+ *           system clock rollback attacks. If the timestamp file exists, loads its mtime.
+ *           If the file doesn't exist, creates it with epoch 1420070400 (January 1, 2015).
+ *           This mechanism detects if the system clock has been rolled back (time travel
+ *           to the past) which could allow replay of expired DNSSEC signatures.
+ * 
+ * @return -1 if timestamp file creation failed (cannot write to filesystem)
+ * @retval 0 if not using timestamp, timestamp exists and is in past (normal operation)
+ * @retval 1 if timestamp exists and is in future (clock rollback detected)
+ * 
+ * @note Sets daemon->back_to_the_future = 1 when operating normally (time advancing forward)
+ * @note Sets global timestamp_time variable to file mtime for subsequent comparisons
+ * @warning Clock rollback detection only works if timestamp file persists across reboots
+ * 
+ * @see daemon->timestamp_file configuration option (--dnssec-timestamp)
+ * @see is_check_date() which uses timestamp_time for signature validation timing
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // During daemon initialization in main()
+ * int status = setup_timestamp();
+ * if (status == 1)
+ *   my_syslog(LOG_WARNING, "Clock rollback detected, deferring DNSSEC validation");
+ * else if (status == -1)
+ *   die("Cannot create timestamp file", NULL, EC_MISC);
+ * @endcode
+ * 
+ * RFC COMPLIANCE: Addresses DNSSEC operational security per RFC 4033 Section 9
+ * SIDE EFFECTS: Creates timestamp file on filesystem, sets daemon->back_to_the_future flag
+ * THREAD SAFETY: Single-threaded, called only during daemon initialization
+ */
 
 static time_t timestamp_time;
 
@@ -111,6 +260,62 @@ int setup_timestamp(void)
 }
 
 /* Check whether today/now is between date_start and date_end */
+/**
+ * @brief Determine whether to check DNSSEC signature timestamp validity based on system clock reliability
+ * 
+ * @detailed
+ * Implements timestamp checking policy for systems with unreliable real-time clocks (embedded devices,
+ * systems without battery-backed RTC). When daemon->timestamp_file is configured, assumes system time
+ * is unreliable until current time exceeds timestamp file mtime. This prevents DNSSEC validation
+ * failures on systems that boot with incorrect time (e.g., 1970-01-01) until NTP synchronization
+ * completes. Once system time advances beyond timestamp file mtime, enables signature timestamp
+ * checking, updates timestamp file to current time, triggers cache purge via EVENT_RELOAD to remove
+ * potentially invalid cached data, and sets daemon->back_to_the_future flag permanently for session.
+ * 
+ * Algorithm:
+ * 1. If timestamp_file configured and back_to_the_future not yet set:
+ *    a. Compare timestamp_time (from file mtime) with curtime
+ *    b. If curtime >= timestamp_time: system clock now reliable
+ *       - Update timestamp file mtime to current time
+ *       - Set back_to_the_future=1, dnssec_no_time_check=0
+ *       - Queue cache reload event to purge unvalidated entries
+ *       - Log transition to timestamp checking mode
+ * 2. Return back_to_the_future if timestamp_file configured
+ * 3. Return inverse of dnssec_no_time_check if no timestamp_file
+ * 
+ * @param curtime Current time in seconds since epoch (from time(0) or cached query time)
+ * 
+ * @return Boolean indicating whether signature timestamp checking should be performed
+ * @retval 1 (true) System clock reliable, check RRSIG inception/expiration times
+ * @retval 0 (false) System clock unreliable, skip timestamp validation (accept all times)
+ * 
+ * @note Timestamp file mtime initialized by setup_timestamp() to 2015-01-01 if created new
+ * @note Once back_to_the_future transitions to 1, it remains set for daemon lifetime
+ * @note Cache purge EVENT_RELOAD triggered on transition ensures no stale pre-validation data
+ * @warning utimes() failure logged but not fatal; timestamp checking still enabled
+ * 
+ * @see setup_timestamp() for timestamp file initialization (line 68)
+ * @see validate_rrset() which calls this function before checking signature validity
+ * @see queue_event() for cache reload triggering (dnsmasq.c event queue)
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * time_t now = time(0);
+ * if (is_check_date(now)) {
+ *   // Check RRSIG inception <= now <= expiration
+ *   if (serial_compare_32(sig_inception, now) != SERIAL_GT &&
+ *       serial_compare_32(sig_expiration, now) != SERIAL_LT) {
+ *     // Signature time valid, proceed with crypto verification
+ *   }
+ * } else {
+ *   // Skip timestamp validation, system clock unreliable
+ * }
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 4035 Section 5.3.1 (signature validity period checking)
+ * SIDE EFFECTS: Updates timestamp file mtime via utimes(), sets back_to_the_future and dnssec_no_time_check, triggers EVENT_RELOAD
+ * THREAD SAFETY: Single-threaded, modifies daemon global state (not thread-safe)
+ */
 static int is_check_date(unsigned long curtime)
 {
   /* Checking timestamps may be temporarily disabled */
@@ -149,13 +354,101 @@ static int is_check_date(unsigned long curtime)
    After each call which returns 1, state->op points to the next byte of data.
    On returning 0, the end has been reached.
 */
+
+/**
+ * @struct rdata_state
+ * @brief Iterator state structure for traversing canonicalized RDATA byte-by-byte
+ * 
+ * Maintains iteration state across multiple get_rdata() calls to return canonical RDATA
+ * one byte at a time. Used by sort_rrset() for RRset comparison per RFC 4034 Section 6.3
+ * canonical ordering and by hash functions during signature verification. The descriptor
+ * array defines RDATA structure: 0=domain name (canonicalize), positive=raw bytes, -1=rest.
+ * 
+ * LIFECYCLE:
+ * Creation: Allocated on stack by caller (sort_rrset, validate_rrset)
+ * Initialization: desc set to RR type descriptor, buff to MAXDNAME*2 buffer, ip/end to RDATA bounds
+ * Destruction: Automatic stack deallocation, buff freed by caller
+ * Ownership: Caller owns state structure and all referenced buffers
+ * 
+ * USAGE PATTERNS:
+ * Initialize once per RR, call get_rdata() repeatedly until returns 0, check state->op for each byte
+ */
 struct rdata_state {
-  short *desc;
-  size_t c;
-  unsigned char *end, *ip, *op;
-  char *buff;
+  short *desc;         /**< RR descriptor array defining RDATA structure (0=name, N=bytes, -1=end) */
+  size_t c;            /**< Bytes remaining in current segment */
+  unsigned char *end;  /**< End of RDATA in wire format packet */
+  unsigned char *ip;   /**< Current input position in wire format RDATA */
+  unsigned char *op;   /**< Output pointer to current canonical byte */
+  char *buff;          /**< Working buffer for canonicalized domain names (MAXDNAME*2 size) */
 };
 
+/**
+ * @brief Return next byte of canonicalized RDATA for RRset comparison and hashing
+ * 
+ * @detailed
+ * Iterator function implementing RFC 4034 Section 6.2 canonical RDATA format for DNSSEC
+ * signature computation and RRset sorting. Processes RDATA according to type-specific
+ * descriptor array that defines structure (domain names vs raw bytes). Canonicalizes
+ * domain names by converting from compressed wire format to uncompressed lowercase wire
+ * format via extract_name() + to_wire(). Returns RDATA bytes sequentially, one per call,
+ * with state->op pointing to current byte. Returns 0 when all bytes consumed.
+ * 
+ * Algorithm for each call:
+ * 1. If bytes remaining in current segment (state->c > 0): return next byte, decrement counter
+ * 2. Otherwise, consult next descriptor entry:
+ *    a. descriptor == -1: rest of RDATA to end (for types like TXT with variable data)
+ *    b. descriptor == 0: domain name field, extract and canonicalize via to_wire()
+ *    c. descriptor == N: N bytes of raw data, return as-is
+ * 3. Set state->op to point to next output byte, state->c to bytes available
+ * 4. Return 1 if byte available, 0 if RDATA exhausted
+ * 
+ * Descriptor array format per RR type (from rrfilter.c RR_DESC arrays):
+ * - A record: {4, -1} = 4 bytes IPv4 address, rest unused
+ * - AAAA: {16, -1} = 16 bytes IPv6 address, rest unused
+ * - NS/CNAME/PTR: {0, -1} = domain name (canonicalize), rest unused
+ * - MX: {2, 0, -1} = 2 bytes preference, domain name, rest unused
+ * - SRV: {2, 2, 2, 0, -1} = priority, weight, port (6 bytes), domain name, rest
+ * - TXT: {-1} = all bytes to end (no canonicalization, variable length data)
+ * 
+ * @param header DNS packet header for extract_name() name compression resolution
+ * @param plen Packet length for bounds checking during name extraction
+ * @param state Iterator state tracking position in RDATA and descriptor array (modified)
+ * 
+ * @return Status code indicating byte availability
+ * @retval 1 Byte available at state->op, caller should process and call again
+ * @retval 0 End of RDATA reached, iteration complete
+ * 
+ * @note State must be initialized: desc=RR descriptor, ip=RDATA start, end=RDATA end, buff=MAXDNAME*2
+ * @note Domain name extraction failure (malformed packet) causes function to skip to next descriptor
+ * @note Caller must not modify state structure between calls (except reading state->op)
+ * @warning Assumes state->buff has sufficient space (MAXDNAME*2 bytes) for canonicalized names
+ * @warning Does not validate RDATA bounds; caller must ensure ip/end point to valid packet regions
+ * 
+ * @see sort_rrset() for primary usage iterating over RRset for canonical comparison (line 222)
+ * @see extract_name() in rfc1035.c for wire format name extraction with compression handling
+ * @see to_wire() in rfc1035.c for domain name canonicalization (lowercase, uncompressed)
+ * @see RFC 4034 Section 6.2 for canonical RDATA format specification
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * struct rdata_state state;
+ * char buff[MAXDNAME * 2];
+ * state.desc = &rr_descriptor_for_A; // {4, -1} for A records
+ * state.ip = rdata_start;
+ * state.end = rdata_start + rdlen;
+ * state.buff = buff;
+ * state.c = 0;
+ * 
+ * while (get_rdata(header, plen, &state)) {
+ *   unsigned char byte = *state.op; // Get canonical RDATA byte
+ *   // Process byte for hashing or comparison
+ * }
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 4034 Section 6.2 (canonical RDATA format for signature computation)
+ * SIDE EFFECTS: Modifies state->desc, state->c, state->ip, state->op during iteration
+ * THREAD SAFETY: Single-threaded, state structure must not be shared across threads
+ */
 static int get_rdata(struct dns_header *header, size_t plen, struct rdata_state *state)
 {
   int d;
@@ -217,8 +510,83 @@ static int get_rdata(struct dns_header *header, size_t plen, struct rdata_state 
     }
 }
 
-/* Bubble sort the RRset into the canonical order. */
-
+/**
+ * @brief Sort RRset into canonical order per RFC 4034 Section 6.3 and remove duplicate RRs
+ * 
+ * @detailed
+ * Implements RFC 4034 Section 6.3 canonical ordering of RRset members for DNSSEC signature
+ * verification. Uses bubble sort algorithm to arrange RRs in ascending byte-wise order of
+ * their canonical RDATA representation. For RR types with no domain names in RDATA (TXT,
+ * A, AAAA, etc.), performs direct memcmp of wire format data. For RR types containing
+ * domain names (NS, MX, SRV, etc.), uses get_rdata() to iterate byte-by-byte through
+ * canonicalized RDATA (domain names converted to lowercase uncompressed wire format).
+ * Removes exact duplicates per RFC 4034 Section 6.3 requirement that duplicate RRs be
+ * removed before signature verification. Returns updated rrsetidx which may be reduced
+ * if duplicates were removed.
+ * 
+ * Algorithm:
+ * 1. Outer loop continues while swaps occur (bubble sort termination)
+ * 2. Inner loop compares adjacent RRs (i and i+1):
+ *    a. Skip name, class, type, TTL to reach RDATA
+ *    b. If RR descriptor[0] == -1 (no names in RDATA):
+ *       - Compare RDATA via memcmp (byte-wise comparison)
+ *       - Swap if rrset[i] > rrset[i+1] or rrset[i] == rrset[i+1] but longer
+ *       - Remove rrset[i] if exact duplicate (same length, same bytes)
+ *    c. If RR descriptor contains domain names:
+ *       - Initialize two rdata_state structures for byte-by-byte iteration
+ *       - Call get_rdata() repeatedly to compare canonical bytes
+ *       - Swap if rrset[i] > rrset[i+1] byte-wise
+ *       - Remove rrset[i] if exact duplicate (all bytes equal)
+ * 3. After each swap or removal, continue outer loop
+ * 4. Return final rrsetidx (original value minus number of duplicates removed)
+ * 
+ * Comparison semantics per RFC 4034 Section 6.3:
+ * - RRs compared byte-by-byte in canonical RDATA form
+ * - Domain names canonicalized: lowercase, uncompressed wire format
+ * - Shorter RR < longer RR if shorter RR is prefix of longer
+ * - Duplicate RRs (exactly equal) removed before signature verification
+ * - Final order is deterministic and matches what signer computed
+ * 
+ * @param header DNS packet header containing RRset (for name extraction)
+ * @param plen Packet length for bounds checking during name skipping
+ * @param rr_desc RR descriptor array defining RDATA structure (0=name, N=bytes, -1=rest)
+ * @param rrsetidx Number of RR pointers in rrset array (modified if duplicates removed)
+ * @param rrset Array of pointers to RR start positions in packet (modified: sorted, duplicates removed)
+ * @param buff1 Working buffer for canonical name conversion (MAXDNAME*2 size, for state1)
+ * @param buff2 Working buffer for canonical name conversion (MAXDNAME*2 size, for state2)
+ * 
+ * @return Updated rrsetidx after duplicate removal
+ * @retval rrsetidx Original value if no duplicates found
+ * @retval <rrsetidx Reduced value if duplicates removed (each duplicate reduces by 1)
+ * 
+ * @note Bubble sort used (O(n^2)) acceptable because typical RRsets contain 1-10 records
+ * @note Short packet detected if RDATA length check fails; returns rrsetidx unchanged
+ * @note Duplicate removal shifts remaining RRs down in array; no gaps left
+ * @note Requires two separate buffers (buff1, buff2) for concurrent canonicalization comparison
+ * @warning rrset array modified in place; caller must not rely on original ordering
+ * @warning Assumes rrset pointers valid and point to well-formed RRs (pre-validated by explore_rrset)
+ * 
+ * @see get_rdata() for byte-by-byte canonical RDATA iteration (line 146)
+ * @see validate_rrset() which calls this function before hashing RRset for signature (line 457)
+ * @see RFC 4034 Section 6.3 for canonical ordering specification and duplicate removal requirement
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * unsigned char *rrset[10]; // Pointers to RRs in packet
+ * char buff1[MAXDNAME * 2], buff2[MAXDNAME * 2];
+ * short a_descriptor[] = {4, -1}; // A record: 4 bytes IPv4, rest unused
+ * int count = 5; // 5 A records initially
+ * 
+ * // Sort and remove duplicates
+ * count = sort_rrset(header, plen, a_descriptor, count, rrset, buff1, buff2);
+ * // count may now be < 5 if duplicates were removed
+ * // rrset[0..count-1] now in canonical order
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 4034 Section 6.3 (canonical RR ordering and duplicate removal)
+ * SIDE EFFECTS: Modifies rrset array in place (reorders and removes duplicates)
+ * THREAD SAFETY: Single-threaded, uses stack buffers (thread-safe if buffers not shared)
+ */
 static int sort_rrset(struct dns_header *header, size_t plen, short *rr_desc, int rrsetidx, 
 		      unsigned char **rrset, char *buff1, char *buff2)
 {
@@ -319,6 +687,101 @@ static unsigned char **rrset = NULL, **sigs = NULL;
 
 /* Get pointers to RRset members and signature(s) for same.
    Check signatures, and return keyname associated in keyname. */
+/**
+ * @brief Explore DNS packet to collect RRset members and their RRSIG signatures
+ * 
+ * @detailed
+ * Scans DNS packet answer and authority sections to find all Resource Records matching
+ * specified name, class, and type (forming an RRset), plus all RRSIG records that sign
+ * this RRset (where RRSIG type_covered field matches the target type). Populates module-
+ * level static arrays rrset[] and sigs[] with pointers to RR start positions in packet.
+ * Extracts signer's name from RRSIG records and validates RFC 4035 5.3.1 security
+ * requirement that signer's name must equal or enclose the RRset name (preventing
+ * cross-zone signature attacks where attacker uses signatures from unrelated zones).
+ * 
+ * Uses static storage arrays (rrset, sigs) that persist across calls and expand
+ * dynamically via expand_workspace() as needed. These arrays are shared module state
+ * accessed by validate_rrset() for signature verification.
+ * 
+ * Algorithm:
+ * 1. Skip question section using skip_questions() to reach answer section
+ * 2. Iterate through all RRs in answer + authority sections (ancount + nscount)
+ * 3. For each RR:
+ *    a. Extract name and compare to target name (EXTR_NAME_COMPARE)
+ *    b. Extract type and class fields
+ *    c. If name matches AND class matches:
+ *       - If type matches target type: add RR pointer to rrset[] array
+ *       - If type is T_RRSIG:
+ *         * Verify rdlen >= 18 bytes (minimum RRSIG size)
+ *         * Extract type_covered field (first 2 bytes of RDATA)
+ *         * Skip algorithm, labels, orig_ttl, sig_expiration, sig_inception, key_tag (16 bytes)
+ *         * Extract signer's name into keyname buffer
+ *         * If this is first RRSIG (gotkey==0):
+ *           - Extract signer's name (EXTR_NAME_EXTRACT mode)
+ *           - Validate signer's name security constraint (RFC 4035 5.3.1):
+ *             RRset name must equal or be subdomain of signer's name
+ *             Walk up RRset name labels until match found or fail
+ *             Root key (empty name) always allowed
+ *         * If subsequent RRSIG (gotkey==1):
+ *           - Compare signer's name to first RRSIG (EXTR_NAME_COMPARE mode)
+ *           - All RRSIGs for RRset must have same signer's name
+ *         * If type_covered matches target type: add RRSIG pointer to sigs[] array
+ * 4. Return success with counts via sigcnt and rrcnt output parameters
+ * 
+ * Security Check (lines 387-401):
+ * RFC 4035 Section 5.3.1 requires signer's name field to equal the zone containing
+ * the RRset. Strict equality cannot be verified without zone boundary knowledge, so
+ * implementation checks that RRset name is equal to or a subdomain of signer's name.
+ * This prevents attacker from using signatures from unrelated zones they control.
+ * Example: RRset "www.example.com" can be signed by "example.com" or "com" or root,
+ * but NOT by "attacker.com". Implementation walks up RRset name labels (chop at dots)
+ * until hostname_isequal() succeeds or name exhausted.
+ * 
+ * @param header DNS packet header for name extraction and section traversal
+ * @param plen Packet length for bounds checking (CHECK_LEN, ADD_RDLEN macros)
+ * @param class DNS class to match (typically IN=1 for Internet class)
+ * @param type RR type to collect (e.g., T_A=1, T_AAAA=28, T_DNSKEY=48)
+ * @param name Domain name to match in presentation format (null-terminated string)
+ * @param keyname Output buffer for signer's name extracted from RRSIG (MAXDNAME size)
+ * @param sigcnt Output parameter returning number of matching RRSIG records found
+ * @param rrcnt Output parameter returning number of RRs in RRset found
+ * 
+ * @return Success/failure indicator
+ * @retval 1 Success - rrset and sigs arrays populated, counts returned via sigcnt/rrcnt
+ * @retval 0 Failure - bad packet, out of memory, or security check failed
+ * 
+ * @note Uses module-level static arrays rrset[] and sigs[] shared with validate_rrset()
+ * @note Static variables rrset_sz and sig_sz track allocated capacity for expand_workspace()
+ * @note All RRSIGs for an RRset must have identical signer's name (RFC 4035 requirement)
+ * @note Empty keyname (root zone) is always accepted as valid signer (lines 393)
+ * @warning Modifies module static state (rrset, sigs arrays); not reentrant
+ * @warning Returns 0 if signer's name check fails (lines 400); legitimate validation failure
+ * 
+ * @see validate_rrset() which calls this function to collect RRset and signatures (line 457)
+ * @see expand_workspace() for dynamic array expansion (lines 360, 407)
+ * @see extract_name() for name extraction modes EXTR_NAME_COMPARE and EXTR_NAME_EXTRACT
+ * @see hostname_isequal() for case-insensitive name comparison (line 396)
+ * @see RFC 4035 Section 5.3.1 for signer's name field requirements (lines 387-401)
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * char keyname[MAXDNAME];
+ * int sigcnt, rrcnt;
+ * 
+ * // Explore packet for A records of "www.example.com"
+ * if (explore_rrset(header, plen, C_IN, T_A, "www.example.com", keyname, &sigcnt, &rrcnt))
+ * {
+ *   // Success: rrset[0..rrcnt-1] points to A records
+ *   //          sigs[0..sigcnt-1] points to RRSIG records
+ *   //          keyname contains signer's name (e.g., "example.com")
+ *   // Now call validate_rrset() to verify signatures
+ * }
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 4035 Section 5.3.1 (signer's name validation, lines 387-401)
+ * SIDE EFFECTS: Populates module-level static rrset[] and sigs[] arrays
+ * THREAD SAFETY: Not thread-safe due to static array usage; single-threaded daemon only
+ */
 static int explore_rrset(struct dns_header *header, size_t plen, int class, int type, 
 			 char *name, char *keyname, int *sigcnt, int *rrcnt)
 {
@@ -454,6 +917,87 @@ int dec_counter(int *counter, char *message)
 
    ttl_out is the floor on TTL, based on TTL and orig_ttl and expiration of sig used to validate.
 */
+/**
+ * @brief Validate RRset by verifying RRSIG signature using DNSKEY from cache or parameter
+ * 
+ * @detailed
+ * Core DNSSEC validation function implementing RFC 4035 Section 5.3 signature verification
+ * algorithm. Canonicalizes RRset per RFC 4034 Section 6, constructs signature input data
+ * by hashing RRSIG RDATA and canonical RR wire format, retrieves DNSKEY from cache or uses
+ * provided key, and verifies signature using cryptographic library (crypto.c). Handles
+ * wildcard expansion per RFC 4035 Section 5.3.2, enforces signature validity period checking,
+ * computes TTL per RFC 4035 Section 5.3.3 rules (minimum of original TTL and time until
+ * expiration), and enforces signature failure counter to prevent DoS via invalid signatures.
+ * 
+ * The validation process follows these steps:
+ * 1. Sort RRset into canonical order (sort_rrset)
+ * 2. For each RRSIG in signature set:
+ *    a. Check signature inception/expiration times if time checking enabled
+ *    b. Verify hash algorithm is supported
+ *    c. Retrieve DNSKEY from cache or use provided key
+ *    d. Hash RRSIG RDATA (18 bytes: type_covered through signer_name)
+ *    e. Hash signer name in wire format
+ *    f. For each RR in canonical RRset:
+ *       - Apply wildcard expansion if labels < name_labels
+ *       - Hash owner name in wire format
+ *       - Hash RR type, class, original TTL, RDATA length
+ *       - Hash canonical RDATA per RFC 4034 Section 6.2
+ *    g. Verify signature against computed hash using all matching DNSKEYs
+ *    h. Return STAT_SECURE if signature valid
+ * 3. Return STAT_BOGUS if no valid signature found after trying all RRSIGs
+ * 
+ * @param now Current time for cache lookups (time_t from forward.c query processing)
+ * @param header DNS packet header containing RRset and RRSIG records
+ * @param plen Packet length for bounds checking during name extraction
+ * @param class DNS class (typically CLASS_IN=1) for RRset validation
+ * @param type DNS record type (A, AAAA, etc.) being validated
+ * @param sigidx Number of RRSIG records in sigs array (from explore_rrset)
+ * @param rrsetidx Number of RRs in rrset array (from explore_rrset)
+ * @param name Owner name of RRset in presentation format (e.g., "www.example.com")
+ * @param keyname Buffer for extracting signer name from RRSIG (MAXDNAME size)
+ * @param wildcard_out Output parameter: Set to wildcard label if wildcard expansion occurred, NULL otherwise
+ * @param key Provided DNSKEY data (blockdata format) or NULL to retrieve from cache
+ * @param keylen Length of provided key in bytes, or 0 if key is NULL
+ * @param algo_in Algorithm number from DS record (for key matching), or 0 to try all keys
+ * @param keytag_in Key tag from DS record (for key matching), or 0 to try all keys
+ * @param ttl_out Output parameter: Computed TTL per RFC 4035 Section 5.3.3, or NULL if not needed
+ * @param validate_counter Pointer to validation work counter (decremented via dec_counter)
+ * 
+ * @return Validation status code
+ * @retval STAT_SECURE Signature verification succeeded, RRset is authentic
+ * @retval STAT_BOGUS No valid signature found after trying all RRSIGs and DNSKEYs
+ * @retval STAT_NEED_KEY Required DNSKEY not in cache, caller must issue DNSKEY query
+ * 
+ * @note Signature failure counter prevents DoS via repeated verification of invalid signatures
+ * @note Wildcard expansion applies when RRSIG labels field < actual name label count
+ * @note TTL computation per RFC 4035 5.3.3: min(orig_ttl, RR_ttl, time_until_expiration)
+ * @note Time checking bypassed if system clock unreliable (is_check_date returns false)
+ * @warning Signature verification is CPU-intensive; caller must enforce DNSSEC_LIMIT_CRYPTO
+ * @warning Function modifies daemon->workspacename buffer during canonicalization
+ * 
+ * @see sort_rrset() for RRset canonical ordering implementation
+ * @see hash_find() for algorithm-to-hash-function mapping (crypto.c integration)
+ * @see cache_find_by_name() for DNSKEY retrieval from DNS cache
+ * @see verify() in crypto.c for actual signature verification via Nettle library
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * char keyname[MAXDNAME];
+ * char *wildcard = NULL;
+ * unsigned long ttl;
+ * int counter = daemon->limit[LIMIT_WORK];
+ * int status = validate_rrset(now, header, plen, C_IN, T_A, 
+ *                              sigidx, rrsetidx, "www.example.com", 
+ *                              keyname, &wildcard, NULL, 0, 0, 0, &ttl, &counter);
+ * if (status == STAT_SECURE) {
+ *   // RRset cryptographically validated, safe to cache with computed TTL
+ * }
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 4035 Section 5.3 (signature verification), RFC 4034 Section 6 (canonical form)
+ * SIDE EFFECTS: Decrements signature failure counter via dec_counter on verification failures
+ * THREAD SAFETY: Single-threaded, modifies daemon->workspacename buffer (not thread-safe)
+ */
 static int validate_rrset(time_t now, struct dns_header *header, size_t plen, int class, int type, int sigidx, int rrsetidx, 
 			  char *name, char *keyname, char **wildcard_out, struct blockdata *key, int keylen,
 			  int algo_in, int keytag_in, unsigned long *ttl_out, int *validate_counter)
@@ -1871,6 +2415,54 @@ static int prove_non_existence(struct dns_header *header, size_t plen, char *key
    STAT_NEED_KEY require DNSKEY record of name returned in keyname.
    name returned unaltered.
 */
+/**
+ * @brief Determine security status of DNS zone by traversing trust chain upward
+ * 
+ * @detailed Walks up the DNS tree from the target name to find either a trust anchor
+ *           (marking the zone as SECURE) or an insecure delegation point without DS
+ *           records (marking the zone as INSECURE). This function implements the zone
+ *           status determination logic essential for DNSSEC validation per RFC 4035.
+ *           
+ *           The algorithm starts at the given name and moves progressively up the DNS
+ *           hierarchy (removing leftmost labels) until it finds:
+ *           1. A trust anchor in daemon->key_cache (zone is SECURE)
+ *           2. A delegation with DS records (zone is potentially SECURE, continue upward)
+ *           3. A delegation without DS records (zone is INSECURE, unsigned)
+ *           4. The root zone is reached (zone is SECURE if trust anchor exists)
+ * 
+ * @param name Domain name to check (presentation format, e.g., "www.example.com")
+ * @param class DNS class (typically C_IN for Internet class)
+ * @param keyname Output buffer to receive name needing key lookup (must be valid pointer)
+ * @param now Current timestamp for cache entry expiration checks
+ * 
+ * @return Security status code from DNSSEC validation
+ * @retval STAT_SECURE Zone is signed and has valid trust chain to anchor
+ * @retval STAT_INSECURE Zone is provably unsigned (no DS at delegation point)
+ * @retval STAT_BOGUS Validation error or malformed data encountered
+ * 
+ * @note This function only examines cached data (key_cache); does not generate queries
+ * @note Expired cache entries are ignored (treated as non-existent)
+ * @warning Assumes keyname buffer is large enough for DNS name (MAXDNAME bytes)
+ * 
+ * @see find_key() which searches trust anchor cache
+ * @see rrset_find() which locates DS records for delegation points
+ * @see dnssec_validate_reply() which calls this to determine validation requirements
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * char keyname[MAXDNAME];
+ * time_t now = time(NULL);
+ * int status = zone_status("www.example.com", C_IN, keyname, now);
+ * if (status == STAT_SECURE)
+ *   // Proceed with DNSSEC validation
+ * else if (status == STAT_INSECURE)
+ *   // Zone is provably unsigned, skip validation
+ * @endcode
+ * 
+ * RFC COMPLIANCE: Implements trust chain traversal per RFC 4035 Section 5.2
+ * SIDE EFFECTS: Writes to keyname buffer (output parameter)
+ * THREAD SAFETY: Single-threaded, accesses shared daemon->key_cache
+ */
 static int zone_status(char *name, int class, char *keyname, time_t now)
 {
   int name_start = strlen(name); /* for when TA is root */
