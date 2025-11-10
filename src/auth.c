@@ -14,10 +14,108 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+/**
+ * @file auth.c
+ * @brief Authoritative DNS server implementation for designated local zones
+ * 
+ * DETAILED PURPOSE:
+ * This module implements authoritative DNS server mode, enabling dnsmasq to respond
+ * authoritatively to DNS queries for configured local zones with the AA (Authoritative 
+ * Answer) flag set. The implementation supports zone transfers (AXFR) to secondary
+ * nameservers, generates SOA (Start of Authority) records with configurable parameters,
+ * and serves multiple record types including A, AAAA, PTR, CNAME, MX, SRV, TXT, and
+ * NAPTR records. This capability allows dnsmasq to act as the primary nameserver for
+ * internal zones without requiring a separate authoritative DNS server.
+ * 
+ * KEY RESPONSIBILITIES:
+ * - Detect and process queries for configured authoritative zones via answer_auth()
+ * - Generate SOA records with default TTL AUTH_TTL=600s (from config.h line 62), 
+ *   SOA refresh=1200s, retry=180s, expiry=1209600s (14 days)
+ * - Respond authoritatively with AA flag set for in-zone queries
+ * - Implement zone transfer (AXFR) protocol for secondary nameserver synchronization
+ * - Support split-horizon DNS through per-zone subnet filtering (auth-peer configuration)
+ * - Serve records from multiple sources: static configuration, interface addresses, 
+ *   DNS cache (DHCP leases and /etc/hosts entries)
+ * - Filter responses based on client subnet for security and topology constraints
+ * - Integrate with DNSSEC signing for authenticated authoritative responses
+ * 
+ * DEPENDENCIES:
+ * Includes: dnsmasq.h (core structures including struct auth_zone, struct auth_name_list),
+ *           dns-protocol.h (DNS protocol constants: T_SOA, T_NS, T_AXFR, etc.)
+ * Called by: forward.c (DNS forwarding engine routes authoritative queries here)
+ * Calls: cache.c (cache enumeration for DHCP/hosts entries), rfc1035.c (packet construction),
+ *        network.c (interface address enumeration)
+ * 
+ * DATA STRUCTURES:
+ * - struct auth_zone: Authoritative zone configuration (src/dnsmasq.h:430-444) containing
+ *   domain name, subnet/exclude filters, and associated name lists
+ * - struct auth_name_list: Named address/CNAME/MX/SRV/TXT records for zone (dnsmasq.h:420-428)
+ * - struct dns_header: DNS packet header with flags, counts (dns-protocol.h)
+ * - struct crec: Cache records for DHCP leases and hosts file entries (dnsmasq.h:250-280)
+ * 
+ * COMPILE-TIME OPTIONS:
+ * HAVE_AUTH: Must be defined to enable authoritative DNS functionality (conditional
+ *            compilation wraps entire file). Disabled by default on Android and 
+ *            resource-constrained platforms where authoritative DNS is not required.
+ * AUTH_TTL: Default TTL for authoritative records (600 seconds, config.h:62)
+ * 
+ * THREADING/CONCURRENCY:
+ * Single-threaded architecture - all functions execute in main event loop context.
+ * No locking required. Zone configuration is read-only after daemon initialization
+ * except during SIGHUP configuration reload.
+ * 
+ * COEXISTENCE WITH FORWARDING MODE:
+ * Authoritative mode operates alongside forwarding mode. The query routing logic
+ * in forward.c determines whether a query matches an authoritative zone (routed to
+ * answer_auth) or should be forwarded to upstream servers. A query can receive
+ * an authoritative answer for configured zones while other queries are forwarded.
+ * This enables split-horizon DNS architectures where internal zones are served
+ * authoritatively and external queries are forwarded.
+ * 
+ * @copyright Copyright (c) 2000-2025 Simon Kelley
+ * @license GPL-2.0-or-later
+ */
+
 #include "dnsmasq.h"
 
 #ifdef HAVE_AUTH
 
+/**
+ * @brief Search an address list for a matching subnet containing the given address
+ * 
+ * @detailed Iterates through a linked list of address ranges/subnets and checks whether
+ *           the provided IP address falls within any of the configured address ranges.
+ *           Handles both IPv4 and IPv6 addresses with appropriate netmask/prefix
+ *           matching. Used internally by subnet filtering and exclude list processing
+ *           to implement split-horizon DNS and access control.
+ * 
+ * @param list Linked list of struct addrlist entries to search (auth_zone->subnet or 
+ *             auth_zone->exclude). NULL is valid (returns NULL immediately).
+ * @param flag Address family indicator (F_IPV4 or F_IPV6) from query context
+ * @param addr_u Union containing the IP address to match (addr4 or addr6 depending on flag)
+ * 
+ * @return Pointer to the matching struct addrlist entry if address is within any configured
+ *         subnet/range, NULL if no match found or list is empty
+ * 
+ * @note IPv4 matching uses netmask calculated from prefixlen with is_same_net() comparison
+ * @note IPv6 matching uses prefixlen directly with is_same_net6() comparison
+ * @warning Address family (flag) must match the address union member being accessed
+ * 
+ * @see find_subnet() - Wrapper for searching zone->subnet list
+ * @see find_exclude() - Wrapper for searching zone->exclude list
+ * @see filter_zone() - Uses both subnet and exclude lists for access control
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * union all_addr addr;
+ * addr.addr4.s_addr = inet_addr("192.168.1.50");
+ * struct addrlist *match = find_addrlist(zone->subnet, F_IPV4, &addr);
+ * if (match) { // Address is in configured subnet }
+ * @endcode
+ * 
+ * SIDE EFFECTS: None (read-only operation)
+ * THREAD SAFETY: Safe for read-only access in single-threaded architecture
+ */
 static struct addrlist *find_addrlist(struct addrlist *list, int flag, union all_addr *addr_u)
 {
   do {
@@ -41,6 +139,38 @@ static struct addrlist *find_addrlist(struct addrlist *list, int flag, union all
   return NULL;
 }
 
+/**
+ * @brief Check if an IP address is within the zone's allowed subnet list
+ * 
+ * @detailed Wrapper function that searches the zone's configured subnet list to determine
+ *           if the provided IP address falls within any allowed subnet. Used for
+ *           split-horizon DNS to restrict which clients receive authoritative answers
+ *           based on their source IP address. If no subnets are configured (zone->subnet
+ *           is NULL), returns NULL indicating no subnet restrictions apply.
+ * 
+ * @param zone Pointer to auth_zone structure containing subnet configuration. Must not be NULL.
+ * @param flag Address family indicator (F_IPV4 or F_IPV6) from query context
+ * @param addr_u Union containing the client IP address to check. Must not be NULL.
+ * 
+ * @return Pointer to matching struct addrlist if address is in allowed subnet, 
+ *         NULL if no subnets configured or address not in any configured subnet
+ * 
+ * @see find_addrlist() - Performs actual subnet matching logic
+ * @see filter_zone() - Uses this function as part of complete filtering logic
+ * @see find_exclude() - Companion function for excluded address checking
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * union all_addr client_addr;
+ * client_addr.addr4 = peer_addr->in.sin_addr;
+ * if (find_subnet(zone, F_IPV4, &client_addr)) {
+ *   // Client is in allowed subnet, serve authoritative answer
+ * }
+ * @endcode
+ * 
+ * SIDE EFFECTS: None (read-only operation)
+ * THREAD SAFETY: Safe for read-only access in single-threaded architecture
+ */
 static struct addrlist *find_subnet(struct auth_zone *zone, int flag, union all_addr *addr_u)
 {
   if (!zone->subnet)
@@ -49,6 +179,42 @@ static struct addrlist *find_subnet(struct auth_zone *zone, int flag, union all_
   return find_addrlist(zone->subnet, flag, addr_u);
 }
 
+/**
+ * @brief Check if an IP address is within the zone's excluded address list
+ * 
+ * @detailed Wrapper function that searches the zone's configured exclude list to determine
+ *           if the provided IP address falls within any excluded subnet. Used for
+ *           split-horizon DNS to explicitly deny authoritative answers to specific
+ *           clients or subnets even if they would otherwise match subnet criteria.
+ *           Exclude lists take precedence over subnet allow lists in filter_zone().
+ *           If no exclusions are configured (zone->exclude is NULL), returns NULL.
+ * 
+ * @param zone Pointer to auth_zone structure containing exclude list. Must not be NULL.
+ * @param flag Address family indicator (F_IPV4 or F_IPV6) from query context
+ * @param addr_u Union containing the client IP address to check. Must not be NULL.
+ * 
+ * @return Pointer to matching struct addrlist if address is in exclude list,
+ *         NULL if no exclusions configured or address not in any excluded subnet
+ * 
+ * @note Exclude lists provide explicit denial - if an address matches, it will not
+ *       receive authoritative answers regardless of subnet configuration
+ * 
+ * @see find_addrlist() - Performs actual subnet matching logic
+ * @see filter_zone() - Uses this function first to check exclusions before subnet matching
+ * @see find_subnet() - Companion function for allowed subnet checking
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * union all_addr client_addr;
+ * client_addr.addr4 = peer_addr->in.sin_addr;
+ * if (find_exclude(zone, F_IPV4, &client_addr)) {
+ *   // Client is explicitly excluded, deny authoritative answer
+ * }
+ * @endcode
+ * 
+ * SIDE EFFECTS: None (read-only operation)
+ * THREAD SAFETY: Safe for read-only access in single-threaded architecture
+ */
 static struct addrlist *find_exclude(struct auth_zone *zone, int flag, union all_addr *addr_u)
 {
   if (!zone->exclude)
@@ -57,6 +223,53 @@ static struct addrlist *find_exclude(struct auth_zone *zone, int flag, union all
   return find_addrlist(zone->exclude, flag, addr_u);
 }
 
+/**
+ * @brief Determine if a client IP address should receive authoritative answers for a zone
+ * 
+ * @detailed Implements the complete filtering logic for split-horizon DNS by checking both
+ *           exclude and subnet lists. The filtering algorithm operates as follows:
+ *           1. If address is in exclude list, deny (return 0)
+ *           2. If no subnet list configured, allow all (return 1) - no filtering
+ *           3. If subnet list exists, allow only if address matches a subnet (return 1 or 0)
+ *           
+ *           This three-tier logic enables flexible access control: explicit denials via
+ *           exclude lists, no restrictions if no subnets configured, or explicit allow
+ *           lists via subnet configuration. Used by answer_auth() to determine whether
+ *           to serve authoritative responses to a particular client.
+ * 
+ * @param zone Pointer to auth_zone structure with subnet/exclude configuration. Must not be NULL.
+ * @param flag Address family indicator (F_IPV4 or F_IPV6) from query context
+ * @param addr_u Union containing the client IP address to filter. Must not be NULL.
+ * 
+ * @return 1 if client should receive authoritative answers (passed filter),
+ *         0 if client should not receive authoritative answers (failed filter)
+ * @retval 1 Address not in exclude list AND (no subnets configured OR address in subnet list)
+ * @retval 0 Address in exclude list OR (subnets configured AND address not in any subnet)
+ * 
+ * @note Exclude lists take precedence over subnet lists - explicit denial overrides allow
+ * @note If zone->subnet is NULL, no filtering is applied (all clients allowed except excluded)
+ * @warning Returning 0 does not generate an error response, it simply prevents authoritative
+ *          answer - query may be forwarded to upstream servers instead
+ * 
+ * @see find_exclude() - Checks exclude list first (highest priority)
+ * @see find_subnet() - Checks subnet allow list second
+ * @see answer_auth() - Uses this function to filter clients before serving authoritative answers
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * union all_addr client_addr;
+ * client_addr.addr4 = peer_addr->in.sin_addr;
+ * if (filter_zone(zone, F_IPV4, &client_addr)) {
+ *   // Client passed filter, serve authoritative answer
+ * } else {
+ *   // Client filtered out, forward query instead
+ * }
+ * @endcode
+ * 
+ * RFC COMPLIANCE: Split-horizon DNS (not RFC standardized, implementation-defined behavior)
+ * SIDE EFFECTS: None (read-only operation)
+ * THREAD SAFETY: Safe for read-only access in single-threaded architecture
+ */
 static int filter_zone(struct auth_zone *zone, int flag, union all_addr *addr_u)
 {
   if (find_exclude(zone, flag, addr_u))
@@ -69,6 +282,72 @@ static int filter_zone(struct auth_zone *zone, int flag, union all_addr *addr_u)
   return find_subnet(zone, flag, addr_u) != NULL;
 }
 
+/**
+ * @brief Check if a hostname is within an authoritative DNS zone
+ * 
+ * @detailed Determines whether a given hostname belongs to the specified authoritative
+ *           zone by performing a case-insensitive suffix match against the zone's domain.
+ *           The function handles two matching scenarios:
+ *           1. Exact match: hostname equals zone domain exactly (e.g., "example.com" in zone "example.com")
+ *           2. Subdomain match: hostname is a subdomain with dot separator (e.g., "www.example.com" in zone "example.com")
+ *           
+ *           The matching algorithm performs suffix comparison from the end of the hostname
+ *           string, ensuring proper domain boundary detection. The optional cut parameter
+ *           enables callers to extract the subdomain prefix by receiving a pointer to the
+ *           dot separator. This function is called by answer_auth() for every query to
+ *           determine which authoritative zone (if any) should handle the query.
+ * 
+ * @param zone Pointer to auth_zone structure containing the zone domain to match against. Must not be NULL.
+ * @param name Hostname to test for zone membership (FQDN format, null-terminated string). Must not be NULL.
+ * @param cut Optional output parameter: pointer to receive location of dot separator between subdomain
+ *            and zone domain. Set to NULL if no subdomain prefix exists (exact match) or if match fails.
+ *            Pass NULL if cut location is not needed. If non-NULL, *cut is set to NULL before processing.
+ * 
+ * @return 1 if hostname is within the authoritative zone (exact match or valid subdomain),
+ *         0 if hostname is not within the zone (no match)
+ * @retval 1 Hostname exactly matches zone->domain OR hostname ends with "." + zone->domain
+ * @retval 0 Hostname does not match zone domain suffix, or matches but without dot separator
+ * 
+ * @note Matching is case-insensitive via hostname_isequal() (RFC 1035 requirement)
+ * @note For subdomain matches, the function verifies proper dot separator to prevent false
+ *       matches (e.g., "notexample.com" should NOT match zone "example.com")
+ * @warning Function modifies *cut output parameter even on failure (sets to NULL)
+ * 
+ * @see answer_auth() - Primary caller, uses this to route queries to appropriate zones
+ * @see hostname_isequal() in util.c - Case-insensitive hostname comparison
+ * @see struct auth_zone in dnsmasq.h:430-444 - Zone configuration structure
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * struct auth_zone *zone; // zone->domain = "example.com"
+ * char *cut = NULL;
+ * 
+ * // Exact match
+ * if (in_zone(zone, "example.com", &cut)) {
+ *   // Returns 1, cut = NULL (no subdomain)
+ * }
+ * 
+ * // Subdomain match
+ * if (in_zone(zone, "www.example.com", &cut)) {
+ *   // Returns 1, cut points to '.' before "example.com"
+ *   // Subdomain prefix is "www" (cut - name = 3 chars)
+ * }
+ * 
+ * // No match - wrong zone
+ * if (!in_zone(zone, "example.org", NULL)) {
+ *   // Returns 0, not in zone
+ * }
+ * 
+ * // No match - no dot separator
+ * if (!in_zone(zone, "wwwexample.com", NULL)) {
+ *   // Returns 0, matches suffix but no dot separator
+ * }
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 1035 Section 3.1 (domain name syntax and case-insensitive comparison)
+ * SIDE EFFECTS: Modifies *cut output parameter if provided (always sets to NULL first)
+ * THREAD SAFETY: Safe - read-only operations on zone structure (zone is immutable during query processing)
+ */
 int in_zone(struct auth_zone *zone, char *name, char **cut)
 {
   size_t namelen = strlen(name);
@@ -96,6 +375,96 @@ int in_zone(struct auth_zone *zone, char *name, char **cut)
 }
 
 
+/**
+ * @brief Process authoritative DNS query and generate authoritative response
+ * 
+ * @detailed This is the main entry point for authoritative DNS processing in dnsmasq.
+ * When the forwarding engine (forward.c) determines that a query matches a configured
+ * authoritative zone, it routes the query to this function. The function generates
+ * authoritative responses with the AA (Authoritative Answer) flag set, supporting
+ * standard queries, SOA queries, NS queries, zone transfers (AXFR), and all record
+ * types configured in the authoritative zone (A, AAAA, PTR, CNAME, MX, SRV, TXT, NAPTR).
+ * 
+ * The response construction process includes:
+ * 1. Query parsing and validation (name extraction, type determination)
+ * 2. Zone matching to find authoritative zone for queried name
+ * 3. Subnet filtering based on peer address (split-horizon DNS support)
+ * 4. Response construction with appropriate records from configuration and cache
+ * 5. Authority section population with NS records
+ * 6. Additional section population with glue records (A/AAAA for NS targets)
+ * 7. AXFR handling for complete zone transfers to secondary nameservers
+ * 8. SOA record generation with configurable timing parameters
+ * 
+ * Split-horizon DNS is supported through per-zone subnet and exclude lists, allowing
+ * different responses based on the client's IP address. This enables internal and
+ * external views of the same zone.
+ * 
+ * @param header DNS packet header structure containing query to process. Modified in-place
+ *               to become the response packet. Must not be NULL.
+ * @param limit Pointer to end of available buffer space for response construction. Used
+ *              to prevent buffer overflow when adding records. Must be >= header address.
+ * @param qlen Length of original query packet in bytes, used for packet size calculations.
+ *             Must be > 0 and <= buffer size.
+ * @param now Current Unix timestamp for TTL calculations and SOA serial number generation.
+ *            Used to compute relative TTLs and generate monotonically increasing SOA serials.
+ * @param peer_addr Socket address of DNS client sending the query. Used for subnet filtering
+ *                  in split-horizon DNS configurations. May be NULL for local queries.
+ * @param local_query Boolean flag: 1 if query originated from local resolver, 0 if from
+ *                    network client. Affects logging and filtering behavior.
+ * 
+ * @return Size of constructed response packet in bytes, including DNS header and all sections.
+ *         Returns original qlen if query is not for an authoritative zone or if an error
+ *         occurred (RCODE set appropriately). Returns 0 only if catastrophic error prevents
+ *         any response construction.
+ * 
+ * @note The function modifies the header structure in-place, transforming the query into
+ *       a response by setting QR flag, adjusting counts, and appending answer/authority/
+ *       additional sections. The original query section remains unchanged.
+ * 
+ * @warning AXFR (zone transfer) queries can generate very large responses containing all
+ *          zone records. Ensure sufficient buffer space is available (limit parameter).
+ *          AXFR is only permitted from IP addresses listed in auth-peer configuration.
+ * 
+ * @see in_zone() for zone matching logic
+ * @see filter_zone() for subnet-based response filtering
+ * @see struct auth_zone in src/dnsmasq.h:430-444 for zone configuration structure
+ * @see struct auth_name_list in src/dnsmasq.h:420-428 for zone record lists
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Called from forward.c when query matches authoritative zone
+ * struct dns_header *header = (struct dns_header *)packet_buffer;
+ * char *limit = packet_buffer + sizeof(packet_buffer);
+ * size_t response_len = answer_auth(header, limit, query_len, time(NULL), 
+ *                                    &client_addr, 0);
+ * // Send response_len bytes from packet_buffer to client
+ * send(sock, packet_buffer, response_len, 0);
+ * @endcode
+ * 
+ * RFC COMPLIANCE:
+ * RFC 1035 Section 4.1.1 - DNS message format and authoritative answer flag
+ * RFC 1035 Section 6.2 - SOA record format and RDATA structure
+ * RFC 1996 - DNS zone transfer (AXFR) protocol over TCP
+ * RFC 2782 - SRV record format for service location
+ * RFC 3596 - AAAA record format for IPv6 addresses
+ * 
+ * SIDE EFFECTS:
+ * - Modifies header structure in-place to construct response packet
+ * - Logs query processing via log_query() for audit and troubleshooting
+ * - Enumerates cache records for DHCP lease and hosts file integration
+ * - May trigger DNSSEC signing operations if zone is DNSSEC-enabled
+ * 
+ * THREAD SAFETY:
+ * Single-threaded architecture - no locking required. Function executes atomically
+ * in main event loop. Zone configuration is read-only except during config reload.
+ * 
+ * ERROR HANDLING:
+ * - Returns NXDOMAIN if queried name not in any authoritative zone
+ * - Returns REFUSED if client subnet not permitted by zone filters
+ * - Returns NOTIMP if query type not supported (e.g., dynamic updates)
+ * - Returns FORMERR if query packet is malformed or truncated
+ * - All error responses include appropriate RCODE and are logged
+ */
 size_t answer_auth(struct dns_header *header, char *limit, size_t qlen, time_t now,
 		   union mysockaddr *peer_addr, int local_query) 
 {
