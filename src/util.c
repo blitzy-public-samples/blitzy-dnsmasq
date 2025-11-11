@@ -1576,7 +1576,44 @@ int is_same_net6(struct in6_addr *a, struct in6_addr *b, int prefixlen)
   return 0;
 }
 
-/* return least significant 64 bits if IPv6 address */
+/**
+ * @brief Extract the host portion (lower 64 bits) from an IPv6 address
+ * 
+ * @detailed Extracts and returns the interface identifier (host portion) of an
+ *           IPv6 address, which consists of the lower 64 bits (bytes 8-15). The
+ *           algorithm iterates through bytes 8 to 15, building a 64-bit integer
+ *           by left-shifting the accumulated result and adding each byte. This
+ *           extracts the host/interface identifier portion while discarding the
+ *           network prefix. Commonly used in DHCPv6, SLAAC, and IPv6 address
+ *           manipulation operations where the host portion needs to be extracted,
+ *           compared, or manipulated separately from the network prefix.
+ * 
+ * @param addr Pointer to IPv6 address structure (must not be NULL)
+ * 
+ * @return 64-bit unsigned integer containing lower 64 bits of IPv6 address
+ * @retval u64 Host portion (interface identifier) extracted from bytes 8-15
+ * 
+ * @note IPv6 addresses are 128 bits: upper 64 bits (network prefix) + lower 64 bits (host)
+ * @note Bytes are processed in big-endian order (network byte order)
+ * @note Complementary function to setaddr6part() which sets the host portion
+ * @warning Parameter addr must not be NULL (no NULL checking performed)
+ * @warning Caller must ensure addr points to valid in6_addr structure
+ * 
+ * @see setaddr6part() for setting the host portion of an IPv6 address
+ * @see is_same_net6() for comparing IPv6 network prefixes
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * struct in6_addr ipv6_addr;
+ * inet_pton(AF_INET6, "2001:db8::1234:5678:90ab:cdef", &ipv6_addr);
+ * u64 host_id = addr6part(&ipv6_addr);
+ * // host_id now contains 0x1234567890abcdef (lower 64 bits)
+ * @endcode
+ * 
+ * RFC COMPLIANCE: IPv6 address structure per RFC 4291 Section 2.5.1
+ * SIDE EFFECTS: None (read-only parameter access)
+ * THREAD SAFETY: Thread-safe (no shared state, read-only operation)
+ */
 u64 addr6part(struct in6_addr *addr)
 {
   int i;
