@@ -194,6 +194,67 @@ stateDiagram-v2
 - Occurs at T2 timer expiration (87.5% of lease)
 - Any server can respond with DHCPACK or DHCPNAK
 
+### DHCP Message Exchange Flow
+
+The following sequence diagram illustrates the complete four-phase DHCP exchange between client and server, showing the timing and content of each message in the DISCOVER→OFFER→REQUEST→ACK handshake.
+
+```mermaid
+sequenceDiagram
+    participant Client as DHCP Client
+    participant Server as dnsmasq Server
+    participant DNS as DNS Cache
+    participant Script as Lease Script
+    
+    Note over Client,Server: Phase 1: Discovery
+    Client->>Server: DHCPDISCOVER (broadcast)<br/>Options: Requested IP, Parameters
+    Note over Server: Check address pools<br/>Select available IP<br/>Match static reservations
+    
+    Note over Client,Server: Phase 2: Offer
+    Server->>Client: DHCPOFFER (broadcast/unicast)<br/>Offered IP: 192.168.1.100<br/>Options: Netmask, Router, DNS, Lease Time
+    Note over Client: Evaluate offers<br/>Select preferred server
+    
+    Note over Client,Server: Phase 3: Request
+    Client->>Server: DHCPREQUEST (broadcast)<br/>Requested IP: 192.168.1.100<br/>Server ID: Server's IP
+    Note over Server: Verify IP still available<br/>Ping test for conflicts<br/>Update lease database
+    Server->>Server: Check ARP cache<br/>Send ICMP echo (ping)
+    
+    alt No Conflict Detected
+        Note over Client,Server: Phase 4: Acknowledgment
+        Server->>Client: DHCPACK<br/>Assigned IP: 192.168.1.100<br/>Options: Full configuration
+        Server->>DNS: Register hostname in DNS cache
+        Server->>Script: Execute lease-change script<br/>(action: add)
+        Note over Client: Configure interface<br/>Start using IP address
+    else Address Conflict Detected
+        Server->>Client: DHCPNAK<br/>Reason: Address in use
+        Note over Client: Return to INIT state<br/>Start discovery again
+    end
+    
+    Note over Client,Server: Lease Renewal (T1 Timer)
+    Client->>Server: DHCPREQUEST (unicast)<br/>Renew existing lease
+    Server->>Client: DHCPACK<br/>Extended lease time
+    Server->>Script: Execute lease-change script<br/>(action: old)
+    
+    Note over Client,Server: Lease Expiration
+    Note over Server: Lease expires after<br/>lease time without renewal
+    Server->>DNS: Remove hostname from DNS cache
+    Server->>Script: Execute lease-change script<br/>(action: del)
+```
+
+**Message Flow Details**:
+
+1. **DHCPDISCOVER Broadcast**: Client broadcasts discovery message with requested parameters
+2. **DHCPOFFER Response**: Server offers available IP address with lease time and configuration options
+3. **DHCPREQUEST Selection**: Client broadcasts request for selected offer, including server identifier
+4. **Conflict Detection**: Server performs ping test before final assignment
+5. **DHCPACK Confirmation**: Server confirms lease and triggers DNS registration and script execution
+6. **Alternative DHCPNAK**: Server rejects request if address unavailable or configuration invalid
+
+**Integration Points** (Source: `src/dhcp.c`, `src/lease.c`):
+
+- **DNS Integration**: Lease assignment triggers immediate DNS cache update via `cache_add_dhcp_entry()`
+- **Script Execution**: Lease changes invoke configured script via `queue_script()` in `src/helper.c`
+- **ARP Cache Consultation**: Address conflict detection uses `find_mac()` from `src/arp.c`
+
 ### Server Processing Logic
 
 The dnsmasq server processes incoming messages based on message type, implementing the server's side of the state machine. Key processing occurs in `src/rfc2131.c:dhcp_reply()`.
