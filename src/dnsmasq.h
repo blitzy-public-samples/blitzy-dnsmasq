@@ -14,6 +14,84 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+/**
+ * @file dnsmasq.h
+ * @brief Global header defining ALL core data structures, function prototypes, event codes, and system-wide includes
+ * 
+ * DETAILED PURPOSE:
+ * This file serves as the central header for the entire dnsmasq system, providing comprehensive
+ * definitions for all core data structures, function prototypes from all modules, compile-time
+ * configuration options, and system-wide type definitions. Every source file in the dnsmasq
+ * project includes this header, making it the authoritative reference for system-wide interfaces,
+ * data layout, and architectural conventions.
+ * 
+ * The header defines the single-threaded event-driven architecture through the global `struct daemon`
+ * state hub, which integrates all subsystems including DNS forwarding/caching, DHCPv4/DHCPv6 servers,
+ * Router Advertisement, TFTP server, DNSSEC validation, and platform-specific integrations. The
+ * structure definitions establish memory layouts and ownership semantics used throughout the codebase.
+ * 
+ * KEY RESPONSIBILITIES:
+ * - Define struct daemon (global state hub with 100+ members linking all subsystems - lines ~1200-1400)
+ * - Define DNS cache structures: struct crec (cache record), struct server (upstream DNS servers)
+ * - Define DHCP structures: struct dhcp_lease, struct dhcp_context, struct dhcp_config
+ * - Define network structures: struct listener, struct iname, struct irec, struct server_details
+ * - Define DNSSEC structures: struct blockdata, struct ds_config, trust anchor data
+ * - Define TFTP structures: struct tftp_transfer, struct tftp_prefix
+ * - Declare function prototypes for ALL modules (cache.c, forward.c, dhcp.c, rfc1035.c, etc.)
+ * - Define event queue types (EVENT_RELOAD, EVENT_DUMP, EVENT_ALARM, etc.)
+ * - Define runtime option flags (OPT_FILTER, OPT_LOG, OPT_NOWILD, etc.)
+ * - Define exit codes (EC_GOOD, EC_BADCONF, EC_BADNET, etc.)
+ * - Establish type definitions (u8, u16, u32, u64, union all_addr)
+ * 
+ * DEPENDENCIES:
+ * Includes: config.h (compile-time configuration), dns-protocol.h (DNS constants),
+ *          dhcp-protocol.h (DHCP constants), dhcp6-protocol.h (DHCPv6 constants),
+ *          radv-protocol.h (Router Advertisement constants), ip6addr.h (IPv6 utilities),
+ *          metrics.h (performance metrics interface)
+ * Called by: ALL source files in src/ directory include this header
+ * Calls: N/A (header file defining interfaces, not implementing them)
+ * 
+ * DATA STRUCTURES:
+ * See detailed @struct documentation below for:
+ * - struct daemon: Global state hub (lines ~1200-1400)
+ * - struct crec: DNS cache record with hash table integration (lines ~300-350)
+ * - struct server: Upstream DNS server with failure tracking (lines ~400-450)
+ * - struct frec: Forward record for DNS query tracking (lines ~500-550)
+ * - struct dhcp_lease: DHCP lease database entry (lines ~600-650)
+ * - struct dhcp_context: DHCP address pool configuration (lines ~700-750)
+ * - struct dhcp_config: Static DHCP host configuration (lines ~800-850)
+ * - Plus 40+ additional critical structures documented inline
+ * 
+ * COMPILE-TIME OPTIONS:
+ * The header behavior is controlled by numerous feature flags from config.h:
+ * - HAVE_DHCP: Enable DHCPv4 server functionality
+ * - HAVE_DHCP6: Enable DHCPv6 and Router Advertisement functionality
+ * - HAVE_DNSSEC: Enable DNSSEC validation with cryptographic verification
+ * - HAVE_TFTP: Enable built-in TFTP server for network boot
+ * - HAVE_AUTH: Enable authoritative DNS mode for local zones
+ * - HAVE_DBUS: Enable D-Bus control interface
+ * - HAVE_UBUS: Enable UBus control interface (OpenWrt)
+ * - HAVE_SCRIPT: Enable lease-change script execution
+ * - HAVE_LUASCRIPT: Enable Lua scripting for lease events
+ * - HAVE_IPSET: Enable Linux ipset firewall integration
+ * - HAVE_NFTSET: Enable nftables set integration
+ * - HAVE_CONNTRACK: Enable connection tracking mark preservation
+ * - HAVE_LOOP: Enable DNS forwarding loop detection
+ * - HAVE_INOTIFY: Enable inotify configuration file monitoring (Linux)
+ * - HAVE_DUMPFILE: Enable packet capture to libpcap format
+ * - NO_TFTP, NO_DHCP, NO_SCRIPT: Disable features (Android builds)
+ * 
+ * THREADING/CONCURRENCY:
+ * Single-threaded event-driven architecture using poll-based I/O multiplexing. All state
+ * modifications occur within the main event loop (dnsmasq.c:main()). The struct daemon
+ * instance is the single global state object accessed by all modules. No mutex or lock
+ * mechanisms required due to single-threaded design. Fork-based helper processes (helper.c)
+ * execute scripts independently without shared state.
+ * 
+ * @copyright Copyright (c) 2000-2025 Simon Kelley
+ * @license GPL-2.0-or-later
+ */
+
 #define COPYRIGHT "Copyright (c) 2000-2025 Simon Kelley"
 
 /* We do defines that influence behavior of stdio.h, so complain
