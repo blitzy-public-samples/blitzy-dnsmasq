@@ -149,9 +149,110 @@
 #include "ip6addr.h"
 #include "metrics.h"
 
+/**
+ * @typedef u8
+ * @brief Unsigned 8-bit integer type
+ * 
+ * Platform-independent 8-bit unsigned integer type alias providing
+ * consistent width across all target platforms. Guaranteed to be exactly
+ * 8 bits wide on all supported architectures (x86, x86-64, ARM, MIPS).
+ * 
+ * USAGE:
+ * - Byte arrays and binary protocol fields
+ * - DNS/DHCP protocol headers and wire format structures
+ * - Network packet parsing where exact byte width is required
+ * - Memory-mapped hardware registers on embedded platforms
+ * 
+ * MEMORY LAYOUT:
+ * Size: 1 byte (8 bits)
+ * Range: 0 to 255
+ * Alignment: 1-byte boundary
+ * 
+ * @see u16, u32, u64
+ */
 typedef unsigned char u8;
+
+/**
+ * @typedef u16
+ * @brief Unsigned 16-bit integer type
+ * 
+ * Platform-independent 16-bit unsigned integer type alias providing
+ * consistent width across all target platforms. Guaranteed to be exactly
+ * 16 bits wide on all supported architectures.
+ * 
+ * USAGE:
+ * - DNS/DHCP protocol port numbers and message IDs
+ * - Network byte order (big-endian) 16-bit fields requiring ntohs/htons
+ * - Resource record data lengths and counts
+ * - DHCP option lengths and TFTP block numbers
+ * 
+ * MEMORY LAYOUT:
+ * Size: 2 bytes (16 bits)
+ * Range: 0 to 65,535
+ * Alignment: Typically 2-byte boundary (platform-dependent)
+ * 
+ * BYTE ORDER CONSIDERATIONS:
+ * Network protocols use big-endian byte order; use ntohs/htons for conversions.
+ * 
+ * @see u8, u32, u64, ntohs(), htons()
+ */
 typedef unsigned short u16;
+
+/**
+ * @typedef u32
+ * @brief Unsigned 32-bit integer type
+ * 
+ * Platform-independent 32-bit unsigned integer type alias providing
+ * consistent width across all target platforms. Guaranteed to be exactly
+ * 32 bits wide on all supported architectures.
+ * 
+ * USAGE:
+ * - IPv4 addresses in network byte order
+ * - DNS TTL values and serial numbers
+ * - DHCP lease times and transaction IDs
+ * - DNSSEC signature timestamps and key tags
+ * - Hash values for cache indexing
+ * 
+ * MEMORY LAYOUT:
+ * Size: 4 bytes (32 bits)
+ * Range: 0 to 4,294,967,295
+ * Alignment: Typically 4-byte boundary (platform-dependent)
+ * 
+ * BYTE ORDER CONSIDERATIONS:
+ * Network protocols use big-endian byte order; use ntohl/htonl for conversions.
+ * IPv4 addresses stored in network byte order (struct in_addr).
+ * 
+ * @see u8, u16, u64, ntohl(), htonl(), struct in_addr
+ */
 typedef unsigned int u32;
+
+/**
+ * @typedef u64
+ * @brief Unsigned 64-bit integer type
+ * 
+ * Platform-independent 64-bit unsigned integer type alias providing
+ * consistent width across all target platforms. Guaranteed to be exactly
+ * 64 bits wide on all supported architectures.
+ * 
+ * USAGE:
+ * - DNSSEC cryptographic operations and signature values
+ * - Large hash values and checksums
+ * - Extended timestamp calculations
+ * - Lease database identifiers on high-volume servers
+ * - Performance counter accumulators (metrics.c)
+ * 
+ * MEMORY LAYOUT:
+ * Size: 8 bytes (64 bits)
+ * Range: 0 to 18,446,744,073,709,551,615
+ * Alignment: Typically 8-byte boundary on 64-bit platforms, 4-byte on 32-bit
+ * 
+ * PORTABILITY NOTES:
+ * - Uses 'unsigned long long' for C99 compatibility
+ * - Avoid unaligned access on architectures requiring strict alignment
+ * - printf format specifier: %llu or PRIu64 from <inttypes.h>
+ * 
+ * @see u8, u16, u32
+ */
 typedef unsigned long long u64;
 
 #define countof(x)      (long)(sizeof(x) / sizeof(x[0]))
@@ -1783,6 +1884,104 @@ void route_sock(void);
 #endif
 
 /* bpf.c or netlink.c */
+/**
+ * @typedef callback_t
+ * @brief Union of function pointers for network interface enumeration callbacks
+ * 
+ * Platform-independent callback mechanism for enumerating network interfaces, addresses,
+ * and neighbor table entries. Used by iface_enumerate() to provide different callback
+ * signatures depending on the address family being enumerated. The union allows a single
+ * callback parameter type while supporting different function signatures for different
+ * enumeration contexts.
+ * 
+ * LIFECYCLE:
+ * Creation: Callback function pointers assigned by caller before passing to iface_enumerate()
+ * Usage: Platform-specific implementations (netlink.c for Linux, bpf.c for BSD) invoke
+ *        the appropriate function pointer based on enumeration context
+ * Cleanup: No explicit cleanup required (function pointers, not allocated memory)
+ * 
+ * USAGE PATTERNS:
+ * - IPv4 address enumeration uses af_inet callback
+ * - IPv6 address enumeration uses af_inet6 callback
+ * - Neighbor table enumeration (ARP/NDP) uses af_unspec callback
+ * - Link-layer interface enumeration uses af_local callback
+ * 
+ * PLATFORM SPECIFICS:
+ * - Linux: Called from netlink message processing (netlink.c:nl_async())
+ * - BSD: Called from BPF routing socket processing (bpf.c:route_sock())
+ * 
+ * THREAD SAFETY:
+ * Single-threaded architecture; callback invoked synchronously during enumeration.
+ * 
+ * @member af_unspec Function pointer for address family-independent neighbor enumeration
+ *         Parameters:
+ *           - family: Address family (AF_INET or AF_INET6)
+ *           - addrp: Pointer to address structure (struct in_addr* or struct in6_addr*)
+ *           - mac: MAC address of neighbor (hardware address)
+ *           - maclen: Length of MAC address (typically 6 for Ethernet)
+ *           - parmv: User-provided opaque parameter passed through from iface_enumerate()
+ *         Returns: Implementation-defined status (0=success typical convention)
+ *         Called from: netlink.c:nl_async() for RTM_NEWNEIGH messages
+ *         Use case: Neighbor table updates (ARP/NDP cache changes)
+ * 
+ * @member af_inet Function pointer for IPv4 address enumeration
+ *         Parameters:
+ *           - local: IPv4 address assigned to interface (struct in_addr)
+ *           - if_index: Interface index (ifindex) for this address
+ *           - label: Interface label/alias name (e.g., "eth0:1" for aliased interfaces)
+ *           - netmask: IPv4 netmask for this address (struct in_addr)
+ *           - broadcast: IPv4 broadcast address (struct in_addr)
+ *           - vparam: User-provided opaque parameter passed through from iface_enumerate()
+ *         Returns: Implementation-defined status (0=success typical convention)
+ *         Called from: netlink.c:nl_async() for RTM_NEWADDR messages with AF_INET
+ *         Use case: IPv4 address addition/updates, DHCP server address binding
+ * 
+ * @member af_inet6 Function pointer for IPv6 address enumeration
+ *         Parameters:
+ *           - local: Pointer to IPv6 address assigned to interface (struct in6_addr*)
+ *           - prefix: Prefix length for this address (e.g., 64 for /64 subnet)
+ *           - scope: IPv6 address scope (IFA_LINK, IFA_SITE, IFA_HOST, IFA_GLOBAL)
+ *           - if_index: Interface index (ifindex) for this address
+ *           - flags: Address flags (IFA_F_TEMPORARY, IFA_F_DEPRECATED, etc.)
+ *           - preferred: Preferred lifetime in seconds (0=infinity for some address types)
+ *           - valid: Valid lifetime in seconds (0=infinity for some address types)
+ *           - vparam: User-provided opaque parameter passed through from iface_enumerate()
+ *         Returns: Implementation-defined status (0=success typical convention)
+ *         Called from: netlink.c:nl_async() for RTM_NEWADDR messages with AF_INET6
+ *         Use case: IPv6 address addition/updates, DHCPv6 server binding, SLAAC monitoring
+ * 
+ * @member af_local Function pointer for link-layer interface enumeration
+ *         Parameters:
+ *           - index: Interface index (ifindex)
+ *           - type: Interface hardware type (ARPHRD_ETHER, ARPHRD_LOOPBACK, etc.)
+ *           - mac: MAC address of interface (hardware address)
+ *           - maclen: Length of MAC address (typically 6 for Ethernet, 0 for loopback)
+ *           - parm: User-provided opaque parameter passed through from iface_enumerate()
+ *         Returns: Implementation-defined status (0=success typical convention)
+ *         Called from: netlink.c:nl_async() for RTM_NEWLINK messages
+ *         Use case: Interface addition/state changes, MAC address discovery for DHCP
+ * 
+ * MEMORY LAYOUT:
+ * Size: sizeof(void*) (pointer size, 4 bytes on 32-bit, 8 bytes on 64-bit)
+ * All union members are function pointers, so union size equals single pointer size.
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Example: Enumerate IPv4 addresses on all interfaces
+ * static int ipv4_callback(struct in_addr local, int if_index, char *label,
+ *                          struct in_addr netmask, struct in_addr broadcast,
+ *                          void *vparam) {
+ *     // Process IPv4 address...
+ *     return 0;
+ * }
+ * 
+ * callback_t cb;
+ * cb.af_inet = ipv4_callback;
+ * iface_enumerate(AF_INET, user_data, cb);
+ * @endcode
+ * 
+ * @see iface_enumerate(), netlink.c:nl_async(), bpf.c:route_sock()
+ */
 typedef union {
 	int (*af_unspec)(int family, void *addrp, char *mac, size_t maclen, void *parmv);
 	int (*af_inet)(struct in_addr local, int if_index, char *label, struct in_addr netmask, struct in_addr broadcast, void *vparam);
