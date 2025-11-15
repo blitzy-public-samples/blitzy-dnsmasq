@@ -1800,8 +1800,6 @@
  * __FreeBSD__, __OpenBSD__, __DragonFly__, __FreeBSD_kernel__, __NetBSD__, __sun.
  */
 
-*/
-
 /* Defining this builds a binary which handles time differently and works better on a system without a 
    stable RTC (it uses uptime, not epoch time) and writes the DHCP leases file less often to avoid flash wear. 
 */
