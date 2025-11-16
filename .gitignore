@@ -8,3 +8,10 @@ contrib/lease-tools/dhcp_lease_time
 contrib/lease-tools/dhcp_release
 contrib/lease-tools/dhcp_release6
 
+# Build artifacts at repository root
+*.o
+build.log
+
+# Temporary build/test directories
+blitzy/
+

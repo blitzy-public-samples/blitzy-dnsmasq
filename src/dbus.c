@@ -14,6 +14,91 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+/**
+ * @file dbus.c
+ * @brief D-Bus control interface for programmatic dnsmasq management and monitoring
+ * 
+ * DETAILED PURPOSE:
+ * This module implements the D-Bus control interface that exposes dnsmasq's operational
+ * state and configuration to external applications through the system D-Bus message bus.
+ * The interface allows monitoring tools, network management systems, and administrative
+ * scripts to query cache statistics, manipulate DNS cache entries, reconfigure upstream
+ * DNS servers, manage DHCP leases, and receive real-time notifications of lease changes
+ * without requiring filesystem access or daemon restarts.
+ * 
+ * The D-Bus service operates on the system bus under the well-known service name
+ * "uk.org.thekelleys.dnsmasq" at object path "/uk/org/thekelleys/dnsmasq". This provides
+ * a standardized IPC mechanism that integrates naturally with Linux desktop environments,
+ * systemd service management, and enterprise monitoring infrastructure.
+ * 
+ * KEY RESPONSIBILITIES:
+ * - Initialize and maintain D-Bus system bus connection (dbus_init)
+ * - Dispatch D-Bus method calls to appropriate handler functions (message_handler)
+ * - Implement upstream server reconfiguration via SetServers/SetServersEx methods
+ * - Provide DNS cache manipulation through ClearCache method
+ * - Expose system metrics via GetMetrics and GetServerMetrics methods
+ * - Support DHCP lease management through AddDhcpLease/DeleteDhcpLease methods
+ * - Emit D-Bus signals for DHCP lease events (DhcpLeaseAdded/Deleted/Updated)
+ * - Manage D-Bus file descriptor watches for event-driven I/O integration (add_watch, remove_watch)
+ * - Integrate with main event loop through set_dbus_listeners and check_dbus_listeners
+ * 
+ * DEPENDENCIES:
+ * Includes: dnsmasq.h (core structures and function declarations), dbus/dbus.h (libdbus-1 API)
+ * Called by: main event loop in dnsmasq.c for initialization and event processing
+ * Calls: cache.c (cache manipulation), forward.c (upstream server management),
+ *        lease.c (DHCP lease operations), metrics.c (statistics collection)
+ * 
+ * DATA STRUCTURES:
+ * - struct watch (dbus.c:164-170): Associates D-Bus watch handles with poll file descriptors
+ *   for event loop integration, enabling non-blocking D-Bus message processing
+ * - DBusConnection: libdbus-1 connection handle to system bus (global variable "connection")
+ * - DBusWatch: libdbus-1 watch handle for file descriptor monitoring
+ * - DBusMessage: libdbus-1 message structure for method calls, replies, and signals
+ * 
+ * COMPILE-TIME OPTIONS:
+ * - HAVE_DBUS: Master flag enabling entire D-Bus interface (required for all functionality)
+ * - HAVE_DHCP: Enables DHCP lease management methods (AddDhcpLease, DeleteDhcpLease) and
+ *   DHCP lease change signals (DhcpLeaseAdded, DhcpLeaseDeleted, DhcpLeaseUpdated)
+ * - HAVE_LOOP: Enables GetLoopServers method for DNS forwarding loop detection queries
+ * 
+ * THREADING/CONCURRENCY:
+ * Single-threaded event-driven model. D-Bus messages are processed synchronously in the
+ * main event loop. File descriptor watches enable non-blocking integration with poll-based
+ * event multiplexing. All D-Bus operations complete within the main thread context.
+ * 
+ * SECURITY MODEL:
+ * Access control enforced via D-Bus system bus policy file (dbus/dnsmasq.conf). Default
+ * policy restricts all methods to root user and members of the netadmin group, preventing
+ * unprivileged users from manipulating DNS cache or reconfiguring upstream servers.
+ * Policy enforcement delegated to dbus-daemon; this module trusts authenticated callers.
+ * 
+ * EXAMPLE USAGE:
+ * External applications interact with dnsmasq via D-Bus using standard D-Bus client libraries
+ * or command-line tools like dbus-send. Example method invocations:
+ * 
+ * Query version:
+ * @code
+ * dbus-send --system --print-reply --dest=uk.org.thekelleys.dnsmasq \
+ *   /uk/org/thekelleys/dnsmasq uk.org.thekelleys.dnsmasq.GetVersion
+ * @endcode
+ * 
+ * Clear DNS cache:
+ * @code
+ * dbus-send --system --dest=uk.org.thekelleys.dnsmasq \
+ *   /uk/org/thekelleys/dnsmasq uk.org.thekelleys.dnsmasq.ClearCache
+ * @endcode
+ * 
+ * Reconfigure upstream servers:
+ * @code
+ * dbus-send --system --dest=uk.org.thekelleys.dnsmasq \
+ *   /uk/org/thekelleys/dnsmasq uk.org.thekelleys.dnsmasq.SetServersEx \
+ *   array:array:string:"","8.8.8.8","","8.8.4.4"
+ * @endcode
+ * 
+ * @copyright Copyright (c) 2000-2025 Simon Kelley
+ * @license GPL-2.0-or-later
+ */
+
 #include "dnsmasq.h"
 
 #ifdef HAVE_DBUS
@@ -108,12 +193,82 @@ const char* introspection_xml_template =
 static char *introspection_xml = NULL;
 static int watches_modified = 0;
 
+/**
+ * @struct watch
+ * @brief Associates D-Bus watch handles with poll file descriptors for event loop integration
+ * 
+ * This structure maintains the list of active D-Bus watch objects that monitor file descriptors
+ * for readable, writable, or error conditions. The watch list enables non-blocking integration
+ * between libdbus-1's event-driven architecture and dnsmasq's poll-based main event loop.
+ * 
+ * LIFECYCLE:
+ * Creation: Allocated via add_watch() when libdbus-1 requests new file descriptor monitoring
+ * Initialization: Fields populated with DBusWatch handle and linked into daemon->watches list
+ * Destruction: Removed via remove_watch() when libdbus-1 no longer needs monitoring; freed with free()
+ * Ownership: Owned by daemon global state; managed by add_watch/remove_watch callbacks
+ * 
+ * MEMORY LAYOUT:
+ * Size: Typically 16 bytes (8-byte pointer + 8-byte next pointer on 64-bit systems)
+ * Alignment: Natural pointer alignment
+ * 
+ * USAGE PATTERNS:
+ * Linked list of watch structures anchored at daemon->watches
+ * Traversed in set_dbus_listeners() to add file descriptors to poll array
+ * Modified by libdbus-1 callbacks (add_watch, remove_watch) during connection lifecycle
+ */
 struct watch {
-  DBusWatch *watch;      
-  struct watch *next;
+  DBusWatch *watch;      /**< @brief libdbus-1 watch handle for file descriptor monitoring
+                          * Valid DBusWatch pointer; never NULL within linked list.
+                          * Used to query file descriptor, flags, and enabled state. */
+  struct watch *next;    /**< @brief Next watch in linked list; NULL for list tail.
+                          * Links form singly-linked list for traversal during poll setup. */
 };
 
 
+/**
+ * @brief Register new D-Bus watch for file descriptor monitoring in main event loop
+ * 
+ * Callback function invoked by libdbus-1 when a new file descriptor requires monitoring
+ * for readable, writable, or error conditions. Allocates a watch structure, links it
+ * into the daemon's watch list, and sets the watches_modified flag to trigger poll
+ * array reconstruction in the next event loop iteration.
+ * 
+ * This function implements the DBusAddWatchFunction callback type required by
+ * dbus_connection_set_watch_functions(). It integrates libdbus-1's event-driven
+ * architecture with dnsmasq's poll-based main event loop by maintaining a list
+ * of active watches that are translated to pollfd structures in set_dbus_listeners().
+ * 
+ * @param watch DBusWatch handle from libdbus-1 representing file descriptor to monitor.
+ *              Must not be NULL. Contains file descriptor, monitoring flags (read/write),
+ *              and enabled state. Ownership remains with libdbus-1.
+ * @param data User data pointer (unused in this implementation); typically daemon context.
+ *             May be NULL. Suppressed with (void) cast to prevent compiler warnings.
+ * 
+ * @return TRUE on successful watch registration; FALSE on memory allocation failure
+ * @retval TRUE Watch successfully added to daemon->watches list or already present
+ * @retval FALSE Memory allocation failed via whine_malloc; watch not registered
+ * 
+ * @note Idempotent: If watch already exists in list, returns TRUE without duplication
+ * @warning Memory allocation failure prevents D-Bus message processing; connection unusable
+ * 
+ * @see remove_watch() for watch deregistration
+ * @see set_dbus_listeners() for poll array setup using watch list
+ * @see dbus_init() for callback registration via dbus_connection_set_watch_functions()
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Registered as callback during D-Bus connection initialization
+ * dbus_connection_set_watch_functions(connection, add_watch, remove_watch, NULL, NULL, NULL);
+ * // libdbus-1 automatically invokes add_watch when new file descriptor needs monitoring
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (D-Bus implementation detail)
+ * SIDE EFFECTS: 
+ * - Allocates memory for struct watch via whine_malloc (logged allocation)
+ * - Modifies daemon->watches linked list by prepending new watch
+ * - Increments watches_modified flag, triggering poll array rebuild
+ * THREAD SAFETY: Single-threaded; assumes called from main event loop context
+ */
 static dbus_bool_t add_watch(DBusWatch *watch, void *data)
 {
   struct watch *w;
@@ -134,6 +289,49 @@ static dbus_bool_t add_watch(DBusWatch *watch, void *data)
   return TRUE;
 }
 
+/**
+ * @brief Deregister D-Bus watch and remove from event loop monitoring
+ * 
+ * Callback function invoked by libdbus-1 when a file descriptor no longer requires
+ * monitoring. Searches the daemon's watch list for the specified watch, removes it
+ * from the linked list, frees associated memory, and sets watches_modified flag to
+ * trigger poll array reconstruction in the next event loop iteration.
+ * 
+ * This function implements the DBusRemoveWatchFunction callback type required by
+ * dbus_connection_set_watch_functions(). It ensures clean deregistration of file
+ * descriptor monitors when D-Bus connection state changes or connection is closed.
+ * Uses pointer-to-pointer traversal technique to modify linked list in single pass.
+ * 
+ * @param watch DBusWatch handle from libdbus-1 identifying file descriptor to stop
+ *              monitoring. Must not be NULL. Ownership remains with libdbus-1; this
+ *              function only removes wrapper struct watch from internal tracking.
+ * @param data User data pointer (unused in this implementation); typically daemon context.
+ *             May be NULL. Suppressed with (void) cast to prevent compiler warnings.
+ * 
+ * @return void (no return value)
+ * 
+ * @note Safe to call with watch not in list (no-op, no error)
+ * @note May remove multiple matching watches if list contains duplicates (defensive)
+ * @warning Frees memory via free(); watch structure must not be accessed after this call
+ * 
+ * @see add_watch() for watch registration
+ * @see set_dbus_listeners() for poll array setup using watch list
+ * @see dbus_init() for callback registration via dbus_connection_set_watch_functions()
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Registered as callback during D-Bus connection initialization
+ * dbus_connection_set_watch_functions(connection, add_watch, remove_watch, NULL, NULL, NULL);
+ * // libdbus-1 automatically invokes remove_watch when file descriptor monitoring ends
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (D-Bus implementation detail)
+ * SIDE EFFECTS:
+ * - Frees memory for struct watch via free()
+ * - Modifies daemon->watches linked list by removing matching watches
+ * - Increments watches_modified flag for each removed watch, triggering poll array rebuild
+ * THREAD SAFETY: Single-threaded; assumes called from main event loop context
+ */
 static void remove_watch(DBusWatch *watch, void *data)
 {
   struct watch **up, *w, *tmp;
@@ -154,6 +352,62 @@ static void remove_watch(DBusWatch *watch, void *data)
   (void)data; /* no warning */
 }
 
+/**
+ * @brief Parse SetServers D-Bus method call and reconfigure upstream DNS servers
+ * 
+ * @detailed Processes incoming D-Bus message containing upstream DNS server addresses
+ * in variant array format (DBUS_TYPE_UINT32 for IPv4, array of DBUS_TYPE_BYTE for IPv6),
+ * optionally followed by domain strings for domain-specific server configuration. Marks
+ * existing SERV_FROM_DBUS servers for removal, adds/updates servers from message, then
+ * removes any servers not present in the new configuration. This implements complete
+ * upstream server replacement via D-Bus interface, enabling dynamic DNS topology changes
+ * without daemon restart or configuration file modification.
+ * 
+ * Message format: Array of variants, where each variant contains either:
+ * - UINT32: IPv4 address in network byte order (big-endian)
+ * - Array of 16 BYTEs: IPv6 address (128 bits)
+ * Each address variant may be followed by zero or more STRING values specifying domains
+ * for domain-specific upstream routing (e.g., ".internal.example.com"). Addresses without
+ * domain strings are treated as general-purpose upstream resolvers.
+ * 
+ * @param message Incoming D-Bus method call message from SetServers method invocation.
+ *                Must contain argument array of variant types. Message ownership remains
+ *                with caller; this function reads but does not modify or free the message.
+ *                If message cannot be parsed, returns error message describing failure.
+ * 
+ * @return NULL on success (no reply message needed; empty reply sent by caller), or
+ *         DBusMessage* error reply on parsing failure with DBUS_ERROR_INVALID_ARGS code
+ * @retval NULL Successfully parsed and applied upstream server configuration
+ * @retval DBusMessage* Error reply if message iteration fails or format invalid
+ * 
+ * @note Clears all existing SERV_FROM_DBUS servers before applying new configuration
+ * @note IPv6 addresses require exactly 16 bytes; partial addresses are skipped
+ * @warning Replaces entire upstream server list configured via D-Bus; previous SetServers
+ *          configuration is lost. Does not affect servers configured via config file.
+ * 
+ * @see dbus_read_servers_ex() for extended format with per-server source addresses
+ * @see add_update_server() in forward.c for server addition implementation
+ * @see cleanup_servers() in forward.c for removal of marked servers
+ * @see mark_servers() in forward.c for marking servers with SERV_FROM_DBUS flag
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // D-Bus method invocation: SetServers with IPv4 address 8.8.8.8
+ * // dbus-send --system --dest=uk.org.thekelleys.dnsmasq \
+ * //   /uk/org/thekelleys/dnsmasq uk.org.thekelleys.dnsmasq.SetServers \
+ * //   array:variant:uint32:0x08080808
+ * // Results in call: dbus_read_servers(message)
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (D-Bus interface for DNS forwarding configuration)
+ * SIDE EFFECTS:
+ * - Marks existing SERV_FROM_DBUS servers for deletion via mark_servers()
+ * - Adds or updates server records via add_update_server()
+ * - Removes unmarked servers via cleanup_servers()
+ * - Modifies daemon->servers linked list structure
+ * - Triggers DNS query forwarding topology change
+ * THREAD SAFETY: Single-threaded; must be called from main event loop context
+ */
 static DBusMessage* dbus_read_servers(DBusMessage *message)
 {
   DBusMessageIter iter;
@@ -247,6 +501,49 @@ static DBusMessage* dbus_read_servers(DBusMessage *message)
 }
 
 #ifdef HAVE_LOOP
+/**
+ * @brief Retrieve list of upstream DNS servers detected in forwarding loops
+ * 
+ * @detailed Generates D-Bus method return containing IP addresses of upstream DNS servers
+ * that have been detected as part of a forwarding loop. Loop detection (enabled via HAVE_LOOP
+ * compile flag) identifies servers that respond to test queries with answers that indicate
+ * the query was forwarded back to dnsmasq, creating a circular forwarding path. These servers
+ * are marked with SERV_LOOP flag and excluded from normal query forwarding to prevent infinite
+ * forwarding loops. This method exposes the list of detected loop servers for monitoring and
+ * diagnostic purposes, enabling administrators to identify and correct misconfigurations.
+ * 
+ * The method returns an array of string representations of IP addresses (both IPv4 and IPv6)
+ * for each server flagged as causing forwarding loops. IP addresses are formatted using
+ * prettyprint_addr() for human-readable output. Empty array indicates no loops detected.
+ * 
+ * @param message Incoming D-Bus method call message for GetLoopServers method
+ * 
+ * @return D-Bus method return message containing array of loop server IP address strings,
+ *         or NULL on error (memory allocation failure for reply message)
+ * 
+ * @note Only available when HAVE_LOOP compile flag enabled (loop detection feature compiled in)
+ * @note Loop detection monitors daemon->servers list checking SERV_LOOP flag on each entry
+ * 
+ * @see daemon->servers - Global server list containing all upstream servers with flags
+ * @see SERV_LOOP - Server flag indicating detected forwarding loop
+ * @see prettyprint_addr() in util.c - IP address formatting for display
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // D-Bus client invoking GetLoopServers method
+ * DBusMessage *method_call = dbus_message_new_method_call(
+ *     "uk.org.thekelleys.dnsmasq", "/uk/org/thekelleys/dnsmasq",
+ *     "uk.org.thekelleys.dnsmasq", "GetLoopServers");
+ * DBusMessage *reply = dbus_reply_server_loop(method_call);
+ * // Extract array of loop server IP addresses from reply
+ * @endcode
+ * 
+ * D-BUS METHOD: GetLoopServers
+ * RETURN TYPE: Array of strings (DBUS_TYPE_ARRAY of DBUS_TYPE_STRING)
+ * 
+ * SIDE EFFECTS: Iterates through global daemon->servers list; formats addresses into daemon->addrbuff
+ * THREAD SAFETY: Single-threaded; accesses global daemon state
+ */
 static DBusMessage *dbus_reply_server_loop(DBusMessage *message)
 {
   DBusMessageIter args, args_iter;
@@ -269,6 +566,92 @@ static DBusMessage *dbus_reply_server_loop(DBusMessage *message)
 }
 #endif
 
+/**
+ * @brief Parse SetServersEx D-Bus method call with extended upstream server configuration
+ * 
+ * @detailed Processes incoming D-Bus message containing upstream DNS server configuration
+ * with extended format supporting source addresses, network interfaces, and domain-specific
+ * routing. Accepts both new format (structured data with explicit fields) and legacy format
+ * (backward compatible with SetServers/SetDomainServers). New format enables advanced
+ * configurations including source address binding for multihomed systems, interface-specific
+ * servers, and complex domain routing scenarios. This provides the most flexible upstream
+ * server configuration mechanism, superseding both SetServers and SetDomainServers methods.
+ * 
+ * Message format supports two modes:
+ * 
+ * NEW FORMAT: Array of arrays of strings, where each inner array contains:
+ * - First element: IP address string (e.g., "8.8.8.8" or "2001:4860:4860::8888")
+ *   Empty string ("") creates SERV_LITERAL_ADDRESS server (no upstream forwarding)
+ * - Optional second element: Source address string prefixed with "#" (e.g., "#192.168.1.1")
+ *   Binds outgoing queries to specified local address on multihomed systems
+ * - Optional third element: Interface name prefixed with "@" (e.g., "@eth0")
+ *   Restricts server to queries arriving on specified network interface
+ * - Remaining elements: Domain strings (e.g., ".internal.example.com")
+ *   Multiple domains separated by "/" within single string or as separate elements
+ *   Servers without domains handle general-purpose queries
+ * 
+ * LEGACY FORMAT: Array of strings (backward compatible with SetDomainServers):
+ * - Each string: "address/domain" format with optional source/interface prefixes
+ * - Automatic detection based on first array element type (array vs string)
+ * 
+ * @param message Incoming D-Bus method call message from SetServersEx method invocation.
+ *                Must contain argument: array of arrays of strings (new format) or
+ *                array of strings (legacy format). Message ownership remains with caller;
+ *                this function reads but does not modify or free the message. If message
+ *                cannot be parsed, returns error message describing the specific failure.
+ * @param strings Boolean flag indicating message format: non-zero for legacy string array
+ *                format (SetDomainServers compatibility), zero for new array-of-arrays format.
+ *                Determines D-Bus message iteration strategy and parsing rules. Value passed
+ *                from message_handler based on method name detection.
+ * 
+ * @return NULL on success (no reply message needed; empty reply sent by caller), or
+ *         DBusMessage* error reply on parsing failure with DBUS_ERROR_INVALID_ARGS code
+ * @retval NULL Successfully parsed and applied upstream server configuration
+ * @retval DBusMessage* Error reply if message iteration fails, format invalid, or
+ *                      IP address parsing fails with detailed error description
+ * 
+ * @note Clears all existing SERV_FROM_DBUS servers before applying new configuration
+ * @note Source address and interface parameters require corresponding system configuration
+ * @note Empty IP address string ("") creates literal address server (no forwarding)
+ * @warning Replaces entire D-Bus-configured upstream server list; previous SetServers/
+ *          SetServersEx configuration is lost. Does not affect config file servers.
+ * @warning Source address must be valid local interface address or binding will fail
+ * @warning Interface name must match existing network interface or queries will not match
+ * 
+ * @see dbus_read_servers() for simpler format without source/interface support
+ * @see parse_server() in option.c for IP address parsing and validation
+ * @see parse_server_next() in option.c for iterating multiple address results
+ * @see parse_server_addr() in option.c for extracting source address and interface
+ * @see add_update_server() in forward.c for server addition with all parameters
+ * @see cleanup_servers() in forward.c for removal of unmarked servers
+ * @see mark_servers() in forward.c for marking servers with SERV_FROM_DBUS flag
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // D-Bus method invocation: SetServersEx with source address and interface
+ * // dbus-send --system --dest=uk.org.thekelleys.dnsmasq \
+ * //   /uk/org/thekelleys/dnsmasq uk.org.thekelleys.dnsmasq.SetServersEx \
+ * //   array:array:string:"8.8.8.8","#192.168.1.1","@eth0",".example.com"
+ * // Results in upstream server 8.8.8.8 bound to source 192.168.1.1 on eth0
+ * // handling queries for .example.com domain
+ * 
+ * // Legacy format compatibility:
+ * // dbus-send --system --dest=uk.org.thekelleys.dnsmasq \
+ * //   /uk/org/thekelleys/dnsmasq uk.org.thekelleys.dnsmasq.SetServersEx \
+ * //   array:string:"8.8.8.8/.example.com","1.1.1.1"
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (D-Bus interface for DNS forwarding configuration)
+ * SIDE EFFECTS:
+ * - Marks existing SERV_FROM_DBUS servers for deletion via mark_servers()
+ * - Adds or updates server records with full parameter set via add_update_server()
+ * - Removes unmarked servers via cleanup_servers()
+ * - Modifies daemon->servers linked list structure
+ * - Triggers DNS query forwarding topology change with source/interface routing
+ * - Allocates and frees temporary string buffers for parsing (whine_malloc/free)
+ * - May perform DNS resolution for hostname-based server addresses (freeaddrinfo)
+ * THREAD SAFETY: Single-threaded; must be called from main event loop context
+ */
 static DBusMessage* dbus_read_servers_ex(DBusMessage *message, int strings)
 {
   DBusMessageIter iter, array_iter, string_iter;
@@ -485,6 +868,71 @@ static DBusMessage* dbus_read_servers_ex(DBusMessage *message, int strings)
   return error;
 }
 
+/**
+ * @brief Extract and validate boolean argument from D-Bus method call message
+ * 
+ * @detailed Parses incoming D-Bus message to extract a single boolean argument, validates
+ * the message format and argument type, and logs the configuration change with human-readable
+ * option name. This is a helper function for D-Bus methods that accept boolean parameters
+ * (SetFilterWin2KOption, SetFilterA, SetFilterAAAA, SetLocaliseQueriesOption, SetBogusPrivOption).
+ * Provides consistent error handling and logging across all boolean configuration methods.
+ * 
+ * The function performs message format validation to ensure the D-Bus method call contains
+ * exactly one argument of type DBUS_TYPE_BOOLEAN. If validation fails, returns a D-Bus
+ * error message with DBUS_ERROR_INVALID_ARGS. On successful extraction, logs the enable/
+ * disable action to syslog with LOG_INFO severity, using the provided option name for
+ * administrator visibility into configuration changes.
+ * 
+ * @param message Incoming D-Bus method call message containing boolean argument. Must
+ *                be valid DBusMessage pointer from libdbus-1. Message ownership remains
+ *                with caller; this function reads but does not modify or free the message.
+ *                If message is NULL or cannot be parsed, returns error message.
+ * @param enabled Output parameter receiving extracted boolean value. Must be pointer to
+ *                dbus_bool_t variable allocated by caller. On successful extraction,
+ *                receives DBUS_TRUE (non-zero) for enabled or DBUS_FALSE (zero) for
+ *                disabled. Value undefined if function returns error message. Must not
+ *                be NULL or behavior is undefined.
+ * @param name Human-readable configuration option name for logging purposes (e.g.,
+ *             "filter-win2k", "filter-a", "bogus-priv"). Used in syslog message
+ *             "Enabling --<name> option from D-Bus" or "Disabling --<name> option
+ *             from D-Bus". Must be NULL-terminated string. Caller retains ownership;
+ *             this function does not modify or free the string.
+ * 
+ * @return NULL on successful boolean extraction and validation, or DBusMessage* error
+ *         reply on parsing failure with DBUS_ERROR_INVALID_ARGS error code
+ * @retval NULL Successfully extracted boolean value; output parameter enabled is valid
+ * @retval DBusMessage* Error reply if message iteration fails, argument missing, or
+ *                      argument type is not DBUS_TYPE_BOOLEAN; error message contains
+ *                      descriptive text "Expected boolean argument"
+ * 
+ * @note Logs configuration change to syslog with LOG_INFO severity on success
+ * @note Does not modify daemon configuration; caller must apply the boolean value
+ * @warning enabled parameter must be valid pointer; no NULL check performed
+ * @warning name parameter must be valid NULL-terminated string for logging
+ * 
+ * @see dbus_set_bool() which calls this function and applies configuration change
+ * @see set_option_bool() in option.c for enabling boolean configuration options
+ * @see reset_option_bool() in option.c for disabling boolean configuration options
+ * @see my_syslog() in log.c for non-blocking syslog message generation
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Internal use by dbus_set_bool to validate and extract boolean:
+ * dbus_bool_t val;
+ * DBusMessage *error = dbus_get_bool(message, &val, "filter-win2k");
+ * if (!error) {
+ *   // val now contains DBUS_TRUE or DBUS_FALSE
+ *   // Caller applies configuration via set_option_bool/reset_option_bool
+ * }
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (D-Bus interface helper function)
+ * SIDE EFFECTS:
+ * - Logs configuration change to syslog via my_syslog()
+ * - Initializes D-Bus message iterator (read-only operation)
+ * - Writes boolean value to enabled output parameter
+ * THREAD SAFETY: Single-threaded; must be called from main event loop context
+ */
 static DBusMessage *dbus_get_bool(DBusMessage *message, dbus_bool_t *enabled, char *name)
 {
   DBusMessageIter iter;
@@ -502,6 +950,47 @@ static DBusMessage *dbus_get_bool(DBusMessage *message, dbus_bool_t *enabled, ch
   return NULL;
 }
 
+/**
+ * @brief Set boolean configuration option value via D-Bus
+ * 
+ * @detailed Parses boolean value from D-Bus message and sets or resets the specified
+ *           configuration flag in the daemon's runtime configuration. This provides
+ *           runtime reconfiguration of boolean options without daemon restart. The
+ *           function delegates message parsing to dbus_get_bool() and applies the
+ *           resulting boolean value via set_option_bool() or reset_option_bool().
+ * 
+ * @param message D-Bus method call message containing boolean argument
+ * @param flag Configuration flag constant from options structure (OPT_xxx from dnsmasq.h)
+ * @param name Human-readable option name for logging (e.g., "filter-win2k", "boguspriv")
+ * 
+ * @return NULL on success (reply handled by caller), or DBusMessage error object on failure
+ * @retval NULL Boolean value successfully applied to configuration flag
+ * @retval DBusMessage Error message (DBUS_ERROR_INVALID_ARGS if argument parsing fails)
+ * 
+ * @note Logs configuration change to syslog via dbus_get_bool()
+ * @note Changes take effect immediately for subsequent DNS queries/operations
+ * @warning Does not validate that flag corresponds to a boolean option; caller responsible
+ * 
+ * @see dbus_get_bool() for argument parsing and validation
+ * @see set_option_bool() in option.c for flag setting implementation
+ * @see reset_option_bool() in option.c for flag clearing implementation
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Called from message_handler for SetFilterWin2KOption method
+ * DBusMessage *result = dbus_set_bool(message, OPT_FILTER, "filter-win2k");
+ * if (result)
+ *   return result;  // Return error to caller
+ * // Success - option now enabled/disabled based on message boolean argument
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (D-Bus-specific implementation)
+ * SIDE EFFECTS: 
+ * - Modifies daemon->options bitmask flag (global state change)
+ * - Logs configuration change to syslog
+ * - Affects subsequent DNS query processing behavior based on flag
+ * THREAD SAFETY: Single-threaded; must be called from main event loop context
+ */
 static DBusMessage *dbus_set_bool(DBusMessage *message, int flag, char *name)
 {
   dbus_bool_t val;
@@ -519,6 +1008,67 @@ static DBusMessage *dbus_set_bool(DBusMessage *message, int flag, char *name)
 }
 
 #ifdef HAVE_DHCP
+/**
+ * @brief Add DHCP lease to lease database via D-Bus method call
+ * 
+ * @detailed Parses DHCP lease parameters from D-Bus AddDhcpLease method call and creates
+ *           a new lease entry in the daemon's lease database. Supports both DHCPv4 and DHCPv6
+ *           leases with full parameter set including IP address, MAC/DUID hardware address,
+ *           hostname, client identifier, lease duration, IPv6 IAID (Identity Association ID),
+ *           and temporary address flag. The function performs parameter validation, converts
+ *           D-Bus argument types to internal lease structures, sets lease expiration time
+ *           based on provided duration, integrates with DNS cache for hostname resolution,
+ *           persists lease to lease file, and triggers lease-change scripts.
+ * 
+ * @param message D-Bus method call message with lease parameters
+ * 
+ * @return DBusMessage method return or error message
+ * @retval DBusMessage Method return (empty, indicates success)
+ * @retval DBusMessage Error message (DBUS_ERROR_INVALID_ARGS) if argument parsing fails
+ * @retval DBusMessage Error message (DBUS_ERROR_FAILED) if lease creation fails
+ * 
+ * @note D-Bus signature: AddDhcpLease(String ipaddr, String hwaddr, Array[Byte] hostname,
+ *       Array[Byte] clid, UInt32 lease_duration, UInt32 ia_id, Boolean is_temporary)
+ * @note Hostname and client ID are byte arrays to support non-UTF8 encodings
+ * @note Zero lease_duration creates permanent lease (never expires)
+ * @note IPv6-specific parameters (ia_id, is_temporary) ignored for IPv4 leases
+ * @note Function conditionally compiled with HAVE_DHCP
+ * 
+ * @warning IP address string must be valid IPv4 or IPv6 address (inet_pton validation)
+ * @warning Hardware address string format depends on address family (MAC for v4, DUID for v6)
+ * @warning Hostname length limited to MAXDNAME-1 characters; longer hostnames truncated
+ * @warning Client ID length limited to DHCP_CHADDR_MAX (16 bytes) for DHCPv4
+ * 
+ * @see lease_allocate_id() in lease.c for lease ID assignment
+ * @see lease_update_from_configs() in lease.c for applying configuration overrides
+ * @see lease_update_file() in lease.c for lease database persistence
+ * @see lease_update_dns() in lease.c for DNS cache integration
+ * @see helper.c script execution for lease-change event notifications
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // D-Bus call from external management tool:
+ * // dbus-send --system --dest=uk.org.thekelleys.dnsmasq \
+ * //   --print-reply /uk/org/thekelleys/dnsmasq \
+ * //   uk.org.thekelleys.dnsmasq.AddDhcpLease \
+ * //   string:"192.168.1.100" string:"00:11:22:33:44:55" \
+ * //   array:byte:"hostname" array:byte:"" uint32:3600 uint32:0 boolean:false
+ * // 
+ * // Internal call from message_handler:
+ * if (strcmp(method, "AddDhcpLease") == 0)
+ *   return dbus_add_lease(message);
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (D-Bus-specific lease management interface)
+ * SIDE EFFECTS:
+ * - Creates or updates lease entry in daemon->leases linked list (global state)
+ * - Integrates lease hostname into DNS cache via lease_update_dns()
+ * - Writes lease to lease file via lease_update_file()
+ * - Triggers lease-change script execution via queue_script(ACTION_ADD)
+ * - Allocates memory for lease structure and associated data (hostname, clid, etc.)
+ * - Updates DHCP lease statistics and metrics
+ * THREAD SAFETY: Single-threaded; must be called from D-Bus message handler in main loop
+ */
 static DBusMessage *dbus_add_lease(DBusMessage* message)
 {
   struct dhcp_lease *lease;
@@ -639,6 +1189,66 @@ static DBusMessage *dbus_add_lease(DBusMessage* message)
   return NULL;
 }
 
+/**
+ * @brief Delete DHCP lease from lease database via D-Bus method call
+ * 
+ * @detailed Parses IP address from D-Bus DeleteDhcpLease method call, locates corresponding
+ *           lease entry in the daemon's lease database, removes the lease, cleans up DNS
+ *           cache integration, persists database changes to lease file, and triggers
+ *           lease-change scripts. The function supports both DHCPv4 (IPv4 address) and
+ *           DHCPv6 (IPv6 address) lease deletion with automatic address family detection.
+ *           Returns success boolean indicating whether the lease was found and deleted.
+ * 
+ * @param message D-Bus method call message with IP address string argument
+ * 
+ * @return DBusMessage method return with boolean success indicator or error message
+ * @retval DBusMessage Method return with boolean TRUE if lease found and deleted
+ * @retval DBusMessage Method return with boolean FALSE if lease not found (no-op)
+ * @retval DBusMessage Error message (DBUS_ERROR_INVALID_ARGS) if argument parsing fails
+ * @retval DBusMessage Error message (DBUS_ERROR_INVALID_ARGS) if IP address format invalid
+ * 
+ * @note D-Bus signature: DeleteDhcpLease(String ipaddr) -> Boolean success
+ * @note IP address string validated with inet_pton for IPv4 and IPv6 formats
+ * @note Lease deletion triggers DNS cache cleanup via cache_unhash_dhcp()
+ * @note Lease file updated via lease_update_file() to persist deletion
+ * @note Lease-change script invoked with ACTION_DEL for external integration
+ * @note Function conditionally compiled with HAVE_DHCP
+ * 
+ * @warning IP address must be valid IPv4 or IPv6 address string
+ * @warning Deleted lease memory freed via lease_free_name() - pointers become invalid
+ * @warning DNS cache entries for deleted lease removed immediately
+ * 
+ * @see lease_find_by_addr() in lease.c for IPv4 lease lookup
+ * @see lease_find_by_addr6() in lease.c for IPv6 lease lookup
+ * @see lease_prune() in lease.c for lease removal and cleanup
+ * @see cache_unhash_dhcp() in cache.c for DNS cache cleanup
+ * @see lease_update_file() in lease.c for lease database persistence
+ * @see queue_script() in helper.c for lease-change script execution
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // D-Bus call from external management tool:
+ * // dbus-send --system --dest=uk.org.thekelleys.dnsmasq \
+ * //   --print-reply /uk/org/thekelleys/dnsmasq \
+ * //   uk.org.thekelleys.dnsmasq.DeleteDhcpLease \
+ * //   string:"192.168.1.100"
+ * // 
+ * // Internal call from message_handler:
+ * if (strcmp(method, "DeleteDhcpLease") == 0)
+ *   return dbus_del_lease(message);
+ * // Return value includes boolean indicating success/failure
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (D-Bus-specific lease management interface)
+ * SIDE EFFECTS:
+ * - Removes lease from daemon->leases linked list (global state modification)
+ * - Frees lease memory via lease_prune() (hostname, client ID, etc.)
+ * - Removes DNS cache entries for deleted lease hostname via cache_unhash_dhcp()
+ * - Writes updated lease database to file via lease_update_file()
+ * - Triggers lease-change script execution via queue_script(ACTION_DEL)
+ * - Updates DHCP lease statistics and metrics (decrements active lease count)
+ * THREAD SAFETY: Single-threaded; must be called from D-Bus message handler in main loop
+ */
 static DBusMessage *dbus_del_lease(DBusMessage* message)
 {
   struct dhcp_lease *lease;
@@ -687,6 +1297,40 @@ static DBusMessage *dbus_del_lease(DBusMessage* message)
 }
 #endif
 
+/**
+ * @brief Retrieve performance metrics via D-Bus GetMetrics method
+ * 
+ * @detailed Collects all performance metrics from the daemon global state and returns them
+ *           as a D-Bus dictionary mapping metric names to uint32 values. Metrics include
+ *           cache statistics (hits, misses, insertions), query counts, and other performance
+ *           counters tracked by the metrics subsystem (see metrics.c). The response format
+ *           is D-Bus type "a{su}" (array of dict entries with string keys and uint32 values).
+ * 
+ * @param message D-Bus method call message (GetMetrics request)
+ * 
+ * @return D-Bus method return message containing metrics dictionary, or NULL on allocation failure
+ * @retval reply D-Bus message with all metrics as key-value pairs
+ * 
+ * @note Iterates through all __METRIC_MAX metrics defined in metrics.h
+ * @note Metric names obtained via get_metric_name() from metrics.c
+ * @note Metric values read from daemon->metrics[] array
+ * 
+ * @see get_metric_name() in metrics.c for metric name resolution
+ * @see metrics.h for complete list of tracked metrics
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // D-Bus client invocation:
+ * // dbus-send --system --print-reply \
+ * //   --dest=uk.org.thekelleys.dnsmasq /uk/org/thekelleys/dnsmasq \
+ * //   uk.org.thekelleys.GetMetrics
+ * // Returns: dict entry("cache_hits" uint32 1234) dict entry("cache_misses" uint32 56)
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (D-Bus API, not a network protocol)
+ * SIDE EFFECTS: Reads daemon->metrics[] array; no state modification
+ * THREAD SAFETY: Single-threaded daemon architecture; accesses global daemon state
+ */
 static DBusMessage *dbus_get_metrics(DBusMessage* message)
 {
   DBusMessage *reply = dbus_message_new_method_return(message);
@@ -711,6 +1355,47 @@ static DBusMessage *dbus_get_metrics(DBusMessage* message)
   return reply;
 }
 
+/**
+ * @brief Add string key-value pair to D-Bus dictionary container
+ * 
+ * @detailed Helper function for constructing D-Bus dictionary (DICT_ENTRY) structures containing
+ *           string-to-string mappings. Opens a new DICT_ENTRY container within the provided parent
+ *           container, appends the key as a string, appends the value as a string, and closes the
+ *           DICT_ENTRY container. This utility simplifies the repetitive task of marshalling
+ *           dictionary entries into D-Bus reply messages, particularly for methods like
+ *           GetServerMetrics that return arrays of dictionaries containing server statistics.
+ * 
+ *           D-Bus dictionary entries have type signature "{ss}" for string-to-string mappings.
+ *           The function handles all D-Bus iterator operations required to construct the entry,
+ *           including container opening, basic type appending, and container closing.
+ * 
+ * @param container Pointer to parent D-Bus message iterator (typically an ARRAY container)
+ *                  that will contain the new dictionary entry. Must not be NULL.
+ * @param key Dictionary key string. Must not be NULL. Passed by pointer for D-Bus API.
+ * @param val Dictionary value string. Must not be NULL. Passed by pointer for D-Bus API.
+ * 
+ * @return void
+ * 
+ * @note Function is static - internal helper not exposed outside dbus.c module
+ * @warning Both key and val must be valid null-terminated strings; no validation performed
+ * 
+ * @see add_dict_int() - Related helper for adding integer values (as strings)
+ * @see dbus_get_server_metrics() - Primary user of this helper function
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * DBusMessageIter array, container;
+ * dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{ss}", &array);
+ * add_dict_entry(&array, "server", "8.8.8.8");
+ * add_dict_entry(&array, "queries_sent", "1234");
+ * dbus_message_iter_close_container(&iter, &array);
+ * @endcode
+ * 
+ * D-BUS TYPE SIGNATURE: {ss} (dictionary entry mapping string to string)
+ * 
+ * SIDE EFFECTS: Modifies D-Bus message iterator state by appending dictionary entry
+ * THREAD SAFETY: Single-threaded; relies on D-Bus library iterator state
+ */
 static void add_dict_entry(DBusMessageIter *container, const char *key, const char *val)
 {
   DBusMessageIter dict;
@@ -721,6 +1406,56 @@ static void add_dict_entry(DBusMessageIter *container, const char *key, const ch
   dbus_message_iter_close_container(container, &dict);
 }
 
+/**
+ * @brief Add string key to unsigned integer value pair to D-Bus dictionary container
+ * 
+ * @detailed Helper function for constructing D-Bus dictionary (DICT_ENTRY) structures containing
+ *           string-to-unsigned-integer mappings. Converts the unsigned integer value to a string
+ *           representation using snprintf(), then delegates to add_dict_entry() to marshall the
+ *           string key-value pair into the D-Bus message. This approach ensures consistent string
+ *           formatting for all numeric values returned via D-Bus, using daemon->namebuff as a
+ *           temporary buffer for the conversion. The function simplifies marshalling numeric
+ *           metrics and statistics into D-Bus reply messages, used extensively by GetMetrics and
+ *           GetServerMetrics methods to return cache hit counters, query rates, and server-specific
+ *           statistics.
+ * 
+ *           While D-Bus supports native unsigned integer types (DBUS_TYPE_UINT32), this implementation
+ *           chooses string representation for consistency with other string-based dictionary entries
+ *           and to simplify client-side parsing. The function handles all formatting and marshalling,
+ *           ensuring decimal string representation of the unsigned integer value.
+ * 
+ * @param container Pointer to parent D-Bus message iterator (typically an ARRAY container)
+ *                  that will contain the new dictionary entry. Must not be NULL.
+ * @param key Dictionary key string. Must not be NULL. Passed by pointer for D-Bus API.
+ * @param val Unsigned integer value to be converted to string and stored in dictionary.
+ *            Formatted as decimal string using snprintf() with "%u" format specifier.
+ * 
+ * @return void
+ * 
+ * @note Function is static - internal helper not exposed outside dbus.c module
+ * @note Uses daemon->namebuff as temporary buffer (size MAXDNAME) for string conversion
+ * @warning Key must be valid null-terminated string; no validation performed
+ * @warning Assumes daemon->namebuff is available and MAXDNAME is sufficient for uint32 string representation
+ * 
+ * @see add_dict_entry() - Underlying helper that performs actual D-Bus marshalling
+ * @see dbus_get_metrics() - Primary user of this helper for cache statistics
+ * @see dbus_get_server_metrics() - Uses this helper for per-server query counters
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * DBusMessageIter array, container;
+ * dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{ss}", &array);
+ * add_dict_int(&array, "cache_hits", daemon->metrics[METRIC_DNS_CACHE_HITS]);
+ * add_dict_int(&array, "cache_misses", daemon->metrics[METRIC_DNS_CACHE_MISSES]);
+ * add_dict_int(&array, "queries_forwarded", 5678);
+ * dbus_message_iter_close_container(&iter, &array);
+ * @endcode
+ * 
+ * D-BUS TYPE SIGNATURE: {ss} (dictionary entry mapping string to string, with value being decimal representation of integer)
+ * 
+ * SIDE EFFECTS: Temporarily modifies daemon->namebuff for string conversion; modifies D-Bus message iterator state
+ * THREAD SAFETY: Single-threaded; uses global daemon->namebuff buffer and D-Bus library iterator state
+ */
 static void add_dict_int(DBusMessageIter *container, const char *key, const unsigned int val)
 {
   snprintf(daemon->namebuff, MAXDNAME, "%u", val);
@@ -728,6 +1463,49 @@ static void add_dict_int(DBusMessageIter *container, const char *key, const unsi
   add_dict_entry(container, key, daemon->namebuff);
 }
 
+/**
+ * @brief Retrieve per-upstream-server performance metrics via D-Bus GetServerMetrics method
+ * 
+ * @detailed Aggregates and returns performance statistics for each configured upstream DNS server.
+ *           The function iterates through all server records in daemon->servers, consolidating
+ *           statistics from multiple records representing the same server (same IP address but
+ *           different domains or query types). For each unique server, collects query counts,
+ *           failure counts, NXDOMAIN responses, retry counts, and average query latency. Returns
+ *           results as a D-Bus array of dictionaries, with each dictionary containing metrics
+ *           for one upstream server. The response format is D-Bus type "aa{ss}" (array of arrays
+ *           of dict entries with string keys and string values).
+ * 
+ * @param message D-Bus method call message (GetServerMetrics request)
+ * 
+ * @return D-Bus method return message containing per-server metrics array, or NULL on allocation failure
+ * @retval reply D-Bus message with array of server statistics dictionaries
+ * 
+ * @note Uses SERV_MARK flag to track which server records have been aggregated
+ * @note Multiple server records with same address (domain-specific upstreams) are consolidated
+ * @note Latency is calculated as average: sigma_latency / count_latency
+ * @note Each server dictionary contains keys: address, port, queries, failed_queries, nxdomain, retries, latency
+ * 
+ * @warning Division by count_latency assumes count_latency > 0 (always true if queries > 0)
+ * 
+ * @see daemon->servers list in dnsmasq.h for upstream server records
+ * @see forward.c for server query tracking and statistics updates
+ * @see add_dict_entry() helper for string dictionary entries
+ * @see add_dict_int() helper for integer dictionary entries (formatted as strings)
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // D-Bus client invocation:
+ * // dbus-send --system --print-reply \
+ * //   --dest=uk.org.thekelleys.dnsmasq /uk/org/thekelleys/dnsmasq \
+ * //   uk.org.thekelleys.GetServerMetrics
+ * // Returns: array [ dict entry("address" "8.8.8.8") dict entry("queries" "1234") ... ]
+ * //          array [ dict entry("address" "1.1.1.1") dict entry("queries" "567") ... ]
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (D-Bus API, not a network protocol)
+ * SIDE EFFECTS: Temporarily modifies SERV_MARK flags in daemon->servers list; flags restored by algorithm
+ * THREAD SAFETY: Single-threaded daemon architecture; accesses and modifies global daemon state
+ */
 static DBusMessage *dbus_get_server_metrics(DBusMessage* message)
 {
   DBusMessage *reply = dbus_message_new_method_return(message);
@@ -782,6 +1560,95 @@ static DBusMessage *dbus_get_server_metrics(DBusMessage* message)
   return reply;
 }
 
+/**
+ * @brief Central D-Bus message handler dispatching incoming method calls to appropriate handlers
+ * 
+ * @detailed This function serves as the main D-Bus message dispatcher, registered as the callback
+ *           for messages received on the dnsmasq D-Bus object path (/uk/org/thekelleys/dnsmasq).
+ *           It examines incoming method call messages, identifies the requested method by name,
+ *           and dispatches to the appropriate handler function or inline processing logic.
+ *           Handles standard D-Bus introspection plus 15+ dnsmasq-specific methods for cache
+ *           management, upstream server configuration, filter control, metrics retrieval, and
+ *           DHCP lease manipulation. After processing, sends the reply message back to the client
+ *           and manages control flags that trigger deferred actions (cache clearing, server updates)
+ *           in the main event loop.
+ * 
+ * @param connection D-Bus system bus connection (established by dbus_init)
+ * @param message Incoming D-Bus method call message to be processed
+ * @param user_data User-provided data (unused in this implementation)
+ * 
+ * @return D-Bus handler result indicating message processing status
+ * @retval DBUS_HANDLER_RESULT_HANDLED Message successfully processed and reply sent
+ * @retval DBUS_HANDLER_RESULT_NOT_YET_HANDLED Method name not recognized (allows other handlers to try)
+ * 
+ * @note Sets daemon->dbus_update_servers flag when upstream server configuration changes via SetServers methods
+ * @note Sets daemon->dbus_clear_cache flag when cache clear requested via ClearCache method
+ * @note Introspection XML generated lazily on first Introspect call and cached in static introspection_xml
+ * 
+ * @warning Method name comparison uses strcmp, case-sensitive matching required
+ * @warning Reply message ownership transferred to D-Bus library via dbus_connection_send
+ * @warning Some methods (AddDhcpLease, DeleteDhcpLease, GetLoopServers) conditionally compiled
+ * 
+ * @see dbus_init() for connection setup and message handler registration
+ * @see check_dbus_listeners() in main event loop for deferred flag processing
+ * @see dbus_read_servers() for SetServers implementation
+ * @see dbus_read_servers_ex() for SetServersEx implementation
+ * @see dbus_set_bool() for filter configuration methods
+ * @see dbus_add_lease() for AddDhcpLease implementation (HAVE_DHCP)
+ * @see dbus_del_lease() for DeleteDhcpLease implementation (HAVE_DHCP)
+ * @see dbus_get_metrics() for GetMetrics implementation
+ * @see dbus_get_server_metrics() for GetServerMetrics implementation
+ * 
+ * HANDLED D-BUS METHODS (15+ methods):
+ * - Introspect: Returns XML interface description (org.freedesktop.DBus.Introspectable)
+ * - GetVersion: Returns VERSION string from compilation
+ * - GetLoopServers: Returns upstream servers causing forwarding loops (HAVE_LOOP only)
+ * - SetServers: Configure upstream servers from variant array (legacy format)
+ * - SetDomainServers: Configure domain-specific upstream servers (string array format)
+ * - SetServersEx: Configure upstream servers with extended format (array of string arrays)
+ * - SetFilterWin2KOption: Enable/disable Win2K filtering via boolean flag
+ * - SetFilterA: Enable/disable IPv4 A record filtering via boolean flag
+ * - SetFilterAAAA: Enable/disable IPv6 AAAA record filtering via boolean flag
+ * - SetLocaliseQueriesOption: Enable/disable query localization via boolean flag
+ * - SetBogusPrivOption: Enable/disable bogus private address filtering via boolean flag
+ * - AddDhcpLease: Add DHCP lease programmatically (HAVE_DHCP only)
+ * - DeleteDhcpLease: Delete DHCP lease by IP address (HAVE_DHCP only)
+ * - GetMetrics: Retrieve global performance metrics dictionary
+ * - GetServerMetrics: Retrieve per-upstream-server performance statistics
+ * - ClearMetrics: Reset all performance metrics to zero
+ * - ClearCache: Flush DNS cache and trigger reload
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // D-Bus client invocation examples (using dbus-send):
+ * 
+ * // Clear DNS cache:
+ * // dbus-send --system --dest=uk.org.thekelleys.dnsmasq \
+ * //   /uk/org/thekelleys/dnsmasq uk.org.thekelleys.ClearCache
+ * 
+ * // Get dnsmasq version:
+ * // dbus-send --system --print-reply --dest=uk.org.thekelleys.dnsmasq \
+ * //   /uk/org/thekelleys/dnsmasq uk.org.thekelleys.GetVersion
+ * 
+ * // Set upstream servers (SetServersEx format):
+ * // dbus-send --system --dest=uk.org.thekelleys.dnsmasq \
+ * //   /uk/org/thekelleys/dnsmasq uk.org.thekelleys.SetServersEx \
+ * //   array:array:string:"8.8.8.8","1.1.1.1"
+ * 
+ * // Enable AAAA filtering:
+ * // dbus-send --system --dest=uk.org.thekelleys.dnsmasq \
+ * //   /uk/org/thekelleys/dnsmasq uk.org.thekelleys.SetFilterAAAA boolean:true
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (D-Bus API implementation)
+ * SIDE EFFECTS: 
+ * - Sets daemon->dbus_update_servers when server configuration changes
+ * - Sets daemon->dbus_clear_cache when cache clear requested
+ * - Allocates introspection_xml on first Introspect call (cached statically)
+ * - Calls dbus_connection_send to transmit reply message
+ * - May call dbus_message_unref to free reply on send failure
+ * THREAD SAFETY: Single-threaded daemon architecture; accesses global daemon state
+ */
 DBusHandlerResult message_handler(DBusConnection *connection, 
 				  DBusMessage *message, 
 				  void *user_data)
@@ -934,6 +1801,49 @@ DBusHandlerResult message_handler(DBusConnection *connection,
  
 
 /* returns NULL or error message, may fail silently if dbus daemon not yet up. */
+/**
+ * @brief Initialize D-Bus connection and register dnsmasq service on system bus
+ * 
+ * @detailed Establishes connection to D-Bus system bus, registers the dnsmasq service name
+ *           (configured via daemon->dbus_name, default "uk.org.thekelleys.dnsmasq"), registers
+ *           the object path /uk/org/thekelleys/dnsmasq with message handler vtable, configures
+ *           watch functions for D-Bus file descriptor monitoring in event loop, and emits "Up"
+ *           signal to notify listeners that dnsmasq D-Bus service is available. Connection
+ *           configured to not exit on disconnect to prevent daemon termination if D-Bus daemon
+ *           restarts.
+ * 
+ * @return NULL on success, error message string on failure (do not free - points to static or D-Bus error message)
+ * @retval NULL D-Bus initialization successful, connection established and registered
+ * @retval error_string D-Bus connection failed, service name registration failed, or object path registration failed
+ * 
+ * @note Stores D-Bus connection in daemon->dbus for use by other D-Bus functions
+ * @note Service name registration failure returns dbus_error.message (owned by libdbus)
+ * @note Object path registration failure returns localized error string
+ * @note Watch functions (add_watch, remove_watch) integrate D-Bus fd monitoring with poll event loop
+ * 
+ * @warning Caller must check return value; non-NULL indicates D-Bus unavailable (daemon continues without D-Bus)
+ * @warning Error string from dbus_error.message not freed (owned by D-Bus library)
+ * 
+ * @see set_dbus_listeners() for activating D-Bus file descriptor polling
+ * @see message_handler() for D-Bus method call dispatcher
+ * @see add_watch() and remove_watch() for D-Bus watch integration
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * char *err = dbus_init();
+ * if (err)
+ *   my_syslog(LOG_WARNING, _("DBus init failure: %s"), err);
+ * @endcode
+ * 
+ * SIDE EFFECTS: 
+ * - Connects to D-Bus system bus
+ * - Registers service name on system bus (may fail if name already taken)
+ * - Registers object path with message handler
+ * - Sets daemon->dbus to established connection
+ * - Emits "Up" signal on system bus
+ * 
+ * THREAD SAFETY: Single-threaded; not thread-safe if called concurrently
+ */
 char *dbus_init(void)
 {
   DBusConnection *connection = NULL;
@@ -972,6 +1882,43 @@ char *dbus_init(void)
 }
  
 
+/**
+ * @brief Register D-Bus file descriptors for poll monitoring in main event loop
+ * 
+ * @detailed Iterates through all D-Bus watches registered via add_watch() callback,
+ *           extracts file descriptors and I/O direction flags (readable/writable) from
+ *           enabled watches, translates D-Bus watch flags to poll event flags (POLLIN,
+ *           POLLOUT, POLLERR), and registers each fd with poll_listen() for monitoring
+ *           in dnsmasq's main event loop. This integration allows D-Bus messages to be
+ *           processed alongside DNS queries, DHCP requests, and other network traffic
+ *           without blocking.
+ * 
+ * @note Called from main event loop setup to activate D-Bus fd monitoring
+ * @note Only processes enabled watches; disabled watches skipped
+ * @note POLLERR always included to detect connection errors
+ * @note Watch list stored in daemon->watches linked list
+ * 
+ * @warning Must be called after dbus_init() which populates daemon->watches
+ * @warning Calling before dbus_init() results in no-op (empty watch list)
+ * 
+ * @see dbus_init() for D-Bus connection setup and watch registration
+ * @see check_dbus_listeners() for processing triggered D-Bus events
+ * @see add_watch() for watch registration callback
+ * @see poll_listen() in poll.c for fd registration with event loop
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // In main event loop setup after dbus_init()
+ * set_dbus_listeners();
+ * // Now poll() will monitor D-Bus fds alongside other sockets
+ * @endcode
+ * 
+ * SIDE EFFECTS:
+ * - Registers D-Bus file descriptors with poll event loop
+ * - Subsequent poll() calls monitor D-Bus connection for I/O
+ * 
+ * THREAD SAFETY: Single-threaded; not thread-safe if watches modified concurrently
+ */
 void set_dbus_listeners(void)
 {
   struct watch *w;
@@ -992,6 +1939,48 @@ void set_dbus_listeners(void)
       }
 }
 
+/**
+ * @brief Check D-Bus watches for triggered events and dispatch D-Bus I/O handling
+ * 
+ * @detailed Iterates through all enabled D-Bus watches registered via add_watch(),
+ *           checks each watch's file descriptor for poll events (POLLIN, POLLOUT, POLLERR)
+ *           using poll_check(), translates poll event flags to D-Bus watch flags, and
+ *           invokes dbus_watch_handle() to process D-Bus I/O operations (reading incoming
+ *           method calls, writing responses, handling connection errors). Returns early
+ *           if watch list modified during processing (indicated by watches_modified flag
+ *           set by add_watch/remove_watch callbacks) to prevent iterator invalidation.
+ * 
+ * @return 1 if all watches processed without modification, 0 if watch list modified during iteration
+ * @retval 1 Watch list stable, all triggered watches processed successfully
+ * @retval 0 Watch list modified (watch added or removed), iteration aborted to prevent invalid access
+ * 
+ * @note Called from check_dbus_listeners() to process D-Bus events detected by poll()
+ * @note watches_modified flag reset to 0 at function entry
+ * @note Only enabled watches processed; disabled watches skipped
+ * @note Early return on watch modification prevents accessing freed memory
+ * 
+ * @warning Caller must retry if return value is 0 (watch list changed)
+ * @warning Watch list modification during iteration is rare but possible if D-Bus connection state changes
+ * 
+ * @see check_dbus_listeners() for caller that retries on watch modification
+ * @see dbus_watch_handle() in libdbus for D-Bus I/O processing
+ * @see add_watch() and remove_watch() for callbacks that set watches_modified
+ * @see poll_check() in poll.c for fd event checking
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // In check_dbus_listeners() after poll() detects D-Bus activity
+ * while (!check_dbus_watches())
+ *   ; // Retry if watch list modified during iteration
+ * @endcode
+ * 
+ * SIDE EFFECTS:
+ * - Calls dbus_watch_handle() which may read/write D-Bus connection
+ * - May trigger message_handler() for incoming D-Bus method calls
+ * - Resets watches_modified flag to 0
+ * 
+ * THREAD SAFETY: Single-threaded; not thread-safe if watches modified concurrently
+ */
 static int check_dbus_watches()
 {
   struct watch *w;
@@ -1022,6 +2011,45 @@ static int check_dbus_watches()
   return 1;
 }
 
+/**
+ * @brief Process D-Bus events detected by poll and dispatch incoming method calls
+ * 
+ * @detailed Called from main event loop when poll() indicates D-Bus file descriptor activity.
+ *           First processes all D-Bus watch events by repeatedly calling check_dbus_watches()
+ *           until watch list stable (no modifications during iteration), then dispatches all
+ *           queued incoming D-Bus messages by calling dbus_connection_dispatch() until message
+ *           queue empty. Connection reference count incremented during dispatch to prevent
+ *           premature connection cleanup if D-Bus daemon disconnects during processing.
+ * 
+ * @note Called from main event loop after poll() detects D-Bus fd activity
+ * @note Retries check_dbus_watches() until watch list stabilizes (prevents iterator invalidation)
+ * @note Dispatches all queued messages in single invocation (DBUS_DISPATCH_DATA_REMAINS loop)
+ * @note Connection reference prevents cleanup during dispatch even if D-Bus daemon disconnects
+ * @note No-op if daemon->dbus is NULL (D-Bus not initialized or initialization failed)
+ * 
+ * @warning Must only be called when poll() indicates D-Bus fd has events (prevents unnecessary CPU usage)
+ * @warning Connection may be disconnected during dispatch; ref/unref prevents use-after-free
+ * 
+ * @see check_dbus_watches() for D-Bus watch event processing
+ * @see set_dbus_listeners() for registering D-Bus fds with poll event loop
+ * @see message_handler() for D-Bus method call dispatcher (invoked by dbus_connection_dispatch)
+ * @see dbus_connection_dispatch() in libdbus for message dispatching
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // In main event loop after poll() returns
+ * if (poll_check(dbus_fd, POLLIN))
+ *   check_dbus_listeners(); // Process D-Bus method calls
+ * @endcode
+ * 
+ * SIDE EFFECTS:
+ * - Calls dbus_watch_handle() via check_dbus_watches() to read/write D-Bus connection
+ * - Dispatches incoming D-Bus method calls via message_handler()
+ * - May modify daemon state via D-Bus method implementations (cache clear, server reconfiguration, etc.)
+ * - Temporarily increments/decrements connection reference count
+ * 
+ * THREAD SAFETY: Single-threaded; not thread-safe if connection accessed concurrently
+ */
 void check_dbus_listeners()
 {
   DBusConnection *connection = (DBusConnection *)daemon->dbus;
@@ -1037,6 +2065,60 @@ void check_dbus_listeners()
 }
 
 #ifdef HAVE_DHCP
+/**
+ * @brief Emit D-Bus signal for DHCP lease state change (add, delete, update)
+ * 
+ * @detailed Constructs and emits D-Bus signal on system bus to notify external applications
+ *           of DHCP lease events. For DHCPv6 leases (LEASE_TA or LEASE_NA flags), formats
+ *           client DUID as MAC-style string and IPv6 address; for DHCPv4 leases, formats
+ *           hardware address (MAC) and IPv4 address. Maps action code to D-Bus signal name
+ *           (DhcpLeaseAdded, DhcpLeaseDeleted, DhcpLeaseUpdated), creates D-Bus signal message
+ *           with three string arguments (IP address, MAC/DUID, hostname), and sends signal
+ *           on system bus for monitoring tools, management scripts, and external integrations.
+ * 
+ * @param action Lease event type: ACTION_ADD (new lease), ACTION_DEL (lease expired/released), ACTION_OLD (lease renewed)
+ * @param lease Pointer to dhcp_lease structure containing lease details (IP, MAC, DUID, flags)
+ * @param hostname Client hostname from DHCP request, or NULL if not provided
+ * 
+ * @note No-op if D-Bus connection not initialized (daemon->dbus is NULL)
+ * @note NULL hostname converted to empty string for D-Bus signal
+ * @note Uses daemon->namebuff for formatted MAC address (overwrites previous contents)
+ * @note Uses daemon->addrbuff for formatted IP address (overwrites previous contents)
+ * @note Signal sent on object path DNSMASQ_PATH with interface daemon->dbus_name
+ * @note DHCPv6 leases identified by LEASE_TA or LEASE_NA flags
+ * @note DHCPv4 leases use extended_hwaddr() for hardware address formatting
+ * 
+ * @warning Requires HAVE_DHCP compile flag; function only compiled with DHCP support
+ * @warning Action codes other than ACTION_ADD, ACTION_DEL, ACTION_OLD silently ignored
+ * @warning Message creation or parameter appending failure silently aborts signal emission
+ * @warning Caller must ensure lease pointer valid; no NULL check performed
+ * 
+ * @see dbus_init() for D-Bus connection establishment
+ * @see print_mac() for MAC/DUID formatting to string
+ * @see extended_hwaddr() for DHCPv4 hardware address extraction
+ * @see lease.c for DHCP lease management and action codes
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // In DHCP lease assignment code (lease.c)
+ * struct dhcp_lease *lease = lease_allocate(...);
+ * emit_dbus_signal(ACTION_ADD, lease, "client-hostname");
+ * // External D-Bus listeners receive DhcpLeaseAdded signal
+ * @endcode
+ * 
+ * D-BUS SIGNAL SIGNATURE:
+ * Signal: DhcpLeaseAdded, DhcpLeaseDeleted, or DhcpLeaseUpdated
+ * Arguments: (ipaddr: string, hwaddr: string, hostname: string)
+ * Example: DhcpLeaseAdded("192.168.1.100", "00:11:22:33:44:55", "client-pc")
+ * 
+ * SIDE EFFECTS:
+ * - Emits D-Bus signal on system bus (visible to all D-Bus listeners)
+ * - Overwrites daemon->namebuff with formatted MAC address
+ * - Overwrites daemon->addrbuff with formatted IP address
+ * - Allocates and frees D-Bus message structure
+ * 
+ * THREAD SAFETY: Single-threaded; not thread-safe if connection accessed concurrently
+ */
 void emit_dbus_signal(int action, struct dhcp_lease *lease, char *hostname)
 {
   DBusConnection *connection = (DBusConnection *)daemon->dbus;

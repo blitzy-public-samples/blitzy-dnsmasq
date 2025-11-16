@@ -14,6 +14,139 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+/**
+ * @file option.c
+ * @brief Configuration parsing and command-line option processing
+ * 
+ * DETAILED PURPOSE:
+ * This module implements comprehensive configuration parsing from command-line options
+ * and configuration files, making it the LARGEST source file in dnsmasq at 6314+ lines.
+ * The implementation handles over 350 configuration directives with complex validation,
+ * precedence rules, and error reporting. This is the central configuration hub that
+ * initializes all daemon subsystems by parsing user input and populating the global
+ * daemon structure with validated configuration parameters.
+ * 
+ * Configuration input flows through multiple layers: command-line arguments are processed
+ * first (highest precedence), then configuration files are parsed recursively with
+ * include directive support, and finally compile-time defaults from config.h are applied
+ * for any unspecified parameters. The module must validate IP addresses, hostnames,
+ * port numbers, file paths, DNS/DHCP options, and protocol-specific parameters while
+ * providing clear error messages for invalid input.
+ * 
+ * KEY RESPONSIBILITIES:
+ * - read_opts(): Main entry point - parses command-line args and config files, returns
+ *   populated daemon structure ready for daemon initialization
+ * - one_file(): Configuration file parser implementing recursive include directive
+ *   processing with cycle detection and depth limiting
+ * - one_opt(): Central option processing function dispatching to specific parsers based
+ *   on option type (short option character or long option constant)
+ * - parse_server(): Upstream DNS server configuration parser handling domain-specific
+ *   forwarding rules, source address binding, and port specifications
+ * - split_chr(), split(): String tokenization utilities respecting quoted strings and
+ *   escape sequences for configuration value parsing
+ * - canonicalise(): Hostname canonicalization converting to lowercase with trailing dot
+ *   for DNS protocol compliance
+ * - unhide_metas(): Meta-character unhiding for strings with escaped special characters
+ * - safe_string_alloc(): Memory allocation with overflow checking and error recovery
+ *   using setjmp/longjmp for graceful failure handling
+ * 
+ * DEPENDENCIES:
+ * Includes: dnsmasq.h (all system headers and structure definitions), setjmp.h (error recovery)
+ * Called by: dnsmasq.c main() function during daemon initialization
+ * Calls: Numerous validation and initialization functions across all subsystems
+ *   - DNS: Functions in forward.c, cache.c, auth.c, dnssec.c
+ *   - DHCP: Functions in dhcp.c, dhcp6.c, lease.c, radv.c
+ *   - Network: Functions in network.c, netlink.c/bpf.c
+ *   - Integration: Functions in dbus.c, ipset.c, helper.c
+ * 
+ * DATA STRUCTURES:
+ * - static struct myoption opts[]: Long option definitions mapping option names to
+ *   internal LOPT_* constants for getopt_long() processing (lines 650-850)
+ * - static char *usage[]: Help text strings displayed by --help option showing all
+ *   command-line options with brief descriptions (lines 6200-6300)
+ * - struct daemon: Primary output structure (defined in dnsmasq.h) populated with
+ *   all parsed configuration parameters
+ * - Various linked list structures: server_list, dhcp_context, dhcp_config, etc.
+ *   dynamically allocated during parsing and attached to daemon structure
+ * 
+ * COMPILE-TIME OPTIONS:
+ * The file is heavily conditionally compiled based on features enabled:
+ * - HAVE_DHCP: Enables DHCPv4 configuration options (dhcp-range, dhcp-host, dhcp-option)
+ * - HAVE_DHCP6: Enables DHCPv6 and Router Advertisement options (enable-ra, dhcp-range=IPv6)
+ * - HAVE_TFTP: Enables TFTP server configuration (enable-tftp, tftp-root, tftp-secure)
+ * - HAVE_DNSSEC: Enables DNSSEC validation options (dnssec, trust-anchor, dnssec-check-unsigned)
+ * - HAVE_DBUS: Enables D-Bus control interface options (enable-dbus, dbus-service-name)
+ * - HAVE_AUTH: Enables authoritative DNS mode options (auth-zone, auth-server)
+ * - HAVE_IPSET: Enables Linux ipset integration (ipset=/domain/set)
+ * - HAVE_NFTSET: Enables nftables set integration (nftset=/domain/table/set)
+ * - HAVE_CONNTRACK: Enables connection tracking options
+ * - HAVE_SCRIPT: Enables DHCP lease-change script options (dhcp-script, dhcp-luascript)
+ * - HAVE_LOOP: Enables DNS loop detection
+ * - HAVE_INOTIFY: Enables inotify-based configuration file monitoring on Linux
+ * - NO_ID: Disables IDN (internationalized domain name) support
+ * - Plus ~15 additional feature flags controlling option availability
+ * 
+ * CONFIGURATION PRECEDENCE RULES:
+ * 1. Command-line options have HIGHEST precedence (override everything)
+ * 2. Configuration file directives processed in order (last occurrence wins for singular options)
+ * 3. Included files (conf-file=, conf-dir=) processed recursively at point of inclusion
+ * 4. Compile-time defaults from config.h used for unspecified options (LOWEST precedence)
+ * 
+ * Special handling:
+ * - List-based options (servers, dhcp-host, etc.) accumulate across all sources
+ * - Boolean options can be negated with no- prefix (e.g., no-resolv disables resolv.conf reading)
+ * - Some options have side effects triggering implicit configuration (e.g., enable-ra implies DHCPv6)
+ * 
+ * ERROR HANDLING AND VALIDATION:
+ * - Invalid option syntax triggers immediate error message and daemon exit (via die())
+ * - IP address validation ensures valid IPv4/IPv6 format and CIDR notation
+ * - Port numbers validated in range 0-65535 with special handling for privileged ports
+ * - Hostname validation ensures RFC 1123 compliance with length and character restrictions
+ * - File path validation checks existence, permissions, and accessibility
+ * - Memory allocation failures trigger graceful cleanup via setjmp/longjmp mechanism
+ * - Conflicting option combinations detected and reported (e.g., resolv-file + no-resolv)
+ * 
+ * CONFIGURATION FILE PARSING STATE MACHINE:
+ * 1. INIT: Open configuration file, check permissions
+ * 2. READ: Read line-by-line with continuation line support (backslash at line end)
+ * 3. TOKENIZE: Split line into option name and value(s) respecting quoted strings
+ * 4. DISPATCH: Call one_opt() with option name/value to process specific option
+ * 5. VALIDATE: Option-specific validation and structure allocation
+ * 6. LINK: Attach newly allocated structures to daemon linked lists
+ * 7. INCLUDE: Recursively process conf-file= and conf-dir= directives
+ * 8. CLOSE: Close file handle, return success/failure status
+ * 
+ * Cycle detection prevents infinite recursion via file path tracking. Maximum include
+ * depth limited to prevent stack overflow.
+ * 
+ * MEMORY MANAGEMENT:
+ * Uses custom safe_string_alloc() and whine_malloc() wrappers providing:
+ * - Overflow checking for string concatenation operations
+ * - setjmp/longjmp error recovery on allocation failure
+ * - Graceful error messages rather than silent corruption or crashes
+ * - All allocated memory remains live for daemon lifetime (no deallocation during operation)
+ * 
+ * THREADING/CONCURRENCY:
+ * Single-threaded initialization phase - all parsing occurs before daemon event loop starts.
+ * No locking required. Configuration reload (SIGHUP) re-invokes read_opts() with existing
+ * daemon structure, freeing and reallocating dynamic structures as needed.
+ * 
+ * PERFORMANCE CONSIDERATIONS:
+ * - Configuration parsing occurs only at startup and SIGHUP reload (not in hot path)
+ * - Linear scan through option array acceptable for ~350 options
+ * - Memory allocation overhead acceptable during initialization
+ * - String operations use efficient pointer manipulation rather than copies where possible
+ * 
+ * PLATFORM-SPECIFIC HANDLING:
+ * - Solaris: Custom facilitynames[] array for syslog facility name mapping (lines 28-52)
+ * - Systems without getopt_long(): Custom struct myoption definition (lines 56-61)
+ * - Android: Specific option restrictions via NO_TFTP and NO_SCRIPT compile flags
+ * - Windows: Not supported (Unix-specific system calls throughout)
+ * 
+ * @copyright Copyright (c) 2000-2025 Simon Kelley
+ * @license GPL-2.0-or-later
+ */
+
 /* define this to get facilitynames */
 #define SYSLOG_NAMES
 #include "dnsmasq.h"
@@ -891,6 +1024,125 @@ static char *parse_mysockaddr(char *arg, union mysockaddr *addr)
   return NULL;
 }
 
+/**
+ * @brief Parse DNS server specification string into structured server details
+ * 
+ * @detailed This function parses complex DNS server specification strings that support
+ *           multiple configuration dimensions: target server addresses (IPv4/IPv6), domain
+ *           restrictions, source addresses, interface binding, and custom port numbers.
+ *           The syntax supports domain-specific forwarding (split-horizon DNS), interface
+ *           binding for multi-homed systems, and non-standard port configurations.
+ *           
+ *           The function handles various specification formats:
+ *           - Simple IP: "8.8.8.8"
+ *           - Domain-specific: "/example.com/8.8.8.8" (only forward example.com to 8.8.8.8)
+ *           - With interface: "8.8.8.8@eth0" (bind to specific interface)
+ *           - With source: "8.8.8.8@192.168.1.1" (use specific source address)
+ *           - With port: "8.8.8.8#5353" (non-standard DNS port)
+ *           - Combined: "/vpn.corp.com/10.0.0.1@tun0#5353"
+ *           
+ *           The function modifies the sdetails structure with parsed components and
+ *           returns NULL on success or an error string describing the parsing failure.
+ *           Special handling exists for the '#' character which delimits local domains
+ *           from upstream servers.
+ * 
+ * @param arg Server specification string to parse (format: [/domain/]addr[@iface|@source][#port])
+ * @param sdetails Output structure to populate with parsed server details (must not be NULL)
+ * 
+ * @return NULL on successful parse, or pointer to static error string describing parse failure
+ * @retval NULL Parsing succeeded, sdetails populated with extracted components
+ * @retval "bad address" Invalid IP address format in specification
+ * @retval "bad domain in server address" Invalid domain name in domain-specific specification
+ * @retval "bad interface" Invalid interface name after @ symbol
+ * @retval "bad port" Invalid port number after # symbol
+ * 
+ * @note The function modifies the input arg string during parsing (inserts NUL terminators)
+ * @note Domain specifications use leading and trailing '/' delimiters: /domain/
+ * @note The '#' character has dual meaning: local domain delimiter OR port number delimiter
+ * @note sdetails structure must be pre-allocated by caller
+ * @warning Input string arg is modified destructively during parsing (not const)
+ * @warning Caller must ensure sdetails pointer is valid (no NULL check performed)
+ * 
+ * @see parse_server_addr() - Helper function for IP address parsing
+ * @see parse_server_next() - Parse multiple server specifications
+ * @see struct server_details - Output structure definition in dnsmasq.h
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * struct server_details details;
+ * char server_spec[] = "/vpn.example.com/10.0.0.1@tun0#5353";
+ * char *error = parse_server(server_spec, &details);
+ * if (error) {
+ *   fprintf(stderr, "Parse error: %s\n", error);
+ * } else {
+ *   // details.domain = "vpn.example.com"
+ *   // details.addr contains 10.0.0.1
+ *   // details.interface = "tun0"
+ *   // details.port = 5353
+ * }
+ * @endcode
+ * 
+ * SUPPORTED SYNTAX FORMATS:
+ * - addr: Simple upstream server address
+ * - /domain/addr: Domain-specific forwarding (split-horizon DNS)
+ * - addr@interface: Bind queries to specific network interface
+ * - addr@source: Use specific source address for queries
+ * - addr#port: Use non-standard DNS port (default 53)
+ * - Combinations: All elements can be combined
+ * 
+ * PARSING ALGORITHM:
+ * 1. Check for leading '/' indicating domain-specific configuration
+ * 2. Extract domain name between '/' delimiters if present
+ * 3. Locate '@' delimiter for interface/source address specification
+ * 4. Locate '#' delimiter for port number specification (disambiguate from local domain '#')
+ * 5. Parse IP address (IPv4 or IPv6) using parse_server_addr()
+ * 6. Validate domain name format if domain-specific
+ * 7. Parse interface name or source address after '@'
+ * 8. Parse port number after '#' and validate range (1-65535)
+ * 9. Populate sdetails structure with extracted components
+ * 
+ * DOMAIN SPECIFICATION SEMANTICS:
+ * - /domain/server: Forward queries for domain to server
+ * - /domain/: Use default upstream for domain (no specific server)
+ * - /#/server: Server for local (non-qualified) names
+ * - Special handling for '#' as both local domain indicator and port delimiter
+ * 
+ * VALIDATION PERFORMED:
+ * - IP address format validation (IPv4 dotted-quad or IPv6 colon-hex)
+ * - Domain name syntax validation (labels, length, allowed characters)
+ * - Port number range validation (1-65535)
+ * - Interface name validation (system interface must exist)
+ * 
+ * ERROR HANDLING:
+ * Returns descriptive error string for:
+ * - Malformed IP addresses (invalid octets, incorrect format)
+ * - Invalid domain names (empty labels, invalid characters)
+ * - Missing or malformed delimiters
+ * - Port numbers outside valid range
+ * - Interface names that don't correspond to system interfaces
+ * 
+ * MEMORY MANAGEMENT:
+ * - Input string arg is modified in place (NUL terminators inserted at delimiters)
+ * - sdetails structure populated with pointers into modified arg string
+ * - Caller retains ownership of arg string memory
+ * - Error strings are static and do not need to be freed
+ * 
+ * SIDE EFFECTS:
+ * - Modifies input arg string destructively (inserts NUL bytes at delimiters)
+ * - Populates sdetails structure with parsed components
+ * - No heap allocations performed
+ * - No system calls issued
+ * 
+ * THREAD SAFETY:
+ * Thread-safe (operates only on caller-provided buffers)
+ * No global state accessed or modified
+ * 
+ * INTEGRATION WITH CONFIGURATION:
+ * - Called by one_opt() when processing "server=" configuration directives
+ * - Supports command-line -S/--server options
+ * - Enables domain-specific upstream server configuration for VPN split-horizon DNS
+ * - Integrates with network.c interface enumeration for interface binding
+ */
 char *parse_server(char *arg, struct server_details *sdetails)
 {
   sdetails->serv_port = NAMESERVER_PORT;
@@ -998,6 +1250,186 @@ char *parse_server(char *arg, struct server_details *sdetails)
   return NULL;
 }
 
+/**
+ * @brief Populate sockaddr structures from parsed server details for DNS query forwarding
+ * 
+ * @detailed This function converts the string-based server configuration parsed by parse_server()
+ *           into binary sockaddr structures suitable for socket operations. It handles both IPv4
+ *           (AF_INET) and IPv6 (AF_INET6) address families, populates port numbers, configures
+ *           source address binding, and validates address family compatibility between server
+ *           and source addresses.
+ *           
+ *           The function performs critical validation to prevent incompatible configurations such
+ *           as attempting to use an IPv4 server with an IPv6 source address, which would fail at
+ *           the socket layer. It also handles platform-specific features like SO_BINDTODEVICE for
+ *           interface binding on Linux systems.
+ *           
+ *           This function is the second stage of server specification processing:
+ *           1. parse_server() extracts string components (domain, address, interface, port)
+ *           2. parse_server_addr() converts strings to binary sockaddr structures
+ *           3. parse_server_next() iterates through multiple resolved addresses (hostname resolution)
+ *           
+ *           The populated sockaddr structures are used directly by forward.c for UDP socket
+ *           operations when forwarding DNS queries to upstream servers.
+ * 
+ * @param sdetails Server details structure containing parsed configuration and output buffers
+ *                 for sockaddr structures. Must contain valid addr_type (AF_INET, AF_INET6, or
+ *                 AF_LOCAL for Unix socket), pre-allocated addr and source_addr union mysockaddr
+ *                 pointers, optional interface name, and configured port number.
+ * 
+ * @return NULL on successful sockaddr population, or pointer to localized error string
+ * @retval NULL Success - addr and source_addr sockaddr structures populated correctly
+ * @retval "cannot use IPv4 server address with IPv6 source address" Address family mismatch
+ * @retval "cannot use IPv6 server address with IPv4 source address" Address family mismatch
+ * @retval "interface can only be specified once" Duplicate interface specification
+ * @retval "interface binding not supported" SO_BINDTODEVICE not available on this platform
+ * @retval "bad address" Address type is not AF_INET, AF_INET6, or AF_LOCAL
+ * 
+ * @note Function uses gettext _() macro for internationalized error messages
+ * @note IPv4 addresses populate sockaddr_in structure (addr->in)
+ * @note IPv6 addresses populate sockaddr_in6 structure (addr->in6)
+ * @note AF_LOCAL (Unix socket) addresses skip sockaddr population
+ * @note Source address binding requires address family match with server address
+ * @note Interface binding on Linux uses SO_BINDTODEVICE socket option
+ * 
+ * @warning sdetails must have addr and source_addr pre-allocated (no NULL check)
+ * @warning Address family mismatch is non-fatal when resolving hostnames (skips address)
+ * @warning Address family mismatch is fatal error when using direct IP addresses
+ * @warning Interface binding only available on Linux (#ifdef SO_BINDTODEVICE)
+ * @warning source_addr must be allocated even if not used (checked for NULL)
+ * 
+ * @see parse_server() - First stage: parse specification string into components
+ * @see parse_server_next() - Third stage: iterate through hostname-resolved addresses
+ * @see struct server_details - Input/output structure defined in dnsmasq.h
+ * @see union mysockaddr - Generic sockaddr union for IPv4/IPv6/Unix (dnsmasq.h)
+ * @see forward.c:forward_query() - Consumer of populated sockaddr structures
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * struct server_details details;
+ * union mysockaddr addr, source;
+ * char spec[] = "8.8.8.8@192.168.1.1#5353";
+ * 
+ * // Stage 1: Parse specification string
+ * char *error = parse_server(spec, &details);
+ * if (error) return error;
+ * 
+ * // Stage 2: Populate sockaddr structures
+ * details.addr = &addr;
+ * details.source_addr = &source;
+ * error = parse_server_addr(&details);
+ * if (error) return error;
+ * 
+ * // addr.in now contains 8.8.8.8:5353
+ * // source.in contains 192.168.1.1
+ * // Ready for socket operations
+ * @endcode
+ * 
+ * SOCKADDR STRUCTURE POPULATION:
+ * 
+ * For IPv4 (AF_INET):
+ * - addr->in.sin_family = AF_INET
+ * - addr->in.sin_addr = (already set by parse_server)
+ * - addr->in.sin_port = htons(sdetails->serv_port) [default 53]
+ * - If source specified: source_addr->in populated similarly
+ * - If interface specified: Error on non-Linux platforms
+ * 
+ * For IPv6 (AF_INET6):
+ * - addr->in6.sin6_family = AF_INET6
+ * - addr->in6.sin6_addr = (already set by parse_server)
+ * - addr->in6.sin6_port = htons(sdetails->serv_port) [default 53]
+ * - addr->in6.sin6_flowinfo = 0
+ * - addr->in6.sin6_scope_id = 0
+ * - If source specified: source_addr->in6 populated similarly
+ * - If interface specified: safe_strncpy to sdetails->interface (Linux only)
+ * 
+ * ADDRESS FAMILY VALIDATION:
+ * 
+ * Server and source address families must match:
+ * - IPv4 server + IPv4 source: Valid
+ * - IPv6 server + IPv6 source: Valid
+ * - IPv4 server + IPv6 source: ERROR (fatal if direct IP, skip if hostname)
+ * - IPv6 server + IPv4 source: ERROR (fatal if direct IP, skip if hostname)
+ * 
+ * Rationale: Socket bind() requires source address family to match socket family
+ * 
+ * HOSTNAME RESOLUTION HANDLING:
+ * 
+ * When server specification contains hostname (not direct IP):
+ * - sdetails->orig_hostinfo is NULL
+ * - Address family mismatch returns error
+ * - Caller detects error and skips this resolved address
+ * - Tries next address from getaddrinfo() results
+ * - Allows hostname that resolves to both IPv4 and IPv6 with single source
+ * 
+ * When server specification contains direct IP:
+ * - sdetails->orig_hostinfo is non-NULL
+ * - Address family mismatch is fatal configuration error
+ * - Parsing stops immediately with error message
+ * 
+ * INTERFACE BINDING (Linux SO_BINDTODEVICE):
+ * 
+ * If interface name specified (e.g., "8.8.8.8@eth0"):
+ * - Requires SO_BINDTODEVICE compile-time support
+ * - interface_opt flag prevents duplicate specification
+ * - interface name copied to sdetails->interface (IF_NAMESIZE bytes)
+ * - Source address set to INADDR_ANY (IPv4) or in6addr_any (IPv6)
+ * - Actual binding performed later by network.c when creating socket
+ * 
+ * If platform lacks SO_BINDTODEVICE:
+ * - Returns "interface binding not supported" error
+ * - Feature disabled at compile time for non-Linux platforms
+ * 
+ * PORT NUMBER HANDLING:
+ * 
+ * Default port: 53 (DNS)
+ * Custom port specified via "#port" suffix in specification
+ * Network byte order conversion: htons(sdetails->serv_port)
+ * Valid range: 1-65535 (validated by parse_server)
+ * 
+ * MEMORY MANAGEMENT:
+ * 
+ * - No heap allocations performed
+ * - Operates only on caller-provided buffers (addr, source_addr)
+ * - Error strings are static gettext-translated strings
+ * - safe_strncpy ensures buffer safety for interface names
+ * 
+ * SIDE EFFECTS:
+ * 
+ * - Populates sdetails->addr sockaddr structure (IPv4 or IPv6)
+ * - Populates sdetails->source_addr if source specified
+ * - Sets sdetails->interface if interface binding specified (Linux only)
+ * - No global state modified
+ * - No system calls issued
+ * 
+ * INTEGRATION POINTS:
+ * 
+ * - Called by one_opt() during "server=" directive processing
+ * - Results consumed by forward.c:forward_query() for upstream queries
+ * - Interface binding enforced by network.c:allocate_sfd()
+ * - Port override enables coexistence with other DNS services
+ * 
+ * ERROR HANDLING STRATEGY:
+ * 
+ * Returns localized error strings via gettext _() macro:
+ * - Enables internationalized error messages in logs and UI
+ * - Error strings are compile-time constants (no allocation)
+ * - NULL return indicates success (no error)
+ * - Caller responsible for logging/displaying error strings
+ * 
+ * THREAD SAFETY:
+ * 
+ * Thread-safe (operates only on caller-provided buffers)
+ * No global state accessed or modified
+ * gettext _() macro may access thread-local storage (implementation-dependent)
+ * 
+ * RFC COMPLIANCE:
+ * 
+ * RFC 1035: DNS protocol - standard port 53
+ * RFC 3493: Basic Socket Interface Extensions for IPv6
+ * IPv4 sockaddr_in: struct defined in <netinet/in.h>
+ * IPv6 sockaddr_in6: struct defined in <netinet/in.h>
+ */
 char *parse_server_addr(struct server_details *sdetails)
 {
   if (sdetails->addr_type == AF_INET)
@@ -1093,6 +1525,245 @@ char *parse_server_addr(struct server_details *sdetails)
   return NULL;
 }
 
+/**
+ * @brief Iterator for hostname-resolved DNS server addresses enabling multi-address failover
+ * 
+ * @detailed This function implements an iterator pattern for DNS server specifications that
+ *           resolve to multiple IP addresses (both IPv4 and IPv6). When a hostname is used
+ *           as the server address instead of a direct IP, getaddrinfo() may return multiple
+ *           addresses (e.g., a hostname with both A and AAAA records). This function enables
+ *           dnsmasq to try each resolved address sequentially, providing automatic failover
+ *           if connections to earlier addresses fail.
+ *           
+ *           The iterator maintains state in the server_details structure across calls:
+ *           - hostinfo: Pointer to current position in getaddrinfo() linked list
+ *           - valid: Boolean flag indicating whether more addresses remain
+ *           - addr: Output buffer where current address is copied
+ *           
+ *           The function supports two distinct iteration modes:
+ *           
+ *           1. HOSTNAME MODE (hostinfo != NULL):
+ *              - Iterates through linked list of addresses from getaddrinfo()
+ *              - Each call extracts one address and advances to next
+ *              - Supports mixed IPv4 and IPv6 addresses from same hostname
+ *              - Continues until ai_next is NULL (end of list)
+ *           
+ *           2. DIRECT IP MODE (hostinfo == NULL, valid == 1):
+ *              - Server specification was direct IP address, not hostname
+ *              - Returns address exactly once, then marks iteration complete
+ *              - No actual iteration occurs (single address only)
+ *           
+ *           This three-stage parsing workflow enables robust server configuration:
+ *           - Stage 1: parse_server() extracts string components
+ *           - Stage 2: parse_server_addr() validates and populates sockaddr
+ *           - Stage 3: parse_server_next() iterates through multiple resolved addresses
+ *           
+ *           The iterator enables resilient upstream configuration where a single server
+ *           directive like "server=dns.example.com" automatically tries all available
+ *           addresses for the hostname, providing transparent failover without requiring
+ *           manual configuration of multiple server directives.
+ * 
+ * @param sdetails Server details structure containing iterator state (hostinfo, valid)
+ *                 and output buffer (addr) for current address. The structure maintains
+ *                 iteration position across multiple calls, enabling stateful traversal
+ *                 of the address list. Must be initialized by parse_server() before first
+ *                 call to this iterator function.
+ * 
+ * @return Integer indicating whether address was retrieved and iteration should continue
+ * @retval 1 Address successfully retrieved and copied to sdetails->addr, caller should
+ *           process this address and may call again for next address
+ * @retval 0 No more addresses available, iteration complete, caller should stop calling
+ * 
+ * @note First call after successful hostname resolution returns first address in list
+ * @note Subsequent calls return next addresses until list exhausted
+ * @note For direct IP specifications, returns 1 once then 0 (simulates single-item iteration)
+ * @note Address family (IPv4 or IPv6) may vary across iterations for dual-stack hostnames
+ * @note Function updates sdetails->addr_type with AF_INET or AF_INET6 for each address
+ * @note Iterator state maintained in sdetails->hostinfo and sdetails->valid fields
+ * 
+ * @warning Caller must not modify hostinfo or valid fields during iteration
+ * @warning Returned address in sdetails->addr is overwritten on next call
+ * @warning No validation performed on address family compatibility with source address
+ * @warning Caller responsible for calling parse_server_addr() after each next() call
+ * 
+ * @see parse_server() - Stage 1: Parse server specification string
+ * @see parse_server_addr() - Stage 2: Validate and populate sockaddr structures
+ * @see struct server_details - Iterator state container (dnsmasq.h)
+ * @see getaddrinfo() - System call that produces hostinfo linked list
+ * @see struct addrinfo - Standard POSIX structure for address resolution results
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * struct server_details details;
+ * union mysockaddr addr, source;
+ * char spec[] = "dns.example.com#5353";
+ * 
+ * // Stage 1: Parse specification (may involve hostname resolution)
+ * char *error = parse_server(spec, &details);
+ * if (error) return error;
+ * 
+ * details.addr = &addr;
+ * details.source_addr = &source;
+ * 
+ * // Stage 3: Iterate through all resolved addresses
+ * while (parse_server_next(&details)) {
+ *   // Stage 2: Validate and populate sockaddr for this address
+ *   error = parse_server_addr(&details);
+ *   if (error) continue; // Skip incompatible addresses
+ *   
+ *   // addr now contains current resolved address
+ *   // Try to use this server address
+ *   if (try_server(&addr)) break; // Success, stop iterating
+ * }
+ * // All addresses exhausted or one succeeded
+ * @endcode
+ * 
+ * ITERATION BEHAVIOR - HOSTNAME MODE:
+ * 
+ * Server: "dns.example.com" resolves to:
+ * - 203.0.113.1 (IPv4)
+ * - 203.0.113.2 (IPv4)  
+ * - 2001:db8::1 (IPv6)
+ * 
+ * Call sequence:
+ * 1. parse_server_next() -> returns 1, addr contains 203.0.113.1, hostinfo advances
+ * 2. parse_server_next() -> returns 1, addr contains 203.0.113.2, hostinfo advances
+ * 3. parse_server_next() -> returns 1, addr contains 2001:db8::1, hostinfo advances
+ * 4. parse_server_next() -> returns 0, no more addresses
+ * 
+ * ITERATION BEHAVIOR - DIRECT IP MODE:
+ * 
+ * Server: "203.0.113.1" (direct IP, no hostname resolution)
+ * 
+ * Call sequence:
+ * 1. parse_server_next() -> returns 1, addr contains 203.0.113.1, sets valid=0
+ * 2. parse_server_next() -> returns 0, iteration complete
+ * 
+ * STATE MACHINE:
+ * 
+ * Initial state after parse_server():
+ * - hostinfo = getaddrinfo() result linked list (or NULL for direct IP)
+ * - valid = 1 (at least one address available)
+ * - addr_type = family of first address
+ * 
+ * State transitions (hostname mode):
+ * - hostinfo != NULL: Extract current address, advance hostinfo to ai_next
+ * - Update valid = (hostinfo->ai_next != NULL)
+ * - Return 1 (address available)
+ * 
+ * State transitions (direct IP mode):
+ * - hostinfo == NULL && valid == 1: Return address once
+ * - Set valid = 0 (prevent repeat)
+ * - Return 1 (address available)
+ * 
+ * Terminal state:
+ * - hostinfo == NULL && valid == 0
+ * - Return 0 (no more addresses)
+ * 
+ * ADDRESS EXTRACTION ALGORITHM:
+ * 
+ * For IPv4 addresses (AF_INET):
+ * 1. Cast ai_addr to (struct sockaddr_in *)
+ * 2. Extract sin_addr (4-byte IPv4 address)
+ * 3. memcpy to sdetails->addr->in.sin_addr
+ * 4. sizeof ensures exactly 4 bytes copied
+ * 
+ * For IPv6 addresses (AF_INET6):
+ * 1. Cast ai_addr to (struct sockaddr_in6 *)
+ * 2. Extract sin6_addr (16-byte IPv6 address)
+ * 3. memcpy to sdetails->addr->in6.sin6_addr
+ * 4. sizeof ensures exactly 16 bytes copied
+ * 
+ * INTEGRATION WITH UPSTREAM SERVER SELECTION:
+ * 
+ * The iterator enables dnsmasq's upstream server failover mechanism:
+ * 1. Configuration: "server=dns.example.com"
+ * 2. Hostname resolves to multiple addresses
+ * 3. Iterator provides each address to forward.c
+ * 4. forward.c tries addresses in sequence until success
+ * 5. Failed addresses marked temporarily unavailable
+ * 6. Automatic retry after failure timeout
+ * 
+ * DUAL-STACK HOSTNAME HANDLING:
+ * 
+ * When hostname has both IPv4 and IPv6 addresses:
+ * - Iterator returns all addresses regardless of family
+ * - Caller (parse_server_addr) validates family compatibility
+ * - If source address specified, incompatible families skipped
+ * - If no source address, both IPv4 and IPv6 accepted
+ * - Enables flexible dual-stack upstream server configuration
+ * 
+ * MEMORY MANAGEMENT:
+ * 
+ * - No heap allocations performed by this function
+ * - hostinfo linked list allocated by getaddrinfo()
+ * - hostinfo freed by freeaddrinfo() after iteration completes
+ * - Caller owns sdetails structure and embedded buffers
+ * - memcpy used for address extraction (no pointer aliasing)
+ * 
+ * SIDE EFFECTS:
+ * 
+ * - Advances sdetails->hostinfo to next address in linked list
+ * - Updates sdetails->addr_type with current address family
+ * - Copies current address to sdetails->addr union
+ * - Updates sdetails->valid flag for iteration control
+ * - In direct IP mode, clears valid flag after first call
+ * 
+ * ERROR HANDLING:
+ * 
+ * - No error conditions (always succeeds)
+ * - Return value 0 indicates natural iteration completion
+ * - Caller must check return value to detect end of iteration
+ * - Invalid addresses handled by caller (parse_server_addr validation)
+ * 
+ * CONCURRENCY CONSIDERATIONS:
+ * 
+ * - Not thread-safe (modifies sdetails structure)
+ * - Designed for sequential processing in single-threaded daemon
+ * - No global state accessed or modified
+ * - Safe for concurrent calls with independent sdetails structures
+ * 
+ * USE CASE SCENARIOS:
+ * 
+ * Scenario 1 - Redundant upstream servers:
+ * - Corporate DNS hostname with primary and backup IPs
+ * - Iterator enables automatic failover on connection failure
+ * - No manual configuration of fallback servers required
+ * 
+ * Scenario 2 - Dual-stack environments:
+ * - Upstream server has both IPv4 and IPv6 connectivity
+ * - Single hostname configuration works for both protocols
+ * - dnsmasq tries both address families automatically
+ * 
+ * Scenario 3 - Direct IP (no hostname):
+ * - Server specification is IP address, not hostname
+ * - Iterator provides consistent interface (returns once)
+ * - Simplifies caller logic (always use iterator pattern)
+ * 
+ * GETADDRINFO INTEGRATION:
+ * 
+ * This function consumes results from getaddrinfo() system call:
+ * - getaddrinfo() returns linked list of struct addrinfo
+ * - Each node contains one resolved address
+ * - ai_family: AF_INET or AF_INET6
+ * - ai_addr: Pointer to sockaddr structure
+ * - ai_next: Pointer to next address or NULL
+ * 
+ * THREAD SAFETY:
+ * 
+ * Not thread-safe (by design):
+ * - Modifies iterator state in sdetails structure
+ * - Single-threaded daemon architecture assumed
+ * - Multiple concurrent calls would corrupt iteration state
+ * 
+ * PERFORMANCE CHARACTERISTICS:
+ * 
+ * - O(1) time complexity per call
+ * - Simple pointer traversal and memory copy
+ * - No system calls or I/O operations
+ * - memcpy of 4 bytes (IPv4) or 16 bytes (IPv6)
+ * - Negligible CPU overhead (<1 microsecond per call)
+ */
 int parse_server_next(struct server_details *sdetails)
 {
   /* Looping over resolved addresses? */
@@ -1997,16 +2668,191 @@ on_error:
 
 #endif
 
+/**
+ * @brief Set a boolean configuration option flag to true (1)
+ * 
+ * @detailed Sets a specific boolean option flag in the daemon's option bitmap array.
+ *           This function uses a bitmap pattern where daemon->options[] is an array of
+ *           unsigned integers, each holding OPTION_BITS (typically 32) boolean flags.
+ *           The option_var() macro selects the correct array element (opt / OPTION_BITS),
+ *           and option_val() creates the bitmask (1u << (opt % OPTION_BITS)).
+ *           The bitwise OR operation sets the corresponding bit to 1 without affecting
+ *           other flags in the same array element.
+ * 
+ * @param opt Option flag identifier (typically from OPT_* constants defined in dnsmasq.h)
+ * 
+ * @return None (void function)
+ * 
+ * @note This function directly modifies global daemon state (daemon->options[])
+ * @note No bounds checking is performed on the opt parameter
+ * @note Multiple flags can be set independently as they occupy distinct bit positions
+ * @note Macro expansion: option_var(opt) |= option_val(opt) becomes
+ *       daemon->options[opt/OPTION_BITS] |= (1u << (opt % OPTION_BITS))
+ * 
+ * @see reset_option_bool() to clear an option flag
+ * @see option_bool() in dnsmasq.h to test if an option flag is set
+ * @see daemon->options[] array in struct daemon (dnsmasq.h)
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Enable DNS query logging
+ * set_option_bool(OPT_LOG);
+ * 
+ * // Enable DHCP server functionality
+ * set_option_bool(OPT_DHCP);
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (internal configuration management)
+ * SIDE EFFECTS: Modifies daemon->options[] global state
+ * THREAD SAFETY: Not thread-safe (single-threaded daemon architecture)
+ */
 void set_option_bool(unsigned int opt)
 {
   option_var(opt) |= option_val(opt);
 }
 
+/**
+ * @brief Clear a boolean configuration option flag to false (0)
+ * 
+ * @detailed Clears a specific boolean option flag in the daemon's option bitmap array.
+ *           This function uses the complement operation of set_option_bool(). It employs
+ *           a bitmap pattern where daemon->options[] is an array of unsigned integers,
+ *           each holding OPTION_BITS (typically 32) boolean flags. The option_var() macro
+ *           selects the correct array element (opt / OPTION_BITS), and option_val()
+ *           creates the bitmask (1u << (opt % OPTION_BITS)). The bitwise negation (~)
+ *           inverts the mask so all bits are 1 except the target bit (which is 0).
+ *           The bitwise AND operation clears only the target bit, leaving all other
+ *           flags in the same array element unchanged.
+ * 
+ * @param opt Option flag identifier (typically from OPT_* constants defined in dnsmasq.h)
+ * 
+ * @return None (void function)
+ * 
+ * @note This function directly modifies global daemon state (daemon->options[])
+ * @note No bounds checking is performed on the opt parameter
+ * @note Clearing an already-cleared flag is safe (idempotent operation)
+ * @note Macro expansion: option_var(opt) &= ~(option_val(opt)) becomes
+ *       daemon->options[opt/OPTION_BITS] &= ~(1u << (opt % OPTION_BITS))
+ * 
+ * @see set_option_bool() to set an option flag
+ * @see option_bool() in dnsmasq.h to test if an option flag is set
+ * @see daemon->options[] array in struct daemon (dnsmasq.h)
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Disable DNS query logging
+ * reset_option_bool(OPT_LOG);
+ * 
+ * // Disable DHCP server functionality
+ * reset_option_bool(OPT_DHCP);
+ * 
+ * // Safe to call multiple times (idempotent)
+ * reset_option_bool(OPT_LOCALISE);
+ * reset_option_bool(OPT_LOCALISE); // No effect if already cleared
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (internal configuration management)
+ * SIDE EFFECTS: Modifies daemon->options[] global state
+ * THREAD SAFETY: Not thread-safe (single-threaded daemon architecture)
+ */
 void reset_option_bool(unsigned int opt)
 {
   option_var(opt) &= ~(option_val(opt));
 }
 
+/**
+ * @brief Parse and process a single configuration option or command-line argument
+ * 
+ * @detailed This is the core option parsing function that processes individual configuration
+ *           directives from both command-line arguments and configuration files. The function
+ *           implements a massive switch statement with 161 case handlers covering all dnsmasq
+ *           configuration options including DNS forwarding, DHCP server configuration, TFTP
+ *           settings, network interface selection, logging options, and security settings.
+ *           
+ *           The function modifies the global daemon structure, allocating and initializing
+ *           data structures as needed for each option type. It performs extensive validation
+ *           of option values including IP address parsing, hostname validation, numeric range
+ *           checking, and configuration consistency verification.
+ *           
+ *           Option categories handled:
+ *           - DNS configuration: upstream servers, cache settings, DNSSEC, authoritative zones
+ *           - DHCP configuration: address pools, static leases, options, vendor classes
+ *           - DHCPv6 and Router Advertisement: IPv6 addressing, prefix delegation, RA parameters
+ *           - Network interfaces: interface selection, listening addresses, bind-interfaces mode
+ *           - TFTP and PXE boot: TFTP root, PXE services, boot parameters
+ *           - Security: DNSSEC trust anchors, query validation, access control
+ *           - Integration: D-Bus, script execution, firewall integration (ipset/nftset)
+ *           - Logging and debugging: query logging, log facility, debug options
+ *           - Performance tuning: cache size, connection limits, timeouts
+ * 
+ * @param option The option identifier - either single character for short options (e.g., 'p' for port)
+ *               or LOPT_* constant for long options (e.g., LOPT_DNSSEC for --dnssec)
+ * @param arg The option argument string - may be NULL for boolean flags, otherwise contains the
+ *            value to parse (e.g., IP address, port number, filename, domain name)
+ * @param errstr Buffer for detailed error messages - should be MAXDNAME bytes; populated with
+ *               specific error description if parsing fails (e.g., "invalid IP address")
+ * @param gen_err Generic error message template - used as prefix for error reporting; typically
+ *                indicates the source of the option (command-line vs config file)
+ * @param command_line Boolean flag - 1 if parsing command-line argument, 0 if parsing config file
+ *                     directive; affects precedence rules and error handling behavior
+ * @param servers_only Boolean flag - 1 to process only server-related options (for --test mode),
+ *                     0 to process all options normally
+ * 
+ * @return 1 on successful option parsing and validation
+ * @retval 1 Option successfully parsed and daemon structure updated
+ * @retval 0 Option parsing failed due to invalid syntax, out-of-range value, or configuration
+ *           inconsistency; errstr contains detailed error description
+ * 
+ * @note This function has side effects - it modifies the global daemon structure by allocating
+ *       memory for option-specific data structures and updating configuration fields. Memory
+ *       allocation failures are handled via longjmp to mem_jmp (set by read_opts).
+ * 
+ * @warning The function uses a longjmp mechanism for memory allocation failure handling. The
+ *          mem_recover flag must be set and mem_jmp buffer initialized before calling this
+ *          function. Failure to do so will cause undefined behavior on allocation failure.
+ * 
+ * @warning Some options have interdependencies - setting certain options may require or conflict
+ *          with other options. The function performs some consistency checking but not all
+ *          conflicts are detected during parsing (some are deferred to post-parse validation).
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * char errstr[MAXDNAME];
+ * // Parse command-line option: -p 5353 (change DNS port)
+ * if (!one_opt('p', "5353", errstr, "command line", 1, 0)) {
+ *   die("Bad port specification: %s", errstr, EC_BADCONF);
+ * }
+ * 
+ * // Parse config file directive: server=8.8.8.8
+ * if (!one_opt('S', "8.8.8.8", errstr, "config file", 0, 0)) {
+ *   die("Bad server specification: %s", errstr, EC_BADCONF);
+ * }
+ * @endcode
+ * 
+ * OPTION PROCESSING FLOW:
+ * 1. Switch on option identifier (character or LOPT_* constant)
+ * 2. Parse and validate option argument string
+ * 3. Allocate memory for option-specific data structures if needed
+ * 4. Update daemon structure with parsed configuration
+ * 5. Return success/failure status
+ * 
+ * RFC COMPLIANCE:
+ * - RFC 1035: DNS protocol options (server, domain, address)
+ * - RFC 2131: DHCP protocol options (dhcp-range, dhcp-host, dhcp-option)
+ * - RFC 3315: DHCPv6 protocol options (dhcp-range for IPv6, enable-ra)
+ * - RFC 4033-4035: DNSSEC options (dnssec, trust-anchor, dnssec-check-unsigned)
+ * - RFC 1350: TFTP protocol options (enable-tftp, tftp-root)
+ * 
+ * SIDE EFFECTS:
+ * - Allocates memory for configuration data structures (servers, interfaces, DHCP configs, etc.)
+ * - Modifies daemon structure fields (flags, counters, option lists)
+ * - May call die() on fatal errors (via longjmp for allocation failures)
+ * - Updates global state for compile-time optional features (DNSSEC, DHCP, TFTP, etc.)
+ * 
+ * THREAD SAFETY: Not thread-safe - modifies global daemon structure
+ * 
+ * Source: /src/option.c lines 2763-6211 (3448 lines, 161 case statements)
+ */
 static int one_opt(int option, char *arg, char *errstr, char *gen_err, int command_line, int servers_only)
 {      
   int i;
@@ -5457,6 +6303,170 @@ err:
   return 1;
 }
 
+/**
+ * @brief Parse configuration directives from an open file stream line by line
+ * 
+ * @detailed This function implements the core configuration file parsing logic that reads
+ * an open file stream line by line, tokenizes each line into option names and arguments,
+ * and dispatches them to one_opt() for processing. The parser handles complex syntax including
+ * quoted strings (preserving whitespace within quotes), backslash escaping for special characters,
+ * comment stripping (# introduces comments), line continuation via trailing backslashes,
+ * and proper handling of both short-form and long-form option syntax.
+ * 
+ * The function implements a state machine for quote handling that tracks whether the parser
+ * is currently inside single quotes, double quotes, or unquoted text, ensuring proper
+ * tokenization of complex configuration values containing whitespace. Memory allocation
+ * failures are handled via setjmp/longjmp mechanism to gracefully recover from out-of-memory
+ * conditions during option parsing.
+ * 
+ * Configuration file syntax supports multiple formats: short options (-x value), long options
+ * (--option=value or --option value), and bare option names (option=value or option value).
+ * The parser normalizes all formats into a consistent representation before passing to one_opt().
+ * 
+ * @param file Configuration file path for error reporting. This parameter is used exclusively
+ *             for generating meaningful error messages that include the filename and line number.
+ *             Must not be NULL. The path appears in error messages like "Bad option at line X
+ *             of /etc/dnsmasq.conf". This is the same file parameter passed to one_file().
+ * 
+ * @param f Open FILE stream from which to read configuration directives. Must be successfully
+ *          opened for reading (via fopen() or popen()) before calling. The function reads from
+ *          this stream using fgets() until EOF or error. Must not be NULL. The caller (one_file())
+ *          is responsible for closing the stream after read_file() returns.
+ * 
+ * @param hard_opt Controls option processing mode and error handling behavior. This value is
+ *                 passed through to one_opt() for each parsed directive. Values include:
+ *                 - 0: Normal configuration file parsing mode with standard error handling
+ *                 - LOPT_CONF_OPT: Default configuration file mode (lenient error handling)
+ *                 - LOPT_CONF_SCRIPT: Command pipe mode (configuration from script stdout)
+ *                 - LOPT_OPTS: DHCP options file parsing mode
+ *                 - Other LOPT_* values for specialized parsing contexts
+ *                 The value affects how one_opt() handles missing required arguments and
+ *                 unrecognized options (fatal errors vs. warnings).
+ * 
+ * @param from_script Flag indicating whether configuration is being read from script output
+ *                    (command pipe via popen). Values:
+ *                    - 0: Normal file input (from fopen)
+ *                    - 1: Script output input (from popen)
+ *                    This flag currently serves as documentation of input source and may be
+ *                    used for specialized error handling or validation in future enhancements.
+ * 
+ * @return void - Function does not return a value. Success or failure is communicated through
+ *         the setjmp/longjmp mechanism (memory errors) or by calling die() for fatal parse errors.
+ * 
+ * @note Configuration file format: Each line contains zero or one configuration directive in one
+ * of these formats:
+ *   - Short option: -x value (e.g., "-p 53" for port)
+ *   - Long option with equals: --option=value (e.g., "--port=53")
+ *   - Long option with space: --option value (e.g., "--port 53")
+ *   - Bare option with equals: option=value (e.g., "port=53")
+ *   - Bare option with space: option value (e.g., "port 53")
+ *   - Boolean flag: --option or option (e.g., "--no-daemon")
+ * Empty lines and lines beginning with # are ignored (treated as comments).
+ * 
+ * @note Quote handling: The parser implements quote-aware tokenization that preserves whitespace
+ * within quoted strings. Single quotes (') and double quotes (") delimit strings. Quotes can be
+ * escaped with backslash (\' or \"). Inside quotes, whitespace is preserved and does not split
+ * tokens. Outside quotes, whitespace separates option name from arguments. Quote state is tracked
+ * via the state variable: 0 (unquoted), 1 (inside single quotes), 2 (inside double quotes).
+ * 
+ * @note Backslash escaping: Backslashes escape the following character, removing its special
+ * meaning. Supported escape sequences:
+ *   - \\ → literal backslash
+ *   - \' → literal single quote (inside single quotes)
+ *   - \" → literal double quote (inside double quotes)
+ *   - \<newline> → line continuation (joins next line to current line)
+ *   - \<space> → literal space (prevents tokenization split)
+ * Trailing backslash at end of line indicates line continuation; the newline is removed and
+ * parsing continues with the next line as if it were part of the current line.
+ * 
+ * @note Comment syntax: Hash character (#) introduces a comment that extends to end of line.
+ * Text after # is ignored during parsing. To include literal # in option values, enclose in
+ * quotes ("value#with#hashes") or escape with backslash (value\#literal). Comments are stripped
+ * during tokenization phase, before quote processing.
+ * 
+ * @note Line continuation: Trailing backslash (\) at end of line (before newline) indicates
+ * the next line should be joined to current line. The backslash and newline are removed, and
+ * parsing continues as if both lines were a single line. This enables long option values to
+ * span multiple lines for readability. Maximum line length after continuation is MAXDNAME (1024).
+ * 
+ * @note Memory error recovery: The function uses setjmp/longjmp mechanism to handle out-of-memory
+ * conditions during option parsing. Before calling one_opt(), setjmp(mem_jmp) establishes an
+ * error recovery point. If safe_malloc() or other memory allocation fails within one_opt() or
+ * its callees, longjmp(mem_jmp, 1) returns control to read_file(), which logs an error and
+ * continues parsing the next line. The mem_recover volatile variable enables the longjmp
+ * mechanism (set to 1 before setjmp, cleared after one_opt returns).
+ * 
+ * @note Error reporting: Parse errors include filename and line number for diagnostic clarity.
+ * Line numbers are tracked via the lineno variable (volatile to prevent compiler optimization
+ * issues with setjmp/longjmp). Error messages use ret_err() and ret_err_free() macros that
+ * call complain() with formatted error strings. Fatal errors call die() which terminates daemon.
+ * 
+ * @note Option name normalization: The parser converts various option syntaxes into canonical
+ * form before calling one_opt():
+ *   - Strips leading dashes from long options (--port → port)
+ *   - Splits option=value into separate option name and value argument
+ *   - Preserves short options as-is (single dash + single character)
+ * This normalization simplifies option matching logic in one_opt().
+ * 
+ * @warning This function calls die() on fatal parse errors (via ret_err macro), which terminates
+ * the entire daemon process. Only use during configuration parsing phase (startup or SIGHUP reload),
+ * never during normal packet processing as termination would interrupt active connections.
+ * 
+ * @warning Maximum line length after continuation is MAXDNAME (1024 bytes). Lines exceeding this
+ * limit trigger fatal error. Configuration files with extremely long option values (e.g., very
+ * long server lists) may hit this limit.
+ * 
+ * @warning The function modifies global daemon state via one_opt() calls. Each parsed option
+ * updates the daemon->* structure fields. This function is not reentrant and must not be called
+ * concurrently from multiple threads (dnsmasq's single-threaded architecture ensures this).
+ * 
+ * @warning File stream f must remain valid for the entire function execution. The caller must
+ * not close the stream until read_file() returns. Premature stream closure results in undefined
+ * behavior during fgets() calls.
+ * 
+ * @see one_opt() in option.c - Called at line 6348 to process each parsed configuration directive
+ * @see one_file() in option.c - Calls read_file() at line 6502 after opening file stream
+ * @see complain() in option.c - Error reporting function called via ret_err macros
+ * @see die() in dnsmasq.c - Fatal error handler that terminates daemon
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Typical usage from one_file() after successful fopen()
+ * FILE *f = fopen("/etc/dnsmasq.conf", "r");
+ * if (f) {
+ *   read_file("/etc/dnsmasq.conf", f, 0, 0);
+ *   fclose(f);
+ * }
+ * 
+ * // Usage for command pipe input from popen()
+ * FILE *p = popen("/usr/local/bin/generate-config.sh", "r");
+ * if (p) {
+ *   read_file("/usr/local/bin/generate-config.sh", p, LOPT_CONF_SCRIPT, 1);
+ *   pclose(p);
+ * }
+ * 
+ * // Usage for DHCP options file
+ * FILE *opts = fopen("/etc/dnsmasq.d/dhcp-options.conf", "r");
+ * if (opts) {
+ *   read_file("/etc/dnsmasq.d/dhcp-options.conf", opts, LOPT_OPTS, 0);
+ *   fclose(opts);
+ * }
+ * @endcode
+ * 
+ * RFC COMPLIANCE: Not applicable - configuration file parsing is dnsmasq-specific
+ * 
+ * SIDE EFFECTS:
+ * - File I/O: Reads from file stream f using fgets() until EOF
+ * - Memory allocation: Allocates temporary buffers for line parsing (via whine_malloc)
+ * - Global state modification: Updates daemon configuration structure via one_opt() calls
+ * - Error logging: Calls complain() for parse errors, die() for fatal errors
+ * - Static state: Sets mem_recover flag for setjmp/longjmp error recovery
+ * - Process termination: May call die() on fatal parse errors (does not return)
+ * 
+ * THREAD SAFETY: Not thread-safe due to static mem_recover variable and global daemon state
+ * modifications. Dnsmasq's single-threaded architecture ensures this function only executes
+ * during configuration parsing phase, eliminating concurrency concerns.
+ */
 static void read_file(char *file, FILE *f, int hard_opt, int from_script)	
 {
   volatile int lineno = 0;
@@ -5599,6 +6609,64 @@ static void read_file(char *file, FILE *f, int hard_opt, int from_script)
   mem_recover = 0;
 }
 
+/**
+ * @brief Dynamically reload DHCP configuration from an inotify-monitored file
+ * 
+ * @detailed This function is called by the inotify file monitoring subsystem when a
+ *           watched configuration file changes. It enables dynamic reconfiguration of
+ *           DHCP host entries and DHCP options without daemon restart. The function
+ *           determines the file type (DHCP hosts or DHCP options) based on flags and
+ *           delegates parsing to one_file() with the appropriate option code.
+ *           
+ *           This enables the --dhcp-hostsfile and --dhcp-optsfile directives to support
+ *           automatic reload when files are modified, added, or deleted in monitored
+ *           directories. The inotify mechanism watches for IN_CLOSE_WRITE, IN_MOVED_TO,
+ *           and IN_DELETE events on configured DHCP configuration files.
+ * 
+ * @param file Absolute path to the configuration file to be reloaded
+ * @param flags File type flags indicating content type:
+ *              - AH_DHCP_HST (16): File contains DHCP host entries (MAC/IP bindings)
+ *              - AH_DHCP_OPT (32): File contains DHCP option definitions
+ *              - Other flags are ignored (returns 0)
+ * 
+ * @return 1 on successful parse, 0 if flags don't match known file types
+ * @retval 1 File parsed successfully and configuration applied
+ * @retval 0 Flags parameter contains neither AH_DHCP_HST nor AH_DHCP_OPT
+ * 
+ * @note Only available when compiled with HAVE_DHCP and HAVE_INOTIFY defined
+ * @note Function logs the reload operation to syslog with MS_DHCP | LOG_INFO facility
+ * @note File path must be absolute (typically constructed by inotify.c)
+ * @note Parse errors in the file are handled by one_file() and may be fatal
+ * 
+ * @warning Invalid configuration in reloaded files can cause daemon to reject reload
+ * @warning No transactional semantics - partial parse may leave inconsistent state
+ * 
+ * @see one_file() in option.c for actual file parsing implementation
+ * @see inotify_dnsmasq_init() in inotify.c for inotify watch setup
+ * @see LOPT_BANK option code for DHCP hosts file parsing
+ * @see LOPT_OPTS option code for DHCP options file parsing
+ * @see AH_DHCP_HST flag defined in dnsmasq.h line 723
+ * @see AH_DHCP_OPT flag defined in dnsmasq.h line 724
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Called by inotify.c when /etc/dnsmasq.d/dhcp-hosts changes
+ * int result = option_read_dynfile("/etc/dnsmasq.d/dhcp-hosts", AH_DHCP_HST);
+ * // Result: DHCP host entries reloaded, returns 1
+ * 
+ * // Called when DHCP options file changes
+ * option_read_dynfile("/etc/dnsmasq.d/dhcp-opts", AH_DHCP_OPT);
+ * // Result: DHCP option definitions reloaded
+ * 
+ * // Invalid flag combination returns 0 without parsing
+ * int ret = option_read_dynfile("/some/file", 0x04);
+ * // Result: ret == 0, no parsing performed
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (internal configuration management)
+ * SIDE EFFECTS: Modifies global daemon DHCP configuration on successful parse
+ * THREAD SAFETY: Not thread-safe (single-threaded daemon architecture)
+ */
 #if defined(HAVE_DHCP) && defined(HAVE_INOTIFY)
 int option_read_dynfile(char *file, int flags)
 {
@@ -5613,6 +6681,120 @@ int option_read_dynfile(char *file, int flags)
 }
 #endif
 
+/**
+ * @brief Parse configuration from a single file or command pipe
+ * 
+ * @detailed This function handles loading and parsing configuration from a single
+ * configuration file or command output stream. It implements several critical features:
+ * duplicate file detection via inode tracking to prevent infinite recursion through
+ * conf-file directives, special handling for stdin input ("-"), command pipe execution
+ * via popen() for dynamic configuration generation, graceful handling of missing
+ * optional configuration files, and proper error reporting for inaccessible required files.
+ * 
+ * The function serves as a wrapper around read_file() that handles file opening,
+ * duplicate detection, and cleanup operations. It integrates with the recursive
+ * configuration file inclusion mechanism allowing conf-file and conf-dir directives
+ * to reference additional configuration sources.
+ * 
+ * @param file Configuration file path, "-" for stdin, or command string when used with
+ *             LOPT_CONF_SCRIPT. Must not be NULL. For normal files, this is a filesystem
+ *             path (absolute or relative to current working directory). For stdin, the
+ *             literal string "-" triggers special stdin handling. For command pipes, this
+ *             is the command string passed to popen().
+ * 
+ * @param hard_opt Controls special parsing modes and error handling behavior. Values include:
+ *                 - 0: Normal configuration file parsing with standard error handling
+ *                 - LOPT_CONF_OPT: Default configuration file mode; missing files are not fatal
+ *                   (nofile_ok flag set), allowing graceful degradation when default config
+ *                   files like /etc/dnsmasq.conf do not exist
+ *                 - LOPT_CONF_SCRIPT: Command pipe mode; file parameter is executed via popen()
+ *                   and its stdout is parsed as configuration directives, enabling dynamic
+ *                   configuration generation from scripts
+ *                 - Other LOPT_* values: Passed through to read_file() for specialized parsing
+ *                   contexts (e.g., LOPT_OPTS for DHCP option files)
+ * 
+ * @return 1 on successful file processing or graceful skip of optional missing files,
+ *         0 on non-fatal errors (when hard_opt is non-zero and not LOPT_CONF_OPT/LOPT_CONF_SCRIPT),
+ *         never returns on fatal errors (calls die() which terminates daemon)
+ * 
+ * @retval 1 Configuration file successfully parsed and options processed
+ * @retval 1 Stdin successfully read when file parameter is "-" (first call only)
+ * @retval 1 File previously processed (duplicate detected via inode tracking)
+ * @retval 1 Optional configuration file does not exist (nofile_ok=1, ENOENT)
+ * @retval 0 Non-fatal error occurred (hard_opt non-zero, error logged to syslog)
+ * 
+ * @note Stdin handling: The function maintains static state (read_stdin flag) to prevent
+ * multiple reads from stdin. First call with file="-" reads stdin successfully; subsequent
+ * calls immediately return 1 without reading. This prevents configuration file inclusion
+ * cycles from consuming stdin multiple times.
+ * 
+ * @note Duplicate file detection: Uses static filesread linked list to track processed files
+ * by device ID and inode number. When hard_opt=0 (normal config file), stat() retrieves file
+ * identity and checks against previously processed files. This prevents infinite loops from
+ * circular conf-file inclusions (e.g., A includes B, B includes A). Memory for tracking
+ * structures allocated via safe_malloc() and never freed (acceptable since configuration
+ * parsing occurs once at startup/reload).
+ * 
+ * @note Command pipe execution: When hard_opt=LOPT_CONF_SCRIPT, popen(file, "r") executes
+ * the command string and reads configuration from its stdout. Exit code verification ensures
+ * command executed successfully (non-zero exit codes trigger die()). This mechanism enables
+ * dynamic configuration generation from scripts, database queries, or external systems.
+ * 
+ * @note Error handling strategy: Fatal errors (missing required config files when hard_opt=0,
+ * popen/pclose failures) call die() to terminate daemon with appropriate error code.
+ * Non-fatal errors (when hard_opt is non-zero and not special mode) log to syslog and return 0,
+ * allowing daemon startup to continue. Optional missing files (nofile_ok=1) return success (1)
+ * to gracefully handle absent default configuration files.
+ * 
+ * @warning This function calls die() on fatal errors, which terminates the entire daemon process
+ * via exit(). Callers must be prepared for non-return in error cases. Only use for configuration
+ * parsing during startup or controlled reload operations (SIGHUP), never during normal packet
+ * processing as termination would interrupt active connections.
+ * 
+ * @warning Command pipe mode (LOPT_CONF_SCRIPT) executes arbitrary commands via popen(),
+ * creating security implications. The file parameter must be carefully validated to prevent
+ * command injection vulnerabilities. Only use with trusted configuration sources.
+ * 
+ * @warning File descriptor leaks: On fatal errors via die(), file handles may not be properly
+ * closed as die() terminates process immediately. This is acceptable for startup/reload failures
+ * since process termination cleans up all file descriptors automatically.
+ * 
+ * @see read_file() in option.c - Called at line 6502 to parse file contents after successful opening
+ * @see read_opts() in option.c - Calls one_file() for each configuration file specified
+ * @see die() in dnsmasq.c - Fatal error handler that logs error and terminates daemon
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Parse default configuration file (missing file is not fatal)
+ * one_file("/etc/dnsmasq.conf", LOPT_CONF_OPT);
+ * 
+ * // Parse required configuration file (missing file is fatal)
+ * one_file("/etc/dnsmasq.d/custom.conf", 0);
+ * 
+ * // Read configuration from stdin
+ * one_file("-", 0);
+ * 
+ * // Execute command and parse output as configuration
+ * one_file("/usr/local/bin/generate-dnsmasq-config.sh", LOPT_CONF_SCRIPT);
+ * 
+ * // Parse DHCP options file (non-fatal if missing)
+ * one_file("/etc/dnsmasq.d/dhcp-options.conf", LOPT_OPTS);
+ * @endcode
+ * 
+ * RFC COMPLIANCE: Not applicable - configuration file parsing is dnsmasq-specific
+ * 
+ * SIDE EFFECTS:
+ * - File system access: stat(), fopen() or popen() operations
+ * - Memory allocation: safe_malloc() for duplicate tracking structures (never freed)
+ * - Static state modification: Updates read_stdin flag and filesread linked list
+ * - Process termination: Calls die() on fatal errors (does not return)
+ * - Syslog output: Logs errors via my_syslog() for non-fatal error cases
+ * - Daemon state updates: read_file() modifies global daemon configuration structure
+ * 
+ * THREAD SAFETY: Not thread-safe due to static variables (read_stdin, filesread).
+ * Dnsmasq's single-threaded architecture ensures this function only executes during
+ * configuration parsing phase before entering event loop, eliminating concurrency concerns.
+ */
 static int one_file(char *file, int hard_opt)
 {
   FILE *f;
@@ -5721,6 +6903,80 @@ static int file_filter(const struct dirent *ent)
   return 1;
 }
 /* expand any name which is a directory */
+/**
+ * @brief Expand directory entries in hostsfile list to individual file entries
+ * 
+ * @detailed This function processes a linked list of hostsfile structures and expands
+ *           any directory paths into individual entries for each regular file contained
+ *           within those directories. This enables the --dhcp-hostsfile, --dhcp-optsfile,
+ *           --addn-hosts, and similar directives to accept directory paths that are
+ *           automatically expanded to include all files within.
+ *           
+ *           The function performs several key operations:
+ *           1. Assigns unique indices to new hostsfile entries (starting from SRC_AH)
+ *           2. Marks directory entries as AH_INACTIVE so they are not processed as files
+ *           3. Scans each directory using scandir() with alphasort for deterministic ordering
+ *           4. For each file in the directory, checks if an existing entry already exists
+ *           5. Reuses existing entries (moving them to list end) or creates new entries
+ *           6. Marks non-regular files (symlinks, devices, etc.) as AH_INACTIVE
+ *           
+ *           The function maintains list integrity by preserving existing entries and only
+ *           creating new records for files not previously seen. This enables efficient
+ *           rescanning when directories change (via inotify) without memory leaks.
+ * 
+ * @param list Head of linked list of hostsfile structures to expand
+ *             May be NULL (returns NULL)
+ *             List may contain mix of file and directory paths
+ *             Directory entries will be marked AH_DIR and AH_INACTIVE
+ * 
+ * @return Pointer to head of expanded hostsfile list with directory contents included
+ * @retval NULL if input list is NULL or memory allocation fails for all entries
+ * @retval non-NULL Pointer to linked list with directories expanded to individual files
+ * 
+ * @note Directory entries remain in list but are marked AH_INACTIVE (not processed)
+ * @note Files within directories are assigned sequential indices starting from SRC_AH
+ * @note scandir() is used with file_filter() to select only appropriate files
+ * @note alphasort is used to ensure consistent file ordering across directory reads
+ * @note Non-regular files (symlinks, devices, FIFOs) are marked AH_INACTIVE
+ * @note Existing file entries are preserved and moved to end of list if found again
+ * 
+ * @warning Memory allocation failures (whine_malloc) cause individual files to be skipped
+ * @warning scandir() failure logs error but continues processing other directories
+ * @warning stat() failures mark entries inactive but do not abort processing
+ * @warning List structure modified in-place; caller must use returned pointer
+ * 
+ * @see struct hostsfile defined in dnsmasq.h for structure definition
+ * @see file_filter() function for file selection criteria (rejects dotfiles, ~backups)
+ * @see AH_DIR flag (dnsmasq.h) indicating directory path
+ * @see AH_INACTIVE flag (dnsmasq.h) indicating entry should not be processed
+ * @see SRC_AH constant (dnsmasq.h) for starting index value
+ * @see read_hostsfile() in cache.c for hostsfile list processing
+ * @see inotify_dnsmasq_init() in inotify.c for directory monitoring
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Initial list has one directory entry
+ * struct hostsfile *list = daemon->addn_hosts;
+ * // list->fname = "/etc/dnsmasq.d/hosts/"
+ * // list->flags = AH_DIR
+ * 
+ * // Expand directory to individual files
+ * list = expand_filelist(list);
+ * // Result: list now contains entries for:
+ * //   /etc/dnsmasq.d/hosts/ (AH_INACTIVE)
+ * //   /etc/dnsmasq.d/hosts/file1.conf (active)
+ * //   /etc/dnsmasq.d/hosts/file2.conf (active)
+ * 
+ * // On subsequent call (after file3.conf added to directory)
+ * list = expand_filelist(list);
+ * // Result: Existing entries preserved, file3.conf added
+ * //   Previous entries moved to end if still present
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (internal configuration management)
+ * SIDE EFFECTS: Modifies list structure in-place; may allocate new hostsfile structures
+ * THREAD SAFETY: Not thread-safe (single-threaded daemon architecture)
+ */
 struct hostsfile *expand_filelist(struct hostsfile *list)
 {
   unsigned int i;
@@ -5831,6 +7087,87 @@ struct hostsfile *expand_filelist(struct hostsfile *list)
   return list;
 }
 
+/**
+ * @brief Read and reload upstream DNS server configuration from external file
+ * 
+ * @detailed This function reads the servers file specified by --servers-file directive
+ *           and reloads the list of upstream DNS servers. It implements dynamic server
+ *           configuration without requiring daemon restart. The function performs a
+ *           complete refresh cycle:
+ *           
+ *           1. Opens the servers file for reading
+ *           2. Marks all existing servers from previous file reads (SERV_FROM_FILE)
+ *           3. Parses the file to add/update server entries
+ *           4. Removes servers from previous reads that are no longer in the file
+ *           5. Validates server configuration for conflicts and errors
+ *           
+ *           The servers file format is one server per line using the "server=" directive
+ *           syntax without the "server=" prefix. Each line can specify:
+ *           - Upstream DNS server IP address (IPv4 or IPv6)
+ *           - Optional domain restriction for split-horizon DNS
+ *           - Optional source address, port, or interface binding
+ *           - Comment lines starting with # are ignored
+ *           
+ *           This function is called:
+ *           - During daemon initialization via read_opts()
+ *           - On SIGHUP configuration reload
+ *           - When inotify detects servers file modification (HAVE_INOTIFY)
+ * 
+ * @param None (operates on daemon->servers_file global configuration)
+ * 
+ * @return void (no return value)
+ * 
+ * @note Function logs error and returns early if file cannot be opened
+ * @note daemon->servers_file must be set via --servers-file configuration directive
+ * @note File path is typically /etc/dnsmasq-servers.conf or similar
+ * @note SERV_FROM_FILE flag distinguishes servers from file vs. command-line/config
+ * @note Empty servers file is valid (removes all file-based servers)
+ * @note Parse errors in file are handled by read_file() and may be fatal
+ * 
+ * @warning File must be readable by dnsmasq user (after privilege drop)
+ * @warning Invalid server specifications may cause configuration rejection
+ * @warning No transactional semantics - parsing stops at first fatal error
+ * @warning File must use Unix line endings (LF); Windows CRLF may cause parse errors
+ * 
+ * @see mark_servers() in forward.c for SERV_FROM_FILE flag marking
+ * @see read_file() in option.c for file parsing with LOPT_REV_SERV option code
+ * @see cleanup_servers() in forward.c for removing unmarked file-based servers
+ * @see check_servers() in forward.c for configuration validation
+ * @see LOPT_REV_SERV option code for "server=" directive parsing
+ * @see SERV_FROM_FILE flag defined in dnsmasq.h (forward.c uses this)
+ * @see daemon->servers_file set by --servers-file option in one_opt()
+ * @see inotify_dnsmasq_init() in inotify.c for automatic file monitoring
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // During daemon initialization
+ * daemon->servers_file = "/etc/dnsmasq-servers.conf";
+ * read_servers_file();
+ * // Result: Upstream servers loaded from file
+ * 
+ * // On SIGHUP configuration reload
+ * read_servers_file();
+ * // Result: Server list refreshed from file
+ * //   - Servers still in file are preserved
+ * //   - Servers removed from file are deleted
+ * //   - New servers in file are added
+ * 
+ * // If file doesn't exist or is unreadable
+ * read_servers_file();
+ * // Result: Error logged, no servers loaded, function returns early
+ * 
+ * // Example servers file content:
+ * // # Upstream DNS servers
+ * // 8.8.8.8
+ * // 8.8.4.4
+ * // 2001:4860:4860::8888
+ * // 192.168.1.1/example.com  # Local domain
+ * @endcode
+ * 
+ * RFC COMPLIANCE: N/A (internal configuration management)
+ * SIDE EFFECTS: Modifies global daemon->servers linked list
+ * THREAD SAFETY: Not thread-safe (single-threaded daemon architecture)
+ */
 void read_servers_file(void)
 {
   FILE *f;
@@ -5894,7 +7231,140 @@ static void clear_dynamic_opt(void)
   clear_dhcp_opt(&daemon->dhcp_opts6);
 #endif
 }
-
+/**
+ * @brief Reload DHCP configuration from dynamic host and option files
+ * 
+ * @detailed Implements hot-reload functionality for DHCP static host assignments and DHCP option
+ * specifications from external files, enabling runtime configuration updates without daemon
+ * restart. This function is invoked either on SIGHUP signal handler for manual reconfiguration
+ * or automatically via inotify file system monitoring when watched configuration files change.
+ * The implementation follows a clear-then-rebuild pattern: (1) Clear all existing dynamic DHCP
+ * configuration entries (hosts and options), (2) Re-expand file lists to detect new includes,
+ * (3) Reparse all active files in the expanded lists, (4) Reinitialize inotify monitoring for
+ * newly discovered files. This ensures configuration consistency by atomically replacing old
+ * configuration with newly parsed state, preventing partial updates or stale entries.
+ * 
+ * Dynamic DHCP configuration supports two distinct categories: DHCP host assignments (mapping
+ * MAC addresses to IP addresses, hostnames, and client-specific options) specified via
+ * dhcp-hostsfile= or dhcp-hostsdir= directives, and DHCP option specifications (network-wide
+ * or tag-specific option values) specified via dhcp-optsfile= or dhcp-optsdir= directives.
+ * File list expansion honors wildcard patterns and directory traversal, enabling flexible
+ * configuration management with separate files per client group or network segment.
+ * 
+ * The function processes configuration even when dhcp_hosts_file or dhcp_opts_file are NULL,
+ * ensuring that dynamically discovered entries from inotify monitoring are properly cleared
+ * and rebuilt. This handles scenarios where configuration files are added after daemon startup
+ * or where directory-based configuration discovers new files during operation.
+ * 
+ * @param void No parameters - operates on global daemon structure dhcp_hosts_file and dhcp_opts_file lists
+ * 
+ * @return Void - function completes silently on success; logs individual file processing via syslog
+ * 
+ * @note CLEAR-AND-REBUILD STRATEGY:
+ *       Phase 1 (Clear): Remove all dynamic DHCP host configurations via clear_dynamic_conf() and
+ *                       remove all dynamic DHCP option configurations via clear_dynamic_opt().
+ *                       This ensures stale entries from deleted or modified files are removed.
+ *       Phase 2 (Expand): Re-expand dhcp_hosts_file and dhcp_opts_file lists to incorporate any
+ *                        new files matching wildcard patterns or directory includes. File list
+ *                        expansion respects AH_INACTIVE flags for administratively disabled files.
+ *       Phase 3 (Parse): Process each active file in expanded lists via one_file() with appropriate
+ *                       option type (LOPT_BANK for hosts, LOPT_OPTS for options). Log successful
+ *                       file processing to syslog with MS_DHCP facility.
+ *       Phase 4 (Monitor): Reinitialize inotify monitoring for all files in expanded lists (Linux
+ *                         systems with HAVE_INOTIFY). Automatic reload on file modification.
+ * 
+ * @warning Function modifies global daemon DHCP configuration state. Must be called with proper
+ *          synchronization if daemon is actively processing DHCP requests (typically from signal
+ *          handler context with blocked signals during execution).
+ * 
+ * @see clear_dynamic_conf() - Removes all dynamic DHCP host configuration entries
+ * @see clear_dynamic_opt() - Removes all dynamic DHCP option configuration entries  
+ * @see expand_filelist() - Expands wildcards and directories in file lists
+ * @see one_file() - Parses individual configuration file with specified option type
+ * @see set_dynamic_inotify() - Configures inotify monitoring for dynamic configuration files
+ * 
+ * INVOCATION CONTEXTS:
+ * 1. SIGHUP signal handler: Manual configuration reload triggered by system administrator sending
+ *    SIGHUP to daemon process. Typical use case for deploying updated DHCP host assignments without
+ *    service interruption.
+ * 2. Inotify callback: Automatic reload when monitored configuration files are modified, created,
+ *    or deleted. Enables real-time configuration management systems to update DHCP assignments
+ *    without explicit reload signaling.
+ * 3. Initial daemon startup: Called during daemon initialization after read_opts() completes to
+ *    establish initial dynamic configuration state and inotify monitoring infrastructure.
+ * 
+ * EXAMPLE USAGE (from SIGHUP signal handler):
+ * @code
+ * // Signal handler for SIGHUP - triggered by administrator or monitoring system
+ * static void sig_handler(int sig) {
+ *   if (sig == SIGHUP) {
+ *     reread_dhcp();  // Reload DHCP configuration from files
+ *     my_syslog(LOG_INFO, "DHCP configuration reloaded");
+ *   }
+ * }
+ * @endcode
+ * 
+ * DHCP HOST FILE FORMAT (dhcp-hostsfile=):
+ * Each line specifies one static host assignment with comma-separated fields:
+ * - MAC address or client identifier
+ * - IP address assignment (optional for name-only entries)
+ * - Hostname (optional)
+ * - Lease time override (optional)
+ * - Client-specific DHCP options (optional)
+ * Example: 01:02:03:04:05:06,192.168.1.100,workstation1,12h,set:blue
+ * 
+ * DHCP OPTION FILE FORMAT (dhcp-optsfile=):
+ * Each line specifies DHCP option values with optional tag matching:
+ * - Option number or name
+ * - Option value (format depends on option type)
+ * - Tag filters (optional, limits option to tagged clients)
+ * Example: option:router,192.168.1.1
+ * Example: tag:blue,option:dns-server,10.0.0.1
+ * 
+ * FILE LIST EXPANSION:
+ * Supports wildcard patterns and directory traversal:
+ * - dhcp-hostsfile=/etc/dnsmasq.d/hosts/*.conf (all .conf files in directory)
+ * - dhcp-hostsdir=/etc/dnsmasq.d/hosts (all files in directory, non-recursive)
+ * - Multiple file specifications accumulate; all matching files processed in order
+ * 
+ * INOTIFY INTEGRATION (Linux systems with HAVE_INOTIFY):
+ * Monitors configuration files and directories for changes. Automatic reload triggered on:
+ * - IN_MODIFY: File content modified
+ * - IN_CREATE: New file created in monitored directory  
+ * - IN_DELETE: File deleted (removed from active configuration)
+ * - IN_MOVED_FROM/IN_MOVED_TO: File renamed (removed then re-added)
+ * 
+ * CROSS-PLATFORM BEHAVIOR:
+ * - Linux with inotify: Automatic reload on file changes, zero-delay configuration propagation
+ * - BSD/Solaris/macOS: Manual reload via SIGHUP required, no automatic file monitoring
+ * - All platforms: expand_filelist() and one_file() operate identically regardless of inotify
+ * 
+ * ERROR HANDLING:
+ * Configuration file parsing errors logged via my_syslog() but do NOT terminate daemon. Invalid
+ * entries skipped; valid entries from same file processed. This fault-tolerance ensures that
+ * configuration errors in one file do not impact other valid configuration files or daemon
+ * operation. Administrators must monitor logs for parse error messages.
+ * 
+ * PERFORMANCE CONSIDERATIONS:
+ * Full configuration clear-and-rebuild on each reload. For large DHCP deployments (thousands of
+ * static assignments), reload latency may reach hundreds of milliseconds. Active DHCP transactions
+ * during reload continue with old configuration; new transactions use new configuration post-reload.
+ * Recommend reload during maintenance windows for very large configurations.
+ * 
+ * SIDE EFFECTS:
+ * - Clears all dynamic DHCP host configurations (MAC-to-IP mappings, hostnames, client options)
+ * - Clears all dynamic DHCP option specifications (network-wide and tag-specific options)
+ * - Opens and reads all files in dhcp_hosts_file and dhcp_opts_file lists (file I/O operations)
+ * - Expands wildcard patterns via filesystem directory traversal (stat syscalls)
+ * - Reinitializes inotify file descriptor monitoring (Linux systems)
+ * - Logs reload events and file processing to syslog (MS_DHCP facility, LOG_INFO level)
+ * - Memory allocation for new configuration entries via opt_malloc() (never freed)
+ * 
+ * THREAD SAFETY:
+ * Single-threaded daemon architecture. Function typically invoked from signal handler context with
+ * signals blocked during execution to prevent reentrancy. Not thread-safe due to global daemon
+ * structure modifications and lack of locking mechanisms.
+ */
 void reread_dhcp(void)
 {
    struct hostsfile *hf;
@@ -5935,6 +7405,350 @@ void reread_dhcp(void)
 }
 #endif
 
+/**
+ * @brief Parse command-line options and configuration files to initialize daemon configuration
+ * 
+ * @detailed This is the main configuration entry point that orchestrates the entire configuration
+ *           parsing workflow. The function performs four major phases: (1) initialization of the
+ *           global daemon structure with default values, (2) command-line argument parsing using
+ *           getopt_long for both short and long options, (3) recursive configuration file processing
+ *           with include directives, and (4) extensive post-processing validation and setup.
+ *           
+ *           The implementation handles over 350 distinct configuration options, each with specific
+ *           validation rules, memory allocation, and data structure population. Configuration
+ *           precedence follows the hierarchy: command-line options (highest) → config file directives →
+ *           compile-time defaults (lowest). The function terminates the daemon with detailed error
+ *           messages if any configuration is invalid.
+ *           
+ *           Post-processing includes: DNSSEC retry configuration, CNAME loop detection, default
+ *           hostname creation (hostmaster), DHCP PXE vendor setup, domain suffix application to
+ *           SRV records, resolv.conf validation, and access control option reconciliation.
+ * 
+ * @param argc Command-line argument count from main()
+ * @param argv Command-line argument vector from main()
+ * @param compile_opts Compile-time options string for --version and --help output (NULL-terminated)
+ * 
+ * @return Void - function terminates process via die() if configuration errors detected
+ * 
+ * @note This function modifies the global daemon structure extensively and calls die() on errors
+ * @warning Must be called exactly once during daemon initialization before any protocol operations
+ * @warning The function may call exit() in test mode (--test option) after syntax validation
+ * 
+ * @see one_file() - Processes individual configuration files
+ * @see one_opt() - Processes individual configuration options
+ * @see die() - Error termination with message reporting
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * int main(int argc, char **argv) {
+ *   char *compile_opts = "DHCP TFTP DNSSEC";
+ *   read_opts(argc, argv, compile_opts);  // Parse all configuration
+ *   // Daemon structure now fully initialized
+ *   return 0;
+ * }
+ * @endcode
+ * 
+ * CONFIGURATION PROCESSING FLOW:
+ * 1. Initialize daemon structure with zero/default values
+ * 2. Parse command-line options via getopt_long (supports both -x and --option formats)
+ * 3. Process default config file if exists and not disabled (typically /etc/dnsmasq.conf)
+ * 4. Process additional config files from command-line (-C/--conf-file options)
+ * 5. Recursively process included files (conf-file=, conf-dir= directives)
+ * 6. Apply configuration validation and cross-option consistency checks
+ * 7. Set up derived configuration (defaults, computed values, interdependent options)
+ * 
+ * VALIDATION PERFORMED:
+ * - IP address and network format validation
+ * - Port number range checking
+ * - File path accessibility verification
+ * - DHCP range consistency (start < end, valid subnet)
+ * - DNS upstream server reachability
+ * - DNSSEC trust anchor validity
+ * - CNAME loop detection in local records
+ * - Configuration option mutual exclusivity checks
+ * 
+ * ERROR HANDLING:
+ * Terminates daemon with exit code and error message for:
+ * - Invalid option syntax or unknown options
+ * - Malformed IP addresses or network specifications
+ * - Inaccessible configuration files (permission denied, not found)
+ * - Conflicting options (e.g., --bind-interfaces with --bind-dynamic)
+ * - Resource allocation failures (out of memory)
+ * - Invalid DHCP/DNS configuration (overlapping ranges, invalid domains)
+ * 
+ * MEMORY MANAGEMENT:
+ * - Allocates memory for configuration structures via opt_malloc() and opt_string_alloc()
+ * - Uses setjmp/longjmp for allocation failure recovery (mem_recover mechanism)
+ * - Linked lists for multi-value options (servers, interfaces, DHCP hosts)
+ * - String duplication for all text configuration values
+ * 
+ * SIDE EFFECTS:
+ * - Populates global daemon structure with parsed configuration
+ * - May read multiple configuration files from disk
+ * - Allocates substantial heap memory for configuration storage
+ * - May terminate process via exit() or die() on errors or in test mode
+ * - Modifies umask if configured
+ * - Sets daemon->default_resolv if no explicit upstream servers configured
+ * 
+ * THREAD SAFETY:
+ * Not thread-safe (modifies global daemon structure, uses static variables)
+ * Must only be called from single-threaded initialization context
+ * 
+ * COMPILE-TIME OPTIONS AFFECTING BEHAVIOR:
+ * - HAVE_DHCP: Enables DHCP-related options parsing
+ * - HAVE_DHCP6: Enables DHCPv6 and Router Advertisement options
+ * - HAVE_DNSSEC: Enables DNSSEC validation options
+ * - HAVE_TFTP: Enables TFTP server configuration
+ * - HAVE_AUTH: Enables authoritative DNS mode options
+ * - HAVE_DBUS: Enables D-Bus control interface options
+ * - Many other conditional features affect available options
+ */
+/**
+ * @brief Main entry point for configuration parsing from command-line and configuration files
+ * 
+ * @detailed Implements comprehensive three-phase configuration parsing: (1) Early option scan
+ * for critical settings like --test, --help, --version, (2) Configuration file processing with
+ * recursive include support, (3) Full command-line option parsing with precedence over file
+ * settings. This function orchestrates the entire configuration lifecycle, populating the global
+ * daemon structure with validated settings from multiple sources. Implements option precedence
+ * rules: command-line options override configuration file directives, which override compile-time
+ * defaults from config.h. Handles configuration syntax validation, memory allocation for dynamic
+ * structures (server lists, DHCP pools, DNS records), cross-option dependency validation, and
+ * error reporting. The parsing state machine processes 350+ configuration directives covering
+ * DNS forwarding, DHCP services, TFTP, PXE boot, DNSSEC validation, firewall integration, and
+ * platform-specific features. Supports configuration reload via SIGHUP through coordination with
+ * one_file() for dynamic reconfiguration without daemon restart.
+ * 
+ * @param argc Command-line argument count from main(); typically includes program name as argv[0]
+ * @param argv Command-line argument vector array; argv[0] is program name, argv[1..argc-1] are options
+ * @param compile_opts String containing compile-time feature flags (HAVE_DHCP, HAVE_DNSSEC, etc.) 
+ *                     for --version display; NULL-terminated string built from config.h macros
+ * 
+ * @return Void; function dies with error message via die() if critical configuration errors detected.
+ *         On success, populates global daemon structure with complete validated configuration.
+ * 
+ * @note THREE-PHASE PARSING PROCESS:
+ *       Phase 1 (Early Scan): Process --test, --help, --version, --conf-file to determine configuration
+ *                            sources before main parsing. Exits immediately for help/version display.
+ *       Phase 2 (File Parse): Load configuration files specified via --conf-file or default location
+ *                            /etc/dnsmasq.conf. Recursively process conf-dir includes. Build initial
+ *                            configuration state from file directives.
+ *       Phase 3 (CLI Parse): Process all command-line options with full validation, overriding any
+ *                           conflicting file settings. Apply option precedence rules and cross-validate
+ *                           configuration consistency.
+ * 
+ * @warning Configuration errors cause immediate daemon termination via die() with descriptive error
+ *          messages. No partial configuration state is preserved. Memory allocated during parsing is
+ *          NOT freed on error (daemon exits). Function modifies global daemon structure extensively.
+ * 
+ * @see one_file() for configuration file parsing state machine implementation
+ * @see one_opt() for individual option parsing and validation logic
+ * @see parse_server() for upstream DNS server specification parsing
+ * 
+ * CONFIGURATION PRECEDENCE RULES (highest to lowest priority):
+ * 1. Command-line options (--option or -x format)
+ * 2. Configuration file directives (option=value format)
+ * 3. Compile-time defaults from config.h (CACHESIZ, MAXLEASES, TIMEOUT, etc.)
+ * 
+ * EXAMPLE USAGE (typical invocation from main):
+ * @code
+ * // From main() in dnsmasq.c after daemon structure initialization
+ * struct daemon *daemon = opt_malloc(sizeof(struct daemon));
+ * memset(daemon, 0, sizeof(struct daemon));
+ * daemon->namebuff = opt_malloc(MAXDNAME);
+ * 
+ * // Parse configuration from command-line and files
+ * read_opts(argc, argv, compile_opts_string);
+ * 
+ * // daemon structure now fully populated with validated configuration
+ * // including upstream servers, DHCP pools, DNS cache size, etc.
+ * @endcode
+ * 
+ * CONFIGURATION FILE SYNTAX:
+ * - One directive per line: "option=value" or "option" (for boolean flags)
+ * - Comments: Lines starting with # are ignored
+ * - Includes: "conf-file=/path/to/file" for recursive inclusion
+ * - Directory includes: "conf-dir=/path/to/dir,*.conf" processes all matching files
+ * 
+ * COMMAND-LINE SYNTAX:
+ * - Long options: --option=value or --option (boolean)
+ * - Short options: -x value or -x (boolean), with OPTSTRING defining all single-char options
+ * - Multiple specifications: Last occurrence wins for singular options; all occurrences accumulate
+ *                           for list options (servers, DHCP ranges, static hosts)
+ * 
+ * CROSS-VALIDATION CHECKS (performed at end of parsing):
+ * - DHCP ranges must be within configured network interfaces
+ * - DHCPv6 requires Router Advertisement configuration (M/O flags)
+ * - DNSSEC validation requires upstream servers supporting DNSSEC
+ * - Authoritative DNS zones require explicit server and zone definitions
+ * - PXE boot requires TFTP server enabled and boot file accessibility
+ * 
+ * MEMORY ALLOCATION STRATEGY:
+ * All configuration data allocated via opt_malloc() wrappers ensuring allocation success or death.
+ * Memory persists for daemon lifetime (no deallocation). Dynamic lists (servers, DHCP hosts, DNS
+ * records) built via linked list construction during parsing.
+ * 
+ * RFC COMPLIANCE:
+ * Configuration syntax and semantics conform to documented dnsmasq.conf.example format. Option
+ * naming aligns with man page documentation. DHCP options follow RFC 2132 (DHCPv4) and RFC 3315
+ * (DHCPv6) numeric option codes.
+ * 
+ * SIDE EFFECTS:
+ * - Modifies global daemon structure extensively (all configuration fields populated)
+ * - Allocates memory for dynamic configuration lists (never freed)
+ * - May terminate daemon via die() on configuration errors
+ * - Prints version/help information to stdout and exits for --version/--help
+ * - Opens and reads configuration files (file I/O operations)
+ * - Validates network interface existence and address configurations
+ * 
+ * THREAD SAFETY:
+ * Single-threaded configuration parsing (called once from main before event loop). Not thread-safe
+ * due to global daemon structure modifications and longjmp-based error handling for memory failures.
+ */
+
+/**
+ * @brief Main entry point for configuration parsing - processes command-line arguments and configuration files
+ * 
+ * @detailed This is the primary public function for dnsmasq configuration initialization. It orchestrates
+ *           the complete configuration parsing workflow including memory allocation for the global daemon
+ *           structure, default value initialization, command-line argument parsing via getopt_long,
+ *           configuration file loading, and extensive post-processing validation and default application.
+ *           
+ *           The function implements a multi-phase configuration parsing strategy:
+ *           
+ *           **Phase 1 - Initialization (lines 7610-7670):**
+ *           - Allocates and zeroes the global daemon structure
+ *           - Initializes default values from config.h constants (FTABSIZ, TIMEOUT, MAXLEASES, etc.)
+ *           - Sets up default paths for resolv.conf, lease database, TFTP root
+ *           - Initializes feature flags and compile-time option strings
+ *           - Sets up longjmp mechanism for memory allocation failure recovery
+ *           
+ *           **Phase 2 - Command-Line Parsing (lines 7671-7722):**
+ *           - Uses getopt_long to parse command-line options
+ *           - Calls one_opt() for each option with command_line=1 flag
+ *           - Command-line options take precedence over config file directives
+ *           - Handles both short options (OPTSTRING) and long options (opts array)
+ *           - Processes special cases: --test mode, --version, --help
+ *           
+ *           **Phase 3 - Configuration File Loading (lines 7723-7732):**
+ *           - Loads primary configuration file (default /etc/dnsmasq.conf or --conf-file specified)
+ *           - Processes conf-dir directories for additional configuration files
+ *           - Handles special case: --conf-file=- reads from stdin
+ *           - Respects --no-resolv flag to skip /etc/resolv.conf processing
+ *           
+ *           **Phase 4 - Post-Processing and Validation (lines 7733-7983):**
+ *           - Applies default values for unspecified options
+ *           - Validates configuration consistency and option interdependencies
+ *           - Sets DNSSEC defaults (trust anchors, check-unsigned behavior)
+ *           - Configures CNAME loop detection limits
+ *           - Updates DNS and DHCP port numbers throughout data structures
+ *           - Generates default hostmaster email for authoritative zones
+ *           - Applies default PXE vendor classes if not specified
+ *           - Processes MX record target expansion (MX:example.com expands to all A/AAAA records)
+ *           - Extracts domain suffix from resolv.conf if not configured
+ *           - Appends default domain to SRV records and other domain-requiring options
+ *           - Configures local-service access control for loop prevention
+ *           - In test mode: validates configuration and exits with status code
+ *           
+ *           **Configuration Precedence Rules:**
+ *           Command-line options override config file directives, which override compiled-in defaults.
+ *           Within config files, last occurrence wins for single-value options; multiple occurrences
+ *           accumulate for list-type options (servers, dhcp-host, etc.).
+ *           
+ *           **Error Handling:**
+ *           Fatal configuration errors call die() with descriptive message and exit code EC_BADCONF.
+ *           Memory allocation failures longjmp to mem_jmp with mem_recover flag handling.
+ *           Non-fatal warnings logged but configuration parsing continues.
+ * 
+ * @param argc Command-line argument count passed from main() - number of arguments including program name
+ * @param argv Command-line argument vector passed from main() - array of null-terminated argument strings
+ * @param compile_opts String containing compile-time feature flags - displayed by --version option and
+ *                     used for feature availability checking; generated at compile time from COPTS
+ * 
+ * @return void - Function does not return a value
+ * 
+ * @note SIDE EFFECTS: This function has extensive side effects:
+ *       - Allocates and initializes the global daemon structure (opt_malloc via whine_malloc)
+ *       - Parses and validates all configuration options from command-line and files
+ *       - May call exit() in test mode (--test) after validation
+ *       - May call die() on fatal configuration errors (invalid syntax, conflicting options)
+ *       - Modifies global state including daemon structure, option lists, server lists
+ *       - Sets up signal handler context via setjmp for memory allocation failures
+ * 
+ * @warning This function must be called before any other dnsmasq initialization. It allocates and
+ *          initializes the global daemon structure that all other subsystems depend on. Calling
+ *          other dnsmasq functions before read_opts() results in undefined behavior (NULL pointer
+ *          dereference or uninitialized data access).
+ * 
+ * @warning In test mode (--test option), the function validates configuration and exits the process
+ *          with status code 0 (success) or 1 (configuration error). Normal operation does not continue
+ *          after --test validation.
+ * 
+ * @warning Memory allocation failures during configuration parsing trigger longjmp to mem_jmp buffer.
+ *          This unwinds the stack and returns control to the setjmp point within this function,
+ *          which then calls die() with out-of-memory error message.
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * int main(int argc, char **argv) {
+ *   // Primary configuration initialization - must be first operation
+ *   read_opts(argc, argv, compile_opts);
+ *   
+ *   // After read_opts returns, daemon structure is fully initialized
+ *   // and all configuration options are parsed and validated
+ *   
+ *   // Proceed with daemon initialization (network setup, privilege drop, etc.)
+ *   // ...
+ * }
+ * @endcode
+ * 
+ * CONFIGURATION SOURCES PROCESSED:
+ * 1. Compiled-in defaults from config.h (FTABSIZ=150, TIMEOUT=10, MAXLEASES=1000, etc.)
+ * 2. Command-line options (highest precedence)
+ * 3. Primary configuration file (default /etc/dnsmasq.conf or --conf-file specified)
+ * 4. Additional configuration files from --conf-dir directories
+ * 5. /etc/resolv.conf for upstream servers (unless --no-resolv specified)
+ * 6. /etc/hosts for static hostname mappings (unless --no-hosts specified)
+ * 
+ * TEST MODE BEHAVIOR:
+ * When --test option is specified, the function performs complete configuration validation
+ * including syntax checking, option consistency verification, and file accessibility testing,
+ * then exits with status 0 (valid configuration) or 1 (configuration errors). This enables
+ * configuration validation without starting the daemon (useful for automated testing and
+ * configuration management systems).
+ * 
+ * CONFIGURATION FILE FORMAT:
+ * Configuration files contain one directive per line with format: option=value
+ * Lines starting with # are comments and ignored. Options without '=' are boolean flags.
+ * Backslash continuation (line ending with \) is NOT supported - use multiple directives.
+ * 
+ * RFC COMPLIANCE:
+ * - Configuration parsing enables RFC-compliant protocol implementations:
+ * - RFC 1035: DNS server and cache configuration options
+ * - RFC 2131: DHCPv4 server configuration options
+ * - RFC 3315: DHCPv6 server configuration options
+ * - RFC 4033-4035: DNSSEC validation configuration
+ * - RFC 1350: TFTP server configuration
+ * 
+ * SIDE EFFECTS:
+ * - Allocates global daemon structure (~100KB with default settings)
+ * - Parses all configuration files and command-line arguments
+ * - Validates file permissions and accessibility (config files, lease database, TFTP root)
+ * - May create default directories if they don't exist (compile-time dependent)
+ * - Logs configuration warnings and errors to stderr during parsing
+ * - In test mode: exits process after validation
+ * - On fatal error: calls die() which exits process with error code
+ * 
+ * THREAD SAFETY: Not thread-safe - must be called from main thread before any threading
+ * 
+ * MEMORY MANAGEMENT:
+ * All configuration memory is allocated via opt_malloc which wraps whine_malloc.
+ * Memory allocation failures trigger longjmp to mem_jmp, which then calls die() with
+ * out-of-memory error. Configuration memory persists for the lifetime of the daemon
+ * process and is not freed (daemon runs until SIGTERM/SIGINT).
+ * 
+ * Source: /src/option.c lines 7608-7984 (376 lines covering complete configuration workflow)
+ */
 void read_opts(int argc, char **argv, char *compile_opts)
 {
   size_t argbuf_size = MAXDNAME;

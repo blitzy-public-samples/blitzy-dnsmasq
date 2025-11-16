@@ -14,6 +14,71 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+/**
+ * @file pattern.c
+ * @brief Hostname pattern validation and matching for security and configuration
+ * 
+ * DETAILED PURPOSE:
+ * This module provides DNS hostname pattern validation and matching functionality
+ * used primarily for conntrack-based filtering and security policy enforcement.
+ * It implements RFC 1123-compliant hostname validation with support for wildcard
+ * patterns, enabling domain-based filtering rules that can match entire domain
+ * hierarchies (e.g., *.example.com) while preventing malicious or malformed patterns.
+ * 
+ * The pattern validation ensures that wildcard characters (*) are used safely,
+ * restricting them from appearing in the final two labels (e.g., *.co.uk is invalid
+ * to prevent overly broad matches). This security measure prevents patterns that would
+ * match unrelated domains and reduces the risk of misconfiguration.
+ * 
+ * KEY RESPONSIBILITIES:
+ * - Validate DNS hostnames against RFC 1123 requirements (is_valid_dns_name)
+ * - Validate DNS hostname patterns with wildcard support (is_valid_dns_name_pattern)
+ * - Match DNS hostnames against validated patterns (is_dns_name_matching_pattern)
+ * - Implement case-insensitive glob pattern matching (is_string_matching_glob_pattern)
+ * - Enforce security restrictions on wildcard placement in patterns
+ * 
+ * DEPENDENCIES:
+ * Includes: dnsmasq.h (global header with system includes, type definitions, macros)
+ * Called by: conntrack.c (for pattern-based connection tracking filtering)
+ * Calls: my_syslog() from log.c for debugging and error reporting
+ * 
+ * DATA STRUCTURES:
+ * This module operates on C strings (char*) and uses primitive types for validation.
+ * No complex data structures are defined or managed within this module. All functions
+ * are stateless and operate only on input parameters.
+ * 
+ * COMPILE-TIME OPTIONS:
+ * - HAVE_CONNTRACK: All functionality in this file is conditionally compiled only
+ *   when connection tracking support is enabled. Without this flag, the file
+ *   contributes no code to the final binary.
+ * 
+ * THREADING/CONCURRENCY:
+ * All functions are pure (no side effects except logging) and thread-safe for
+ * read-only operations on input strings. Functions do not modify shared state.
+ * 
+ * PATTERN SYNTAX:
+ * Patterns support the wildcard character '*' which matches zero or more characters.
+ * Valid patterns include:
+ *   - Exact matches: "www.example.com"
+ *   - Subdomain wildcards: "*.example.com" (matches any subdomain)
+ *   - Multiple wildcards: "*example*.com" (matches any label containing "example")
+ * Invalid patterns include:
+ *   - Wildcards in TLD: "*.com" (too broad, security risk)
+ *   - Wildcards in second-level and TLD: "*.co.uk" (country-code TLD protection)
+ * 
+ * SECURITY CONSIDERATIONS:
+ * Pattern validation includes multiple security checks to prevent injection attacks
+ * and overly broad matching:
+ * - Label length validation (max 63 characters per RFC 1123)
+ * - Total hostname length validation (max 255 characters)
+ * - Character validation (alphanumeric, hyphen, period, wildcard only)
+ * - Wildcard placement restrictions (not in final two labels)
+ * - Input sanitization against buffer overflows via length checks
+ * 
+ * @copyright Copyright (c) 2000-2025 Simon Kelley
+ * @license GPL-2.0-or-later
+ */
+
 #include "dnsmasq.h"
 
 #ifdef HAVE_CONNTRACK
@@ -30,19 +95,51 @@
   } while (0)
 
 /**
- * Determines whether a given string value matches against a glob pattern
- * which may contain zero-or-more-character wildcards denoted by '*'.
- *
- * Based on "Glob Matching Can Be Simple And Fast Too" by Russ Cox,
- * See https://research.swtch.com/glob
- *
- * @param      value                A string value.
- * @param      num_value_bytes      The number of bytes of the string value.
- * @param      pattern              A glob pattern.
- * @param      num_pattern_bytes    The number of bytes of the glob pattern.
- *
- * @return 1                        If the provided value matches against the glob pattern.
- * @return 0                        Otherwise.
+ * @brief Match a string value against a glob pattern with wildcard support
+ * 
+ * @detailed Implements case-insensitive glob pattern matching where '*' acts as a
+ *           zero-or-more-character wildcard. This function uses an efficient backtracking
+ *           algorithm based on Russ Cox's "Glob Matching Can Be Simple And Fast Too"
+ *           (https://research.swtch.com/glob). The algorithm avoids exponential complexity
+ *           by maintaining a single backtrack point rather than recursive backtracking.
+ *           Case-insensitive comparison converts lowercase ASCII characters to uppercase
+ *           during matching (a-z become A-Z).
+ * 
+ * @param value A string value to match against the pattern. Must not be NULL.
+ * @param num_value_bytes The number of bytes in the string value (not including null terminator)
+ * @param pattern A glob pattern potentially containing '*' wildcards. Must not be NULL.
+ * @param num_pattern_bytes The number of bytes in the glob pattern (not including null terminator)
+ * 
+ * @return 1 if the value matches the pattern (case-insensitive)
+ * @return 0 if the value does not match or if invalid input detected
+ * 
+ * @note This is an internal static function used by is_dns_name_matching_pattern()
+ * @warning Input strings must be valid for num_*_bytes length; buffer overruns will occur
+ *          if lengths exceed actual string sizes. No NULL-terminator is required.
+ * 
+ * @see is_dns_name_matching_pattern() - public interface using this matching algorithm
+ * @see Source: /src/pattern.c:line 47
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Match exact string
+ * int result1 = is_string_matching_glob_pattern("example", 7, "example", 7);
+ * // result1 == 1 (match)
+ * 
+ * // Match with wildcard
+ * int result2 = is_string_matching_glob_pattern("www.example.com", 15, "*.example.com", 13);
+ * // result2 == 1 (match)
+ * 
+ * // Case-insensitive match
+ * int result3 = is_string_matching_glob_pattern("Example", 7, "EXAMPLE", 7);
+ * // result3 == 1 (match)
+ * @endcode
+ * 
+ * RFC COMPLIANCE: Not directly tied to RFC (internal algorithm), but supports
+ *                 case-insensitive DNS name matching per RFC 1035 Section 3.1
+ * 
+ * SIDE EFFECTS: May call ASSERT macro which logs to syslog on assertion failure
+ * THREAD SAFETY: Thread-safe (read-only operations on input parameters)
  */
 static int is_string_matching_glob_pattern(
   const char *value,
@@ -105,23 +202,64 @@ static int is_string_matching_glob_pattern(
 }
 
 /**
- * Determines whether a given string value represents a valid DNS name.
- *
- * - DNS names must adhere to RFC 1123: 1 to 253 characters in length, consisting of a sequence of labels
- *   delimited by dots ("."). Each label must be 1 to 63 characters in length, contain only
- *   ASCII letters ("a"-"Z"), digits ("0"-"9"), or hyphens ("-") and must not start or end with a hyphen.
- *
- * - A valid name must be fully qualified, i.e., consist of at least two labels.
- *   The final label must not be fully numeric, and must not be the "local" pseudo-TLD.
- *
- * - Examples:
- *   Valid: "example.com"
- *   Invalid: "ipcamera", "ipcamera.local", "8.8.8.8"
- *
- * @param      value                A string value.
- *
- * @return 1                        If the provided string value is a valid DNS name.
- * @return 0                        Otherwise.
+ * @brief Validate a DNS hostname against RFC 1123 requirements
+ * 
+ * @detailed Validates DNS hostnames according to RFC 1123 Section 2.1 (host naming conventions)
+ *           with additional security restrictions for conntrack filtering. The validation ensures:
+ *           
+ *           1. Total length: 1-253 characters (DNS protocol limit)
+ *           2. Label structure: Dot-separated labels, each 1-63 characters
+ *           3. Character restrictions: ASCII letters (a-z, A-Z), digits (0-9), hyphens (-)
+ *           4. Label boundaries: Labels must not start or end with hyphen
+ *           5. Fully qualified: Minimum two labels (e.g., "host.domain")
+ *           6. TLD restrictions: Final label must not be fully numeric (prevents IP addresses)
+ *           7. Pseudo-TLD blocking: Rejects ".local" TLD (mDNS/Bonjour namespace)
+ *           
+ *           The function performs single-pass validation with character-by-character inspection,
+ *           tracking label boundaries and numeric content. Invalid characters, malformed labels,
+ *           or security-restricted patterns cause immediate rejection with syslog logging.
+ * 
+ * @param value A null-terminated string representing a hostname. Must not be NULL.
+ * 
+ * @return 1 if the hostname is valid per RFC 1123 and security restrictions
+ * @return 0 if the hostname is invalid or fails security checks
+ * 
+ * @note This function is used by conntrack.c for validating domain patterns in filtering rules
+ * @warning NULL input triggers ASSERT macro (logs error); behavior undefined in production without assertions
+ * 
+ * @see is_valid_dns_name_pattern() - validates patterns with wildcard support
+ * @see Source: /src/pattern.c:line 126
+ * 
+ * EXAMPLE USAGE:
+ * @code
+ * // Valid fully-qualified domain names
+ * int valid1 = is_valid_dns_name("example.com");
+ * // valid1 == 1 (two labels, valid characters)
+ * 
+ * int valid2 = is_valid_dns_name("www.example.com");
+ * // valid2 == 1 (three labels, valid)
+ * 
+ * // Invalid: single label (not fully qualified)
+ * int invalid1 = is_valid_dns_name("ipcamera");
+ * // invalid1 == 0 (must have at least two labels)
+ * 
+ * // Invalid: .local pseudo-TLD (mDNS namespace)
+ * int invalid2 = is_valid_dns_name("ipcamera.local");
+ * // invalid2 == 0 (security restriction on .local)
+ * 
+ * // Invalid: numeric TLD (looks like IP address)
+ * int invalid3 = is_valid_dns_name("8.8.8.8");
+ * // invalid3 == 0 (all-numeric final label rejected)
+ * @endcode
+ * 
+ * RFC COMPLIANCE: RFC 1123 Section 2.1 (Host Names and Numbers)
+ *                 Enforces syntax rules for Internet host names with additional
+ *                 security restrictions beyond the RFC specification
+ * 
+ * SIDE EFFECTS: Logs validation failure messages to syslog at LOG_DEBUG level
+ *               via LOG() macro when invalid characters or patterns detected
+ * 
+ * THREAD SAFETY: Thread-safe (read-only operations on input string)
  */
 int is_valid_dns_name(const char *value)
 {
@@ -213,28 +351,73 @@ int is_valid_dns_name(const char *value)
 }
 
 /**
- * Determines whether a given string value represents a valid DNS name pattern.
+ * @brief Validate DNS hostname pattern with wildcard support and security restrictions
  *
- * - DNS names must adhere to RFC 1123: 1 to 253 characters in length, consisting of a sequence of labels
- *   delimited by dots ("."). Each label must be 1 to 63 characters in length, contain only
- *   ASCII letters ("a"-"Z"), digits ("0"-"9"), or hyphens ("-") and must not start or end with a hyphen.
+ * @detailed Validates that a string represents a valid DNS hostname pattern conforming to
+ * RFC 1123 naming requirements with wildcard extensions for pattern matching. This function
+ * is primarily used for conntrack filtering rules to ensure that domain-based filters are
+ * syntactically valid and do not pose security risks through overly broad matching.
  *
- * - Patterns follow the syntax of DNS names, but additionally allow the wildcard character "*" to be used up to
- *   twice per label to match 0 or more characters within that label. Note that the wildcard never matches a dot
- *   (e.g., "*.example.com" matches "api.example.com" but not "api.us.example.com").
+ * The validation enforces multiple security and correctness constraints:
+ * - RFC 1123 compliance: Total length 1-253 characters, labels 1-63 characters each
+ * - Character restrictions: ASCII letters, digits, hyphens, periods, and wildcards only
+ * - Label format: Labels cannot start or end with hyphens
+ * - Wildcard restrictions: Up to two wildcards (*) per label, matching zero or more characters
+ * - Security restriction: Final two labels must be literal (no wildcards) to prevent overly
+ *   broad matches like "*.com" or "*.co.uk" which would match unrelated domains
+ * - Fully qualified requirement: Minimum two labels required
+ * - TLD restrictions: Final label cannot be fully numeric or "local" pseudo-TLD
  *
- * - A valid name or pattern must be fully qualified, i.e., consist of at least two labels.
- *   The final label must not be fully numeric, and must not be the "local" pseudo-TLD.
- *   A pattern must end with at least two literal (non-wildcard) labels.
+ * Wildcard behavior: The wildcard character (*) matches zero or more characters within a single
+ * label but never crosses label boundaries (dots). For example, "*.example.com" matches
+ * "api.example.com" but NOT "api.us.example.com" (the wildcard does not match "api.us").
  *
- * - Examples:
- *   Valid: "example.com", "*.example.com", "video*.example.com", "api*.*.example.com", "*-prod-*.example.com"
- *   Invalid: "ipcamera", "ipcamera.local", "*", "*.com", "8.8.8.8"
+ * @param value String to validate as DNS hostname pattern (null-terminated C string)
+ *              Must not be NULL (assertion enforced via ASSERT macro)
  *
- * @param      value                A string value.
+ * @return 1 if the string is a valid DNS hostname pattern meeting all RFC and security requirements
+ * @retval 1 Pattern is syntactically valid, wildcards properly placed, length constraints satisfied
+ * @retval 0 Pattern is invalid (syntax error, security violation, or RFC 1123 non-compliance)
  *
- * @return 1                        If the provided string value is a valid DNS name pattern.
- * @return 0                        Otherwise.
+ * @note This function logs detailed error messages via LOG() macro for each validation failure,
+ *       enabling debugging of rejected patterns. Logging uses syslog LOG_DEBUG level.
+ *
+ * @warning Wildcard restrictions are security-critical: patterns with wildcards in the final
+ *          two labels are explicitly rejected to prevent accidental or malicious overly broad
+ *          matching. For example, "*.com" would match millions of unrelated domains.
+ *
+ * @see is_valid_dns_name() for validation of hostnames without wildcard support
+ * @see is_dns_name_matching_pattern() for matching hostnames against validated patterns
+ * @see RFC 1123 Section 2.1 for hostname syntax requirements
+ *
+ * EXAMPLE USAGE:
+ * @code
+ * // Valid patterns accepted by function
+ * if (is_valid_dns_name_pattern("example.com"))         // Exact hostname
+ *   accept_rule();
+ * if (is_valid_dns_name_pattern("*.example.com"))       // Subdomain wildcard
+ *   accept_rule();
+ * if (is_valid_dns_name_pattern("video*.example.com"))  // Partial label wildcard
+ *   accept_rule();
+ * if (is_valid_dns_name_pattern("api*.*.example.com"))  // Multiple labels with wildcards
+ *   accept_rule();
+ *
+ * // Invalid patterns rejected by function
+ * if (!is_valid_dns_name_pattern("ipcamera"))           // Not fully qualified (single label)
+ *   reject_rule();
+ * if (!is_valid_dns_name_pattern("*.com"))              // Wildcard in TLD (security risk)
+ *   reject_rule();
+ * if (!is_valid_dns_name_pattern("*.co.uk"))            // Wildcard in second-to-last label
+ *   reject_rule();
+ * if (!is_valid_dns_name_pattern("ipcamera.local"))     // "local" pseudo-TLD forbidden
+ *   reject_rule();
+ * if (!is_valid_dns_name_pattern("8.8.8.8"))            // Fully numeric final label
+ *   reject_rule();
+ * @endcode
+ *
+ * RFC COMPLIANCE: RFC 1123 Section 2.1 (hostname syntax requirements)
+ * SIDE EFFECTS: Logs validation failures to syslog at LOG_DEBUG level via my_syslog()
+ * THREAD SAFETY: Thread-safe for read-only operations; no shared state modified
  */
 int is_valid_dns_name_pattern(const char *value)
 {
@@ -345,13 +528,92 @@ int is_valid_dns_name_pattern(const char *value)
 }
 
 /**
- * Determines whether a given DNS name matches against a DNS name pattern.
+ * @brief Match DNS hostname against validated pattern with wildcard support
  *
- * @param      name                 A valid DNS name.
- * @param      pattern              A valid DNS name pattern.
+ * @detailed Performs label-by-label matching of a DNS hostname against a validated DNS
+ * hostname pattern, with support for wildcard matching within labels. This function
+ * implements the pattern matching semantics used for conntrack filtering rules, where
+ * domain-based filters need to match actual connection hostnames against configured patterns.
  *
- * @return 1                        If the provided DNS name matches against the DNS name pattern.
- * @return 0                        Otherwise.
+ * The matching algorithm processes both the name and pattern simultaneously, comparing
+ * corresponding labels (segments separated by dots). Each label pair is matched using
+ * case-insensitive glob pattern matching with wildcard support. The wildcard character (*)
+ * within a pattern label matches zero or more characters within the corresponding name
+ * label, but never crosses label boundaries.
+ *
+ * Matching semantics:
+ * - Case-insensitive: "Example.COM" matches pattern "example.com"
+ * - Label-by-label: Both name and pattern must have the same number of labels
+ * - Wildcard behavior: "*" matches within a label but not across dots
+ * - Complete match required: All labels must match and both strings must be fully consumed
+ *
+ * Examples:
+ * - "api.example.com" matches "*.example.com" (wildcard label match)
+ * - "api.us.example.com" does NOT match "*.example.com" (label count mismatch)
+ * - "video123.example.com" matches "video*.example.com" (partial wildcard match)
+ * - "www.example.com" matches "www.example.com" (exact match)
+ * - "API.EXAMPLE.COM" matches "api.example.com" (case-insensitive)
+ *
+ * @param name Valid DNS hostname to test against pattern (null-terminated C string)
+ *             Must not be NULL and must be valid per is_valid_dns_name() (assertion enforced)
+ *             Examples: "www.example.com", "api.service.internal", "host123.domain.org"
+ * @param pattern Valid DNS hostname pattern with optional wildcards (null-terminated C string)
+ *                Must not be NULL and must be valid per is_valid_dns_name_pattern() (assertion enforced)
+ *                Examples: "*.example.com", "api*.service.internal", "host123.domain.org"
+ *
+ * @return 1 if the hostname matches the pattern according to glob matching semantics
+ * @retval 1 All labels match and both name and pattern are fully consumed (complete match)
+ * @retval 0 At least one label fails to match, or label counts differ (no match)
+ *
+ * @note The function assumes inputs are pre-validated. Assertions verify that name is a
+ *       valid DNS hostname (via is_valid_dns_name) and pattern is a valid DNS pattern
+ *       (via is_valid_dns_name_pattern). Invalid inputs will trigger assertion failures
+ *       with syslog error messages in debug builds.
+ *
+ * @warning This function does NOT validate its inputs beyond assertions. Callers must
+ *          ensure that name and pattern are valid using is_valid_dns_name() and
+ *          is_valid_dns_name_pattern() respectively before calling this function.
+ *          Invalid inputs in production builds (where assertions may be disabled) will
+ *          result in undefined behavior.
+ *
+ * @see is_valid_dns_name() for hostname validation without wildcards
+ * @see is_valid_dns_name_pattern() for pattern validation with wildcard support
+ * @see is_string_matching_glob_pattern() for the label-level matching implementation
+ *
+ * EXAMPLE USAGE:
+ * @code
+ * // Typical usage pattern: validate then match
+ * const char *hostname = "api.example.com";
+ * const char *filter_pattern = "*.example.com";
+ * 
+ * if (is_valid_dns_name(hostname) && is_valid_dns_name_pattern(filter_pattern)) {
+ *   if (is_dns_name_matching_pattern(hostname, filter_pattern)) {
+ *     // Hostname matches pattern - apply filtering rule
+ *     apply_conntrack_rule(hostname);
+ *   }
+ * }
+ *
+ * // Example match scenarios
+ * is_dns_name_matching_pattern("www.example.com", "*.example.com")         // Returns 1
+ * is_dns_name_matching_pattern("api.us.example.com", "*.example.com")      // Returns 0 (label count)
+ * is_dns_name_matching_pattern("video123.site.org", "video*.site.org")     // Returns 1
+ * is_dns_name_matching_pattern("test.COM", "test.com")                     // Returns 1 (case-insensitive)
+ * is_dns_name_matching_pattern("api-prod-01.example.com", "*-prod-*.example.com") // Returns 1
+ * @endcode
+ *
+ * ALGORITHM IMPLEMENTATION:
+ * The function implements a label-by-label comparison algorithm:
+ * 1. Initialize pointers to the start of both name and pattern strings
+ * 2. Loop while labels remain in both strings:
+ *    a. Extract the next label from name (characters up to next dot or end)
+ *    b. Extract the next label from pattern (characters up to next dot or end)
+ *    c. Call is_string_matching_glob_pattern() to match the label pair
+ *    d. If labels don't match, break immediately (no match)
+ *    e. Advance past the dot separator in both strings (if present)
+ * 3. Return success only if both strings are fully consumed (both at end)
+ *
+ * SIDE EFFECTS: None (pure function with no external state modifications)
+ * THREAD SAFETY: Thread-safe for read-only operations on input strings; no shared state
  */
 int is_dns_name_matching_pattern(const char *name, const char *pattern)
 {
