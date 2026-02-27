@@ -17,6 +17,9 @@ pub mod v6;
 #[cfg(feature = "dhcp6")]
 pub mod radv;
 
+// DHCP lease persistence, DNS hostname registration, and expiration management
+pub mod lease;
+
 // Privilege-separated script helper process
 #[cfg(feature = "script")]
 pub mod helper;
