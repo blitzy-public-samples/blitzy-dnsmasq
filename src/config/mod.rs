@@ -5,5 +5,7 @@
 //!
 //! # Submodules
 //! - [`constants`] — Numeric constants (cache sizes, timeouts, limits, file paths)
+//! - [`feature_flags`] — Cargo feature flag integration, detection, and reporting
 
 pub mod constants;
+pub mod feature_flags;
