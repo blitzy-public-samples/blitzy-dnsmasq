@@ -1,0 +1,7 @@
+# Cross-compilation profiles for dnsmasq Rust build
+
+[target.x86_64-unknown-linux-gnu]
+# Native compilation on x86-64 Linux
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
