@@ -15,6 +15,9 @@
 #[cfg(feature = "conntrack")]
 pub mod conntrack;
 
+#[cfg(feature = "inotify_monitor")]
+pub mod inotify;
+
 #[cfg(feature = "ipset")]
 pub mod ipset;
 
