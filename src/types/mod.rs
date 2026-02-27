@@ -12,6 +12,10 @@
 //! - `ipv6` — IPv6 address classification helpers
 
 pub mod addr;
+pub mod ipv6;
 
 // Re-export commonly used address types for ergonomic imports.
 pub use addr::{AllAddr, CnameTarget, SocketAddress, RR_IMDATALEN};
+
+// Re-export IPv6 extension trait for ergonomic imports.
+pub use ipv6::Ipv6AddrExt;
