@@ -15,6 +15,9 @@
 #[cfg(feature = "conntrack")]
 pub mod conntrack;
 
+#[cfg(feature = "netlink")]
+pub mod netlink;
+
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
 
