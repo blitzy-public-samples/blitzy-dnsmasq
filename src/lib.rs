@@ -6,6 +6,7 @@ pub mod core;
 pub mod dns;
 pub mod types;
 pub mod net;
+#[cfg(feature = "dump")]
 pub mod debug;
 
 #[cfg(any(feature = "dhcp", feature = "dhcp6"))]

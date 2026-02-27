@@ -28,6 +28,7 @@
 
 use std::env;
 use std::fs;
+use std::path::Path;
 
 /// Fallback version string used when the VERSION file is missing or contains
 /// a git archive placeholder (e.g., `$Format:%d$`). This matches the version
@@ -301,7 +302,7 @@ fn detect_conntrack_library(target_os: &str) {
     }
 }
 
-/// Emit direct link directives for OpenWrt UBus libraries.
+/// Detect and conditionally link OpenWrt UBus libraries.
 ///
 /// Replaces C Makefile line 57:
 ///   ubus_libs = `echo $(COPTS) | $(top)/bld/pkg-wrapper HAVE_UBUS "" --copy '-lubox -lubus'`
@@ -309,6 +310,20 @@ fn detect_conntrack_library(target_os: &str) {
 /// UBus does not have pkg-config support — the C Makefile uses direct -l flags.
 /// This is OpenWrt-specific, running on Linux. The libraries libubus and libubox
 /// must be installed in the system library path or specified via LIBRARY_PATH.
+///
+/// Unlike the C Makefile which unconditionally emits `-lubus -lubox`, this function
+/// first checks whether the libraries are actually installed on the build system.
+/// This prevents linker failures on non-OpenWrt Linux systems (e.g., standard
+/// Debian/Ubuntu, Fedora, CI environments) where libubus and libubox are unavailable.
+///
+/// When the libraries are found:
+///   - Emits `cargo:rustc-link-lib=ubus` and `cargo:rustc-link-lib=ubox`
+///   - Emits `cargo:rustc-cfg=has_ubus_libs` for conditional FFI compilation
+///
+/// When the libraries are NOT found:
+///   - Emits a warning explaining UBus integration requires the libraries
+///   - The `ubus` Cargo feature remains enabled (code compiles) but no native
+///     library linking occurs, allowing the module to serve as a compile-only stub
 fn detect_ubus_library(target_os: &str) {
     // Only emit link directives if the "ubus" feature is enabled in Cargo.toml
     if env::var_os("CARGO_FEATURE_UBUS").is_none() {
@@ -325,12 +340,106 @@ fn detect_ubus_library(target_os: &str) {
         return;
     }
 
-    // No pkg-config for ubus — directly emit link instructions matching the
-    // C Makefile's `-lubox -lubus` flags.
-    println!("cargo:rustc-link-lib=ubus");
-    println!("cargo:rustc-link-lib=ubox");
+    // No pkg-config for ubus — check whether the libraries are actually installed
+    // before emitting link directives. This prevents linker failures on non-OpenWrt
+    // systems where libubus/libubox are unavailable.
+    let ubus_found = find_native_library("ubus");
+    let ubox_found = find_native_library("ubox");
 
-    println!("cargo:warning=UBus feature enabled: linking against libubus and libubox");
+    if ubus_found && ubox_found {
+        // Libraries found — emit link directives matching the C Makefile's
+        // `-lubox -lubus` flags, plus a cfg flag for conditional FFI code.
+        println!("cargo:rustc-link-lib=ubus");
+        println!("cargo:rustc-link-lib=ubox");
+        println!("cargo:rustc-cfg=has_ubus_libs");
+        println!("cargo:warning=UBus feature enabled: linking against libubus and libubox");
+    } else {
+        // Libraries not found — emit a warning but do not fail the build.
+        // The ubus module will compile (feature-gated code is syntactically valid)
+        // but no native library linking will occur. Actual FFI calls in the ubus
+        // module should be gated behind `#[cfg(has_ubus_libs)]` to prevent
+        // unresolved symbol errors.
+        println!(
+            "cargo:warning=UBus feature enabled but libubus/libubox not found in system \
+             library paths. UBus module will compile without native library backing. \
+             Install libubus-dev and libubox-dev for full UBus support on OpenWrt."
+        );
+    }
+}
+
+// ============================================================================
+// NATIVE LIBRARY SEARCH UTILITIES
+// ============================================================================
+
+/// Search standard system library directories for a native shared or static library.
+///
+/// This function is used for library detection when pkg-config is not available
+/// (e.g., UBus libraries on OpenWrt). It searches the following locations in order:
+///
+/// 1. Directories listed in the `LIBRARY_PATH` environment variable (user/toolchain override)
+/// 2. Standard system library paths: `/usr/lib`, `/usr/local/lib`
+/// 3. Architecture-specific multilib directories matching the Cargo target architecture
+///    (e.g., `/usr/lib/x86_64-linux-gnu` for Debian/Ubuntu x86-64 multilib layout,
+///    `/usr/lib64` for Red Hat/Fedora x86-64 layout)
+///
+/// Returns `true` if `lib{name}.so` or `lib{name}.a` is found in any search path.
+///
+/// # Arguments
+///
+/// * `name` - The library name without the `lib` prefix or file extension
+///   (e.g., `"ubus"` to search for `libubus.so` or `libubus.a`)
+fn find_native_library(name: &str) -> bool {
+    let mut search_dirs: Vec<String> = Vec::new();
+
+    // 1. Check LIBRARY_PATH environment variable — this allows users and
+    //    cross-compilation toolchains to specify custom library locations.
+    if let Ok(library_path) = env::var("LIBRARY_PATH") {
+        for dir in library_path.split(':') {
+            if !dir.is_empty() {
+                search_dirs.push(dir.to_string());
+            }
+        }
+    }
+
+    // 2. Standard Linux system library paths
+    search_dirs.push("/usr/lib".to_string());
+    search_dirs.push("/usr/local/lib".to_string());
+
+    // 3. Architecture-specific multilib directories based on the Cargo target.
+    //    Debian/Ubuntu use /usr/lib/<triplet>, Red Hat/Fedora use /usr/lib64.
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    match target_arch.as_str() {
+        "x86_64" => {
+            search_dirs.push("/usr/lib/x86_64-linux-gnu".to_string());
+            search_dirs.push("/usr/lib64".to_string());
+        }
+        "aarch64" => {
+            search_dirs.push("/usr/lib/aarch64-linux-gnu".to_string());
+            search_dirs.push("/usr/lib64".to_string());
+        }
+        "arm" => {
+            search_dirs.push("/usr/lib/arm-linux-gnueabihf".to_string());
+            search_dirs.push("/usr/lib/arm-linux-gnueabi".to_string());
+        }
+        "mips" | "mipsel" => {
+            search_dirs.push("/usr/lib/mips-linux-gnu".to_string());
+            search_dirs.push("/usr/lib/mipsel-linux-gnu".to_string());
+        }
+        _ => {
+            // For unrecognized architectures, rely on the standard paths above.
+        }
+    }
+
+    // Search each directory for the shared (.so) or static (.a) library file
+    for dir in &search_dirs {
+        let so_path = format!("{}/lib{}.so", dir, name);
+        let a_path = format!("{}/lib{}.a", dir, name);
+        if Path::new(&so_path).exists() || Path::new(&a_path).exists() {
+            return true;
+        }
+    }
+
+    false
 }
 
 // ============================================================================
