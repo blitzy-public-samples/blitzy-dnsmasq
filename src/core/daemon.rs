@@ -498,6 +498,49 @@ pub struct DnsConfig {
     /// List of RR types to filter from responses. C: `daemon->filter_rr`
     /// Used by RrFilterMode::Config to strip specified record types.
     pub filter_rr: Vec<u16>,
+
+    // -- Authoritative DNS zone fields (C daemon->auth_zones, etc.) ----------
+
+    /// Authoritative zones list. C: `daemon->auth_zones`.
+    #[cfg(feature = "auth")]
+    pub auth_zones: Vec<crate::types::dns::AuthZone>,
+
+    /// Interface names for DNS resolution (`--interface-name`). C: `daemon->int_names`.
+    pub int_names: Vec<crate::types::network::InterfaceName>,
+
+    /// MX and SRV records (`--mx-host`, `--srv-host`). C: `daemon->mxnames`.
+    pub mxnames: Vec<crate::types::dns::MxSrvRecord>,
+
+    /// TXT records (`--txt-record`). C: `daemon->txt`.
+    pub txt: Vec<crate::types::dns::TxtRecord>,
+
+    /// Custom RR records (`--dns-rr`). C: `daemon->rr`.
+    pub rr: Vec<crate::types::dns::TxtRecord>,
+
+    /// NAPTR records (`--naptr-record`). C: `daemon->naptr`.
+    #[cfg(feature = "auth")]
+    pub naptr: Vec<crate::dns::auth::NaptrRecord>,
+
+    /// CNAME aliases (`--cname`). C: `daemon->cnames`.
+    pub cnames: Vec<crate::types::dns::CnameRecord>,
+
+    /// Host records (`--host-record`). C: `daemon->host_records`.
+    pub host_records: Vec<crate::types::dns::HostRecord>,
+
+    /// Synthetic domain configurations. C: `daemon->synth_domains`.
+    pub synth_domains: Vec<crate::dns::domain::ConditionalDomain>,
+
+    /// AXFR peer ACL list. C: `daemon->auth_peers`.
+    #[cfg(feature = "auth")]
+    pub auth_peers: Vec<crate::dns::auth::AuthPeer>,
+
+    /// Whether an auth interface is configured. C: `daemon->authinterface`.
+    #[cfg(feature = "auth")]
+    pub authinterface: bool,
+
+    /// Secondary forward server list for NS record delegation. C: `daemon->secondary_forward_server`.
+    #[cfg(feature = "auth")]
+    pub secondary_forward_server: Vec<crate::dns::auth::SecondaryServer>,
 }
 
 impl Default for DnsConfig {
@@ -542,6 +585,23 @@ impl Default for DnsConfig {
             dbus_name: None,
             ubus_name: None,
             filter_rr: Vec::new(),
+            #[cfg(feature = "auth")]
+            auth_zones: Vec::new(),
+            int_names: Vec::new(),
+            mxnames: Vec::new(),
+            txt: Vec::new(),
+            rr: Vec::new(),
+            #[cfg(feature = "auth")]
+            naptr: Vec::new(),
+            cnames: Vec::new(),
+            host_records: Vec::new(),
+            synth_domains: Vec::new(),
+            #[cfg(feature = "auth")]
+            auth_peers: Vec::new(),
+            #[cfg(feature = "auth")]
+            authinterface: false,
+            #[cfg(feature = "auth")]
+            secondary_forward_server: Vec::new(),
         }
     }
 }
