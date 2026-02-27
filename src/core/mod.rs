@@ -3,6 +3,7 @@
 // Contains the event loop, signal handling, logging, utilities, metrics, and daemon
 // state management that form the foundation of the dnsmasq runtime.
 
+pub mod daemon;
 pub mod metrics;
 pub mod logging;
 pub mod signal;
