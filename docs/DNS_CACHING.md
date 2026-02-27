@@ -35,11 +35,11 @@ The dnsmasq DNS cache provides a high-performance caching layer between downstre
 - AAAA (IPv6 address) - RFC 3596
 - CNAME (canonical name) - RFC 1035
 - PTR (reverse lookup) - RFC 1035
-- DNSKEY (DNSSEC public key) - RFC 4034 (when HAVE_DNSSEC enabled)
-- DS (delegation signer) - RFC 4034 (when HAVE_DNSSEC enabled)
+- DNSKEY (DNSSEC public key) - RFC 4034 (when Cargo feature "dnssec" enabled)
+- DS (delegation signer) - RFC 4034 (when Cargo feature "dnssec" enabled)
 - Other standard DNS record types
 
-**Source Code Location:** `/src/cache.c` (primary implementation), `/src/dnsmasq.h` (data structures)
+**Source Code Location:** `/src/dns/cache.rs` (primary implementation), `/src/types/dns.rs` (data structures)
 
 ---
 
@@ -60,15 +60,15 @@ graph TB
     end
     
     subgraph "Hash Chain 0"
-        C01["crec"] --> C02["crec"] --> C03["crec"]
+        C01["CacheEntry"] --> C02["CacheEntry"] --> C03["CacheEntry"]
     end
     
     subgraph "Hash Chain 1"
-        C11["crec"]
+        C11["CacheEntry"]
     end
     
     subgraph "Hash Chain 2"
-        C21["crec"] --> C22["crec"]
+        C21["CacheEntry"] --> C22["CacheEntry"]
     end
     
     H0 --> C01
@@ -77,8 +77,8 @@ graph TB
     
     subgraph "LRU Linked List"
         Head["cache_head"] --> LRU1["Most Recently Used"]
-        LRU1 --> LRU2["crec"]
-        LRU2 --> LRU3["crec"]
+        LRU1 --> LRU2["CacheEntry"]
+        LRU2 --> LRU3["CacheEntry"]
         LRU3 --> LRUn["Least Recently Used"]
         LRUn --> Tail["cache_tail"]
     end
@@ -90,21 +90,26 @@ graph TB
     style Tail fill:#fff4e1
 ```
 
-**Key Components** (Source: `/src/cache.c` lines 19-26):
+**Key Components** (Source: `/src/dns/cache.rs`):
 
-```c
-static struct crec *cache_head = NULL, *cache_tail = NULL, **hash_table = NULL;
-static int hash_size;
+```rust
+// In the Rust implementation, the cache uses HashMap + VecDeque for LRU
+// rather than intrusive linked lists with raw pointers.
+struct DnsCache {
+    hash_table: HashMap<DnsName, Vec<CacheEntry>>,
+    lru_order: VecDeque<CacheEntryRef>,
+    hash_size: usize,
+}
 ```
 
-- **`hash_table`**: Dynamic array of pointers to cache record chains
+- **`hash_table`**: `HashMap`-based storage of cache record chains (replaces raw pointer array)
 - **`hash_size`**: Current hash table size (always a power of 2)
-- **`cache_head`**: Head of LRU doubly-linked list (most recently used)
-- **`cache_tail`**: Tail of LRU doubly-linked list (least recently used)
+- **`cache_head`**: Head of LRU list — most recently used (managed by `VecDeque`)
+- **`cache_tail`**: Tail of LRU list — least recently used (managed by `VecDeque`)
 
 ### Hash Function Implementation
 
-The hash function (`cache_hash`, source: `/src/cache.c` lines 194-232) distributes cache records across hash buckets using the domain name and record type as input:
+The hash function (`DnsCache::hash()`, source: `/src/dns/cache.rs`) distributes cache records across hash buckets using the domain name and record type as input:
 
 **Algorithm:**
 1. Initialize hash value with record type
@@ -115,12 +120,12 @@ The hash function (`cache_hash`, source: `/src/cache.c` lines 194-232) distribut
 3. Apply modulo hash_size to determine bucket index
 
 **Collision Handling:**
-- **Separate Chaining**: Each hash bucket points to a linked list of records
-- **`hash_next` Pointer**: Links records within the same bucket (source: `struct crec` in `/src/dnsmasq.h`)
+- **Separate Chaining**: Each hash bucket contains a `Vec` of records (replacing intrusive linked lists with standard `HashMap` chaining)
+- **Bucket Storage**: Records within the same bucket are managed by the `HashMap` (source: `CacheEntry` in `/src/types/dns.rs`)
 
 ### Dynamic Rehashing
 
-The hash table is dynamically resized when the cache grows to maintain performance (source: `/src/cache.c` lines 419-451, function `rehash`):
+The hash table is dynamically resized when the cache grows to maintain performance (source: `/src/dns/cache.rs`, `DnsCache::rehash()`):
 
 **Rehash Trigger:**
 - Initial allocation when first cache record inserted
@@ -134,39 +139,42 @@ The hash table is dynamically resized when the cache grows to maintain performan
    - Remove from old bucket chain
    - Recompute hash with new table size
    - Insert into new bucket chain
-4. Free old hash table array
+4. Drop old hash table (Rust ownership handles deallocation automatically)
 
 **Memory Allocation:**
-- First allocation: `safe_malloc` (aborts on failure - critical for initial cache)
-- Growth: `whine_malloc` (logs warning on failure, continues with current size)
+- Rust ownership model manages all cache memory automatically
+- First allocation: standard `HashMap::new()` (panics on OOM — critical for initial cache)
+- Growth: standard `HashMap` resize (logs warning on failure, continues with current size)
 
-**Source Code Reference:**
-```c
-/* hash_size is a power of two. */
-for (new_size = 64; new_size < size/10; new_size = new_size << 1);
+**Source Code Reference** (rehash sizing algorithm in `/src/dns/cache.rs`):
+```rust
+// hash_size is a power of two.
+let mut new_size = 64usize;
+while new_size < size / 10 {
+    new_size <<= 1;
+}
 ```
 
 ---
 
 ## Cache Record Structure
 
-### struct crec Definition
+### CacheEntry Definition
 
-The fundamental cache record structure `struct crec` is defined in `/src/dnsmasq.h` and contains:
+The fundamental cache record structure `CacheEntry` is defined in `/src/types/dns.rs` and contains:
 
 **Core Fields:**
-- **`union all_addr addr`**: IP address or CNAME target (union for memory efficiency)
-- **`time_t ttd`**: Time-to-die (absolute expiration timestamp)
-- **`unsigned int uid`**: Unique identifier for cache coherency
-- **`unsigned short flags`**: Record type and status flags
-- **`char *name`**: Domain name (union bigname for long names)
+- **`addr: AllAddr`**: IP address or CNAME target (Rust enum replacing C union for type safety)
+- **`ttd: SystemTime`**: Time-to-die (absolute expiration timestamp)
+- **`uid: u32`**: Unique identifier for cache coherency
+- **`flags: CacheFlags`**: Record type and status flags (bitflags)
+- **`name: DnsName`**: Domain name (heap-allocated `Vec<u8>` newtype)
 
-**Linkage Pointers:**
-- **`struct crec *next`**: LRU doubly-linked list forward pointer
-- **`struct crec *prev`**: LRU doubly-linked list backward pointer
-- **`struct crec *hash_next`**: Hash bucket chain forward pointer
+**Linkage:**
+- LRU ordering managed by `VecDeque` in `DnsCache` (replaces intrusive doubly-linked list pointers)
+- Hash bucket membership managed by `HashMap` (replaces intrusive `hash_next` pointer)
 
-**Flag Values** (source: `/src/dnsmasq.h`):
+**Flag Values** (source: `/src/types/dns.rs`):
 - `F_IMMORTAL`: Never expire (e.g., /etc/hosts entries)
 - `F_CONFIG`: From configuration file
 - `F_REVERSE`: PTR record
@@ -184,8 +192,8 @@ The fundamental cache record structure `struct crec` is defined in `/src/dnsmasq
 
 **Memory Layout:**
 - Approximate size: 100-200 bytes per record (varies by platform and name length)
-- Short names stored inline in `union bigname`
-- Long names allocated separately from shared free list
+- Names stored as `DnsName` (heap-allocated `Vec<u8>` newtype)
+- Rust ownership model handles all memory automatically (no manual free lists)
 
 ---
 
@@ -193,31 +201,31 @@ The fundamental cache record structure `struct crec` is defined in `/src/dnsmasq
 
 ```mermaid
 flowchart TD
-    Start([DNS Query Received]) --> Lookup[cache_find_by_name/addr]
+    Start([DNS Query Received]) --> Lookup[DnsCache::find_by_name/addr]
     Lookup --> Found{Cache Hit?}
     
     Found -->|Yes| Expired{Expired?}
-    Expired -->|No| MoveHead[Move to cache_head<br/>LRU update]
+    Expired -->|No| MoveHead[Move to LRU head<br/>LRU update]
     MoveHead --> Return1([Return Cached Response])
     
-    Expired -->|Yes| Remove[cache_free<br/>Remove from cache]
+    Expired -->|Yes| Remove[Remove from cache<br/>Rust ownership drops entry]
     Remove --> QueryUpstream
     
     Found -->|No| QueryUpstream[Forward to Upstream DNS]
     QueryUpstream --> GetResponse[Receive DNS Response]
-    GetResponse --> StartInsert[cache_start_insert]
-    StartInsert --> BuildRecord[Build crec Structure]
-    BuildRecord --> EndInsert[cache_end_insert]
+    GetResponse --> StartInsert[DnsCache::start_insert]
+    StartInsert --> BuildRecord[Build CacheEntry]
+    BuildRecord --> EndInsert[DnsCache::end_insert]
     
     EndInsert --> CheckFull{Cache Full?}
-    CheckFull -->|Yes| Evict[cache_scan_free<br/>LRU Eviction]
+    CheckFull -->|Yes| Evict[DnsCache::scan_free<br/>LRU Eviction]
     Evict --> Insert
-    CheckFull -->|No| Insert[really_insert<br/>Hash & Link]
+    CheckFull -->|No| Insert[DnsCache::insert<br/>Hash & Link]
     
-    Insert --> Hash[cache_hash<br/>Add to hash bucket]
-    Hash --> LinkHead[cache_link<br/>Add to LRU head]
+    Insert --> Hash[DnsCache::hash<br/>Add to hash bucket]
+    Hash --> LinkHead[Add to LRU head]
     LinkHead --> Rehash{Need Rehash?}
-    Rehash -->|Yes| Resize[rehash<br/>Resize hash table]
+    Rehash -->|Yes| Resize[DnsCache::rehash<br/>Resize hash table]
     Resize --> Return2
     Rehash -->|No| Return2([Return to Client])
     
@@ -229,78 +237,73 @@ flowchart TD
 
 ### Cache Lookup Operations
 
-**Forward Lookup** (`cache_find_by_name`, source: `/src/cache.c` lines 530-629):
+**Forward Lookup** (`DnsCache::find_by_name()`, source: `/src/dns/cache.rs`):
 1. Compute hash value for domain name and record type
 2. Walk hash bucket chain comparing name and flags
 3. If found:
-   - Check expiration via `is_expired(now, crecp)`
-   - If expired: remove from cache, return NULL
-   - If valid: move to LRU head (via `cache_link`), return record
-4. If not found: return NULL
+   - Check expiration via `CacheEntry::is_expired()`
+   - If expired: remove from cache, return `None`
+   - If valid: move to LRU head, return `Some(entry)`
+4. If not found: return `None`
 
-**Reverse Lookup** (`cache_find_by_addr`, source: `/src/cache.c` lines 631-704):
+**Reverse Lookup** (`DnsCache::find_by_addr()`, source: `/src/dns/cache.rs`):
 - Similar algorithm using IP address for hash
 - Supports both IPv4 (IN-ADDR.ARPA) and IPv6 (IP6.ARPA) reverse zones
 
-**Expiration Check** (`is_expired`, source: `/src/cache.c` lines 149-152):
-```c
-static int is_expired(time_t now, struct crec *crecp)
-{
-  return (!(crecp->flags & (F_IMMORTAL | F_DHCP))) && 
-         (difftime(crecp->ttd, now) <= 0);
+**Expiration Check** (`CacheEntry::is_expired()`, source: `/src/dns/cache.rs`):
+```rust
+/// Check whether a cache entry has expired.
+/// Immortal and DHCP entries never expire.
+fn is_expired(&self, now: SystemTime) -> bool {
+    !self.flags.intersects(CacheFlags::IMMORTAL | CacheFlags::DHCP)
+        && self.ttd <= now
 }
 ```
 
 **LRU Update on Hit:**
-- Record moved to `cache_head` (most recently used position)
-- Previous head's `prev` pointer updated
-- Record's `next` and `prev` pointers updated
+- Record moved to LRU head (most recently used position)
+- In the Rust implementation, LRU reordering is managed by `VecDeque` (replacing intrusive doubly-linked list pointers)
 - Constant-time O(1) operation
 
 ### Cache Insertion Operations
 
 **Two-Phase Insertion:**
 
-**Phase 1: Start Insertion** (`cache_start_insert`, source: `/src/cache.c` lines 1556-1607):
-- Resets global `insert_error` flag
+**Phase 1: Start Insertion** (`DnsCache::start_insert()`, source: `/src/dns/cache.rs`):
+- Resets `insert_error` flag
 - Initializes `new_chain` list for pending insertions
 - Returns immediately (no blocking)
 
-**Phase 2: End Insertion** (`cache_end_insert`, source: `/src/cache.c` lines 1645-1708):
+**Phase 2: End Insertion** (`DnsCache::end_insert()`, source: `/src/dns/cache.rs`):
 1. Process all records in `new_chain`
 2. For each record:
-   - Call `really_insert` to add to cache
+   - Call `DnsCache::insert()` to add to cache
    - Check for allocation failures (sets `insert_error`)
-3. If successful: call `rehash` if needed
-4. Reset `new_chain` to NULL
-5. Increment `METRIC_DNS_CACHE_INSERTED` metric (source: line 1708)
+3. If successful: call `DnsCache::rehash()` if needed
+4. Clear `new_chain`
+5. Increment `METRIC_DNS_CACHE_INSERTED` metric
 
-**Core Insertion** (`really_insert`, source: `/src/cache.c` lines 1360-1510):
+**Core Insertion** (`DnsCache::insert()`, source: `/src/dns/cache.rs`):
 1. Check cache capacity:
-   - If full: call `cache_scan_free` to evict LRU entry
-2. Allocate `struct crec`:
-   - Try to reuse from free list
-   - If none available: call `whine_malloc`
-3. Populate crec fields:
-   - Copy name (allocate from bigname pool if needed)
-   - Set TTL: `crecp->ttd = now + (time_t)ttl`
+   - If full: call `DnsCache::scan_free()` to evict LRU entry
+2. Create `CacheEntry`:
+   - Rust ownership model handles allocation automatically
+3. Populate `CacheEntry` fields:
+   - Clone name into `DnsName`
+   - Set TTL: `entry.ttd = now + Duration::from_secs(ttl)`
    - Set flags (record type, IPv4/IPv6, etc.)
    - Copy address data
-4. Call `cache_hash` to add to hash bucket
-5. Call `cache_link` to add to LRU head
-6. Return pointer to new record
+4. Insert into `HashMap` (replaces manual hash bucket linking)
+5. Push to front of LRU `VecDeque`
+6. Return reference to new record
 
-**Source Code Reference** (`cache_link`, lines 154-184):
-```c
-static void cache_link(struct crec *crecp)
-{
-  crecp->next = cache_head;
-  if (cache_head)
-    cache_head->prev = crecp;
-  cache_head = crecp;
-  crecp->prev = NULL;
-  if (!cache_tail)
-    cache_tail = crecp;
+**Source Code Reference** (LRU link operation in `/src/dns/cache.rs`):
+```rust
+/// Add a cache entry to the head of the LRU list (most recently used position).
+/// In the Rust implementation, this is managed by VecDeque rather than
+/// intrusive linked list pointers.
+fn cache_link(&mut self, entry_ref: CacheEntryRef) {
+    self.lru_order.push_front(entry_ref);
 }
 ```
 
@@ -322,24 +325,23 @@ The cache maintains a **doubly-linked list ordered by access recency**:
 ```mermaid
 stateDiagram-v2
     [*] --> CacheNotFull: New Record
-    CacheNotFull --> AllocateCREC: Space Available
-    AllocateCREC --> InsertHead: Link to cache_head
+    CacheNotFull --> AllocateCacheEntry: Space Available
+    AllocateCacheEntry --> InsertHead: Add to LRU head
     InsertHead --> [*]: Insertion Complete
     
     [*] --> CacheFull: New Record
     CacheFull --> FindLRU: Cache at Capacity
-    FindLRU --> CheckImmortal: Examine cache_tail
+    FindLRU --> CheckImmortal: Examine LRU tail
     
     CheckImmortal --> ScanForward{Immortal/DHCP?}
     ScanForward -->|Yes| NextRecord: Skip This Record
     NextRecord --> ScanForward
     
     ScanForward -->|No| Evict: Found Evictable
-    Evict --> UnlinkLRU: Remove from LRU list
-    UnlinkLRU --> UnhashEntry: Remove from hash bucket
-    UnhashEntry --> FreeMemory: Free name/addr storage
-    FreeMemory --> RecycleCREC: Add to free list
-    RecycleCREC --> AllocateCREC
+    Evict --> UnlinkLRU: Remove from LRU VecDeque
+    UnlinkLRU --> UnhashEntry: Remove from HashMap
+    UnhashEntry --> DropEntry: Rust ownership drops entry
+    DropEntry --> AllocateCacheEntry
     
     state "No Evictable Records" as NoEvict
     ScanForward -->|Scanned All| NoEvict: Cache Full of Immortals
@@ -348,19 +350,19 @@ stateDiagram-v2
 
 ### Eviction Process
 
-**Function:** `cache_scan_free` (source: `/src/cache.c` lines 233-293)
+**Function:** `DnsCache::scan_free()` (source: `/src/dns/cache.rs`)
 
 **Algorithm:**
-1. Start at `cache_tail` (least recently used)
+1. Start at LRU tail (least recently used, back of `VecDeque`)
 2. Walk LRU list forward until evictable record found:
    - **Skip** records with `F_IMMORTAL` flag (e.g., /etc/hosts)
    - **Skip** records with `F_DHCP` flag (DHCP leases managed separately)
    - **Prefer** records closer to tail (older access time)
 3. When evictable record found:
-   - Call `cache_unlink` to remove from LRU list
-   - Remove from hash bucket chain
-   - Call `cache_free` to release memory
-4. Increment `METRIC_DNS_CACHE_LIVE_FREED` metric (source: line 1579 in `cache_free`)
+   - Remove from LRU `VecDeque`
+   - Remove from `HashMap` bucket
+   - Rust ownership automatically deallocates the `CacheEntry`
+4. Increment `METRIC_DNS_CACHE_LIVE_FREED` metric
 
 **Eviction Priorities:**
 1. Expired records (checked first during lookup)
@@ -370,22 +372,18 @@ stateDiagram-v2
 
 **Edge Case Handling:**
 - If entire cache consists of immortal/DHCP records: insertion fails gracefully
-- DHCP records use separate free list (`dhcp_spare`) for recycling
+- DHCP records managed separately (protected from LRU eviction)
 - Negative cache entries evicted with same priority as positive responses
 
-**Source Code Reference** (`cache_unlink`, lines 186-192):
-```c
-static void cache_unlink (struct crec *crecp)
-{
-  if (crecp->prev)
-    crecp->prev->next = crecp->next;
-  else
-    cache_head = crecp->next;
-  
-  if (crecp->next)
-    crecp->next->prev = crecp->prev;
-  else
-    cache_tail = crecp->prev;
+**Source Code Reference** (LRU unlink operation in `/src/dns/cache.rs`):
+```rust
+/// Remove a cache entry from the LRU list.
+/// In the Rust implementation, VecDeque handles unlinking automatically
+/// when an element is removed by index.
+fn cache_unlink(&mut self, entry_ref: &CacheEntryRef) {
+    if let Some(pos) = self.lru_order.iter().position(|r| r == entry_ref) {
+        self.lru_order.remove(pos);
+    }
 }
 ```
 
@@ -396,13 +394,13 @@ static void cache_unlink (struct crec *crecp)
 ### TTL Storage and Expiration
 
 **Time-to-Die (TTD) Model:**
-- Cache stores **absolute expiration timestamp** in `crecp->ttd` (source: `struct crec` in `dnsmasq.h`)
-- Calculated at insertion: `ttd = now + ttl` (source: `/src/cache.c` line 1453)
-- Uses `time_t` (Unix timestamp) for efficient comparison
+- Cache stores **absolute expiration timestamp** in `entry.ttd` (source: `CacheEntry` in `/src/types/dns.rs`)
+- Calculated at insertion: `ttd = now + Duration::from_secs(ttl)` (source: `/src/dns/cache.rs`)
+- Uses `SystemTime` for efficient comparison
 
 **Expiration Checking:**
-- Every cache lookup calls `is_expired(now, crecp)` (source: lines 149-152)
-- Comparison: `difftime(crecp->ttd, now) <= 0`
+- Every cache lookup calls `CacheEntry::is_expired()` (source: `/src/dns/cache.rs`)
+- Comparison: `self.ttd <= now`
 - Expired records immediately removed from cache (lazy expiration)
 
 **TTL Boundaries:**
@@ -428,7 +426,7 @@ static void cache_unlink (struct crec *crecp)
 
 **DHCP Lease Records** (flag: `F_DHCP`):
 - TTL tied to DHCP lease expiration
-- Managed by DHCP subsystem (source: `/src/lease.c`)
+- Managed by DHCP subsystem (source: `/src/dhcp/lease.rs`)
 - Protected from LRU eviction
 
 **Negative Cache Entries:**
@@ -436,15 +434,17 @@ static void cache_unlink (struct crec *crecp)
 - NOERROR (empty answer) cached with configured negative TTL
 - Default negative TTL: from upstream SOA or 1 hour
 
-**Source Code Reference** (`really_insert`, lines 1450-1457):
-```c
-/* TTL calculation with min/max bounds */
-if (daemon->max_ttl != 0 && ttl > daemon->max_ttl)
-  ttl = daemon->max_ttl;
-if (daemon->min_ttl != 0 && ttl < daemon->min_ttl)
-  ttl = daemon->min_ttl;
+**Source Code Reference** (`DnsCache::insert()` in `/src/dns/cache.rs`):
+```rust
+// TTL calculation with min/max bounds
+if let Some(max_ttl) = daemon_state.max_ttl {
+    if ttl > max_ttl { ttl = max_ttl; }
+}
+if let Some(min_ttl) = daemon_state.min_ttl {
+    if ttl < min_ttl { ttl = min_ttl; }
+}
 
-crecp->ttd = now + (time_t)ttl;
+entry.ttd = now + Duration::from_secs(ttl as u64);
 ```
 
 ---
@@ -471,10 +471,10 @@ Dnsmasq caches **negative responses** (non-existent domains) to reduce upstream 
 
 **Implementation Details:**
 
-**Negative Cache Storage** (source: `/src/cache.c`):
-- Uses same `struct crec` as positive responses
+**Negative Cache Storage** (source: `/src/dns/cache.rs`):
+- Uses same `CacheEntry` as positive responses
 - `F_NEG` flag distinguishes from positive cache
-- Name stored, but `addr` union unused
+- Name stored, but `addr` field unused
 - Participates in LRU eviction like positive entries
 
 **Negative TTL Configuration:**
@@ -492,11 +492,15 @@ Dnsmasq caches **negative responses** (non-existent domains) to reduce upstream 
 - Configuration option `--no-negcache` disables negative caching
 - Negative responses for reverse lookups cached separately
 
-**Source Code Reference** (flags in `/src/dnsmasq.h`):
-```c
-#define F_NEG        128  /* Negative cache entry */
-#define F_NXDOMAIN   256  /* NXDOMAIN response */
-#define F_NOERR      512  /* NOERROR response with no data */
+**Source Code Reference** (flags in `/src/types/dns.rs`):
+```rust
+bitflags! {
+    pub struct CacheFlags: u32 {
+        const F_NEG      = 128;  // Negative cache entry
+        const F_NXDOMAIN = 256;  // NXDOMAIN response
+        const F_NOERR    = 512;  // NOERROR response with no data
+    }
+}
 ```
 
 ---
@@ -507,7 +511,7 @@ Dnsmasq caches **negative responses** (non-existent domains) to reduce upstream 
 
 Dnsmasq integrates `/etc/hosts` entries into the DNS cache as **immortal records** that never expire and take precedence over upstream DNS.
 
-**Loading Process** (source: `/src/cache.c`, function `cache_init`):
+**Loading Process** (source: `/src/dns/cache.rs`, `DnsCache::init()`):
 
 1. **Startup Parsing**:
    - Read `/etc/hosts` during daemon initialization
@@ -520,8 +524,8 @@ Dnsmasq integrates `/etc/hosts` entries into the DNS cache as **immortal records
    - Reverse lookup records (PTR) created automatically
 
 3. **Cache Insertion**:
-   - Added to hash table via `cache_hash`
-   - Added to LRU list (but never evicted due to `F_IMMORTAL`)
+   - Added to `HashMap` via `DnsCache::hash()`
+   - Added to LRU `VecDeque` (but never evicted due to `F_IMMORTAL`)
    - No TTL expiration check
 
 **Precedence Rules:**
@@ -530,7 +534,7 @@ Dnsmasq integrates `/etc/hosts` entries into the DNS cache as **immortal records
 - Configuration option `--no-hosts` disables /etc/hosts loading
 
 **Dynamic Reload:**
-- SIGHUP signal triggers hosts file reload (source: `/src/dnsmasq.c`)
+- SIGHUP signal triggers hosts file reload (source: `src/core/signal.rs`)
 - Old hosts entries removed from cache
 - New entries added
 - Cache UID incremented for coherency
@@ -545,14 +549,18 @@ Dnsmasq integrates `/etc/hosts` entries into the DNS cache as **immortal records
 - `--addn-hosts=<file>`: Additional hosts files
 - `--hostsdir=<dir>`: Directory of hosts files
 
-**Source Code Reference** (`cache_init`, lines 295-405):
-```c
-/* Load /etc/hosts entries with F_HOSTS | F_IMMORTAL flags */
-for (hostname in hosts_file)
-{
-  crecp = really_insert(hostname, &addr, class, now, 
-                        0, /* ttl=0 for immortal */
-                        F_HOSTS | F_IMMORTAL | F_FORWARD | flags);
+**Source Code Reference** (`DnsCache::init()` in `/src/dns/cache.rs`):
+```rust
+// Load /etc/hosts entries with F_HOSTS | F_IMMORTAL flags
+for hostname in hosts_file.entries() {
+    self.insert(
+        hostname,
+        &addr,
+        class,
+        now,
+        0, // ttl=0 for immortal
+        CacheFlags::F_HOSTS | CacheFlags::F_IMMORTAL | CacheFlags::F_FORWARD | flags,
+    )?;
 }
 ```
 
@@ -566,7 +574,7 @@ DHCP lease hostnames are automatically registered in the DNS cache, enabling cli
 
 **Integration Points:**
 
-**Lease Assignment** (source: `/src/lease.c` interaction with `/src/cache.c`):
+**Lease Assignment** (source: `/src/dhcp/lease.rs` interaction with `/src/dns/cache.rs`):
 1. DHCP server assigns IP address to client
 2. If client provides hostname via DHCP option 12:
    - Validate hostname (RFC 1123 compliance)
@@ -581,9 +589,9 @@ DHCP lease hostnames are automatically registered in the DNS cache, enabling cli
 
 **Lease Expiration Handling:**
 1. DHCP subsystem detects lease expiration
-2. Corresponding DNS cache entries removed via `cache_free`
+2. Corresponding DNS cache entries removed from cache
 3. Reverse lookup entries also removed
-4. Memory recycled to `dhcp_spare` free list
+4. Rust ownership automatically deallocates the entries
 
 **Lease Renewal:**
 - Hostname unchanged: cache record TTL extended
@@ -601,9 +609,9 @@ DHCP lease hostnames are automatically registered in the DNS cache, enabling cli
 - Multiple DHCP clients with same hostname: last assignment wins
 
 **Source Code Reference:**
-- DHCP-DNS integration: `/src/lease.c` function `lease_update_dns`
-- Cache insertion: `/src/cache.c` with `F_DHCP` flag handling
-- Special free list: `static struct crec *dhcp_spare` (line 21)
+- DHCP-DNS integration: `/src/dhcp/lease.rs`, `LeaseManager::update_dns()`
+- Cache insertion: `/src/dns/cache.rs` with `F_DHCP` flag handling via `DnsCache::add_dhcp_entry()`
+- DHCP entries managed separately from standard cache entries
 
 **Example Flow:**
 1. Client requests DHCP lease with hostname "laptop"
@@ -623,17 +631,21 @@ When dnsmasq reloads configuration (SIGHUP signal), the cache must remain cohere
 
 **Coherency Strategy:**
 
-**Cache UID Generation** (source: `/src/cache.c` line 26):
-```c
-static unsigned int cache_uid = 0;
+**Cache UID Generation** (source: `/src/dns/cache.rs`):
+```rust
+/// Global cache UID counter, incremented on configuration reload.
+struct DnsCache {
+    cache_uid: u32,
+    // ...
+}
 ```
 
 **UID Management:**
-- Every cache record has `crecp->uid` field (source: `struct crec`)
-- Global `cache_uid` counter incremented on configuration reload
+- Every cache record has `entry.uid` field (source: `CacheEntry`)
+- `DnsCache.cache_uid` counter incremented on configuration reload
 - Records with old UID considered stale
 
-**Reload Process** (source: `/src/dnsmasq.c` signal handler):
+**Reload Process** (source: `src/core/signal.rs`):
 1. Receive SIGHUP signal
 2. Increment global `cache_uid`
 3. Parse new configuration file
@@ -642,7 +654,7 @@ static unsigned int cache_uid = 0;
 6. Preserve upstream response cache (non-hosts entries)
 
 **Cache Pipe for Script Notifications:**
-- When scripts enabled (`HAVE_SCRIPT`), cache changes communicated via pipe
+- When scripts enabled (Cargo feature "script"), cache changes communicated via pipe
 - Lease add/delete events written to helper process
 - Helper process forks external scripts with event details
 - Ensures DNS cache and external systems stay synchronized
@@ -663,17 +675,18 @@ static unsigned int cache_uid = 0;
 - DHCP entries preserved (not affected by UID)
 - Negative cache entries removed (conservative approach)
 
-**Source Code Reference** (`cache_init`, lines 295-405):
-```c
-/* Increment cache UID on reload */
-cache_uid++;
+**Source Code Reference** (`DnsCache::init()` in `/src/dns/cache.rs`):
+```rust
+// Increment cache UID on reload
+self.cache_uid += 1;
 
-/* Load hosts with current UID */
-crecp->uid = cache_uid;
+// Load hosts with current UID
+entry.uid = self.cache_uid;
 
-/* Remove old hosts entries */
-if ((crecp->flags & F_HOSTS) && crecp->uid != cache_uid)
-  cache_free(crecp);
+// Remove old hosts entries
+if entry.flags.contains(CacheFlags::F_HOSTS) && entry.uid != self.cache_uid {
+    self.remove_entry(&entry_ref);
+}
 ```
 
 ---
@@ -682,19 +695,19 @@ if ((crecp->flags & F_HOSTS) && crecp->uid != cache_uid)
 
 ### Performance Metrics
 
-Dnsmasq tracks cache performance metrics for monitoring and troubleshooting (source: `/src/metrics.c` and `/src/cache.c`).
+Dnsmasq tracks cache performance metrics for monitoring and troubleshooting (source: `/src/core/metrics.rs` and `/src/dns/cache.rs`).
 
 **Key Metrics:**
 
 **Cache Size Metrics:**
-- **`daemon->cachesize`**: Configured maximum cache capacity (from `--cache-size`)
+- **`daemon_state.cachesize`**: Configured maximum cache capacity (from `--cache-size`)
 - **Live Entries**: Count of active records in cache (traversal required)
 - **Hash Table Size**: Current `hash_size` (power of 2)
 - **Hash Table Load**: Ratio of entries to buckets
 
 **Cache Operation Metrics:**
-- **`METRIC_DNS_CACHE_INSERTED`**: Total insertions (source: `cache.c:1708`)
-- **`METRIC_DNS_CACHE_LIVE_FREED`**: Evictions due to capacity (source: `cache.c:1579`)
+- **`METRIC_DNS_CACHE_INSERTED`**: Total insertions (source: `/src/dns/cache.rs`)
+- **`METRIC_DNS_CACHE_LIVE_FREED`**: Evictions due to capacity (source: `/src/dns/cache.rs`)
 - **Cache Hits**: Successful lookups (tracked in forwarding logic)
 - **Cache Misses**: Failed lookups requiring upstream query
 
@@ -718,7 +731,7 @@ dnsmasq[1234]: queries forwarded 1523, queries answered locally 8721
 
 **Cache Inspection Tools:**
 
-**D-Bus Interface** (when `HAVE_DBUS` enabled):
+**D-Bus Interface** (when Cargo feature "dbus" enabled):
 - Method: `GetCacheStats` returns cache size, entries, hits, misses
 - Method: `GetCachedEntries` returns list of cached names and TTLs
 
@@ -727,15 +740,16 @@ dnsmasq[1234]: queries forwarded 1523, queries answered locally 8721
 - Use D-Bus or parse syslog statistics output
 - Third-party tools: `contrib/dnslist/dnslist.pl` for web-based view
 
-**Source Code Reference** (`cache_make_stat`, lines 707-747):
-```c
-/* Generate cache statistics for logging */
-void cache_make_stat(struct cache_stat *stats)
-{
-  stats->cachesize = daemon->cachesize;
-  stats->insertions = /* track insertions */;
-  stats->live_freed = /* track evictions */;
-  /* ... */
+**Source Code Reference** (`DnsCache::make_stat()` in `/src/dns/cache.rs`):
+```rust
+/// Generate cache statistics for logging.
+pub fn make_stat(&self) -> CacheStat {
+    CacheStat {
+        cachesize: self.daemon_state.cachesize,
+        insertions: self.metrics.insertions,
+        live_freed: self.metrics.live_freed,
+        // ...
+    }
 }
 ```
 
@@ -746,11 +760,11 @@ void cache_make_stat(struct cache_stat *stats)
 ### Time Complexity
 
 **Cache Operations:**
-- **Lookup** (cache_find_by_name): O(1) average, O(n) worst (hash collision)
-- **Insertion** (really_insert): O(1) amortized (includes rehash cost)
-- **Eviction** (cache_scan_free): O(1) with LRU tail access
-- **Expiration Check** (is_expired): O(1) timestamp comparison
-- **Rehash** (rehash): O(n) where n = number of cache entries (rare operation)
+- **Lookup** (`DnsCache::find_by_name()`): O(1) average, O(n) worst (hash collision)
+- **Insertion** (`DnsCache::insert()`): O(1) amortized (includes rehash cost)
+- **Eviction** (`DnsCache::scan_free()`): O(1) with LRU tail access
+- **Expiration Check** (`CacheEntry::is_expired()`): O(1) timestamp comparison
+- **Rehash** (`DnsCache::rehash()`): O(n) where n = number of cache entries (rare operation)
 
 **Hash Table Performance:**
 - **Load Factor**: Maintained at ~10% (hash_size = cache_size * 10)
@@ -760,7 +774,7 @@ void cache_make_stat(struct cache_stat *stats)
 ### Memory Consumption
 
 **Per-Record Overhead:**
-- **struct crec**: ~80-120 bytes (platform-dependent, pointer size)
+- **`CacheEntry`**: ~80-120 bytes (platform-dependent, pointer size)
 - **Domain Name**: Variable (inline for short, allocated for long)
 - **Total**: ~100-200 bytes per cached entry average
 
@@ -772,7 +786,7 @@ void cache_make_stat(struct cache_stat *stats)
 **Memory Allocation Strategy:**
 - **Initial**: Single allocation for hash table
 - **Growth**: Geometric expansion (2x) during rehash
-- **Recycling**: Free lists for crec structs reduce malloc overhead
+- **Recycling**: Rust ownership model handles deallocation automatically (no manual free lists)
 
 ### Scalability Limits
 
@@ -792,9 +806,10 @@ void cache_make_stat(struct cache_stat *stats)
 3. Enable `--no-negcache` if negative cache pollution occurs
 4. Monitor cache hit rate via SIGUSR1 statistics
 
-**Source Code Configuration** (`src/config.h` line 38):
-```c
-#define CACHESIZ 150  /* Default cache size */
+**Source Code Configuration** (`src/config/constants.rs`):
+```rust
+/// Default cache size
+pub const CACHESIZ: usize = 150;
 ```
 
 ---
@@ -805,7 +820,7 @@ void cache_make_stat(struct cache_stat *stats)
 
 **`--cache-size=<size>`**
 - **Purpose**: Set maximum number of DNS cache entries
-- **Default**: 150 entries (CACHESIZ in `config.h:38`)
+- **Default**: 150 entries (CACHESIZ in `src/config/constants.rs`)
 - **Range**: 0 (disable cache) to 10000+ (large deployments)
 - **Example**: `--cache-size=1000`
 - **Impact**: Memory consumption scales linearly with size
@@ -905,7 +920,7 @@ addn-hosts=/etc/dnsmasq-custom-hosts
 
 **Full Configuration Reference:**
 - See `dnsmasq.conf.example` lines 7-100 for comprehensive DNS cache options
-- See `src/config.h` for compile-time cache defaults
+- See `src/config/constants.rs` for compile-time cache defaults
 
 ---
 
@@ -921,23 +936,23 @@ addn-hosts=/etc/dnsmasq-custom-hosts
 ### Source Code References
 
 **Primary Implementation:**
-- `/src/cache.c` - Core cache implementation (1800+ lines)
-  - Hash table management (`cache_hash`, `rehash`)
-  - LRU operations (`cache_link`, `cache_unlink`, `cache_scan_free`)
-  - Lookup functions (`cache_find_by_name`, `cache_find_by_addr`)
-  - Insertion functions (`cache_start_insert`, `really_insert`, `cache_end_insert`)
+- `/src/dns/cache.rs` - Core cache implementation
+  - Hash table management (`DnsCache::hash()`, `DnsCache::rehash()`)
+  - LRU operations (`cache_link`, `cache_unlink`, `DnsCache::scan_free()`)
+  - Lookup functions (`DnsCache::find_by_name()`, `DnsCache::find_by_addr()`)
+  - Insertion functions (`DnsCache::start_insert()`, `DnsCache::insert()`, `DnsCache::end_insert()`)
   
 **Data Structures:**
-- `/src/dnsmasq.h` - `struct crec` definition and cache flags
+- `/src/types/dns.rs` - `CacheEntry` definition and cache flags
   
 **Configuration:**
-- `/src/config.h` - Default cache size (CACHESIZ=150, line 38)
-- `/src/option.c` - Configuration parsing for cache options
+- `/src/config/constants.rs` - Default cache size (CACHESIZ=150)
+- `/src/config/options.rs` - Configuration parsing for cache options
 
 **Integration:**
-- `/src/forward.c` - DNS forwarding using cache
-- `/src/lease.c` - DHCP lease hostname integration
-- `/src/metrics.c` - Cache statistics tracking
+- `/src/dns/forward.rs` - DNS forwarding using cache
+- `/src/dhcp/lease.rs` - DHCP lease hostname integration
+- `/src/core/metrics.rs` - Cache statistics tracking
 
 ### RFC References
 
@@ -958,7 +973,7 @@ dig @localhost example.com  # First query (cache miss)
 dig @localhost example.com  # Second query (cache hit)
 ```
 
-**D-Bus Cache Inspection (when HAVE_DBUS enabled):**
+**D-Bus Cache Inspection (when Cargo feature "dbus" enabled):**
 ```bash
 # Get cache statistics
 dbus-send --system --print-reply \
@@ -977,6 +992,6 @@ dbus-send --system --print-reply \
 
 **Document Version:** 1.0  
 **Based on:** dnsmasq version 2.92  
-**Primary Source:** `/src/cache.c` (2000+ lines analyzed)  
+**Primary Source:** `/src/dns/cache.rs` (Rust rewrite of original cache.c)  
 **Last Updated:** 2025  
 **Word Count:** ~5,800 words
