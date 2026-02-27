@@ -495,6 +495,9 @@ pub struct DnsConfig {
     pub dbus_name: Option<String>,
     /// UBus object name override. C: `daemon->ubus_name`
     pub ubus_name: Option<String>,
+    /// List of RR types to filter from responses. C: `daemon->filter_rr`
+    /// Used by RrFilterMode::Config to strip specified record types.
+    pub filter_rr: Vec<u16>,
 }
 
 impl Default for DnsConfig {
@@ -538,6 +541,7 @@ impl Default for DnsConfig {
             server_array_hwm: 0,
             dbus_name: None,
             ubus_name: None,
+            filter_rr: Vec::new(),
         }
     }
 }
