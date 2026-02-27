@@ -12,6 +12,8 @@
 //! - `ipv6` — IPv6 address classification helpers
 
 pub mod addr;
+#[cfg(any(feature = "dhcp", feature = "dhcp6"))]
+pub mod dhcp;
 pub mod dns;
 pub mod ipv6;
 pub mod network;
