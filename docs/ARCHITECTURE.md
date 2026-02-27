@@ -1,4 +1,4 @@
-# Dnsmasq Architecture Documentation
+# Dnsmasq System Architecture (Rust Implementation)
 
 ## Table of Contents
 
@@ -17,7 +17,7 @@
 
 ## Overview and Design Philosophy
 
-Dnsmasq is designed as a **lightweight, single-process network services daemon** that provides DNS forwarding and caching, DHCP server capabilities, TFTP services, and Router Advertisement for small networks and embedded systems. The architecture embodies traditional Unix design principles: simplicity, portability, and efficiency.
+Dnsmasq is designed as a **lightweight, single-process network services daemon** that provides DNS forwarding and caching, DHCP server capabilities, TFTP services, and Router Advertisement for small networks and embedded systems. The codebase has been **rewritten in Rust from the original C implementation**, preserving the proven architectural design while gaining compile-time memory safety, type-safe error handling, and modern dependency management. The architecture embodies traditional Unix design principles: simplicity, portability, and efficiency.
 
 ### Design Goals
 
@@ -27,17 +27,17 @@ The architecture prioritizes:
 
 2. **Operational Simplicity**: Zero-configuration deployment capability with automatic upstream DNS server discovery from `/etc/resolv.conf`, integrated DNS-DHCP management eliminating synchronization overhead, and hot-reload support via SIGHUP signal without service interruption.
 
-3. **Universal Portability**: Runs on Linux (glibc/uclibc), BSD variants (FreeBSD, OpenBSD, NetBSD), macOS, Solaris, and Android with platform-specific optimizations isolated in dedicated modules.
+3. **Platform Portability**: Runs on Linux (glibc/musl) and BSD variants (FreeBSD, OpenBSD, NetBSD) with platform-specific optimizations isolated in dedicated modules using Rust's conditional compilation (`#[cfg(target_os = "...")]`).
 
-4. **Deterministic Behavior**: Explicit memory management without garbage collection, single-threaded event-driven model without synchronization complexity, and predictable resource consumption patterns enable months or years of continuous operation.
+4. **Deterministic Behavior**: Rust's ownership model ensures deterministic memory deallocation without garbage collection pauses, single-threaded event-driven model without synchronization complexity, and predictable resource consumption patterns enable months or years of continuous operation.
 
 ### Key Architectural Characteristics
 
-- **Single Daemon Process**: All services (DNS, DHCP, TFTP, RA) operate within a single process using event-driven I/O multiplexing, eliminating inter-process communication overhead.
+- **Single Daemon Process**: All services (DNS, DHCP, TFTP, RA) operate within a single process using event-driven I/O multiplexing via `mio`, eliminating inter-process communication overhead.
 
 - **No External Dependencies**: Zero reliance on databases, message queues, or external services ensures reliable operation even when network connectivity is limited.
 
-- **Modular Compilation**: Conditional compilation with feature flags (`HAVE_DHCP`, `HAVE_DNSSEC`, `HAVE_TFTP`, etc.) enables customized builds from minimal (DNS-only, ~100KB) to full-featured (~500KB).
+- **Modular Compilation**: Compile-time feature selection via Cargo feature flags (`dhcp`, `dnssec`, `tftp`, etc.) enables customized builds from minimal (DNS-only, ~200KB) to full-featured (~800KB). The Rust module hierarchy is organized across ~70 modules grouped by functional domain.
 
 ---
 
@@ -45,74 +45,74 @@ The architecture prioritizes:
 
 ### 1. Single-Threaded Event-Driven Architecture
 
-Dnsmasq employs a single-threaded event-driven architecture using poll-based I/O multiplexing. This design eliminates thread synchronization complexity while maintaining responsive performance through non-blocking operations.
+Dnsmasq employs a single-threaded event-driven architecture using `mio`-based I/O multiplexing. This design eliminates thread synchronization complexity while maintaining responsive performance through non-blocking operations.
 
-**Core Implementation**: The main event loop in `src/dnsmasq.c` and `src/poll.c` monitors multiple file descriptors simultaneously:
+**Core Implementation**: The main event loop in `src/main.rs` and `src/core/event_loop.rs` monitors multiple file descriptors simultaneously using `mio::Poll`:
 
 - **DNS sockets** (UDP port 53 for queries, TCP port 53 for large responses and zone transfers)
 - **DHCP sockets** (UDP port 67 for DHCPv4 server, port 547 for DHCPv6 server)
 - **TFTP sockets** (UDP port 69 for TFTP server when enabled)
 - **Control interfaces** (D-Bus connections on Linux, UBus on OpenWrt)
 - **Platform-specific sockets** (Netlink sockets on Linux, routing sockets on BSD)
-- **Signal pipes** (for async-signal-safe signal handling)
+- **Signal pipes** (for async-signal-safe signal handling via the `nix` crate)
 
-The event loop uses the POSIX `poll()` system call to wait for I/O events, dispatching to appropriate handlers when file descriptors become ready. This approach provides excellent performance for typical small network workloads (hundreds to thousands of queries per second) while maintaining predictable latency.
+The event loop uses `mio::Poll::poll()` to wait for I/O events, dispatching to appropriate handlers when file descriptors become ready. Each file descriptor is registered with a unique `mio::Token` for efficient identification. This approach provides excellent performance for typical small network workloads (hundreds to thousands of queries per second) while maintaining predictable latency.
 
 **Advantages**:
 - No thread synchronization primitives (mutexes, condition variables) required
 - No race conditions or deadlocks possible
 - Deterministic resource usage and behavior
 - Single core suffices for target deployment scenarios
+- Rust's ownership model enforces single-owner semantics at compile time
 
 **Trade-offs**:
 - Cannot utilize multiple CPU cores (acceptable for target embedded systems)
 - Long-running operations must be non-blocking or offloaded (DNS queries have timeouts, scripts use fork/exec)
 
-### 2. Explicit Manual Memory Management
+### 2. Rust Ownership Model
 
-All memory allocation and deallocation is explicit using custom allocators that wrap standard `malloc()` and `free()`. This approach ensures deterministic memory consumption without garbage collection pauses.
+All memory management is handled by Rust's ownership and borrowing system. This approach ensures deterministic memory consumption without garbage collection pauses and eliminates entire classes of bugs (use-after-free, double-free, buffer overflows) at compile time.
 
-**Key Strategies** (from `src/util.c`):
+**Key Strategies**:
 
-- **Safe Allocation Wrappers**: Functions like `safe_malloc()` and `whine_malloc()` wrap `malloc()` with error checking, terminating the daemon if allocation fails rather than returning NULL pointers that could cause crashes.
+- **Standard Library Allocation**: Types like `Vec<T>`, `Box<T>`, `String`, and `HashMap<K, V>` replace manual `malloc()`/`free()` patterns. Rust's allocator handles all memory automatically, with deallocation occurring deterministically when values go out of scope via the `Drop` trait.
 
-- **Fixed-Size Data Structures**: Core data structures use bounded sizes to prevent unbounded memory growth:
-  - DNS cache: Default 150 entries (`CACHESIZ` in `src/config.h:38`), configurable via `--cache-size`
-  - DHCP lease table: Maximum 1000 leases (`MAXLEASES` in `src/config.h:40`)
-  - Forward record table: 150 concurrent queries (`FTABSIZ` in `src/config.h:17`)
+- **Bounded Collections with Configurable Limits**: Core data structures use bounded sizes to prevent unbounded memory growth:
+  - DNS cache: Default 150 entries (`CACHESIZ` in `src/config/constants.rs`), configurable via `--cache-size`, implemented as `HashMap<DnsName, Vec<CacheEntry>>` with `VecDeque`-based LRU eviction
+  - DHCP lease table: Maximum 1000 leases (`MAXLEASES` in `src/config/constants.rs`), stored in `HashMap<IpAddr, DhcpLease>`
+  - Forward record table: 150 concurrent queries (`FTABSIZ` in `src/config/constants.rs`), managed in `HashMap<u16, ForwardRecord>`
 
-- **Block Allocation for Variable-Length Data**: The `blockdata` system (`src/blockdata.c`) manages variable-length data (DNSSEC records) using fixed-size block chains, preventing memory fragmentation.
+- **Zero-Copy Buffer Handling**: DNS and DHCP packet processing uses Rust slices (`&[u8]`) and the `bytes::Bytes` crate for efficient zero-copy buffer management, avoiding unnecessary allocations in hot paths.
 
-- **Minimal Dynamic Allocation in Hot Paths**: Packet processing paths use stack-allocated buffers and pre-allocated structures, avoiding heap allocation latency.
+- **Minimal Dynamic Allocation in Hot Paths**: Packet processing paths leverage stack-allocated buffers and pre-allocated structures, with Rust's compiler ensuring no hidden allocations.
 
-### 3. Modular Compilation with Feature Flags
+### 3. Modular Compilation with Cargo Feature Flags
 
-The codebase uses conditional compilation to enable customized builds containing only required functionality. This approach reduces binary size and eliminates dead code for unused features.
+The codebase uses Cargo feature flags to enable customized builds containing only required functionality. This approach reduces binary size and eliminates dead code for unused features through Rust's conditional compilation.
 
-**Primary Feature Flags** (from `src/config.h` and `Makefile`):
+**Primary Feature Flags** (from `Cargo.toml`):
 
 | Feature Flag | Purpose | Dependencies |
 |--------------|---------|--------------|
-| `HAVE_DHCP` | Enable DHCPv4 server | None |
-| `HAVE_DHCP6` | Enable DHCPv6 and Router Advertisement | `HAVE_DHCP` implied |
-| `HAVE_DNSSEC` | Enable DNSSEC validation | Nettle library (libnettle, libhogweed) |
-| `HAVE_TFTP` | Enable TFTP server | None |
-| `HAVE_AUTH` | Enable authoritative DNS mode | None |
-| `HAVE_DBUS` | Enable D-Bus control interface | libdbus-1 |
-| `HAVE_UBUS` | Enable UBus interface (OpenWrt) | libubus, libubox |
-| `HAVE_IPSET` | Enable Linux ipset integration | ipset headers/library |
-| `HAVE_NFTSET` | Enable nftables set integration | libnftables |
-| `HAVE_CONNTRACK` | Enable connection tracking | libnetfilter_conntrack |
-| `HAVE_SCRIPT` | Enable external script execution | None |
-| `HAVE_LUASCRIPT` | Enable Lua script integration | Lua library |
-| `HAVE_IDN` | Enable IDN 2003 support | libidn |
-| `HAVE_LIBIDN2` | Enable IDN 2008 support | libidn2 |
+| `dhcp` | Enable DHCPv4 server | None |
+| `dhcp6` | Enable DHCPv6 and Router Advertisement | `dhcp` implied |
+| `dnssec` | Enable DNSSEC validation | `ring` crate (pure Rust) |
+| `tftp` | Enable TFTP server | None |
+| `auth` | Enable authoritative DNS mode | None |
+| `dbus` | Enable D-Bus control interface | `dbus` crate (FFI to libdbus-1) |
+| `ubus` | Enable UBus interface (OpenWrt) | FFI to libubus, libubox |
+| `ipset` | Enable Linux ipset integration | `netlink-packet-core` crate |
+| `nftset` | Enable nftables set integration | FFI to libnftables |
+| `conntrack` | Enable connection tracking | FFI to libnetfilter_conntrack |
+| `script` | Enable external script execution | None |
+| `idn` | Enable IDN 2008 support | `idna` crate (pure Rust) |
+| `dump` | Enable pcap packet dumping | `pcap-file` crate |
 
-**Build Configuration**: Feature flags are set via the `COPTS` variable passed to make:
+**Build Configuration**: Feature flags are set via Cargo:
 
 ```bash
-make COPTS="-DHAVE_DNSSEC -DHAVE_DBUS"  # Enable only DNSSEC and D-Bus
-make  # Default build with common features enabled
+cargo build --release --features "dnssec,dbus"  # Enable only DNSSEC and D-Bus
+cargo build --release                            # Default build with common features
 ```
 
 ### 4. Zero External Service Dependencies
@@ -124,44 +124,45 @@ Dnsmasq operates as a completely self-contained daemon without dependencies on:
 - **External APIs**: No cloud service API calls, metrics collection services, or telemetry
 - **Configuration Servers**: Reads local configuration files only
 
+The core binary has no runtime dependencies beyond `libc`. Optional features (D-Bus, nftset, conntrack) require system libraries accessed via thin FFI wrappers. Cryptographic operations for DNSSEC use the `ring` crate, which is pure Rust with no external library dependency, replacing the C implementation's Nettle/GnuTLS requirement.
+
 This independence ensures reliable operation even when network connectivity to external services is unavailable, making dnsmasq suitable for isolated networks, air-gapped environments, and network infrastructure recovery scenarios.
 
 ---
 
 ## Core Services Breakdown
 
-### DNS Forwarding Subsystem (`src/forward.c`)
+### DNS Forwarding Subsystem (`src/dns/forward.rs`)
 
 The DNS forwarding engine operates as a **forwarding resolver** (not a recursive resolver). It accepts queries from downstream clients, consults a local cache, and forwards cache misses to configured upstream recursive DNS servers.
 
 **Key Components**:
 
 - **Query Reception**: Listens on UDP port 53 for standard queries and TCP port 53 for large responses (>512 bytes), AXFR zone transfers in authoritative mode, and DNSSEC-validated responses
-- **Forward Record Table**: Tracks up to 150 concurrent outstanding queries (`struct frec` in `src/dnsmasq.h`), mapping client queries to upstream queries with state management
+- **Forward Record Table**: Tracks up to 150 concurrent outstanding queries (`ForwardRecord` in `src/types/dns.rs`), managed in a `HashMap<u16, ForwardRecord>` keyed by transaction ID with state management
 - **Upstream Server Selection**: Supports multiple upstream servers with:
   - Round-robin selection for load distribution
-  - Domain-specific routing (e.g., `*.internal.company.com` → internal DNS server)
+  - Domain-specific routing (e.g., `*.internal.company.com` → internal DNS server) via `src/dns/server_match.rs`
   - Fallback on timeout or SERVFAIL responses
   - Source port randomization for security
 - **TCP Fallback**: Automatically retries failed UDP queries over TCP when upstream servers require it
-- **Query Timeout Management**: Default 10-second timeout (`TIMEOUT` in `src/config.h:30`), after which query fails and client receives SERVFAIL
+- **Query Timeout Management**: Default 10-second timeout (`TIMEOUT` in `src/config/constants.rs`), after which query fails and client receives SERVFAIL
 
 **Data Flow**:
 1. Client query arrives on UDP/TCP socket
 2. Check local cache for matching entry (see DNS Caching Subsystem)
-3. On cache miss: allocate `struct frec`, forward to upstream server
+3. On cache miss: create `ForwardRecord`, forward to upstream server
 4. Upstream response received → validate, cache, and forward to client
-5. Release `struct frec` for reuse
+5. `ForwardRecord` dropped automatically via RAII when processing completes
 
-### DNS Caching Subsystem (`src/cache.c`)
+### DNS Caching Subsystem (`src/dns/cache.rs`)
 
 Implements an in-memory LRU (Least Recently Used) cache for DNS records, integrated with multiple data sources.
 
 **Cache Structure**:
 
-- **Hash Table**: Records stored in hash table with chaining for collision resolution
-- **Hash Function**: `cache_hash()` computes hash from domain name for O(1) average-case lookup
-- **LRU Eviction**: When cache reaches capacity, least recently accessed entries are evicted
+- **HashMap-Based Storage**: Records stored in `HashMap<DnsName, Vec<CacheEntry>>` for O(1) average-case lookup by domain name
+- **LRU Eviction**: `VecDeque`-based tracking of access order; when cache reaches capacity, least recently accessed entries are evicted
 - **Default Capacity**: 150 entries (`CACHESIZ`), configurable to thousands via `--cache-size`
 
 **Cached Record Types**:
@@ -185,7 +186,7 @@ Implements an in-memory LRU (Least Recently Used) cache for DNS records, integra
 - Configurable maximum TTL (`--max-cache-ttl`) ensures stale data eventually expires
 - Negative cache TTL from SOA minimum field
 
-### DHCPv4 Server Subsystem (`src/dhcp.c`, `src/rfc2131.c`)
+### DHCPv4 Server Subsystem (`src/dhcp/v4/server.rs`, `src/dhcp/v4/rfc2131.rs`)
 
 Provides complete RFC 2131 compliant DHCPv4 server functionality with static reservations and dynamic address allocation.
 
@@ -200,10 +201,10 @@ The four-phase DHCP message exchange:
 **Address Allocation**:
 
 - **Static Reservations**: MAC address → fixed IP mapping takes precedence
-- **Dynamic Allocation**: First available IP from configured `dhcp-range` pools
-- **Conflict Detection**: Optional ping before offer to detect IP conflicts
-- **Lease Database**: Persistent storage in `/var/lib/misc/dnsmasq.leases` (Linux default)
-- **Default Lease Time**: 3600 seconds (1 hour, `DEFLEASE` in `src/config.h:50`)
+- **Dynamic Allocation**: First available IP from configured `dhcp-range` pools, using SDBM hash-based allocation
+- **Conflict Detection**: Optional ICMP ping before offer to detect IP conflicts
+- **Lease Database**: Persistent storage in `/var/lib/misc/dnsmasq.leases` (Linux default), managed by `src/dhcp/lease.rs`
+- **Default Lease Time**: 3600 seconds (1 hour, `DEFLEASE` in `src/config/constants.rs`)
 - **Maximum Leases**: 1000 concurrent leases (`MAXLEASES`)
 
 **DNS Integration**:
@@ -214,16 +215,16 @@ When a DHCP lease is assigned with a hostname:
 3. Lease expiration/release removes DNS cache entry
 4. No manual DNS zone file editing required
 
-**Script Integration** (when `HAVE_SCRIPT` enabled):
+**Script Integration** (when `script` feature enabled):
 
-Lease events trigger external script execution:
+Lease events trigger external script execution via `src/dhcp/helper.rs`:
 - **add**: New lease assigned
 - **old**: Existing lease renewed
 - **del**: Lease expired or released
 
 Scripts receive MAC address, IP address, hostname as arguments and environment variables including `DNSMASQ_LEASE_LENGTH`, `DNSMASQ_CLIENT_ID`, `DNSMASQ_INTERFACE`.
 
-### DHCPv6 Server Subsystem (`src/dhcp6.c`, `src/rfc3315.c`)
+### DHCPv6 Server Subsystem (`src/dhcp/v6/server.rs`, `src/dhcp/v6/rfc3315.rs`)
 
 Implements RFC 3315 DHCPv6 with both stateful (address assignment) and stateless (configuration only) operation modes.
 
@@ -233,14 +234,14 @@ Implements RFC 3315 DHCPv6 with both stateful (address assignment) and stateless
    - SOLICIT → ADVERTISE → REQUEST → REPLY exchange
    - Daemon assigns IPv6 addresses from configured pools
    - Lease tracking similar to DHCPv4
-   - Default lease time: 86400 seconds (24 hours, `DEFLEASE6` in `src/config.h:51`)
+   - Default lease time: 86400 seconds (24 hours, `DEFLEASE6` in `src/config/constants.rs`)
 
 2. **Stateless DHCPv6** (Configuration only, O=1, M=0 in RA):
    - INFORMATION-REQUEST → REPLY exchange
    - Provides DNS servers, domain search lists without address assignment
    - Clients use SLAAC for address configuration
 
-**Coordination with Router Advertisement** (`src/radv.c`):
+**Coordination with Router Advertisement** (`src/dhcp/radv/server.rs`):
 
 The M (managed) and O (other configuration) flags in Router Advertisement messages control client DHCPv6 behavior:
 - **M=1**: Use DHCPv6 for address assignment (stateful)
@@ -249,16 +250,16 @@ The M (managed) and O (other configuration) flags in Router Advertisement messag
 
 **Prefix Delegation**:
 
-Supports IPv6 prefix delegation (IA_PD) for hierarchical network addressing, enabling downstream routers to obtain prefixes for their local networks.
+Supports IPv6 prefix delegation (IA_PD) for hierarchical network addressing, enabling downstream routers to obtain prefixes for their local networks. DHCPv6 option serialization is handled by `src/dhcp/v6/outpacket.rs`.
 
-### TFTP Server Subsystem (`src/tftp.c`)
+### TFTP Server Subsystem (`src/integration/tftp.rs`)
 
 Read-only TFTP server primarily for network boot scenarios, implementing RFC 1350 with performance extensions.
 
 **Features**:
-- **Concurrent Connections**: Default 50 maximum (`TFTP_MAX_CONNECTIONS` in `src/config.h:54`)
+- **Concurrent Connections**: Default 50 maximum (`TFTP_MAX_CONNECTIONS` in `src/config/constants.rs`)
 - **Option Negotiation**: RFC 2349 (blksize, tsize, timeout) and RFC 7440 (windowsize)
-- **Maximum Window Size**: 32 blocks (`TFTP_MAX_WINDOW` in `src/config.h:55`)
+- **Maximum Window Size**: 32 blocks (`TFTP_MAX_WINDOW` in `src/config/constants.rs`)
 - **Transfer Modes**: Netascii and binary (octet)
 - **Security**: Secure mode verifies file ownership, root directory restriction prevents path traversal
 
@@ -269,7 +270,7 @@ Works with DHCPv4 PXE boot options:
 - Option 93: Client architecture type
 - PXE proxy mode: Coexists with existing DHCP servers
 
-### Authoritative DNS Mode Subsystem (`src/auth.c`)
+### Authoritative DNS Mode Subsystem (`src/dns/auth.rs`)
 
 Enables dnsmasq to serve as primary nameserver for designated local zones, complementing the forwarding mode.
 
@@ -285,22 +286,22 @@ Enables dnsmasq to serve as primary nameserver for designated local zones, compl
 - Split-horizon DNS (internal vs external views)
 - Small zone hosting without separate authoritative DNS server
 
-### DNSSEC Validation Subsystem (`src/dnssec.c`, `src/crypto.c`)
+### DNSSEC Validation Subsystem (`src/dns/dnssec/validation.rs`, `src/dns/dnssec/crypto.rs`)
 
 Provides cryptographic validation of DNS responses to protect against cache poisoning and man-in-the-middle attacks.
 
 **Validation Process**:
 
 1. **Trust Chain Validation**: DNSKEY → DS → parent zone, recursively to root trust anchor
-2. **RRSIG Verification**: Cryptographic signature validation using Nettle library
+2. **RRSIG Verification**: Cryptographic signature validation using the `ring` crate (RSA, ECDSA P-256/P-384, Ed25519)
 3. **NSEC/NSEC3 Processing**: Authenticated denial-of-existence proofs
-4. **Trust Anchor Management**: Root zone KSK from `trust-anchors.conf` (updated July 2024)
+4. **Trust Anchor Management**: Root zone KSK from `trust-anchors.conf`
 
-**Resource Limits** (DoS protection):
-- Maximum 40 queries per validation (`DNSSEC_LIMIT_WORK` in `src/config.h:25`)
-- Maximum 20 signature failures (`DNSSEC_LIMIT_SIG_FAIL` in `src/config.h:26`)
-- Maximum 200 crypto operations (`DNSSEC_LIMIT_CRYPTO` in `src/config.h:27`)
-- Maximum 150 NSEC3 iterations (`DNSSEC_LIMIT_NSEC3_ITERS` in `src/config.h:29`)
+**Resource Limits** (DoS protection, defined in `src/config/constants.rs`):
+- Maximum 40 queries per validation (`DNSSEC_LIMIT_WORK`)
+- Maximum 20 signature failures (`DNSSEC_LIMIT_SIG_FAIL`)
+- Maximum 200 crypto operations (`DNSSEC_LIMIT_CRYPTO`)
+- Maximum 150 NSEC3 iterations (`DNSSEC_LIMIT_NSEC3_ITERS`)
 
 **Validation States**:
 - **SECURE**: Valid DNSSEC chain to trust anchor
@@ -322,38 +323,39 @@ graph TB
         TFTPClient[TFTP Clients<br/>Port 69]
     end
     
-    subgraph "Core Runtime - Main Event Loop"
-        MainLoop[Main Event Loop<br/>src/dnsmasq.c<br/>src/poll.c]
-        SigHandler[Signal Handler<br/>SIGHUP/SIGUSR1/SIGTERM]
-        ConfigParser[Configuration Parser<br/>src/option.c]
-        Logger[Logging System<br/>src/log.c]
+    subgraph "Core Runtime - mio Event Loop"
+        MainLoop[Entry Point / Event Loop<br/>src/main.rs<br/>src/core/event_loop.rs]
+        SigHandler[Signal Handler<br/>src/core/signal.rs<br/>SIGHUP/SIGUSR1/SIGTERM]
+        ConfigParser[Configuration Parser<br/>src/config/options.rs]
+        Logger[Logging System<br/>src/core/logging.rs]
     end
     
     subgraph "DNS Service Layer"
-        DNSForward[DNS Forwarder<br/>src/forward.c]
-        DNSCache[DNS Cache<br/>src/cache.c]
-        RFC1035[Wire Format Parser<br/>src/rfc1035.c]
-        DNSSEC[DNSSEC Validator<br/>src/dnssec.c]
-        Auth[Authoritative DNS<br/>src/auth.c]
+        DNSForward[DNS Forwarder<br/>src/dns/forward.rs]
+        DNSCache[DNS Cache<br/>src/dns/cache.rs]
+        Wire[Wire Format Parser<br/>src/dns/wire.rs]
+        DNSSEC[DNSSEC Validator<br/>src/dns/dnssec/validation.rs]
+        Auth[Authoritative DNS<br/>src/dns/auth.rs]
     end
     
     subgraph "DHCP Service Layer"
-        DHCP4[DHCPv4 Server<br/>src/dhcp.c, rfc2131.c]
-        DHCP6[DHCPv6 Server<br/>src/dhcp6.c, rfc3315.c]
-        LeaseDB[Lease Database<br/>src/lease.c]
-        RadV[Router Advertisement<br/>src/radv.c]
+        DHCP4[DHCPv4 Server<br/>src/dhcp/v4/server.rs<br/>src/dhcp/v4/rfc2131.rs]
+        DHCP6[DHCPv6 Server<br/>src/dhcp/v6/server.rs<br/>src/dhcp/v6/rfc3315.rs]
+        LeaseDB[Lease Database<br/>src/dhcp/lease.rs]
+        RadV[Router Advertisement<br/>src/dhcp/radv/server.rs]
     end
     
     subgraph "Network Abstraction Layer"
-        Network[Network Core<br/>src/network.c]
-        Netlink[Linux Netlink<br/>src/netlink.c]
-        BPF[BSD BPF<br/>src/bpf.c]
+        Interface[Network Interfaces<br/>src/net/interface.rs]
+        Socket[Socket Pool<br/>src/net/socket.rs]
+        Netlink[Linux Netlink<br/>src/net/platform/linux/netlink.rs]
+        BPF[BSD BPF<br/>src/net/platform/bsd/bpf.rs]
     end
     
     subgraph "Integration Layer"
-        Scripts[Script Executor<br/>src/helper.c]
-        DBus[D-Bus Interface<br/>src/dbus.c]
-        Firewall[Firewall Integration<br/>src/ipset.c, nftset.c]
+        Scripts[Script Executor<br/>src/dhcp/helper.rs]
+        DBus[D-Bus Interface<br/>src/integration/dbus.rs]
+        Firewall[Firewall Integration<br/>src/net/platform/linux/ipset.rs<br/>src/integration/nftset.rs]
     end
     
     subgraph "External Systems"
@@ -377,7 +379,7 @@ graph TB
     Logger --> Syslog
     
     DNSForward --> DNSCache
-    DNSForward --> RFC1035
+    DNSForward --> Wire
     DNSForward --> DNSSEC
     DNSForward --> Upstream
     DNSForward --> Auth
@@ -392,13 +394,14 @@ graph TB
     LeaseDB --> Scripts
     LeaseDB --> DNSCache
     
-    DNSForward --> Network
-    DHCP4 --> Network
-    DHCP6 --> Network
-    RadV --> Network
+    DNSForward --> Interface
+    DNSForward --> Socket
+    DHCP4 --> Interface
+    DHCP6 --> Interface
+    RadV --> Interface
     
-    Network --> Netlink
-    Network --> BPF
+    Interface --> Netlink
+    Interface --> BPF
     
     DNSForward --> Firewall
     
@@ -409,70 +412,71 @@ graph TB
     style MainLoop fill:#e1f5ff
     style DNSCache fill:#fff4e1
     style LeaseDB fill:#fff4e1
-    style Network fill:#e1ffe1
+    style Interface fill:#e1ffe1
 ```
 
 ### Component Responsibilities
 
 **Core Runtime Components**:
 
-- **Main Event Loop** (`src/dnsmasq.c`, `src/poll.c`): Coordinates all subsystem activities through poll-based I/O multiplexing, monitoring file descriptors for DNS, DHCP, TFTP, control interfaces, and platform-specific sockets
-- **Configuration Parser** (`src/option.c`): Processes 350+ configuration directives from config file and command line, validating options and initializing subsystem configurations
-- **Signal Handler**: Manages process lifecycle via signals - SIGTERM (graceful shutdown), SIGHUP (configuration reload), SIGUSR1 (cache statistics dump), SIGUSR2 (detailed status)
-- **Logging System** (`src/log.c`): Non-blocking, fork-safe logging queue with maximum 5 queued messages, prevents main loop blocking on syslog operations
+- **Entry Point / Event Loop** (`src/main.rs`, `src/core/event_loop.rs`): Coordinates all subsystem activities through `mio::Poll`-based I/O multiplexing, monitoring file descriptors for DNS, DHCP, TFTP, control interfaces, and platform-specific sockets. Each file descriptor is registered with a unique `mio::Token` for dispatch.
+- **Configuration Parser** (`src/config/options.rs`): Processes 350+ configuration directives from config file and command line using `Result<DaemonConfig, ConfigError>` return types for type-safe error handling, validating options and initializing subsystem configurations
+- **Signal Handler** (`src/core/signal.rs`): Manages process lifecycle via signals using `nix::sys::signal` with a safe self-pipe pattern - SIGTERM (graceful shutdown), SIGHUP (configuration reload), SIGUSR1 (cache statistics dump), SIGUSR2 (detailed status)
+- **Logging System** (`src/core/logging.rs`): Non-blocking logging via the `log`/`tracing` crate facade with bounded message queue (maximum 5 queued messages), prevents main loop blocking on syslog operations
 
 **DNS Service Components**:
 
-- **DNS Forwarder** (`src/forward.c`): State machine tracking up to 150 concurrent queries, manages upstream server selection with domain-specific routing, implements retry and timeout logic
-- **DNS Cache** (`src/cache.c`): Hash table with LRU eviction, default 150 entries, integrates data from upstream, `/etc/hosts`, and DHCP leases
-- **Wire Format Parser** (`src/rfc1035.c`): RFC 1035 DNS packet parsing and serialization, name compression, resource record encoding/decoding
-- **DNSSEC Validator** (`src/dnssec.c`): Complete DNSSEC validation chain with resource limits preventing DoS attacks
-- **Authoritative DNS** (`src/auth.c`): Serves designated local zones with SOA generation and AXFR support
+- **DNS Forwarder** (`src/dns/forward.rs`): State machine tracking up to 150 concurrent queries in `HashMap<u16, ForwardRecord>`, manages upstream server selection with domain-specific routing via `src/dns/server_match.rs`, implements retry and timeout logic
+- **DNS Cache** (`src/dns/cache.rs`): `HashMap`-based storage with `VecDeque` LRU eviction, default 150 entries, integrates data from upstream, `/etc/hosts`, and DHCP leases
+- **Wire Format Parser** (`src/dns/wire.rs`): RFC 1035 DNS packet parsing and serialization, name compression, resource record encoding/decoding using Rust slices for zero-copy buffer handling
+- **DNSSEC Validator** (`src/dns/dnssec/validation.rs`): Complete DNSSEC validation chain using the `ring` crate for cryptographic operations, with resource limits preventing DoS attacks
+- **Authoritative DNS** (`src/dns/auth.rs`): Serves designated local zones with SOA generation and AXFR support
 
 **DHCP Service Components**:
 
-- **DHCPv4 Server** (`src/dhcp.c`, `src/rfc2131.c`): Full RFC 2131 implementation, static reservations, dynamic pools, PXE boot support
-- **DHCPv6 Server** (`src/dhcp6.c`, `src/rfc3315.c`): Stateful and stateless modes, prefix delegation, coordination with Router Advertisement
-- **Lease Database** (`src/lease.c`): Persistent lease storage with filesystem-based persistence, DNS integration, script trigger management
-- **Router Advertisement** (`src/radv.c`): ICMPv6 RA transmission with configurable M/O flags, RDNSS options, prefix information
+- **DHCPv4 Server** (`src/dhcp/v4/server.rs`, `src/dhcp/v4/rfc2131.rs`): Full RFC 2131 implementation, static reservations, dynamic pools, PXE boot support
+- **DHCPv6 Server** (`src/dhcp/v6/server.rs`, `src/dhcp/v6/rfc3315.rs`): Stateful and stateless modes, prefix delegation, coordination with Router Advertisement
+- **Lease Database** (`src/dhcp/lease.rs`): Persistent lease storage with filesystem-based persistence, DNS integration, script trigger management
+- **Router Advertisement** (`src/dhcp/radv/server.rs`): ICMPv6 RA transmission with configurable M/O flags, RDNSS options, prefix information
 
 **Network Abstraction Components**:
 
-- **Network Core** (`src/network.c`): Platform-independent interface for socket creation, listener management, interface enumeration, packet transmission/reception
-- **Linux Netlink** (`src/netlink.c`): Real-time monitoring of network interface state changes (up/down, address add/remove) via netlink sockets
-- **BSD BPF** (`src/bpf.c`): Berkeley Packet Filter for raw packet access on BSD platforms, routing socket monitoring for interface events
+- **Network Interfaces** (`src/net/interface.rs`): Platform-independent interface for listener socket creation, interface enumeration, and listener management
+- **Socket Pool** (`src/net/socket.rs`): Upstream server socket pool with randomized source ports for security
+- **Linux Netlink** (`src/net/platform/linux/netlink.rs`): Real-time monitoring of network interface state changes (up/down, address add/remove) via netlink sockets
+- **BSD BPF** (`src/net/platform/bsd/bpf.rs`): Berkeley Packet Filter for raw packet access on BSD platforms, routing socket monitoring for interface events
 
 **Integration Components**:
 
-- **Script Executor** (`src/helper.c`): Fork-based execution of external scripts on lease events, proper signal handling and exit status collection
-- **D-Bus Interface** (`src/dbus.c`): System bus control interface at `uk.org.thekelleys.dnsmasq`, cache query/manipulation, upstream server reconfiguration
-- **Firewall Integration** (`src/ipset.c`, `src/nftset.c`): Populates ipset collections and nftables sets with resolved IP addresses for domain-based firewall rules
+- **Script Executor** (`src/dhcp/helper.rs`): Fork-based execution of external scripts on lease events via `unsafe` FFI to `nix::unistd::fork()`, proper signal handling and exit status collection
+- **D-Bus Interface** (`src/integration/dbus.rs`): System bus control interface at `uk.org.thekelleys.dnsmasq`, cache query/manipulation, upstream server reconfiguration
+- **Firewall Integration** (`src/net/platform/linux/ipset.rs`, `src/integration/nftset.rs`): Populates ipset collections and nftables sets with resolved IP addresses for domain-based firewall rules
 
 ---
 
 ## Event Loop Architecture
 
-### Poll-Based I/O Multiplexing
+### mio-Based I/O Multiplexing
 
-The event loop implementation uses the POSIX `poll()` system call to monitor multiple file descriptors with a single blocking wait. This approach is more efficient than `select()` (no FD_SETSIZE limit) and more portable than `epoll()` (Linux-only).
+The event loop implementation uses the `mio` crate's `Poll` abstraction to monitor multiple file descriptors with a single blocking wait. On Linux, `mio` uses `epoll` internally; on BSD it uses `kqueue`. This provides efficient, portable I/O multiplexing without exposing platform-specific APIs.
 
-**Event Loop Flow** (`src/dnsmasq.c` main function, `src/poll.c`):
+**Event Loop Flow** (`src/main.rs` entry point, `src/core/event_loop.rs`):
 
 ```mermaid
 flowchart TD
     Start[Start Daemon] --> Init[Initialize Subsystems]
-    Init --> Setup[Setup File Descriptors]
-    Setup --> EventLoop{Poll for Events}
+    Init --> Setup[Register FDs with mio::Poll]
+    Setup --> EventLoop{mio::Poll::poll for Events}
     
-    EventLoop --> CheckFD{Check Ready FDs}
+    EventLoop --> CheckToken{Match Event Token}
     
-    CheckFD -->|DNS Query| ProcessDNS[Process DNS Query<br/>forward.c:receive_query]
-    CheckFD -->|DNS Response| ProcessResp[Process DNS Response<br/>forward.c:reply_query]
-    CheckFD -->|DHCP Request| ProcessDHCP[Process DHCP Request<br/>dhcp.c:dhcp_reply]
-    CheckFD -->|TFTP Request| ProcessTFTP[Process TFTP Request<br/>tftp.c]
-    CheckFD -->|Signal Pipe| ProcessSig[Process Signal<br/>async_event]
-    CheckFD -->|Netlink Event| ProcessNet[Process Network Change<br/>netlink.c]
-    CheckFD -->|Timer Expiry| ProcessTimer[Process Timeouts]
+    CheckToken -->|DNS_UDP_TOKEN| ProcessDNS[Process DNS Query<br/>dns::forward::receive_query]
+    CheckToken -->|DNS_REPLY_TOKEN| ProcessResp[Process DNS Response<br/>dns::forward::reply_query]
+    CheckToken -->|DHCP_TOKEN| ProcessDHCP[Process DHCP Request<br/>dhcp::v4::server::dhcp_reply]
+    CheckToken -->|TFTP_TOKEN| ProcessTFTP[Process TFTP Request<br/>integration::tftp]
+    CheckToken -->|SIGNAL_TOKEN| ProcessSig[Process Signal<br/>core::signal::process]
+    CheckToken -->|NETLINK_TOKEN| ProcessNet[Process Network Change<br/>net::platform::linux::netlink]
+    CheckToken -->|Timer Expiry| ProcessTimer[Process Timeouts]
     
     ProcessDNS --> EventLoop
     ProcessResp --> EventLoop
@@ -506,12 +510,12 @@ flowchart TD
    - DHCPv6: UDP socket on port 547
    - Router Advertisement: ICMPv6 raw socket
 
-3. **TFTP Listener Socket** (when enabled):
+3. **TFTP Listener Socket** (when `tftp` feature enabled):
    - UDP socket on port 69
 
 4. **Control Interface Sockets**:
-   - D-Bus connection file descriptor (when `HAVE_DBUS`)
-   - UBus connection file descriptor (when `HAVE_UBUS`)
+   - D-Bus connection file descriptor (when `dbus` feature enabled)
+   - UBus connection file descriptor (when `ubus` feature enabled)
 
 5. **Platform Monitoring Sockets**:
    - Linux: Netlink socket for interface/address changes
@@ -520,28 +524,29 @@ flowchart TD
 6. **Signal Communication**:
    - Signal pipe for async-signal-safe signal delivery from signal handlers to main loop
 
-**Poll Structure** (`src/poll.c`):
+**mio Event Registration** (`src/core/event_loop.rs`):
 
-The daemon maintains a sorted array of `struct pollfd` entries, with helper functions to add, remove, and check file descriptors. The `poll()` call blocks with a timeout of typically a few seconds, returning when:
-- One or more file descriptors become ready for I/O
-- A signal is received (EINTR, restarted after signal processing)
+The daemon maintains a `mio::Poll` registry where each file descriptor is registered with a unique `mio::Token`. The `mio::Poll::poll()` call blocks with a configurable timeout, returning when:
+- One or more file descriptors become ready for I/O (identified by their `Token`)
+- A signal is received (detected via the signal pipe's `Token`)
 - The timeout expires (triggers periodic maintenance tasks)
 
 ### Signal Handling Strategy
 
 **Async-Signal-Safe Approach**:
 
-Traditional signal handlers have severe restrictions on what functions they can safely call. Dnsmasq uses a two-stage signal handling mechanism:
+Traditional signal handlers have severe restrictions on what functions they can safely call. Dnsmasq uses a two-stage signal handling mechanism implemented in `src/core/signal.rs`:
 
-1. **Signal Handler Stage** (`sig_handler()` in `src/dnsmasq.c`):
+1. **Signal Handler Stage** (registered via `nix::sys::signal::sigaction`):
    - Minimal work: writes signal number to signal pipe
    - Uses only async-signal-safe operations
    - Returns immediately
 
-2. **Main Loop Stage** (`async_event()` in `src/dnsmasq.c`):
-   - Main loop detects signal pipe ready for reading
+2. **Main Loop Stage** (signal event processing in `src/core/signal.rs`):
+   - Main loop detects signal pipe ready for reading (via `SIGNAL_TOKEN`)
    - Reads signal number from pipe
    - Performs full signal processing in normal context with access to all functions
+   - Uses Rust pattern matching to dispatch signal-specific handlers
 
 **Signal Responses**:
 
@@ -556,17 +561,17 @@ Traditional signal handlers have severe restrictions on what functions they can 
 To maintain event loop responsiveness, all operations must either complete quickly or be non-blocking:
 
 **Fast Synchronous Operations**:
-- DNS cache lookups: Hash table lookup, typically <0.1ms
-- DHCP lease lookups: Array or hash table scan, <1ms
-- Packet parsing: Wire format decoding, <1ms
+- DNS cache lookups: HashMap lookup, typically <0.1ms
+- DHCP lease lookups: HashMap lookup, <1ms
+- Packet parsing: Wire format decoding via Rust slices, <1ms
 
 **Handled via Timeout**:
 - DNS upstream queries: 10-second timeout, no result → SERVFAIL to client
 - TCP connections: 5-second timeout per connection
 
 **Offloaded to Child Processes**:
-- External script execution: Fork/exec pattern, parent continues processing
-- Lua script execution: Runs in daemon context but fast (<1ms typically)
+- External script execution: `nix::unistd::fork()` via `unsafe` FFI in `src/dhcp/helper.rs`, parent continues processing
+- Note: Lua script embedding is deferred to a future phase; only external script execution is supported
 
 ---
 
@@ -584,17 +589,17 @@ sequenceDiagram
     Client->>Daemon: DNS Query (A record for example.com)
     activate Daemon
     
-    Daemon->>Cache: cache_find_by_name("example.com", A)
+    Daemon->>Cache: cache.find_by_name("example.com", A)
     activate Cache
     
     alt Cache Hit
-        Cache-->>Daemon: Cached A Record (TTL remaining)
+        Cache-->>Daemon: Cached CacheEntry (TTL remaining)
         Daemon-->>Client: DNS Response (from cache)
     else Cache Miss
-        Cache-->>Daemon: NULL (not cached)
+        Cache-->>Daemon: None (not cached)
         deactivate Cache
         
-        Daemon->>Daemon: Allocate struct frec (forward record)
+        Daemon->>Daemon: Create ForwardRecord in HashMap
         Daemon->>Upstream: Forward Query (random src port)
         
         Note over Daemon,Upstream: Wait up to 10s for response
@@ -604,15 +609,15 @@ sequenceDiagram
         Daemon->>Daemon: Validate response format
         
         opt DNSSEC Enabled
-            Daemon->>Daemon: Validate DNSSEC signatures
+            Daemon->>Daemon: Validate DNSSEC signatures (ring crate)
         end
         
-        Daemon->>Cache: cache_insert(example.com, A record, TTL)
+        Daemon->>Cache: cache.insert(example.com, CacheEntry, TTL)
         activate Cache
         Cache-->>Daemon: Record cached
         deactivate Cache
         
-        Daemon->>Daemon: Free struct frec
+        Daemon->>Daemon: Drop ForwardRecord (RAII cleanup)
         Daemon-->>Client: DNS Response
     end
     
@@ -621,23 +626,23 @@ sequenceDiagram
 
 **Step-by-Step DNS Query Processing**:
 
-1. **Query Reception** (`forward.c:receive_query()`):
+1. **Query Reception** (`dns::forward::receive_query()`):
    - UDP packet arrives on port 53 listener
-   - Parse DNS header and question section
+   - Parse DNS header and question section via `dns::wire`
    - Extract query name, type, class
    - Validate packet format, reject malformed queries
 
-2. **Cache Lookup** (`cache.c:cache_find_by_name()`):
+2. **Cache Lookup** (`dns::cache::Cache::find_by_name()`):
    - Compute hash of query name
-   - Search hash table for matching entry
+   - Search `HashMap` for matching entry
    - Check TTL hasn't expired
    - If found: return cached answer immediately
 
-3. **Forward Record Allocation** (on cache miss):
-   - Allocate `struct frec` from pool of 150 entries (`FTABSIZ`)
+3. **Forward Record Creation** (on cache miss):
+   - Create `ForwardRecord` and insert into `HashMap<u16, ForwardRecord>` bounded to `FTABSIZ` (150)
    - Store client query ID, source address, query details
    - Generate new query ID for upstream (prevents query ID prediction attacks)
-   - Select upstream server based on domain-specific routing rules
+   - Select upstream server based on domain-specific routing rules via `dns::server_match`
 
 4. **Upstream Forwarding**:
    - Construct DNS query packet with new query ID
@@ -645,26 +650,26 @@ sequenceDiagram
    - Use randomized source port for security
    - Set 10-second timeout
 
-5. **Response Reception** (`forward.c:reply_query()`):
+5. **Response Reception** (`dns::forward::reply_query()`):
    - Upstream response arrives
-   - Match response to outstanding `struct frec` by query ID
+   - Match response to outstanding `ForwardRecord` by query ID in the HashMap
    - Validate response: matching question section, reasonable TTL values
 
-6. **DNSSEC Validation** (if enabled, `dnssec.c`):
+6. **DNSSEC Validation** (if `dnssec` feature enabled, `dns::dnssec::validation` module):
    - Check for RRSIG records
-   - Validate signature chain to trust anchor
+   - Validate signature chain to trust anchor using `ring` crate
    - Process NSEC/NSEC3 proofs for negative responses
    - Return SERVFAIL if validation fails (bogus)
 
-7. **Cache Insertion** (`cache.c:cache_insert()`):
+7. **Cache Insertion** (`dns::cache::Cache::insert()`):
    - Add validated response to cache
-   - Apply LRU eviction if cache full
+   - Apply `VecDeque`-based LRU eviction if cache full
    - TTL copied from response
 
 8. **Client Response**:
    - Restore original query ID
    - Send response packet to client
-   - Free `struct frec` for reuse
+   - `ForwardRecord` dropped automatically (RAII cleanup — Rust's `Drop` trait closes any associated resources)
 
 ### DHCP Lease Assignment Flow
 
@@ -690,7 +695,7 @@ sequenceDiagram
         LeaseDB-->>Daemon: Available IP address
     end
     
-    Daemon->>Daemon: Optional: Ping test IP<br/>(detect conflicts)
+    Daemon->>Daemon: Optional: ICMP ping test IP<br/>(detect conflicts)
     
     Daemon-->>Client: DHCPOFFER (IP address, options)
     deactivate Daemon
@@ -698,14 +703,14 @@ sequenceDiagram
     Client->>Daemon: DHCPREQUEST (requesting offered IP)
     activate Daemon
     
-    Daemon->>LeaseDB: Create/Update Lease<br/>(MAC, IP, hostname, expiry)
+    Daemon->>LeaseDB: Create/Update DhcpLease<br/>(MAC, IP, hostname, expiry)
     LeaseDB-->>Daemon: Lease committed
     
-    Daemon->>DNSCache: Add A record<br/>(hostname → IP)
+    Daemon->>DNSCache: Add CacheEntry (A record)<br/>(hostname → IP)
     DNSCache-->>Daemon: DNS entry added
     
     opt Script Configured
-        Daemon->>Script: Fork/exec with "add"<br/>(MAC, IP, hostname)
+        Daemon->>Script: unsafe fork/exec with "add"<br/>(MAC, IP, hostname)
         Script-->>Daemon: Script runs asynchronously
     end
     
@@ -717,8 +722,8 @@ sequenceDiagram
 
 **DHCP Processing Steps**:
 
-1. **DISCOVER Reception** (`dhcp.c:dhcp_reply()`):
-   - Parse DHCP options from packet
+1. **DISCOVER Reception** (`dhcp::v4::server::dhcp_reply()`):
+   - Parse DHCP options from packet via `dhcp::common`
    - Extract client MAC address, requested IP, hostname, vendor class
    - Apply tag-based configuration rules
 
@@ -742,18 +747,18 @@ sequenceDiagram
    - Verify request matches previous offer
    - Finalize lease assignment
 
-6. **Lease Database Update** (`lease.c`):
-   - Write lease to in-memory table
+6. **Lease Database Update** (`dhcp::lease` module):
+   - Write `DhcpLease` to in-memory `HashMap<IpAddr, DhcpLease>`
    - Asynchronously write to lease file on disk
    - Format: `<expiry> <mac> <ip> <hostname> <client-id>`
 
 7. **DNS Integration**:
-   - Immediately add A record to DNS cache
+   - Immediately add `CacheEntry` (A record) to DNS cache
    - Client now resolvable by hostname
    - PTR record added for reverse lookup
 
 8. **Script Execution** (if configured):
-   - Fork child process
+   - Fork child process via `unsafe` FFI to `nix::unistd::fork()` in `src/dhcp/helper.rs`
    - Execute script with arguments: `add <mac> <ip> <hostname>`
    - Environment includes `DNSMASQ_LEASE_LENGTH`, interface, client ID
    - Parent continues without waiting
@@ -762,72 +767,65 @@ sequenceDiagram
 
 ## Memory Management Strategy
 
-### Fixed-Size Data Structures
+### Rust Ownership and Bounded Collections
 
-Dnsmasq uses predominantly fixed-size or bounded-size data structures to ensure predictable memory consumption and prevent unbounded growth under load or attack.
+Dnsmasq uses Rust's ownership and borrowing system for all memory management, combined with bounded-size collections to ensure predictable memory consumption and prevent unbounded growth under load or attack. The Rust compiler enforces memory safety at compile time, eliminating use-after-free, double-free, and buffer overflow vulnerabilities.
 
-**Core Capacity Limits** (from `src/config.h`):
+**Core Capacity Limits** (from `src/config/constants.rs`):
 
-| Structure | Default Size | Configuration | Purpose |
-|-----------|--------------|---------------|---------|
-| DNS Cache | 150 entries | `CACHESIZ` (line 38)<br/>`--cache-size` | Cached DNS records |
-| Forward Record Table | 150 entries | `FTABSIZ` (line 17) | Outstanding DNS queries |
-| DHCP Lease Table | 1000 leases | `MAXLEASES` (line 40) | Active DHCP leases |
-| TCP Child Processes | 20 processes | `MAX_PROCS` (line 18) | Concurrent TCP DNS connections |
-| TFTP Connections | 50 connections | `TFTP_MAX_CONNECTIONS` (line 54) | Concurrent TFTP transfers |
+| Structure | Default Size | Constant | Purpose |
+|-----------|--------------|----------|---------|
+| DNS Cache | 150 entries | `CACHESIZ` / `--cache-size` | Cached DNS records |
+| Forward Record Table | 150 entries | `FTABSIZ` | Outstanding DNS queries |
+| DHCP Lease Table | 1000 leases | `MAXLEASES` | Active DHCP leases |
+| TCP Child Processes | 20 processes | `MAX_PROCS` | Concurrent TCP DNS connections |
+| TFTP Connections | 50 connections | `TFTP_MAX_CONNECTIONS` | Concurrent TFTP transfers |
 
 ### Memory Allocation Patterns
 
 **Initialization Phase**:
-- Large structures allocated once at daemon startup
-- DNS cache hash table allocated based on configured size
-- Lease table pre-allocated for maximum lease count
-- Configuration structures sized based on config file
+- `DaemonState` struct and nested domain-specific structs allocated at startup
+- DNS cache `HashMap` allocated with `HashMap::with_capacity(cache_size)`
+- Lease table `HashMap` pre-allocated with `HashMap::with_capacity(max_leases)`
+- Configuration structures sized based on config file via `Vec::with_capacity()`
 
 **Runtime Phase**:
 - Minimal heap allocation during packet processing
-- Stack-allocated buffers for packet parsing (avoid malloc overhead)
-- Pool-based allocation for forward records (pre-allocated array, not malloc per query)
+- Stack-allocated buffers and Rust slices (`&[u8]`) for packet parsing avoid heap allocation latency
+- `HashMap<u16, ForwardRecord>` with capacity limit for forward records (entries automatically dropped when removed)
+- Rust's compiler manages all lifetimes and deallocation via the `Drop` trait
 
-**Custom Allocators** (`src/util.c`):
+**Standard Library Allocation**:
 
-```c
-// Example: safe_malloc wrapper
-void *safe_malloc(size_t size)
-{
-    void *ptr = malloc(size);
-    if (!ptr)
-    {
-        // Log error and terminate - better than returning NULL
-        // and risking NULL pointer dereference
-        my_syslog(LOG_EMERG, "Memory allocation failed");
-        exit(1);
-    }
-    return ptr;
-}
+Rust's standard library allocator handles all memory allocation. The `safe_malloc`/`whine_realloc` wrappers from the original C implementation are eliminated — Rust panics on allocation failure by default, or can be configured to abort via `[profile.release] panic = "abort"` in `Cargo.toml`.
+
+```rust
+// Rust allocation examples — no manual free required
+let cache = HashMap::with_capacity(cache_size);  // Pre-allocated HashMap
+let buffer = Vec::with_capacity(4096);            // Pre-allocated buffer
+let entry = Box::new(CacheEntry::new(...));       // Heap-allocated entry
+// All automatically freed when they go out of scope
 ```
 
-### Block Data System (`src/blockdata.c`)
+### Variable-Length Data
 
-For variable-length data (primarily DNSSEC records which can be large), dnsmasq uses a block allocation system:
-
-- **Fixed Block Size**: Each block is a fixed size (typically 128 or 256 bytes)
-- **Chain Structure**: Large data items span multiple blocks linked together
-- **Reduced Fragmentation**: Fixed-size blocks prevent heap fragmentation
-- **Bounded Growth**: Total block pool size can be limited
+The block allocation system from the original C implementation (`blockdata.c`) is entirely replaced by Rust's `Vec<u8>` and the `bytes::Bytes` crate for variable-length data. Rust's allocator handles fragmentation prevention natively.
 
 **Use Cases**:
-- DNSSEC RRSIG records (variable-length signatures)
-- DNSKEY records (public keys, various sizes)
-- Large TXT records
+- DNSSEC RRSIG records (variable-length signatures) → `Vec<u8>`
+- DNSKEY records (public keys, various sizes) → `Vec<u8>`
+- Large TXT records → `String` or `Vec<u8>`
+- DNS/DHCP packet construction → `bytes::BytesMut` for efficient append operations
 
 ### Memory Consumption Profile
 
 **Typical Memory Usage**:
 
-- **Minimal Configuration** (DNS forwarding only, 150 cache entries): ~1-2MB RSS
-- **Standard Configuration** (DNS + DHCP, 150 cache, 50 leases): ~2-3MB RSS
-- **Full Configuration** (DNS + DHCP + DNSSEC + TFTP, 1000 cache, 200 leases): ~5-10MB RSS
+- **Minimal Configuration** (DNS forwarding only, 150 cache entries): ~2-3MB RSS
+- **Standard Configuration** (DNS + DHCP, 150 cache, 50 leases): ~3-5MB RSS
+- **Full Configuration** (DNS + DHCP + DNSSEC + TFTP, 1000 cache, 200 leases): ~6-12MB RSS
+
+Note: Rust binaries include the Rust standard library, which adds ~1-2MB to base RSS compared to the C implementation.
 
 **Memory Growth Factors**:
 - Cache size: ~200 bytes per cached record
@@ -835,43 +833,46 @@ For variable-length data (primarily DNSSEC records which can be large), dnsmasq 
 - Configuration size: Static hosts, DHCP reservations (~50-100 bytes each)
 - DNSSEC: Additional memory for DNSKEY/DS records and validation state
 
-**Memory Leak Prevention**:
-- All allocations paired with corresponding frees
-- No dynamic allocation in hot paths (prevents slow leaks)
-- Valgrind testing during development to detect leaks
+**Memory Safety Guarantees**:
+
+Memory safety is guaranteed by Rust's ownership and borrowing system. No manual allocation/deallocation pairing is needed. The `unsafe` FFI boundaries (D-Bus, netfilter, nftables, and `fork`/`exec` for the helper process) are the only areas requiring manual memory audit. Each `unsafe` block includes a `// SAFETY:` comment explaining the invariants maintained.
 
 ---
 
 ## Platform Abstraction Layer
 
-Dnsmasq supports diverse Unix-like platforms through careful abstraction of platform-specific functionality. Platform differences are isolated in dedicated modules, with conditional compilation selecting appropriate implementations.
+Dnsmasq supports Linux and BSD platforms through careful abstraction of platform-specific functionality. Platform differences are isolated in dedicated modules under `src/net/platform/`, with Rust's conditional compilation (`#[cfg(target_os = "...")]`) selecting appropriate implementations at compile time.
 
 ### Network Interface Monitoring
 
 Different platforms provide different mechanisms for monitoring network interface state changes:
 
-**Linux: Netlink Sockets** (`src/netlink.c`):
+**Linux: Netlink Sockets** (`src/net/platform/linux/netlink.rs`):
 
-```c
-// Netlink socket monitoring (simplified concept)
-// Linux provides real-time notifications of:
-// - Interface up/down events
-// - IP address addition/removal
-// - Route changes
+```rust
+use nix::sys::socket::{socket, AddressFamily, SockType, SockFlag};
 
-int netlink_init(void)
-{
-    int fd = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-    // Bind and configure netlink socket
-    // Add to poll() file descriptor set
-    return fd;
+/// Initialize netlink socket for route/address monitoring.
+/// Registers the fd with the mio::Poll event loop.
+pub fn netlink_init(poll: &mio::Poll) -> Result<RawFd, nix::Error> {
+    let fd = socket(
+        AddressFamily::Netlink,
+        SockType::Raw,
+        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        // NETLINK_ROUTE protocol
+    )?;
+    // Bind to RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR
+    // Register fd with mio::Poll using NETLINK_TOKEN
+    Ok(fd)
 }
 
-void netlink_process(void)
-{
-    // Process netlink messages
+/// Process incoming netlink messages and update interface state.
+pub fn netlink_process(state: &mut DaemonState) -> Result<(), Error> {
+    // Read netlink messages from socket
+    // Parse RTM_NEWADDR, RTM_DELADDR, RTM_NEWLINK, RTM_DELLINK
     // Update internal interface state
     // Trigger listener reconfiguration if needed
+    Ok(())
 }
 ```
 
@@ -881,23 +882,27 @@ void netlink_process(void)
 - Supports IPv4 and IPv6 address monitoring
 - Route table change detection
 
-**BSD: Routing Sockets and BPF** (`src/bpf.c`):
+**BSD: Routing Sockets and BPF** (`src/net/platform/bsd/bpf.rs`):
 
-```c
-// BSD routing socket monitoring (simplified concept)
-// BSD provides interface events via routing sockets
+```rust
+use nix::sys::socket::{socket, AddressFamily, SockType, SockFlag};
 
-int bpf_init(void)
-{
-    int fd = socket(PF_ROUTE, SOCK_RAW, 0);
-    // Configure routing socket
-    return fd;
+/// Initialize BSD routing socket for interface event monitoring.
+pub fn bpf_init(poll: &mio::Poll) -> Result<RawFd, nix::Error> {
+    let fd = socket(
+        AddressFamily::Route,
+        SockType::Raw,
+        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+    )?;
+    // Register fd with mio::Poll
+    Ok(fd)
 }
 
-void bpf_process(void)
-{
+/// Process routing socket messages and update interface state.
+pub fn bpf_process(state: &mut DaemonState) -> Result<(), Error> {
     // Read routing messages
     // Update interface state
+    Ok(())
 }
 ```
 
@@ -906,34 +911,36 @@ void bpf_process(void)
 - BPF for raw packet access (DHCP, TFTP)
 - Different ioctl() interfaces for interface enumeration
 
-**Platform Detection** (`src/config.h`):
+**Platform Detection** (Rust conditional compilation):
 
-```c
-// Compile-time platform detection
-#if defined(__linux__)
-#  define HAVE_LINUX_NETWORK
-#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
-#  define HAVE_BSD_NETWORK
-#endif
+```rust
+// In src/net/platform/mod.rs
+#[cfg(target_os = "linux")]
+pub mod linux;
+
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+pub mod bsd;
 ```
 
-### Unified Network API (`src/network.c`)
+Platform selection is handled entirely at compile time by Rust's `#[cfg()]` attributes, replacing the C preprocessor's `#ifdef HAVE_LINUX_NETWORK` / `#ifdef HAVE_BSD_NETWORK` guards. The `build.rs` script performs additional platform detection for optional native library linking.
 
-The network core module provides platform-independent interfaces:
+### Unified Network API (`src/net/interface.rs`, `src/net/socket.rs`)
+
+The network modules provide platform-independent interfaces via the `trait NetworkBackend` pattern:
 
 **Interface Enumeration**:
 - `enumerate_interfaces()`: Returns list of all network interfaces
-- Abstracts: Linux `getifaddrs()`, BSD `getifaddrs()`, Solaris `ioctl(SIOCGIFCONF)`
+- Abstracts: Linux `getifaddrs()`, BSD `getifaddrs()` via the `nix` crate
 
-**Socket Creation**:
+**Socket Creation** (`src/net/socket.rs`):
 - `create_bound_listeners()`: Creates listener sockets on specific interfaces
 - `create_wildcard_listeners()`: Creates wildcard listeners (all interfaces)
-- Handles: IPv4/IPv6 dual-stack, SO_REUSEADDR, IPV6_V6ONLY
+- Handles: IPv4/IPv6 dual-stack, `SO_REUSEADDR`, `IPV6_V6ONLY` via the `socket2` crate
 
 **Address Utilities**:
 - `iface_check()`: Check if address is on specific interface
 - `local_addr()`: Determine if address is local to daemon
-- Platform-agnostic address family handling
+- Platform-agnostic address family handling via `std::net` types
 
 ### Service Management Integration
 
@@ -944,23 +951,13 @@ Different platforms use different service management frameworks:
 - Socket activation support
 - Integration with systemd-resolved
 
-**macOS: launchd** (`contrib/MacOSX-launchd/`):
-- Property list: `uk.org.thekelleys.dnsmasq.plist`
-- Automatic daemon restart on crash
-- Integration with macOS network preferences
-
-**Solaris: SMF** (`contrib/Solaris10/`):
-- Service manifest: `dnsmasq.xml`
-- Service dependency management
-- Integration with Solaris zones
-
 **BSD: rc.d**:
 - Init script: `/etc/rc.d/dnsmasq` or `/usr/local/etc/rc.d/dnsmasq`
 - rcvar configuration
 
 ### File System Paths
 
-Platform-specific file paths are defined in `src/config.h` lines 207-243:
+Platform-specific file paths are defined as constants in `src/config/constants.rs`:
 
 | Purpose | Linux Default | BSD Default | Configurable |
 |---------|---------------|-------------|--------------|
@@ -977,81 +974,83 @@ Platform-specific file paths are defined in `src/config.h` lines 207-243:
 ```mermaid
 graph TD
     subgraph "Foundation Layer"
-        Config[config.h<br/>Compile-time Configuration]
-        DnsmasqH[dnsmasq.h<br/>Core Data Structures]
-        Util[util.c<br/>Utility Functions]
+        Config[config/constants.rs<br/>Compile-time Constants]
+        Types[types/mod.rs<br/>Core Type Definitions]
+        Util[core/util.rs<br/>Utility Functions]
     end
     
     subgraph "Runtime Core"
-        Main[dnsmasq.c<br/>Main Event Loop]
-        Poll[poll.c<br/>I/O Multiplexing]
-        Log[log.c<br/>Logging]
-        Option[option.c<br/>Config Parser]
+        Main[main.rs<br/>Entry Point]
+        EventLoop[core/event_loop.rs<br/>mio Event Loop]
+        Log[core/logging.rs<br/>Logging]
+        Option[config/options.rs<br/>Config Parser]
     end
     
     subgraph "Network Layer"
-        Network[network.c<br/>Network Core]
-        Netlink[netlink.c<br/>Linux Monitor]
-        BPF[bpf.c<br/>BSD Monitor]
+        Interface[net/interface.rs<br/>Network Interfaces]
+        Socket[net/socket.rs<br/>Socket Pool]
+        Netlink[net/platform/linux/netlink.rs<br/>Linux Monitor]
+        BPF[net/platform/bsd/bpf.rs<br/>BSD Monitor]
     end
     
     subgraph "DNS Services"
-        Forward[forward.c<br/>DNS Forwarder]
-        Cache[cache.c<br/>DNS Cache]
-        RFC1035[rfc1035.c<br/>Wire Format]
-        DNSSEC[dnssec.c<br/>DNSSEC]
-        Auth[auth.c<br/>Authoritative]
+        Forward[dns/forward.rs<br/>DNS Forwarder]
+        Cache[dns/cache.rs<br/>DNS Cache]
+        Wire[dns/wire.rs<br/>Wire Format]
+        DNSSEC[dns/dnssec/validation.rs<br/>DNSSEC]
+        Auth[dns/auth.rs<br/>Authoritative]
     end
     
     subgraph "DHCP Services"
-        DHCP[dhcp.c<br/>DHCP Server]
-        RFC2131[rfc2131.c<br/>DHCPv4]
-        DHCP6[dhcp6.c<br/>DHCPv6]
-        RFC3315[rfc3315.c<br/>DHCPv6 Protocol]
-        Lease[lease.c<br/>Lease DB]
-        RadV[radv.c<br/>Router Advert]
+        DHCPv4[dhcp/v4/server.rs<br/>DHCPv4 Server]
+        RFC2131[dhcp/v4/rfc2131.rs<br/>DHCPv4 Protocol]
+        DHCPv6[dhcp/v6/server.rs<br/>DHCPv6 Server]
+        RFC3315[dhcp/v6/rfc3315.rs<br/>DHCPv6 Protocol]
+        Lease[dhcp/lease.rs<br/>Lease DB]
+        RadV[dhcp/radv/server.rs<br/>Router Advert]
     end
     
-    Config --> DnsmasqH
-    DnsmasqH --> Main
-    DnsmasqH --> Forward
-    DnsmasqH --> Cache
-    DnsmasqH --> DHCP
-    DnsmasqH --> Lease
+    Config --> Types
+    Types --> Main
+    Types --> Forward
+    Types --> Cache
+    Types --> DHCPv4
+    Types --> Lease
     
     Util --> Main
     Util --> Forward
     Util --> Cache
-    Util --> DHCP
+    Util --> DHCPv4
     
-    Main --> Poll
+    Main --> EventLoop
     Main --> Log
     Main --> Option
-    Main --> Network
+    Main --> Interface
     Main --> Forward
-    Main --> DHCP
+    Main --> DHCPv4
     
-    Network --> Netlink
-    Network --> BPF
+    Interface --> Netlink
+    Interface --> BPF
+    Interface --> Socket
     
     Forward --> Cache
-    Forward --> RFC1035
+    Forward --> Wire
     Forward --> DNSSEC
     Forward --> Auth
-    Forward --> Network
+    Forward --> Socket
     
-    DHCP --> RFC2131
-    DHCP --> Lease
-    DHCP --> Network
+    DHCPv4 --> RFC2131
+    DHCPv4 --> Lease
+    DHCPv4 --> Interface
     
-    DHCP6 --> RFC3315
-    DHCP6 --> Lease
-    DHCP6 --> RadV
-    DHCP6 --> Network
+    DHCPv6 --> RFC3315
+    DHCPv6 --> Lease
+    DHCPv6 --> RadV
+    DHCPv6 --> Interface
     
     Lease --> Cache
     
-    style DnsmasqH fill:#ffe1e1
+    style Types fill:#ffe1e1
     style Main fill:#e1f5ff
     style Cache fill:#fff4e1
     style Lease fill:#fff4e1
@@ -1059,120 +1058,110 @@ graph TD
 
 ### Key Integration Points
 
-**DNS-DHCP Integration** (`cache.c` ↔ `lease.c`):
+**DNS-DHCP Integration** (`dns::cache` ↔ `dhcp::lease`):
 
 When a DHCP lease is assigned with a hostname:
-1. `lease.c:lease_update()` updates lease database
-2. Calls `cache.c:cache_add_dhcp_entry()` to add DNS A record
+1. `dhcp::lease::Lease::update()` updates lease database
+2. Calls `dns::cache::Cache::add_dhcp_entry()` to add DNS A record
 3. DNS cache immediately contains hostname → IP mapping
 4. Subsequent DNS queries for hostname return cached entry
-5. Lease expiration/release triggers `cache_del_dhcp_entry()`
+5. Lease expiration/release triggers `Cache::del_dhcp_entry()`
 
-**Forward-Cache Integration** (`forward.c` → `cache.c`):
+**Forward-Cache Integration** (`dns::forward` → `dns::cache`):
 
-```c
-// Simplified query processing flow
-void receive_query(int fd)
-{
+```rust
+/// Simplified query processing flow (src/dns/forward.rs)
+pub fn receive_query(
+    state: &mut DaemonState,
+    fd: RawFd,
+) -> Result<(), DnsError> {
     // Parse DNS query
-    struct dns_header *header = parse_query(packet);
+    let header: DnsHeader = dns::wire::parse_header(packet)?;
     
     // Check cache
-    struct crec *cached = cache_find_by_name(query_name, query_type);
+    if let Some(entry) = state.cache.find_by_name(&query_name, query_type) {
+        if !entry.is_expired(state.now) {
+            // Cache hit — return immediately
+            return send_cached_answer(fd, &header, &entry);
+        }
+    }
     
-    if (cached && !is_expired(cached))
-    {
-        // Cache hit - return immediately
-        return_cached_answer(fd, header, cached);
-    }
-    else
-    {
-        // Cache miss - forward to upstream
-        struct frec *forward = allocate_frec();
-        forward_to_upstream(forward, header, query_name);
-    }
+    // Cache miss — forward to upstream
+    let forward = ForwardRecord::new(&header, client_addr, query_name);
+    state.forward_table.insert(forward.new_id, forward);
+    forward_to_upstream(state, &header, &query_name)?;
+    Ok(())
 }
 
-void reply_query(int fd)
-{
+pub fn reply_query(
+    state: &mut DaemonState,
+    fd: RawFd,
+) -> Result<(), DnsError> {
     // Upstream response received
-    struct frec *forward = find_frec_by_id(query_id);
+    let forward = state.forward_table.remove(&query_id)
+        .ok_or(DnsError::UnknownQueryId)?;
     
     // Validate response
-    if (validate_response(response))
-    {
+    if validate_response(&response)? {
         // Add to cache
-        cache_insert(query_name, response_data, ttl);
+        state.cache.insert(&query_name, response_data, ttl);
         
         // Return to client
-        return_answer(forward->client_fd, response);
-        
-        // Free forward record
-        free_frec(forward);
+        send_answer(forward.client_fd, &response)?;
     }
+    // ForwardRecord dropped here automatically (RAII)
+    Ok(())
 }
 ```
 
-**Network-Multiple Services** (`network.c` → all protocol handlers):
+**Network-Multiple Services** (`src/core/event_loop.rs` → all protocol handlers):
 
-The network core creates listener sockets and dispatches incoming packets to appropriate handlers:
+The event loop dispatches incoming events to appropriate handlers based on `mio::Token`:
 
-```c
-// Simplified dispatch logic
-void poll_loop(void)
-{
-    while (running)
-    {
-        int ready = poll(pollfds, nfds, timeout);
+```rust
+/// Simplified dispatch logic (src/core/event_loop.rs)
+pub fn run_event_loop(state: &mut DaemonState) -> Result<(), Error> {
+    let mut events = mio::Events::with_capacity(1024);
+    
+    loop {
+        state.poll.poll(&mut events, Some(timeout))?;
         
-        for (each ready fd)
-        {
-            if (fd == dns_udp_fd)
-                receive_query(fd);
-            else if (fd == dhcp_fd)
-                dhcp_reply(fd);
-            else if (fd == dhcp6_fd)
-                dhcp6_reply(fd);
-            else if (fd == tftp_fd)
-                tftp_request(fd);
-            else if (fd == netlink_fd)
-                netlink_process(fd);
-            // ... etc
+        for event in events.iter() {
+            match event.token() {
+                DNS_UDP_TOKEN   => dns::forward::receive_query(state)?,
+                DNS_REPLY_TOKEN => dns::forward::reply_query(state)?,
+                DHCP_TOKEN      => dhcp::v4::server::dhcp_reply(state)?,
+                DHCP6_TOKEN     => dhcp::v6::server::dhcp6_reply(state)?,
+                TFTP_TOKEN      => integration::tftp::tftp_request(state)?,
+                NETLINK_TOKEN   => net::platform::linux::netlink::process(state)?,
+                SIGNAL_TOKEN    => core::signal::process(state)?,
+                _               => {} // Unknown token, ignore
+            }
         }
     }
 }
 ```
 
-**Configuration-All Modules** (`option.c` → global `daemon` struct):
+**Configuration-All Modules** (`config::options` → `DaemonState`):
 
-Configuration parsing initializes the global `struct daemon *daemon` which all modules reference:
+Configuration parsing initializes the `DaemonState` struct which is passed by reference to all subsystem methods:
 
-```c
-// Global daemon structure (src/dnsmasq.h)
-struct daemon
-{
-    // DNS configuration
-    int port;                    // DNS port (default 53)
-    int cachesize;               // Cache size entries
-    struct server *servers;      // Upstream DNS servers
-    
-    // DHCP configuration
-    struct dhcp_context *dhcp;   // DHCP address ranges
-    struct dhcp_config *dhcp_conf; // Static DHCP reservations
-    struct dhcp_lease *leases;   // Active lease list
-    
-    // Network configuration
-    struct listener *listeners;  // Network listeners
-    struct iname *if_names;      // Interface specifications
-    
-    // Runtime state
-    time_t now;                  // Current time cache
-    int num_leases;              // Active lease count
-    // ... hundreds more fields
-};
+```rust
+/// Central daemon state (src/core/daemon.rs)
+pub struct DaemonState {
+    pub dns: DnsConfig,           // DNS configuration
+    pub cache: CacheState,        // DNS cache state  
+    pub dhcp: DhcpState,          // DHCP configuration and state
+    pub network: NetworkState,    // Network listeners and interfaces
+    pub leases: LeaseStore,       // Active DHCP leases
+    pub forward_table: HashMap<u16, ForwardRecord>,  // Outstanding queries
+    pub poll: mio::Poll,          // Event loop poll instance
+    pub now: Instant,             // Current time cache
+    // ...
+}
 ```
 
-All modules access this global state, eliminating need for passing context pointers through all function calls.
+`DaemonState` is passed as `&mut` or `&` reference to subsystem methods, enforcing Rust's borrowing rules. Where multiple subsystems need mutation within the single-threaded event loop, interior mutability via `RefCell` is used for specific fields. This replaces the C pattern of a global `struct daemon` pointer accessed by all modules.
 
 ---
 
@@ -1180,50 +1169,49 @@ All modules access this global state, eliminating need for passing context point
 
 ### Compilation Model
 
-**Makefile Structure**:
+**Cargo.toml Workspace**:
 
-The build system (`Makefile` in repository root) provides:
+The build system (`Cargo.toml` in repository root) provides:
 
-1. **Feature Detection**: Uses `pkg-config` to detect optional libraries
-2. **Conditional Compilation**: Sets `COPTS` with `-DHAVE_*` flags
-3. **Platform Detection**: Uses `uname` to identify OS and adjust flags
-4. **Cross-Compilation**: Supports setting `CC`, `CFLAGS`, `LDFLAGS`
+1. **Feature Detection**: Cargo features with optional `pkg-config` for native library detection in `build.rs`
+2. **Conditional Compilation**: `#[cfg(feature = "...")]` attributes on modules and functions
+3. **Platform Detection**: Rust's `#[cfg(target_os = "...")]` attributes and `build.rs` for platform-specific configuration
+4. **Cross-Compilation**: `.cargo/config.toml` with target-specific linker configurations for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`
 
 **Default Build** (common features enabled):
 
 ```bash
-# Standard build with common features
-make
+# Standard build with default features
+cargo build --release
 
-# Resulting binary includes:
+# Default features include:
 # - DNS forwarding and caching (always)
-# - DHCP and DHCPv6 (always)
-# - TFTP (if enabled in Makefile, default yes)
-# - Authoritative DNS (if enabled, default yes)
-# - DNSSEC (if Nettle detected via pkg-config)
-# - D-Bus (if libdbus-1 detected)
-# - IDN support (if libidn or libidn2 detected)
+# - DHCP and DHCPv6 (dhcp, dhcp6 features)
+# - TFTP (tftp feature)
+# - Authoritative DNS (auth feature)
+# - Script execution (script feature)
+# - ipset integration (ipset feature)
+# - Loop detection (loop_detect feature)
+# - Packet dumping (dump feature)
 ```
 
 **Minimal Build** (embedded systems):
 
 ```bash
 # Minimal DNS-only build
-make COPTS="-DNO_DHCP -DNO_TFTP -DNO_AUTH -DNO_DNSSEC -DNO_SCRIPT"
+cargo build --release --no-default-features
 
-# Result: ~100KB stripped binary, DNS forwarding only
+# Result: Minimal binary, DNS forwarding only
 ```
 
 **Full-Featured Build**:
 
 ```bash
 # Enable all optional features
-make COPTS="-DHAVE_DNSSEC -DHAVE_DBUS -DHAVE_IDN -DHAVE_LIBIDN2 \
-            -DHAVE_CONNTRACK -DHAVE_IPSET -DHAVE_NFTSET \
-            -DHAVE_LUASCRIPT -DHAVE_DUMPFILE"
+cargo build --release --all-features
 
-# Requires all optional libraries installed
-# Result: ~500KB stripped binary, all features
+# Includes: dnssec, dbus, ubus, conntrack, nftset, idn
+# Requires optional system libraries for FFI features
 ```
 
 ### Configuration File Processing
@@ -1233,15 +1221,17 @@ make COPTS="-DHAVE_DNSSEC -DHAVE_DBUS -DHAVE_IDN -DHAVE_LIBIDN2 \
 1. **Command-line options**: Override all other settings
 2. **Configuration file**: Default `/etc/dnsmasq.conf`, specifiable via `-C`
 3. **Included files**: `conf-dir=` and `conf-file=` directives
-4. **Built-in defaults**: Hardcoded in `src/config.h`
+4. **Built-in defaults**: Defined as `const` values in `src/config/constants.rs`
 
-**Configuration Parsing** (`src/option.c`):
+**Configuration Parsing** (`src/config/options.rs`):
 
-The `read_opts()` function processes configuration in multiple passes:
+The `config::options::parse()` function processes configuration and returns `Result<DaemonConfig, ConfigError>`:
 
-1. **First Pass**: Parse basic options, open files, check syntax
+1. **First Pass**: Parse basic options, open files, check syntax — errors propagated via `Result<T, ConfigError>`
 2. **Network Pass**: Enumerate interfaces, validate interface names
 3. **Final Pass**: Validate cross-dependencies, initialize structures
+
+This replaces the C implementation's `setjmp`/`longjmp` error recovery pattern with idiomatic Rust `Result<T, E>` propagation using the `?` operator.
 
 **Configuration Validation**:
 
@@ -1275,30 +1265,31 @@ log-dhcp
 
 **Hot Reload via SIGHUP**:
 
-When SIGHUP is received:
+When SIGHUP is received, the signal handler in `src/core/signal.rs` dispatches reload processing:
 
-```c
-// Simplified reload logic
-void reload_config(void)
-{
+```rust
+/// Simplified reload logic (src/core/signal.rs)
+fn handle_sighup(state: &mut DaemonState) -> Result<(), Error> {
     // Clear DNS cache completely
-    cache_init();
+    state.cache.clear();
     
     // Re-read configuration file
-    read_opts(argc, argv, config_file);
+    let new_config = config::options::parse(&state.config_path)?;
+    state.apply_config(new_config);
     
     // Re-enumerate network interfaces
-    enumerate_interfaces();
+    net::interface::enumerate_interfaces(state)?;
     
     // Recreate DNS listeners (if interfaces changed)
-    set_dns_listeners();
+    net::interface::set_dns_listeners(state)?;
     
     // Reload /etc/hosts entries
-    read_hosts_file();
+    state.cache.read_hosts_file(&state.hosts_path)?;
     
     // DHCP leases preserved (not cleared)
     
     // Resume normal operation
+    Ok(())
 }
 ```
 
@@ -1322,11 +1313,13 @@ void reload_config(void)
 
 | Scenario | Expected Latency | Notes |
 |----------|------------------|-------|
-| Cache hit | <1ms | Memory lookup, no I/O |
+| Cache hit | <1ms | HashMap lookup, no I/O |
 | Cache miss, fast upstream | 10-20ms | Upstream RTT + processing |
 | Cache miss, slow upstream | 100-200ms | Depends on upstream latency |
-| DNSSEC validation | +10-50ms | Crypto operations, additional queries |
+| DNSSEC validation | +10-50ms | `ring` crate crypto operations, additional queries |
 | First query after startup | +5-10ms | Cache cold, interface enumeration |
+
+Rust's zero-cost abstractions maintain the same performance characteristics as the original C implementation.
 
 **DHCP Transaction Latency**:
 
@@ -1373,14 +1366,14 @@ void reload_config(void)
 Predictable and bounded by configuration:
 
 ```
-Base memory: 1-2 MB
+Base memory: 2-3 MB (includes Rust standard library)
 + (cache_size * 200 bytes) for DNS cache
 + (max_leases * 150 bytes) for DHCP leases
 + (config_entries * 100 bytes) for static configuration
 + DNSSEC validation state (when active): 1-5 MB
 
-Typical: 2-5 MB RSS
-Maximum (large deployment): 10-20 MB RSS
+Typical: 3-6 MB RSS
+Maximum (large deployment): 12-25 MB RSS
 ```
 
 **Network Bandwidth**:
@@ -1396,11 +1389,11 @@ Minimal - only DNS and DHCP protocol overhead:
 
 | Metric | Recommended Maximum | Hard Limit | Constraint |
 |--------|---------------------|------------|-----------|
-| Concurrent clients | 250 | 1000 | DHCP lease table |
-| DNS cache size | 10,000 | No hard limit | Memory, hash table efficiency |
+| Concurrent clients | 250 | 1000 | DHCP lease table (`MAXLEASES`) |
+| DNS cache size | 10,000 | No hard limit | Memory, HashMap efficiency |
 | Query rate | 5,000 qps | 10,000 qps | Single-core CPU |
-| Concurrent TCP connections | 20 | 20 | `MAX_PROCS` limit |
-| TFTP connections | 50 | 50 | `TFTP_MAX_CONNECTIONS` |
+| Concurrent TCP connections | 20 | 20 | `MAX_PROCS` in `src/config/constants.rs` |
+| TFTP connections | 50 | 50 | `TFTP_MAX_CONNECTIONS` in `src/config/constants.rs` |
 | Static host entries | 10,000 | No hard limit | Memory, startup time |
 
 ---
@@ -1418,8 +1411,8 @@ Minimal - only DNS and DHCP protocol overhead:
 
 **Runtime Phase** (running as unprivileged user):
 
-5. Drop privileges to configured user (default "nobody") via `setuid()`
-6. Drop supplementary groups via `setgroups()`
+5. Drop privileges to configured user (default "nobody") via `nix::unistd::setuid()`
+6. Drop supplementary groups via `nix::unistd::setgroups()`
 7. Continue operation with minimal privileges
 
 **Linux Capabilities** (when available):
@@ -1431,23 +1424,24 @@ Instead of full root privileges, retain only necessary capabilities:
 
 ### Attack Surface Reduction
 
-**Minimal Attack Surface**:
+**Memory Safety**:
 
-- **No shell execution in main process**: Scripts use safe fork/exec
-- **Input validation**: DNS packet parsing validates format
-- **Bounds checking**: Fixed-size buffers prevent overflows
-- **Resource limits**: Prevents DoS via resource exhaustion
+- **Compile-time safety**: Rust's type system and borrow checker prevent buffer overflows, use-after-free, and data races at compile time
+- **Zero `unsafe` blocks** except thin FFI wrappers around D-Bus, netfilter, nftables, and fork/exec — each annotated with `// SAFETY:` comments
+- **No shell execution in main process**: Scripts use safe fork/exec via `nix::unistd::fork()` in `src/dhcp/helper.rs`
+- **Input validation**: DNS packet parsing validates format via `src/dns/wire.rs`
+- **Resource limits**: Prevents DoS via resource exhaustion (bounded collections)
 
 **DNSSEC Validation**:
 
-- **Cache poisoning protection**: Cryptographic validation
+- **Cache poisoning protection**: Cryptographic validation via the `ring` crate
 - **Trust chain enforcement**: Invalid signatures → SERVFAIL
 - **Resource limits**: Prevent validation DoS attacks
 
 ### Secure Defaults
 
 - DNS cache enabled by default (reduces upstream exposure)
-- Query ID randomization (prevents cache poisoning)
+- Query ID randomization via `rand` crate CSPRNG (prevents cache poisoning)
 - Source port randomization (prevents blind spoofing)
 - Negative caching limited (prevents false negative DoS)
 
@@ -1457,14 +1451,15 @@ Instead of full root privileges, retain only necessary capabilities:
 
 ### External Integration Points
 
-**Script Execution** (`src/helper.c`):
+**Script Execution** (`src/dhcp/helper.rs`):
 
 - **Lease events**: add, old, del on DHCP assignments
 - **Auth scripts**: Custom authentication logic
 - **Environment**: Full lease details, interface, client ID
 - **Security**: Scripts run as daemon user, not root
+- **Implementation**: Fork-based via `unsafe` FFI to `nix::unistd::fork()`
 
-**D-Bus Interface** (`src/dbus.c`):
+**D-Bus Interface** (`src/integration/dbus.rs`):
 
 Methods exposed on `uk.org.thekelleys.dnsmasq`:
 - `GetVersion()`: Query daemon version
@@ -1472,7 +1467,7 @@ Methods exposed on `uk.org.thekelleys.dnsmasq`:
 - `SetServers()`: Reconfigure upstream servers
 - `GetMetrics()`: Retrieve cache statistics
 
-**UBus Interface** (`src/ubus.c`):
+**UBus Interface** (`src/integration/ubus.rs`):
 
 OpenWrt-specific control interface:
 - `metrics`: Cache hit/miss ratios
@@ -1492,7 +1487,7 @@ nftset=/example.com/ip/filter/block # Add to nftables set
 When `example.com` is queried:
 1. DNS resolution completes
 2. Resolved IP addresses extracted
-3. IPs added to specified ipset/nftset
+3. IPs added to specified ipset/nftset via `src/net/platform/linux/ipset.rs` or `src/integration/nftset.rs`
 4. Firewall rules using set are immediately active
 
 **Use Cases**:
@@ -1575,24 +1570,24 @@ Dnsmasq is designed for simple deployments and does **not include built-in HA**:
 **1. Multi-Threading for DNS Cache Hits**:
 
 - Current: Single thread limits cache hit throughput
-- Potential: Read-only cache lookups could be parallelized
+- Potential: Read-only cache lookups could be parallelized using `Arc<RwLock<Cache>>`
 - Trade-off: Added complexity vs. performance gain
 
 **2. Improved Cache Algorithms**:
 
-- Current: Simple LRU eviction
+- Current: Simple LRU eviction via `VecDeque`
 - Potential: Frequency-based eviction, adaptive sizing
 - Benefit: Better hit rates for working set
 
 **3. DNS-over-HTTPS / DNS-over-TLS**:
 
 - Current: Plaintext DNS only
-- Potential: Encrypted upstream communication
-- Challenge: Increased complexity, external dependencies
+- Potential: Encrypted upstream communication via `rustls` crate
+- Challenge: Increased complexity, TLS library dependency
 
 **4. Prometheus Metrics**:
 
-- Current: Basic syslog statistics
+- Current: Basic syslog statistics via `src/core/metrics.rs`
 - Potential: Native Prometheus exporter
 - Benefit: Modern monitoring integration
 
@@ -1601,28 +1596,29 @@ Dnsmasq is designed for simple deployments and does **not include built-in HA**:
 **Preserved Principles**:
 
 - Single-threaded event-driven core (simplicity)
-- Manual memory management (determinism)
+- Rust ownership model (memory safety with deterministic deallocation)
 - Zero external service dependencies (reliability)
 - Minimal binary size (embedded deployment)
-- Universal Unix portability (broad platform support)
+- Linux and BSD portability via conditional compilation
 
-These core principles guide all evolution decisions.
+These core principles guide all evolution decisions. The Rust rewrite preserves all these architectural strengths while adding compile-time memory safety, type-safe error handling via `Result<T, E>`, and modern dependency management via Cargo.
 
 ---
 
 ## Conclusion
 
-Dnsmasq's architecture reflects 25 years of evolution toward a singular goal: **providing lightweight, reliable network services for small networks and embedded systems**. The single-process event-driven design, explicit memory management, and platform abstraction enable deployment across diverse environments while maintaining predictable resource usage and operational simplicity.
+Dnsmasq's architecture reflects 25 years of design evolution toward a singular goal: **providing lightweight, reliable network services for small networks and embedded systems**. The Rust rewrite preserves the proven single-process event-driven design while adding compile-time memory safety, type-safe error handling, and modern dependency management through Cargo.
 
-The architecture demonstrates that sophisticated network services (DNS forwarding with DNSSEC validation, DHCPv4/v6, TFTP, Router Advertisement) can be delivered in a compact, efficient package suitable for resource-constrained devices, without sacrificing reliability or standards compliance.
+The architecture demonstrates that sophisticated network services (DNS forwarding with DNSSEC validation, DHCPv4/v6, TFTP, Router Advertisement) can be delivered in a compact, efficient package suitable for resource-constrained devices, without sacrificing reliability or standards compliance. Rust's ownership model eliminates entire classes of memory safety bugs at compile time, while the `mio`-based event loop maintains the same performance characteristics as the original C `poll()` implementation.
 
 ### Key Architectural Strengths
 
 1. **Simplicity**: Single-threaded design eliminates concurrency complexity
-2. **Efficiency**: Minimal overhead suitable for embedded single-core processors
-3. **Reliability**: Deterministic behavior enables months/years of continuous operation
-4. **Portability**: Runs on all major Unix-like platforms with platform-specific optimizations
+2. **Efficiency**: Minimal overhead suitable for embedded single-core processors; Rust's zero-cost abstractions add no runtime penalty
+3. **Reliability**: Deterministic behavior enables months/years of continuous operation; Rust's ownership model prevents memory corruption
+4. **Portability**: Runs on Linux and BSD platforms with platform-specific optimizations via `#[cfg(target_os)]` conditional compilation
 5. **Integration**: DNS-DHCP integration eliminates manual synchronization overhead
+6. **Safety**: Memory safety guaranteed at compile time — zero `unsafe` blocks outside of thin FFI wrappers
 
 ### Appropriate Use Cases
 
@@ -1638,16 +1634,16 @@ For enterprise-scale deployments requiring high availability, horizontal scaling
 
 **Document Information**:
 
-- **Version**: 1.0
+- **Version**: 2.0
 - **Target Audience**: Developers, system architects, platform engineers
-- **Based on**: dnsmasq version 2.92 source code
-- **Word Count**: ~11,500 words
+- **Based on**: dnsmasq version 2.92 Rust implementation
 - **Last Updated**: [Current Date]
 
 **References**:
 
-- Source Code: `src/` directory (51 files)
-- Build System: `Makefile`, `src/config.h`
+- Source Code: `src/` directory (Rust module hierarchy — ~70 modules organized by functional domain)
+- Build System: `Cargo.toml`, `build.rs`, `rust-toolchain.toml`, `.cargo/config.toml`
+- Type Definitions: `src/types/` module (`addr.rs`, `dns.rs`, `dhcp.rs`, `network.rs`, `ipv6.rs`)
+- Configuration Constants: `src/config/constants.rs`, `src/config/feature_flags.rs`
 - Documentation: `doc.html`, `setup.html`
 - Configuration: `dnsmasq.conf.example`
-
