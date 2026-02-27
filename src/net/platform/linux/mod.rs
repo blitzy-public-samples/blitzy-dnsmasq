@@ -12,6 +12,9 @@
 //! - `inotify` — inotify file-change monitoring (`#[cfg(feature = "inotify_monitor")]`)
 //! - `conntrack` — netfilter conntrack mark retrieval (`#[cfg(feature = "conntrack")]`)
 
+#[cfg(feature = "conntrack")]
+pub mod conntrack;
+
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
 
