@@ -15,6 +15,9 @@
 #[cfg(feature = "conntrack")]
 pub mod conntrack;
 
+#[cfg(feature = "ipset")]
+pub mod ipset;
+
 #[cfg(feature = "netlink")]
 pub mod netlink;
 
