@@ -3,6 +3,10 @@
 // DHCPv4 wire-format constants (always available for protocol handling)
 pub mod protocol_v4;
 
+// DHCPv6 wire-format constants (only with dhcp6 feature)
+#[cfg(feature = "dhcp6")]
+pub mod protocol_v6;
+
 // Submodule stubs — will be populated by other agents
 pub mod v4;
 #[cfg(feature = "dhcp6")]
