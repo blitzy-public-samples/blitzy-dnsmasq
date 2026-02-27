@@ -4,9 +4,9 @@
 
 The dnsmasq TFTP server provides built-in read-only TFTP service primarily designed for network boot scenarios including PXE (Preboot Execution Environment) boot, diskless workstations, and automated operating system deployment. The implementation adheres to RFC 1350 (Trivial File Transfer Protocol) with performance-enhancing extensions from RFC 2349 (TFTP Timeout Interval and Transfer Size Options) and RFC 7440 (TFTP Windowsize Option).
 
-**Source:** `/src/tftp.c` (1041 lines, complete implementation)
+**Source:** `/src/integration/tftp.rs`
 
-**Compile-Time Configuration:** HAVE_TFTP flag enables TFTP server functionality
+**Compile-Time Configuration:** Cargo feature `"tftp"` enables TFTP server functionality
 
 **Key Design Characteristics:**
 - Read-only operation (no file uploads, write requests rejected)
@@ -23,65 +23,66 @@ The dnsmasq TFTP server provides built-in read-only TFTP service primarily desig
 
 The TFTP server enforces strict concurrency limits to prevent resource exhaustion on embedded and resource-constrained systems:
 
-**Default Maximum Connections:** 50 concurrent transfers (TFTP_MAX_CONNECTIONS in `src/config.h` line 54)
+**Default Maximum Connections:** 50 concurrent transfers (TFTP_MAX_CONNECTIONS in `src/config/constants.rs`)
 
 **Configurable Override:** `--tftp-max=<count>` option adjusts the connection limit at runtime
 
-**Connection Lifecycle Management** (Source: `src/tftp.c` lines 44-400):
+**Connection Lifecycle Management** (Source: `src/integration/tftp.rs`):
 
-```c
-/* Connection state tracked in struct tftp_transfer linked list */
-struct tftp_transfer {
-  int sockfd;                    /* Per-transfer UDP socket */
-  time_t timeout;                /* Transfer timeout (default 120s) */
-  int backoff;                   /* Exponential backoff for retransmissions */
-  unsigned int block;            /* Current block number */
-  unsigned int window;           /* Window size (RFC 7440) */
-  char *file;                    /* Filename being transferred */
-  struct tftp_transfer *next;    /* Linked list pointer */
-  /* Additional fields for state management */
-};
+```rust
+/// Connection state tracked in Vec<TftpTransfer> collection
+pub struct TftpTransfer {
+    pub sockfd: RawFd,                  // Per-transfer UDP socket
+    pub timeout: Instant,               // Transfer timeout (default 120s)
+    pub backoff: u32,                   // Exponential backoff for retransmissions
+    pub block: u32,                     // Current block number
+    pub window: u32,                    // Window size (RFC 7440)
+    pub file: Option<String>,           // Filename being transferred
+    // Additional fields for state management
+}
 ```
 
 **Connection Establishment Process:**
 
-1. **Initial Request Reception** (`tftp_request` function, line 44): Server receives RRQ (Read Request) packet on UDP port 69
-2. **Connection Limit Check** (line 180): If active transfers >= TFTP_MAX_CONNECTIONS, reject with ERR_NOTDEF "maximum TFTP connections exceeded"
-3. **Ephemeral Socket Creation** (lines 231-286): Allocate per-transfer socket with random ephemeral port or configured port range
-4. **Transfer State Initialization** (lines 327-365): Create `struct tftp_transfer` tracking block number, window size, timeout, file descriptor
+1. **Initial Request Reception** (`TftpServer::handle_request` method): Server receives RRQ (Read Request) packet on UDP port 69
+2. **Connection Limit Check**: If active transfers >= TFTP_MAX_CONNECTIONS, reject with ERR_NOTDEF "maximum TFTP connections exceeded"
+3. **Ephemeral Socket Creation**: Allocate per-transfer socket with random ephemeral port or configured port range
+4. **Transfer State Initialization**: Create `TftpTransfer` tracking block number, window size, timeout, file descriptor
 
 **Connection Cleanup:**
 
-The `free_transfer` function (lines 40-60) releases resources when transfers complete or abort:
-- Close per-transfer socket file descriptor
-- Remove transfer from active connection list
-- Free allocated memory (filename, file buffer, transfer structure)
+The `TftpTransfer` drop implementation releases resources when transfers complete or abort:
+- Close per-transfer socket file descriptor (via RAII `Drop` trait)
+- Remove transfer from active connection `Vec<TftpTransfer>`
+- Rust ownership automatically reclaims all allocated memory
 - Log transfer completion statistics if logging enabled
 
 ### Transfer Timeout Handling
 
-**Default Transfer Timeout:** 120 seconds (TFTP_TRANSFER_TIME in `src/config.h` line 56)
+**Default Transfer Timeout:** 120 seconds (TFTP_TRANSFER_TIME in `src/config/constants.rs`)
 
-**Timeout Mechanism** (Source: `src/tftp.c` `check_tftp_listeners` function, lines 800-900):
+**Timeout Mechanism** (Source: `src/integration/tftp.rs`, `TftpServer::check_listeners` method):
 
-The main TFTP event loop invoked by the daemon's poll-based event loop monitors all active transfers:
+The main TFTP event loop invoked by the daemon's mio-based event loop monitors all active transfers:
 
-```c
-/* Pseudocode representation of timeout logic */
-void check_tftp_listeners(time_t now) {
-  for (each active transfer in transfer list) {
-    if (now > transfer->timeout) {
-      /* Transfer exceeded timeout limit */
-      send_err_packet(ERR_NOTDEF, "timeout");
-      free_transfer(transfer);
-      log("TFTP transfer timeout");
-    }
-  }
+```rust
+/// Pseudocode representation of timeout logic
+fn check_listeners(&mut self, now: Instant) {
+    self.transfers.retain_mut(|transfer| {
+        if now > transfer.timeout {
+            // Transfer exceeded timeout limit
+            Self::send_err_packet(&transfer, ERR_NOTDEF, "timeout");
+            log::info!("TFTP transfer timeout");
+            false // Remove transfer from collection
+        } else {
+            true // Keep transfer active
+        }
+    });
 }
 ```
 
 **Timeout Reset Conditions:**
-- Each successful ACK reception resets `transfer->timeout = now + TFTP_TRANSFER_TIME`
+- Each successful ACK reception resets `transfer.timeout = now + TFTP_TRANSFER_TIME`
 - Option negotiation completion resets timeout
 - Retransmission backoff increases timeout exponentially (up to maximum)
 
@@ -89,7 +90,7 @@ void check_tftp_listeners(time_t now) {
 
 ### RFC 1350: Basic TFTP Protocol
 
-**TFTP Opcodes** (Defined lines 30-35):
+**TFTP Opcodes:**
 - OP_RRQ (1): Read Request
 - OP_WRQ (2): Write Request (rejected immediately with ERR_PERM)
 - OP_DATA (3): Data packet
@@ -97,7 +98,7 @@ void check_tftp_listeners(time_t now) {
 - OP_ERR (5): Error packet
 - OP_OACK (6): Option Acknowledgment (RFC 2347)
 
-**TFTP Error Codes** (Defined lines 37-42):
+**TFTP Error Codes:**
 - ERR_NOTDEF (0): Not defined error
 - ERR_FNF (1): File not found
 - ERR_PERM (2): Access violation
@@ -115,27 +116,27 @@ void check_tftp_listeners(time_t now) {
   2 bytes  string  1B   string  1B  string  1B
 ```
 
-**RRQ Handler** (`tftp_request` function, lines 44-600):
+**RRQ Handler** (`TftpServer::handle_request` method):
 
-1. **Packet Reception** (lines 93-100): Receive RRQ packet via `recvmsg` on listening socket (UDP port 69)
+1. **Packet Reception**: Receive RRQ packet via `recvmsg` on listening socket (UDP port 69)
 
-2. **Opcode Validation** (line 102): Verify packet starts with OP_RRQ opcode
+2. **Opcode Validation**: Verify packet starts with OP_RRQ opcode
 
-3. **Filename Extraction** (lines 110-120): Parse null-terminated filename string from packet
+3. **Filename Extraction**: Parse null-terminated filename string from packet
    - Call `sanitise` function to remove path traversal attempts (`../` sequences)
    - Apply TFTP prefix if configured (`--tftp-prefix` or per-interface prefix)
 
-4. **Transfer Mode Parsing** (lines 122-130): Extract transfer mode ("netascii" or "octet")
+4. **Transfer Mode Parsing**: Extract transfer mode ("netascii" or "octet")
    - Modern implementations use "octet" (binary) mode exclusively
    - "netascii" mode performs newline translation (rarely used)
 
-5. **Option Parsing** (lines 145-200): Process RFC 2347 TFTP option extensions:
+5. **Option Parsing**: Process RFC 2347 TFTP option extensions:
    - `blksize`: Block size negotiation (default 512 bytes, max 65464 bytes)
    - `tsize`: Transfer size query (server returns file size in bytes)
    - `timeout`: Per-packet timeout (default from configuration)
    - `windowsize`: Number of DATA packets before requiring ACK (RFC 7440)
 
-6. **Security Validation** (`check_tftp_fileperm`, lines 630-750): Verify file access permissions (detailed in Security section)
+6. **Security Validation** (`TftpServer::check_file_permissions`): Verify file access permissions (detailed in Security section)
 
 7. **Response Generation**:
    - **With Options**: Send OP_OACK packet listing negotiated options
@@ -174,26 +175,28 @@ stateDiagram-v2
 
 ### Data Packet Construction
 
-**`get_block` Function** (Source: lines 910-1000):
+**`TftpTransfer::get_block` Method** (Source: `src/integration/tftp.rs`):
 
-```c
-static ssize_t get_block(struct tftp_transfer *transfer) {
-  /* Construct DATA packet:
-   * +--------+--------+--------+
-   * | Opcode | Block# | Data   |
-   * +--------+--------+--------+
-   *  2 bytes  2 bytes  n bytes
-   */
-  
-  packet[0] = 0;
-  packet[1] = OP_DATA;
-  packet[2] = (transfer->block >> 8) & 0xFF;  /* Block number high byte */
-  packet[3] = transfer->block & 0xFF;         /* Block number low byte */
-  
-  /* Read file data from current offset */
-  ssize_t read_bytes = read(transfer->file_fd, &packet[4], transfer->blocksize);
-  
-  return read_bytes + 4;  /* Opcode (2) + Block# (2) + data */
+```rust
+fn get_block(&mut self, packet: &mut Vec<u8>) -> Result<usize, io::Error> {
+    // Construct DATA packet:
+    // +--------+--------+--------+
+    // | Opcode | Block# | Data   |
+    // +--------+--------+--------+
+    //  2 bytes  2 bytes  n bytes
+
+    packet.clear();
+    packet.push(0);
+    packet.push(OP_DATA);
+    packet.push((self.block >> 8) as u8);   // Block number high byte
+    packet.push((self.block & 0xFF) as u8); // Block number low byte
+
+    // Read file data from current offset
+    let mut buf = vec![0u8; self.blocksize as usize];
+    let read_bytes = self.file.read(&mut buf)?;
+    packet.extend_from_slice(&buf[..read_bytes]);
+
+    Ok(read_bytes + 4) // Opcode (2) + Block# (2) + data
 }
 ```
 
@@ -201,18 +204,22 @@ static ssize_t get_block(struct tftp_transfer *transfer) {
 
 When `windowsize` > 1, server sends multiple DATA packets before expecting ACK:
 
-```c
-/* Send window of DATA packets (lines 880-900) */
-for (int i = 0; i < transfer->window && !last_block; i++) {
-  send_data_packet();
-  transfer->block++;
+```rust
+// Send window of DATA packets
+for _ in 0..transfer.window {
+    let size = transfer.get_block(&mut packet)?;
+    Self::send_data_packet(&transfer, &packet[..size])?;
+    transfer.block += 1;
+    if size < (transfer.blocksize as usize + 4) {
+        break; // Last block
+    }
 }
-/* Wait for ACK acknowledging highest block in window */
+// Wait for ACK acknowledging highest block in window
 ```
 
 **Performance Impact:**
 - Window size 1 (default): One DATA packet, wait for ACK (high latency on lossy links)
-- Window size 32 (max, TFTP_MAX_WINDOW): Send 32 packets before ACK (improved throughput)
+- Window size 32 (max `TFTP_MAX_WINDOW`): Send 32 packets before ACK (improved throughput)
 
 ## Option Negotiation (RFC 2349, RFC 7440)
 
@@ -242,7 +249,7 @@ OACK: blksize=1468
 
 **windowsize Option (RFC 7440):**
 - **Purpose:** Number of DATA packets sent before ACK required
-- **Range:** 1 to 32 (TFTP_MAX_WINDOW in `src/config.h` line 55)
+- **Range:** 1 to 32 (TFTP_MAX_WINDOW in `src/config/constants.rs`)
 - **Benefit:** Pipelined transfers improve throughput on high-latency links
 
 **Example Transfer with Windowed Mode:**
@@ -262,27 +269,34 @@ Client → Server: ACK block=16
 
 ### Option Negotiation Process
 
-**Parser Implementation** (Lines 145-200 in `tftp_request`):
+**Parser Implementation** (`TftpServer::handle_request` method):
 
-```c
-/* Parse option name-value pairs from RRQ packet */
-while ((option = next(&p, end)) != NULL) {
-  char *value = next(&p, end);
-  
-  if (strcasecmp(option, "blksize") == 0) {
-    requested_blksize = atoi(value);
-    if (requested_blksize >= 512 && requested_blksize <= 65464)
-      transfer->blocksize = requested_blksize;
-  }
-  else if (strcasecmp(option, "tsize") == 0) {
-    /* Client queries file size */
-    transfer->tsize_request = 1;
-  }
-  else if (strcasecmp(option, "windowsize") == 0) {
-    requested_window = atoi(value);
-    if (requested_window >= 1 && requested_window <= TFTP_MAX_WINDOW)
-      transfer->window = requested_window;
-  }
+```rust
+// Parse option name-value pairs from RRQ packet
+while let Some(option) = next_option(&mut p, end) {
+    if let Some(value) = next_option(&mut p, end) {
+        match option.to_ascii_lowercase().as_str() {
+            "blksize" => {
+                if let Ok(requested) = value.parse::<u16>() {
+                    if (512..=65464).contains(&requested) {
+                        transfer.blocksize = requested;
+                    }
+                }
+            }
+            "tsize" => {
+                // Client queries file size
+                transfer.tsize_request = true;
+            }
+            "windowsize" => {
+                if let Ok(requested) = value.parse::<u32>() {
+                    if (1..=TFTP_MAX_WINDOW).contains(&requested) {
+                        transfer.window = requested;
+                    }
+                }
+            }
+            _ => {} // Ignore unknown options
+        }
+    }
 }
 ```
 
@@ -304,22 +318,28 @@ Client must ACK the OACK with ACK block=0 before data transfer begins.
 
 ### Path Traversal Prevention
 
-**Sanitization Function** (`sanitise`, lines 760-780):
+**Sanitization Function** (`sanitise` in `src/integration/tftp.rs`):
 
-```c
-static void sanitise(char *buf) {
-  char *p = buf;
-  char *dest = buf;
-  
-  /* Remove ../ and ..\\ path traversal attempts */
-  while (*p) {
-    if (*p == '.' && *(p+1) == '.' && (*(p+2) == '/' || *(p+2) == '\\')) {
-      p += 3;  /* Skip ../ or ..\ */
-      continue;
+```rust
+fn sanitise(buf: &str) -> String {
+    let mut result = String::with_capacity(buf.len());
+    let chars: Vec<char> = buf.chars().collect();
+    let mut i = 0;
+
+    // Remove ../ and ..\ path traversal attempts
+    while i < chars.len() {
+        if i + 2 < chars.len()
+            && chars[i] == '.'
+            && chars[i + 1] == '.'
+            && (chars[i + 2] == '/' || chars[i + 2] == '\\')
+        {
+            i += 3; // Skip ../ or ..\
+            continue;
+        }
+        result.push(chars[i]);
+        i += 1;
     }
-    *dest++ = *p++;
-  }
-  *dest = '\0';
+    result
 }
 ```
 
@@ -327,33 +347,31 @@ static void sanitise(char *buf) {
 
 ### File Permission Verification
 
-**`check_tftp_fileperm` Function** (Lines 630-750):
+**`TftpServer::check_file_permissions` Method** (in `src/integration/tftp.rs`):
 
 This critical security function validates every file access request:
 
 **Step 1: Construct Absolute Path**
-```c
-/* Combine TFTP root + requested filename */
-char *fullpath = malloc(strlen(tftp_root) + strlen(filename) + 2);
-sprintf(fullpath, "%s/%s", tftp_root, filename);
+```rust
+// Combine TFTP root + requested filename
+let fullpath = PathBuf::from(&self.tftp_root).join(filename);
 ```
 
 **Step 2: Resolve Canonical Path**
-```c
-/* realpath() resolves symlinks, removes ./ and ../, verifies file exists */
-char *canonical = realpath(fullpath, NULL);
-if (canonical == NULL) {
-  return NULL;  /* File not found or path resolution failed */
-}
+```rust
+// canonicalize() resolves symlinks, removes ./ and ../, verifies file exists
+let canonical = match fullpath.canonicalize() {
+    Ok(path) => path,
+    Err(_) => return Err(TftpError::FileNotFound), // File not found or path resolution failed
+};
 ```
 
 **Step 3: Verify Within TFTP Root**
-```c
-/* Ensure canonical path starts with TFTP root directory */
-if (strncmp(canonical, tftp_root, strlen(tftp_root)) != 0) {
-  /* Path escaped TFTP root via symlink or other means */
-  free(canonical);
-  return NULL;  /* Access violation */
+```rust
+// Ensure canonical path starts with TFTP root directory
+if !canonical.starts_with(&self.tftp_root) {
+    // Path escaped TFTP root via symlink or other means
+    return Err(TftpError::AccessViolation);
 }
 ```
 
@@ -361,16 +379,19 @@ if (strncmp(canonical, tftp_root, strlen(tftp_root)) != 0) {
 
 When `--tftp-secure` option is enabled:
 
-```c
-struct stat statbuf;
-if (stat(canonical, &statbuf) != 0) {
-  return NULL;  /* Cannot stat file */
-}
+```rust
+let metadata = std::fs::metadata(&canonical)
+    .map_err(|_| TftpError::AccessViolation)?;
 
-uid_t daemon_uid = daemon->tftp_uid ? daemon->tftp_uid : geteuid();
-if (statbuf.st_uid != daemon_uid) {
-  /* File not owned by dnsmasq user */
-  return NULL;  /* Access violation */
+let daemon_uid = if self.tftp_uid != 0 {
+    self.tftp_uid
+} else {
+    nix::unistd::geteuid().as_raw()
+};
+
+if metadata.st_uid() != daemon_uid {
+    // File not owned by dnsmasq user
+    return Err(TftpError::AccessViolation);
 }
 ```
 
@@ -542,25 +563,28 @@ The TFTP server can execute external scripts when file transfers complete, enabl
 tftp-script=/usr/local/bin/tftp-notify.sh
 ```
 
-**Script Invocation** (`do_tftp_script_run` function, lines 1015-1041):
+**Script Invocation** (`TftpServer::run_script` method in `src/integration/tftp.rs`):
 
-```c
-static void do_tftp_script_run(struct tftp_transfer *transfer) {
-  if (!daemon->tftp_script)
-    return;  /* No script configured */
-  
-  /* Fork helper process */
-  pid_t pid = fork();
-  if (pid == 0) {
-    /* Child process */
-    execl(daemon->tftp_script, 
-          daemon->tftp_script,
-          transfer->file,        /* Argument 1: filename */
-          inet_ntoa(peer_addr),  /* Argument 2: client IP */
-          transfer->size,        /* Argument 3: bytes transferred */
-          NULL);
-    _exit(EXIT_FAILURE);
-  }
+```rust
+fn run_script(&self, transfer: &TftpTransfer) -> Result<(), TftpError> {
+    let script = match &self.tftp_script {
+        Some(s) => s,
+        None => return Ok(()), // No script configured
+    };
+
+    let filename = transfer.file.as_deref().unwrap_or("");
+    let client_ip = transfer.peer_addr.to_string();
+    let size = transfer.bytes_transferred.to_string();
+
+    // Spawn helper process
+    std::process::Command::new(script)
+        .arg(filename)       // Argument 1: filename
+        .arg(&client_ip)     // Argument 2: client IP
+        .arg(&size)          // Argument 3: bytes transferred
+        .spawn()
+        .map_err(|e| TftpError::ScriptError(e.to_string()))?;
+
+    Ok(())
 }
 ```
 
@@ -983,26 +1007,26 @@ aide --check
 
 ## Source Code Reference
 
-**Primary Implementation:** `/src/tftp.c` (1041 lines)
+**Primary Implementation:** `/src/integration/tftp.rs`
 
-**Key Functions:**
-- `tftp_request` (lines 44-600): RRQ/WRQ handler, option parsing
-- `handle_tftp` (lines 610-800): DATA/ACK processing state machine
-- `check_tftp_listeners` (lines 800-900): Main event loop, timeout management
-- `get_block` (lines 910-1000): DATA packet construction
-- `check_tftp_fileperm` (lines 630-750): Security validation
-- `do_tftp_script_run` (lines 1015-1041): Script execution trigger
+**Key Methods:**
+- `TftpServer::handle_request`: RRQ/WRQ handler, option parsing
+- `TftpServer::handle_data_ack`: DATA/ACK processing state machine
+- `TftpServer::check_listeners`: Main event loop, timeout management
+- `TftpTransfer::get_block`: DATA packet construction
+- `TftpServer::check_file_permissions`: Security validation
+- `TftpServer::run_script`: Script execution trigger
 
-**Configuration Constants:** `/src/config.h`
-- TFTP_MAX_CONNECTIONS (line 54): Default 50
-- TFTP_MAX_WINDOW (line 55): Default 32
-- TFTP_TRANSFER_TIME (line 56): Default 120 seconds
+**Configuration Constants:** `/src/config/constants.rs`
+- TFTP_MAX_CONNECTIONS: Default 50
+- TFTP_MAX_WINDOW: Default 32
+- TFTP_TRANSFER_TIME: Default 120 seconds
 
 **Configuration Examples:** `dnsmasq.conf.example` (lines 500-600)
 
-**Compile-Time Flags:**
-- HAVE_TFTP: Enable TFTP server compilation
-- HAVE_SCRIPT: Enable script execution support
+**Cargo Feature Flags:**
+- Cargo feature `"tftp"`: Enable TFTP server compilation
+- Cargo feature `"script"`: Enable script execution support
 
 ## Standards Compliance
 
@@ -1030,11 +1054,11 @@ aide --check
 - [PXE Network Boot](PXE_BOOT.md) - Detailed PXE boot configuration
 - [DHCP Configuration](DHCP_V4.md) - DHCP options for network boot
 - [Architecture Overview](ARCHITECTURE.md) - System design and integration
-- [Building dnsmasq](BUILDING.md) - Compilation with HAVE_TFTP flag
+- [Building dnsmasq](BUILDING.md) - Building with Cargo feature `"tftp"`
 
 ---
 
 **Document Version:** 1.0  
 **Based on:** dnsmasq version 2.92  
-**Source Analysis:** Complete review of `src/tftp.c` (1041 lines)  
+**Source Analysis:** Complete review of `src/integration/tftp.rs`  
 **Word Count:** 5,300+ words (target: 1000+ words)
