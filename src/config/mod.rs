@@ -9,3 +9,4 @@
 
 pub mod constants;
 pub mod feature_flags;
+pub mod options;
