@@ -83,7 +83,7 @@ thiserror = "2.0.12"
 anyhow = "1.0.98"
 bytes = "1.10.1"
 cfg-if = "1.0.0"
-socket2 = "0.5.9"
+socket2 = { version = "0.5.9", features = ["all"] }
 rand = "0.9.1"
 
 # Optional dependencies (feature-gated)
