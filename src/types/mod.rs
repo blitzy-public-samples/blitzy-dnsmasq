@@ -14,6 +14,7 @@
 pub mod addr;
 pub mod dns;
 pub mod ipv6;
+pub mod network;
 
 // Re-export commonly used address types for ergonomic imports.
 pub use addr::{AllAddr, CnameTarget, SocketAddress, RR_IMDATALEN};
