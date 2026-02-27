@@ -13,5 +13,6 @@
 //! trait, with implementations for Linux (netlink) and BSD (BPF/routing sockets).
 
 pub mod arp;
+pub mod interface;
 pub mod platform;
 pub mod socket;
