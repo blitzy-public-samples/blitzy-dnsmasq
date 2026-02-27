@@ -7,6 +7,9 @@ pub mod protocol_v4;
 #[cfg(feature = "dhcp6")]
 pub mod protocol_v6;
 
+// Shared DHCP utilities (tag matching, option tables, config lookup)
+pub mod common;
+
 // Submodule stubs — will be populated by other agents
 pub mod v4;
 #[cfg(feature = "dhcp6")]
