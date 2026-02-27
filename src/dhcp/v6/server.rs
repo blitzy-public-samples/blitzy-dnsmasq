@@ -361,6 +361,8 @@ fn set_ipv6_tclass(socket: &Socket) {
     {
         use std::os::unix::io::AsRawFd;
         let class: libc::c_int = 0xC0; // IPTOS_CLASS_CS6
+        // SAFETY: setsockopt on valid IPv6 socket fd with stack-allocated i32 option
+        // value for IPV6_TCLASS; socket is open and option buffer has correct size.
         let ret = unsafe {
             libc::setsockopt(
                 socket.as_raw_fd(),
@@ -380,6 +382,8 @@ fn set_ipv6_tclass(socket: &Socket) {
 fn set_ipv6_recvpktinfo(socket: &Socket) -> Result<(), std::io::Error> {
     use std::os::unix::io::AsRawFd;
     let one: libc::c_int = 1;
+    // SAFETY: setsockopt enabling IPV6_RECVPKTINFO on valid IPv6 socket fd;
+    // option value is a stack-allocated i32 with correct size.
     let ret = unsafe {
         libc::setsockopt(
             socket.as_raw_fd(),
@@ -433,6 +437,8 @@ pub fn dhcp6_packet(daemon: &DaemonState, _now: SystemTime) -> Result<(), Dhcp6S
     // Prepare receive buffer
     let mut buf = vec![0u8; 65536];
     let mut control_buf = vec![0u8; 256];
+    // SAFETY: sockaddr_in6 is a repr(C) POD struct; zeroed memory is a valid
+    // initial state with AF_UNSPEC family and all-zero address/port fields.
     let mut src_addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
     let src_addr_len: libc::socklen_t =
         std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
@@ -453,7 +459,8 @@ pub fn dhcp6_packet(daemon: &DaemonState, _now: SystemTime) -> Result<(), Dhcp6S
         msg_flags: 0,
     };
 
-    // Receive DHCPv6 packet with ancillary data
+    // SAFETY: recvmsg with valid DHCPv6 socket fd, properly initialized msghdr
+    // with valid iovec and control message buffers whose lifetimes exceed the call.
     let sz = unsafe { libc::recvmsg(dhcp6_fd, &mut msg, 0) };
     if sz < 0 {
         let err = std::io::Error::last_os_error();
@@ -529,15 +536,26 @@ pub fn dhcp6_packet(daemon: &DaemonState, _now: SystemTime) -> Result<(), Dhcp6S
 /// Parses the control message buffer to find the `in6_pktinfo` structure
 /// containing the interface index and destination IPv6 address.
 fn extract_pktinfo(msg: &libc::msghdr, if_index: &mut u32, dst_addr: &mut Ipv6Addr) {
+    // SAFETY: CMSG_FIRSTHDR reads the msg_controllen field to determine if any
+    // control messages exist; msg points to a valid msghdr populated by recvmsg.
     let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
     while !cmsg.is_null() {
+        // SAFETY: cmsg is non-null and points within the control buffer that was
+        // populated by recvmsg; the cmsghdr struct is properly aligned.
         let hdr = unsafe { &*cmsg };
         if hdr.cmsg_level == libc::IPPROTO_IPV6 && hdr.cmsg_type == libc::IPV6_PKTINFO {
+            // SAFETY: CMSG_DATA returns a pointer to the data portion of a valid
+            // cmsghdr; we verified the cmsg_level/cmsg_type match in6_pktinfo.
             let pktinfo_ptr = unsafe { libc::CMSG_DATA(cmsg) } as *const libc::in6_pktinfo;
+            // SAFETY: pktinfo_ptr is valid because CMSG_DATA returned a properly
+            // aligned pointer within the control buffer, and the cmsg_len is
+            // sufficient for in6_pktinfo.
             let pktinfo = unsafe { &*pktinfo_ptr };
             *if_index = pktinfo.ipi6_ifindex as u32;
             *dst_addr = Ipv6Addr::from(pktinfo.ipi6_addr.s6_addr);
         }
+        // SAFETY: CMSG_NXTHDR advances to the next cmsghdr within the control
+        // buffer, returning null when no more messages exist.
         cmsg = unsafe { libc::CMSG_NXTHDR(msg, cmsg) };
     }
 }
@@ -590,6 +608,8 @@ pub fn get_client_mac(
     ns_packet[8..24].copy_from_slice(&client.octets());
 
     // Build destination sockaddr_in6
+    // SAFETY: sockaddr_in6 is a repr(C) POD struct; zeroed memory is a valid
+    // initial state that is immediately populated with correct family/address.
     let mut dest_addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
     dest_addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
     dest_addr.sin6_port = 0; // ICMPv6 doesn't use ports
@@ -601,6 +621,9 @@ pub fn get_client_mac(
         // For now, we attempt the neighbor solicitation probe.
 
         if icmp6fd >= 0 {
+            // SAFETY: sendto with valid ICMPv6 raw socket fd, stack-allocated
+            // NS packet buffer with correct length, and properly initialized
+            // sockaddr_in6 destination address.
             let ret = unsafe {
                 libc::sendto(
                     icmp6fd,

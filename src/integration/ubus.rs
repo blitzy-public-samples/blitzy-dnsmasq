@@ -341,6 +341,9 @@ mod ffi {
 
     /// Create a zeroed BlobBuf.
     pub fn new_blob_buf() -> Box<BlobBuf> {
+        // SAFETY: BlobBuf is a repr(C) struct of POD types; zeroed memory is a
+        // valid initial state for this FFI type (matching libubus blob_buf_init
+        // expectations).
         Box::new(unsafe { std::mem::zeroed::<BlobBuf>() })
     }
 }

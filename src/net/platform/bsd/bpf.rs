@@ -884,6 +884,9 @@ fn query_ipv6_flags_lifetimes(
 
         // SIOCGIFALIFETIME_IN6: Get IPv6 address lifetimes.
         // Re-copy the address into the buffer (ioctl may have modified it).
+        // SAFETY: copy_nonoverlapping from a valid sockaddr_in6 reference into
+        // the ifr6_buf at offset 16; both source and destination are properly
+        // aligned and the copy length matches sockaddr_in6 size.
         unsafe {
             let src_ptr = ss_ref as *const _ as *const u8;
             let sin6_size = mem::size_of::<libc::sockaddr_in6>();
@@ -891,6 +894,8 @@ fn query_ipv6_flags_lifetimes(
         }
 
         let siocgifalifetime_in6: libc::c_ulong = 0xC0906951; // Platform-specific value
+        // SAFETY: ioctl with valid socket fd and SIOCGIFALIFETIME_IN6 request;
+        // ifr6_buf is properly sized and initialized with the interface address.
         let ret =
             unsafe { libc::ioctl(fd, siocgifalifetime_in6, ifr6_buf.as_mut_ptr()) };
         if ret != -1 {

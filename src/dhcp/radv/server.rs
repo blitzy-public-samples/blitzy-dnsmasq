@@ -379,6 +379,9 @@ fn format_mac(mac: &[u8]) -> String {
 /// Safe wrapper around `libc::if_nametoindex`.
 fn nix_if_nametoindex(name: &str) -> Result<u32, ()> {
     let cname = std::ffi::CString::new(name).map_err(|_| ())?;
+    // SAFETY: if_nametoindex is a POSIX function that accepts a valid
+    // null-terminated C string; cname is a valid CString with guaranteed
+    // null terminator.
     let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
     if idx == 0 {
         Err(())
@@ -595,6 +598,8 @@ pub fn icmp6_packet(daemon: &DaemonState, config: &DaemonConfig, now: i64) {
         // Prepare receive buffer
         let mut buf = vec![0u8; 4096];
         let mut control_buf = vec![0u8; 256];
+        // SAFETY: sockaddr_in6 is a repr(C) POD struct; zeroed memory is a valid
+        // initial state with AF_UNSPEC family and all-zero address/port fields.
         let mut src_addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
         let mut if_index: i32 = 0;
 
@@ -996,6 +1001,9 @@ fn send_ra_alias(
         // Set outgoing interface for multicast
         if dest.is_none() {
             let iface_val: libc::c_int = send_iface;
+            // SAFETY: setsockopt on valid ICMPv6 socket fd with stack-allocated
+            // i32 value for IPV6_MULTICAST_IF; socket is open and option value
+            // has correct size.
             unsafe {
                 libc::setsockopt(
                     icmp6_fd,
@@ -1008,6 +1016,8 @@ fn send_ra_alias(
         }
 
         // Construct sockaddr_in6
+        // SAFETY: sockaddr_in6 is a repr(C) POD struct; zeroed memory is a valid
+        // initial state that is immediately populated with correct family/address.
         let mut addr6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
         addr6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
         addr6.sin6_port = 0;

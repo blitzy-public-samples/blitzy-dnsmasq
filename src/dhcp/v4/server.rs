@@ -241,6 +241,9 @@ fn do_icmp_ping_raw(addr: Ipv4Addr, _icmp_fd: i32) -> bool {
         if sock.send_to(&icmp_pkt, &dest).is_err() {
             return false;
         }
+        // SAFETY: Creating an array of MaybeUninit<u8>; MaybeUninit does not
+        // require initialization, so assume_init on the outer array is sound
+        // because MaybeUninit<u8> has no validity invariants.
         let mut reply_buf: [MaybeUninit<u8>; 64] = unsafe { MaybeUninit::uninit().assume_init() };
         match sock.recv(&mut reply_buf) {
             Ok(n) if n >= 8 => {
@@ -278,7 +281,12 @@ fn do_icmp_ping_raw(addr: Ipv4Addr, _icmp_fd: i32) -> bool {
         if !send_ok {
             return false;
         }
+        // SAFETY: We borrow the fd for recv but do NOT close it; into_raw_fd()
+        // is called below to prevent the Socket destructor from closing the fd.
         let sock2 = unsafe { Socket::from_raw_fd(_icmp_fd) };
+        // SAFETY: Creating an array of MaybeUninit<u8>; MaybeUninit does not
+        // require initialization, so assume_init on the outer array is sound
+        // because MaybeUninit<u8> has no validity invariants.
         let mut reply_buf: [MaybeUninit<u8>; 128] = unsafe { MaybeUninit::uninit().assume_init() };
         let result = match sock2.recv(&mut reply_buf) {
             Ok(n) if n >= 28 => {

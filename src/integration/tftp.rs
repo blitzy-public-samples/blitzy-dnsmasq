@@ -22,24 +22,32 @@
 //! - **RFC 7440** — Window size option for improved throughput
 //!
 //! Used primarily for PXE (Preboot Execution Environment) network boot scenarios.
-//! Feature-gated behind `#[cfg(feature = "tftp")]`. This is a **pure Rust
-//! implementation** with NO unsafe FFI required.
+//! Feature-gated behind `#[cfg(feature = "tftp")]`.
+//!
+//! # FFI Approach
+//!
+//! This module is primarily safe Rust, using `libc` only for a small number of
+//! low-level socket operations (`close`, `setsockopt`) that lack safe Rust
+//! wrappers at the required granularity. Unlike `dbus.rs` (which uses the safe
+//! `dbus` crate) or `ubus.rs` (which requires raw FFI due to no Rust crate for
+//! libubus), this module minimizes unsafe to essential POSIX socket calls only.
 //!
 //! # Architecture
 //! - [`TftpServer`] manages all active transfers via `HashMap` keyed by peer address
 //! - [`TftpTransfer`] tracks individual transfer state (block numbers, file handle, socket)
 //! - [`TftpFile`] represents an open file with `Arc`-based sharing for multiple transfers
+//!   using `Mutex<TftpFileState>` for safe interior mutability of file I/O state
 //! - Event-driven via the main `mio` poll loop; `check_tftp_listeners()` is the entry point
 //!
 //! # Key Transformations from C
 //! - C `struct tftp_transfer` linked list → `HashMap<SocketAddr, TftpTransfer>`
-//! - C `struct tftp_file` with manual refcount → `Arc<TftpFile>`
+//! - C `struct tftp_file` with manual refcount → `Arc<TftpFile>` with `Mutex<TftpFileState>`
 //! - C `setjmp`/`longjmp` error handling → `Result<T, TftpServerError>`
 //! - C `union mysockaddr` → `SocketAddress` enum from `types::addr`
 //! - C `poll_check` → `mio::Poll` event readiness
 //!
 //! # Security
-//! - Path traversal prevention (rejects `/../` sequences)
+//! - Path traversal prevention (rejects `/../` sequences + canonicalization defense-in-depth)
 //! - World-readable enforcement when running as root
 //! - Secure mode ownership checks (`--tftp-secure`)
 //! - Log injection prevention via `sanitise()` on all user-supplied strings
@@ -50,7 +58,7 @@ use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
@@ -241,6 +249,20 @@ impl TftpErrorCode {
 // TftpFile — Open file descriptor with sharing support
 // ===========================================================================
 
+/// Mutable file I/O state protected by `Mutex` for safe shared access.
+///
+/// Contains the file handle and current read position — the only fields
+/// that require mutation during a transfer. Protected by `Mutex` to provide
+/// interior mutability through `Arc<TftpFile>` without violating Rust's
+/// aliasing rules.
+struct TftpFileState {
+    /// Open file handle for reading.
+    file: File,
+    /// Current read position (for sequential read optimization).
+    /// If the next read starts here, we skip the seek call.
+    posn: u64,
+}
+
 /// An open file being served via TFTP, with reference counting for sharing.
 ///
 /// When multiple clients request the same file simultaneously (common during
@@ -248,21 +270,24 @@ impl TftpErrorCode {
 /// conserve file descriptor resources. Matching is done by (device, inode)
 /// pair to handle hard links and renamed files correctly.
 ///
+/// Immutable metadata (`filename`, `file_size`, `dev`, `inode`) is accessed
+/// directly through the `Arc`. Mutable I/O state (`file`, `posn`) is
+/// protected by a `Mutex<TftpFileState>` for safe interior mutability.
+///
 /// Replaces C `struct tftp_file` (dnsmasq.h line 1289).
 pub struct TftpFile {
     /// Canonical path to the file on disk.
     pub filename: String,
-    /// Open file handle for reading.
-    pub file: File,
     /// Total file size in bytes (from fstat at open time).
     pub file_size: u64,
     /// Device number from file metadata.
     pub dev: u64,
     /// Inode number from file metadata.
     pub inode: u64,
-    /// Current read position (for sequential read optimization).
-    /// If the next read starts here, we skip the seek call.
-    posn: u64,
+    /// Mutable file I/O state (file handle + read position), protected by Mutex
+    /// for safe shared access across concurrent transfers in the single-threaded
+    /// event loop.
+    state: Mutex<TftpFileState>,
 }
 
 // ===========================================================================
@@ -792,6 +817,8 @@ impl TftpServer {
         if is_err {
             // Clean up socket if we created one
             if !daemon.option_bool(OPT_SINGLE_PORT) && sockfd >= 0 {
+                // SAFETY: closing a valid socket fd obtained from socket() call;
+                // fd is consumed and not used after this point.
                 unsafe { libc::close(sockfd); }
             }
         } else {
@@ -1040,7 +1067,25 @@ impl TftpServer {
         secure_mode: bool,
     ) -> Result<Arc<TftpFile>, TftpServerError> {
         // Path traversal prevention: reject paths containing "/../"
+        // This string-based check matches the C dnsmasq behavior for backward compatibility.
         if prefix.is_some() && full_path.contains("/../") {
+            return Err(TftpServerError::PathTraversal {
+                path: full_path.to_string(),
+            });
+        }
+
+        // Defense-in-depth: canonicalize the path and verify it still starts with the
+        // allowed prefix directory. This catches URL-encoded, double-encoded, or
+        // symlink-based traversal attempts that the string check above may miss.
+        // See OWASP Path Traversal guidance for rationale.
+        // If canonicalize fails (e.g., file doesn't exist yet), the subsequent
+        // File::open will produce the appropriate error. The string check above
+        // still provides baseline protection.
+        if let Some(pfx) = prefix
+            && let Ok(canonical) = std::fs::canonicalize(full_path)
+            && let Ok(canonical_prefix) = std::fs::canonicalize(pfx)
+            && !canonical.starts_with(&canonical_prefix)
+        {
             return Err(TftpServerError::PathTraversal {
                 path: full_path.to_string(),
             });
@@ -1131,14 +1176,13 @@ impl TftpServer {
             }
         }
 
-        // Create new TftpFile
+        // Create new TftpFile with mutable I/O state behind Mutex
         let tftp_file = Arc::new(TftpFile {
             filename: full_path.to_string(),
-            file,
             file_size,
             dev,
             inode,
-            posn: 0,
+            state: Mutex::new(TftpFileState { file, posn: 0 }),
         });
 
         self.files.insert(key, Arc::clone(&tftp_file));
@@ -1356,30 +1400,30 @@ fn get_block(
     packet[3] = (block_num & 0xFF) as u8;
 
     if data_size > 0 {
-        // Get mutable access to the file via Arc
-        // Since Arc doesn't give us &mut, we need to work with the file differently.
-        // In the single-threaded model, we use unsafe to get mutable access since
-        // we know there's no concurrent access.
-        let file_ref = Arc::as_ptr(&transfer.file) as *mut TftpFile;
-
-        // SAFETY: Single-threaded event loop guarantees exclusive access to file state.
-        // This mirrors the C code which directly mutates shared file state.
-        let file_mut = unsafe { &mut *file_ref };
+        // Acquire mutable access to the file I/O state via Mutex.
+        // The Mutex provides safe interior mutability through Arc<TftpFile>,
+        // replacing the previous unsafe Arc::as_ptr cast. In the single-threaded
+        // event loop, the lock is never contended.
+        let mut file_state = transfer
+            .file
+            .state
+            .lock()
+            .expect("TftpFileState mutex poisoned");
 
         // Seek to the correct position if needed
-        if file_mut.posn != transfer.offset {
-            file_mut
+        if file_state.posn != transfer.offset {
+            file_state
                 .file
                 .seek(SeekFrom::Start(transfer.offset))
                 .map_err(TftpBlockError::Seek)?;
         }
 
         // Read file data into packet buffer after the 4-byte header
-        let bytes_read = file_mut
+        let bytes_read = file_state
             .file
             .read(&mut packet[4..4 + data_size])?;
 
-        file_mut.posn = transfer.offset + bytes_read as u64;
+        file_state.posn = transfer.offset + bytes_read as u64;
 
         // Netascii LF→CRLF conversion
         if transfer.netascii {
@@ -1516,6 +1560,9 @@ fn build_tftp_err_oops(packet: &mut [u8], filename: &str) -> usize {
 fn free_transfer(transfer: TftpTransfer, single_port: bool) {
     // Close transfer socket unless it's a shared single-port socket
     if !single_port && transfer.sockfd >= 0 {
+        // SAFETY: closing transfer socket fd; fd is valid (obtained from socket()
+        // during transfer setup) and transfer struct is being dropped, so the fd
+        // is not used after this point.
         unsafe {
             libc::close(transfer.sockfd);
         }
@@ -1669,6 +1716,8 @@ fn create_transfer_socket(
     {
         // IP_PMTUDISC_DONT = 0
         let flag: libc::c_int = 0; // IP_PMTUDISC_DONT
+        // SAFETY: setsockopt on valid socket fd with stack-allocated i32 for
+        // IP_MTU_DISCOVER option; socket is open, option value has correct size.
         unsafe {
             libc::setsockopt(
                 socket.as_raw_fd(),
@@ -1902,11 +1951,13 @@ mod tests {
     fn test_handle_tftp_ack() {
         let file = Arc::new(TftpFile {
             filename: "/tmp/test".to_string(),
-            file: File::open("/dev/null").unwrap(),
             file_size: 1024,
             dev: 0,
             inode: 0,
-            posn: 0,
+            state: Mutex::new(TftpFileState {
+                file: File::open("/dev/null").unwrap(),
+                posn: 0,
+            }),
         });
 
         let mut transfer = TftpTransfer {
@@ -1950,11 +2001,13 @@ mod tests {
     fn test_handle_tftp_error() {
         let file = Arc::new(TftpFile {
             filename: "/tmp/test".to_string(),
-            file: File::open("/dev/null").unwrap(),
             file_size: 1024,
             dev: 0,
             inode: 0,
-            posn: 0,
+            state: Mutex::new(TftpFileState {
+                file: File::open("/dev/null").unwrap(),
+                posn: 0,
+            }),
         });
 
         let mut transfer = TftpTransfer {
@@ -1999,11 +2052,13 @@ mod tests {
     fn test_handle_tftp_wrap_around() {
         let file = Arc::new(TftpFile {
             filename: "/tmp/test".to_string(),
-            file: File::open("/dev/null").unwrap(),
             file_size: u64::MAX / 2,
             dev: 0,
             inode: 0,
-            posn: 0,
+            state: Mutex::new(TftpFileState {
+                file: File::open("/dev/null").unwrap(),
+                posn: 0,
+            }),
         });
 
         let mut transfer = TftpTransfer {
@@ -2049,11 +2104,13 @@ mod tests {
     fn test_get_block_oack() {
         let file = Arc::new(TftpFile {
             filename: "/tmp/test".to_string(),
-            file: File::open("/dev/null").unwrap(),
             file_size: 1024,
             dev: 0,
             inode: 0,
-            posn: 0,
+            state: Mutex::new(TftpFileState {
+                file: File::open("/dev/null").unwrap(),
+                posn: 0,
+            }),
         });
 
         let mut transfer = TftpTransfer {

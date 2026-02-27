@@ -531,6 +531,8 @@ impl InterfaceManager {
             Err(e) => {
                 if die_now {
                     // Clean up UDP socket before returning error
+                    // SAFETY: closing a valid UDP socket fd obtained from
+                    // make_sock(); fd is consumed and not used after this point.
                     unsafe {
                         libc::close(udp_fd);
                     }
