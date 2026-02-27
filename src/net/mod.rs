@@ -12,4 +12,5 @@
 //! Platform-specific behavior is abstracted behind the [`platform::NetworkBackend`]
 //! trait, with implementations for Linux (netlink) and BSD (BPF/routing sockets).
 
+pub mod arp;
 pub mod platform;
