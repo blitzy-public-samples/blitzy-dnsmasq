@@ -46,11 +46,14 @@ script = []
 # Authoritative DNS (HAVE_AUTH)
 auth = []
 
-# Linux ipset integration (HAVE_IPSET)
-ipset = []
+# Linux ipset integration (HAVE_IPSET) - uses netlink message construction
+ipset = ["dep:netlink-packet-core"]
 
 # nftables set population (HAVE_NFTSET) - requires libnftables
 nftset = []
+
+# Linux netlink platform networking (NETLINK_ROUTE interface/route monitoring)
+netlink = ["dep:netlink-packet-route", "dep:netlink-sys"]
 
 # inotify file monitoring (HAVE_INOTIFY) - Linux only
 inotify_monitor = ["dep:inotify"]
