@@ -58,6 +58,16 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR");
 
     // ========================================================================
+    // CHECK-CFG DECLARATIONS
+    // ========================================================================
+    // Declare custom cfg names so the compiler doesn't emit unexpected_cfgs
+    // warnings. These are emitted conditionally by library detection below.
+    println!("cargo::rustc-check-cfg=cfg(has_ubus_libs)");
+    println!("cargo::rustc-check-cfg=cfg(has_dbus_libs)");
+    println!("cargo::rustc-check-cfg=cfg(has_conntrack_libs)");
+    println!("cargo::rustc-check-cfg=cfg(has_nftset_libs)");
+
+    // ========================================================================
     // PLATFORM DETECTION
     // ========================================================================
     // Detect the target operating system and emit cargo:rustc-cfg directives
