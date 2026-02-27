@@ -42,16 +42,16 @@ This three-tier approach enables:
 
 ### Configuration Parsing Overview
 
-The configuration system is implemented in `src/option.c` (approximately 7,800 lines), the largest single source file in dnsmasq. The parser implements a state machine that processes configuration directives sequentially, maintaining global state in the `daemon` structure.
+The configuration system is implemented in `src/config/options.rs`, the largest single source module in dnsmasq. The parser implements a state machine that processes configuration directives sequentially, maintaining state in the `DaemonState` structure.
 
 ```mermaid
 graph TB
-    Start[Program Start] --> ParseCmdLine[Parse Command-Line<br/>getopt_long]
+    Start[Program Start] --> ParseCmdLine[Parse Command-Line<br/>argument parsing]
     ParseCmdLine --> ReadConfigFile{Config File<br/>Specified?}
-    ReadConfigFile -->|Yes| OpenFile[Open Config File<br/>one_file]
+    ReadConfigFile -->|Yes| OpenFile[Open Config File<br/>parse_config_file]
     ReadConfigFile -->|No| DefaultConfig[Use Default<br/>/etc/dnsmasq.conf]
     DefaultConfig --> OpenFile
-    OpenFile --> ParseLine[Read Line<br/>one_opt]
+    OpenFile --> ParseLine[Read Line<br/>parse_option]
     ParseLine --> ValidateLine{Valid<br/>Option?}
     ValidateLine -->|No| ErrorReport[Report Error<br/>with Line Number]
     ErrorReport --> ExitFail[Exit with Failure]
@@ -71,66 +71,65 @@ graph TB
 
 ### Configuration Parsing Entry Point
 
-**Source:** `src/option.c:7752`
+**Source:** `src/config/options.rs`
 
-```c
-void read_opts(int argc, char **argv, char *compile_opts)
+```rust
+pub fn read_opts(args: &[String], compile_opts: &str) -> Result<DaemonConfig, ConfigError>
 ```
 
-**Function:** Main configuration parsing entry point called from `main()` in `src/dnsmasq.c`
+**Function:** Main configuration parsing entry point called from `main()` in `src/main.rs`
 
 **Parameters:**
-- `argc`, `argv`: Command-line argument count and vector
+- `args`: Command-line argument slice
 - `compile_opts`: String containing compile-time feature flags (displayed in version output)
+
+**Returns:** `Result<DaemonConfig, ConfigError>` — parsed configuration or a descriptive error
 
 **Processing Flow:**
 1. Initialize option parsing state
-2. Parse command-line options using `getopt_long()` (line 7811)
-3. Process configuration file(s) via `one_file()` function
+2. Parse command-line options
+3. Process configuration file(s)
 4. Validate interdependent options
 5. Apply default values for unspecified options
 6. Allocate and initialize data structures
 
-### Command-Line Parsing with getopt_long
+### Command-Line Parsing
 
-**Source:** `src/option.c:7811`
+**Source:** `src/config/options.rs`
 
-```c
-option = getopt_long(argc, argv, OPTSTRING, opts, NULL);
-```
+The options definitions contain all long command-line options with their corresponding short options, argument requirements, and help text. This structure drives both command-line parsing and `--help` output generation.
 
-The `opts` array (defined starting at line 335) contains all long command-line options with their corresponding short options, argument requirements, and help text. This structure drives both command-line parsing and `--help` output generation.
+**Example from option definitions:**
 
-**Example from opts[] array:**
-
-```c
-static const struct option opts[] = {
-  { "version", 0, 0, 'v' },
-  { "no-hosts", 0, 0, 'h' },
-  { "no-poll", 0, 0, 'n' },
-  { "help", 0, 0, 'w' },
-  { "no-daemon", 0, 0, 'd' },
-  { "log-queries", 2, 0, 'q' },
-  { "user", 2, 0, 'u' },
-  { "group", 2, 0, 'g' },
-  { "resolv-file", 2, 0, 'r' },
-  { "servers-file", 1, 0, LOPT_SERV_FILE },
-  { "mx-host", 1, 0, 'm' },
-  { "mx-target", 1, 0, 't' },
-  { "cache-size", 2, 0, 'c' },
-  { "port", 1, 0, 'p' },
-  { "dhcp-leasefile", 2, 0, 'l' },
-  { "dhcp-lease", 1, 0, 'l' },
-  { "dhcp-host", 1, 0, 'G' },
-  { "dhcp-range", 1, 0, 'F' },
-  { "dhcp-option", 1, 0, 'O' },
-  // ... (continues for 300+ options)
-};
+```rust
+/// Option definitions for all supported command-line and config file options.
+/// Each entry specifies the long name, optional short flag, argument type, and description.
+const OPTIONS: &[OptionDef] = &[
+    OptionDef::new("version",        Some('v'), ArgType::None,     "Display version"),
+    OptionDef::new("no-hosts",       Some('h'), ArgType::None,     "Don't read /etc/hosts"),
+    OptionDef::new("no-poll",        Some('n'), ArgType::None,     "Don't poll resolv.conf"),
+    OptionDef::new("help",           Some('w'), ArgType::None,     "Display help"),
+    OptionDef::new("no-daemon",      Some('d'), ArgType::None,     "Don't daemonize"),
+    OptionDef::new("log-queries",    Some('q'), ArgType::Optional, "Log DNS queries"),
+    OptionDef::new("user",           Some('u'), ArgType::Optional, "Run as user"),
+    OptionDef::new("group",          Some('g'), ArgType::Optional, "Run as group"),
+    OptionDef::new("resolv-file",    Some('r'), ArgType::Optional, "Alternate resolv.conf"),
+    OptionDef::new("servers-file",   None,      ArgType::Required, "Servers file"),
+    OptionDef::new("mx-host",        Some('m'), ArgType::Required, "MX host"),
+    OptionDef::new("mx-target",      Some('t'), ArgType::Required, "MX target"),
+    OptionDef::new("cache-size",     Some('c'), ArgType::Optional, "DNS cache size"),
+    OptionDef::new("port",           Some('p'), ArgType::Required, "DNS port"),
+    OptionDef::new("dhcp-leasefile", Some('l'), ArgType::Optional, "Lease file path"),
+    OptionDef::new("dhcp-host",      Some('G'), ArgType::Required, "Static DHCP lease"),
+    OptionDef::new("dhcp-range",     Some('F'), ArgType::Required, "DHCP address range"),
+    OptionDef::new("dhcp-option",    Some('O'), ArgType::Required, "DHCP option value"),
+    // ... (continues for 300+ options)
+];
 ```
 
 ### Configuration File Parsing
 
-**Source:** `src/option.c` functions `one_file()` and `one_opt()`
+**Source:** `src/config/options.rs`
 
 **File Format:**
 - One option per line
@@ -249,7 +248,7 @@ Dnsmasq supports 350+ command-line options organized by functional area:
 
 | Option | Argument | Description |
 |--------|----------|-------------|
-| `--dnssec` | - | Enable DNSSEC validation (requires HAVE_DNSSEC) |
+| `--dnssec` | - | Enable DNSSEC validation (requires Cargo feature `dnssec`) |
 | `--trust-anchor` | KEYTAG,ALGO,DIGEST | Specify trust anchor |
 | `--dnssec-check-unsigned` | - | Check unsigned replies for security |
 | `--dnssec-no-timecheck` | - | Don't check DNSSEC signature timestamps |
@@ -310,7 +309,7 @@ The complete list of all supported options is available via:
 dnsmasq --help
 ```
 
-Or by examining the `opts[]` array in `src/option.c:335-800`.
+Or by examining the options definitions in `src/config/options.rs`.
 
 ---
 
@@ -340,16 +339,16 @@ graph LR
    - Multiple configuration files: processed in order specified
 
 3. **Compile-Time Defaults (Lowest Precedence)**
-   - Default values compiled into binary from `src/config.h`
+   - Default values defined in `src/config/constants.rs`
    - Used only when option not specified in config file or command-line
 
 ### Precedence Example
 
 **Scenario:** Cache size configuration
 
-**Compile-time default** (`src/config.h:38`):
-```c
-#define CACHESIZ 150
+**Compile-time default** (`src/config/constants.rs`):
+```rust
+pub const CACHESIZ: usize = 150;
 ```
 
 **Configuration file** (`/etc/dnsmasq.conf`):
@@ -393,58 +392,58 @@ Dnsmasq uses compile-time feature flags to enable or disable entire subsystems a
 
 ### Feature Flag Specification
 
-**Via Makefile COPTS variable:**
+**Via Cargo feature flags:**
 
 ```bash
-make COPTS="-DHAVE_DHCP -DHAVE_DNSSEC"
+cargo build --release --features "dhcp,dnssec"
 ```
 
-**Via config.h editing:**
+**Via Cargo.toml default features:**
 
-Uncomment desired features in `src/config.h:71-200`
+Configure the `[features]` section in `Cargo.toml` to set default features, or use `--features` and `--no-default-features` flags to customize at build time.
 
 ### Complete Compile-Time Option Reference
 
-**Source:** `src/config.h:71-200`
+**Source:** `src/config/feature_flags.rs` and `Cargo.toml` `[features]` section
 
-#### Core Protocol Features
+#### Service Features
 
-| Flag | Description | Dependencies | Impact |
-|------|-------------|--------------|--------|
-| `HAVE_DHCP` | Enable DHCPv4 server | None | Enables `src/dhcp.c`, `src/rfc2131.c`, lease management; adds ~50KB to binary |
-| `HAVE_DHCP6` | Enable DHCPv6 and Router Advertisement | Implies `HAVE_DHCP` | Enables `src/dhcp6.c`, `src/rfc3315.c`, `src/radv.c`; adds ~40KB |
-| `HAVE_TFTP` | Enable TFTP server | None | Enables `src/tftp.c`; adds ~15KB |
-| `HAVE_DNSSEC` | Enable DNSSEC validation | Requires Nettle library | Enables `src/dnssec.c`, `src/crypto.c`; adds ~60KB plus Nettle dependency |
-| `HAVE_AUTH` | Enable authoritative DNS mode | None | Enables `src/auth.c`; adds ~20KB |
+| Cargo Feature | Description | Dependencies | Impact |
+|---------------|-------------|--------------|--------|
+| `dhcp` | Enable DHCPv4 server | None | Enables `src/dhcp/v4/server.rs`, `src/dhcp/v4/rfc2131.rs`, lease management |
+| `dhcp6` | Enable DHCPv6 and Router Advertisement | Requires `dhcp` | Enables `src/dhcp/v6/server.rs`, `src/dhcp/v6/rfc3315.rs`, `src/dhcp/radv/server.rs` |
+| `tftp` | Enable TFTP server | None | Enables `src/integration/tftp.rs` |
+| `dnssec` | Enable DNSSEC validation | Uses `ring` crate | Enables `src/dns/dnssec/validation.rs`, `src/dns/dnssec/crypto.rs` |
+| `auth` | Enable authoritative DNS mode | None | Enables `src/dns/auth.rs` |
 
 #### Integration Features
 
-| Flag | Description | Dependencies | Impact |
-|------|-------------|--------------|--------|
-| `HAVE_DBUS` | Enable D-Bus control interface | Requires libdbus-1 | Enables `src/dbus.c`; adds D-Bus service on system bus |
-| `HAVE_UBUS` | Enable UBus interface (OpenWrt) | Requires libubox, libubus | Enables `src/ubus.c`; OpenWrt-specific integration |
-| `HAVE_SCRIPT` | Enable lease-change script execution | None | Enables fork-exec for external scripts in `src/helper.c` |
-| `HAVE_LUASCRIPT` | Enable Lua scripting for lease events | Requires Lua library | Enables embedded Lua interpreter; reduces fork overhead |
-| `HAVE_IPSET` | Enable Linux ipset integration | None (uses netlink or legacy ipset API) | Enables `src/ipset.c`; firewall integration |
-| `HAVE_NFTSET` | Enable nftables set integration | Requires libnftables | Enables `src/nftset.c`; modern firewall integration |
-| `HAVE_CONNTRACK` | Enable connection tracking marks | Requires libnetfilter_conntrack | Enables `src/conntrack.c`; advanced routing support |
+| Cargo Feature | Description | Dependencies | Impact |
+|---------------|-------------|--------------|--------|
+| `dbus` | Enable D-Bus control interface | Requires libdbus-1 | Enables `src/integration/dbus.rs`; adds D-Bus service on system bus |
+| `ubus` | Enable UBus interface (OpenWrt) | Requires libubox, libubus | Enables `src/integration/ubus.rs`; OpenWrt-specific integration |
+| `script` | Enable lease-change script execution | None | Enables fork-exec for external scripts in `src/dhcp/helper.rs` |
+| `ipset` | Enable Linux ipset integration | None (uses netlink) | Enables `src/net/platform/linux/ipset.rs`; firewall integration |
+| `nftset` | Enable nftables set integration | Requires libnftables | Enables `src/integration/nftset.rs`; modern firewall integration |
+| `conntrack` | Enable connection tracking marks | Requires libnetfilter_conntrack | Enables `src/net/platform/linux/conntrack.rs`; advanced routing support |
+
+> **Note:** Embedded Lua scripting support is deferred to a future enhancement and is not available in the current Rust rewrite. External script execution via the `script` feature provides equivalent lease-event functionality.
 
 #### Internationalization and Standards
 
-| Flag | Description | Dependencies | Impact |
-|------|-------------|--------------|--------|
-| `HAVE_IDN` | Enable IDN 2003 support | Requires libidn | Internationalized domain name support (2003 standard) |
-| `HAVE_LIBIDN2` | Enable IDN 2008 support | Requires libidn2 | Internationalized domain name support (2008 standard, preferred) |
+| Cargo Feature | Description | Dependencies | Impact |
+|---------------|-------------|--------------|--------|
+| `idn` | Enable IDN 2008 support | Uses `idna` crate | Internationalized domain name support (IDNA 2008 standard) |
 
 #### Platform and Debugging Features
 
-| Flag | Description | Dependencies | Impact |
-|------|-------------|--------------|--------|
-| `HAVE_LINUX_NETWORK` | Enable Linux-specific networking | Linux kernel | Enables `src/netlink.c` for interface monitoring via netlink |
-| `HAVE_INOTIFY` | Enable inotify for config file monitoring | Linux kernel with inotify | Enables `src/inotify.c` for automatic config reload on file changes |
-| `HAVE_LOOP` | Enable DNS forwarding loop detection | None | Enables `src/loop.c`; sends test queries to detect loops |
-| `HAVE_DUMPFILE` | Enable packet capture to libpcap format | None | Enables `src/dump.c`; packet debugging |
-| `HAVE_BROKEN_RTC` | Enable RTC-less embedded operation | None | Uses uptime instead of wall clock; flash-friendly lease file writes |
+| Cargo Feature | Description | Dependencies | Impact |
+|---------------|-------------|--------------|--------|
+| (auto-detected) | Linux-specific networking | Linux kernel | Enables `src/net/platform/linux/netlink.rs` for interface monitoring via netlink |
+| `inotify_monitor` | Enable inotify for config file monitoring | Linux kernel with inotify | Enables `src/net/platform/linux/inotify.rs` for automatic config reload on file changes |
+| `loop_detect` | Enable DNS forwarding loop detection | None | Enables `src/dns/loop_detect.rs`; sends test queries to detect loops |
+| `dump` | Enable packet capture to libpcap format | None | Enables `src/debug/dump.rs`; packet debugging |
+| `broken_rtc` | Enable RTC-less embedded operation | None | Uses uptime instead of wall clock; flash-friendly lease file writes |
 
 ### Feature Dependencies
 
@@ -452,14 +451,13 @@ Some features require or imply other features:
 
 ```mermaid
 graph TB
-    DHCP6[HAVE_DHCP6] -.->|implies| DHCP[HAVE_DHCP]
-    DNSSEC[HAVE_DNSSEC] -.->|requires| Nettle[Nettle Library<br/>libnettle, libhogweed]
-    NFTSET[HAVE_NFTSET] -.->|requires| LibNFT[libnftables]
-    CONNTRACK[HAVE_CONNTRACK] -.->|requires| LibNFConn[libnetfilter_conntrack]
-    LUASCRIPT[HAVE_LUASCRIPT] -.->|requires| Lua[Lua Library<br/>liblua5.x]
-    DBUS[HAVE_DBUS] -.->|requires| LibDBus[libdbus-1]
-    UBUS[HAVE_UBUS] -.->|requires| UBusLibs[libubox + libubus]
-    IDN[HAVE_IDN] -.->|mutually exclusive| IDN2[HAVE_LIBIDN2]
+    DHCP6[dhcp6] -.->|implies| DHCP[dhcp]
+    DNSSEC[dnssec] -.->|uses| Ring[ring crate<br/>cryptography]
+    NFTSET[nftset] -.->|requires| LibNFT[libnftables]
+    CONNTRACK[conntrack] -.->|requires| LibNFConn[libnetfilter_conntrack]
+    DBUS[dbus] -.->|requires| LibDBus[libdbus-1]
+    UBUS[ubus] -.->|requires| UBusLibs[libubox + libubus]
+    IDN[idn] -.->|uses| IdnaCrate[idna crate]
     
     style DHCP6 fill:#ffe1e1
     style DNSSEC fill:#ffe1e1
@@ -468,11 +466,11 @@ graph TB
 
 **Key Dependency Rules:**
 
-1. `HAVE_DHCP6` automatically enables `HAVE_DHCP` (DHCPv6 requires DHCPv4 infrastructure)
-2. `HAVE_DNSSEC` requires Nettle cryptography library at link time
-3. `HAVE_NFTSET` requires libnftables (nftables user-space library)
-4. `HAVE_IDN` and `HAVE_LIBIDN2` are mutually exclusive (use one or the other, not both)
-5. Platform-specific features (`HAVE_LINUX_NETWORK`, `HAVE_INOTIFY`) auto-detected by build system
+1. `dhcp6` automatically enables `dhcp` (DHCPv6 requires DHCPv4 infrastructure)
+2. `dnssec` uses the `ring` crate for cryptographic verification (RSA, ECDSA, Ed25519)
+3. `nftset` requires libnftables (nftables user-space library)
+4. `idn` uses the `idna` crate for IDNA 2008 internationalized domain name support
+5. Platform-specific networking (netlink, inotify) is auto-detected via `#[cfg(target_os = "linux")]`
 
 ### Checking Compiled Features
 
@@ -500,7 +498,7 @@ The "Compile time options" line shows which features are enabled.
 |---------|-------------------|---------------|------------|----------------------|
 | DHCP | +50KB | +500KB (1000 leases) | Low | None |
 | DHCP6 | +40KB | +300KB (lease tracking) | Low | None |
-| DNSSEC | +60KB | +50KB (validation state) | High (crypto) | libnettle |
+| DNSSEC | +60KB | +50KB (validation state) | High (crypto) | ring crate |
 | TFTP | +15KB | +100KB (50 connections) | Medium (I/O) | None |
 | Auth DNS | +20KB | +50KB (zone data) | Low | None |
 | DBus | +20KB | +20KB (bus connection) | Low | libdbus-1 |
@@ -511,9 +509,9 @@ The "Compile time options" line shows which features are enabled.
 
 ## Numeric Constants
 
-Dnsmasq defines numerous numeric constants in `src/config.h` that control performance limits, timeouts, and default behaviors.
+Dnsmasq defines numerous numeric constants in `src/config/constants.rs` that control performance limits, timeouts, and default behaviors.
 
-**Source:** `src/config.h:17-70`
+**Source:** `src/config/constants.rs`
 
 ### DNS Configuration Constants
 
@@ -632,15 +630,14 @@ Most numeric constants are **hardcoded** and require recompilation to change. No
 - `TFTP_MAX_CONNECTIONS` → `--tftp-max`
 
 **Build-Time Modification:**
-Edit `src/config.h` and recompile:
+Edit `src/config/constants.rs` and rebuild:
 
 ```bash
-# Edit src/config.h to change constants
-vim src/config.h
+# Edit src/config/constants.rs to change constants
+vim src/config/constants.rs
 
-# Recompile
-make clean
-make
+# Rebuild
+cargo build --release
 ```
 
 ---
@@ -663,7 +660,7 @@ Dnsmasq performs extensive configuration validation during startup, detecting co
 - Domain name format (RFC 1123 compliance)
 
 **Phase 3: Consistency Validation**
-- Feature availability (e.g., DHCP options require HAVE_DHCP at compile time)
+- Feature availability (e.g., DHCP options require Cargo feature `dhcp` enabled at build time)
 - Conflicting options (e.g., `--bind-interfaces` and `--listen-address`)
 - Interface existence (specified interfaces must exist at startup)
 - DHCP range validity (start < end, within subnet)
@@ -702,9 +699,9 @@ Cause: Lease file not writable by dnsmasq user
 
 **Feature Not Compiled:**
 ```
-dnsmasq: DHCP not available: set HAVE_DHCP in src/config.h
+dnsmasq: DHCP not available: rebuild with --features "dhcp"
 ```
-Cause: DHCP options specified but `HAVE_DHCP` not enabled at compile time
+Cause: DHCP options specified but Cargo feature `dhcp` not enabled at build time
 
 ### Error Reporting
 
@@ -786,7 +783,7 @@ service dnsmasq reload
 ### What Does NOT Get Reloaded
 
 **Compile-Time Options:**
-- Feature flags (HAVE_DHCP, HAVE_DNSSEC, etc.) cannot change without recompilation
+- Feature flags (`dhcp`, `dnssec`, etc.) cannot change without rebuilding the binary
 
 **Network Binding:**
 - Listening interfaces (`--interface`, `--listen-address`)
@@ -833,9 +830,9 @@ sequenceDiagram
 
 ### Configuration File Monitoring (Linux)
 
-**Feature:** Automatic reload on file change (requires `HAVE_INOTIFY`)
+**Feature:** Automatic reload on file change (requires Cargo feature `inotify_monitor`)
 
-**Source:** `src/inotify.c`
+**Source:** `src/net/platform/linux/inotify.rs`
 
 **Behavior:**
 - Monitors configuration file(s) for changes using Linux inotify
@@ -844,7 +841,7 @@ sequenceDiagram
 
 **Enable automatic reload:**
 ```bash
-# Automatically enabled if HAVE_INOTIFY compiled in
+# Automatically enabled if inotify_monitor feature compiled in
 dnsmasq --conf-file=/etc/dnsmasq.conf
 ```
 
@@ -1168,7 +1165,7 @@ esac
 
 3. **Enable Configuration File Monitoring**
    ```
-   # Automatic with HAVE_INOTIFY on Linux
+   # Automatic with Cargo feature inotify_monitor on Linux
    # Manual: send SIGHUP after config changes
    ```
 
@@ -1391,10 +1388,10 @@ journalctl -u dnsmasq -n 50
 - Man page: `man 8 dnsmasq`
 
 **Source Code References:**
-- Configuration parsing: `src/option.c` (7,800 lines)
-- Compile-time options: `src/config.h` (480 lines)
-- Option structure definition: `src/option.c:335` (`opts[]` array)
-- Main entry point: `src/dnsmasq.c:main()`
+- Configuration parsing: `src/config/options.rs`
+- Compile-time options: `src/config/constants.rs` and `src/config/feature_flags.rs`
+- Option definitions: `src/config/options.rs` (`OPTIONS` array)
+- Main entry point: `src/main.rs`
 
 **Related Documentation:**
 - ARCHITECTURE.md - System architecture and component relationships
@@ -1406,7 +1403,7 @@ journalctl -u dnsmasq -n 50
 
 **Document Version:** 1.0  
 **Based on:** dnsmasq version 2.92  
-**Primary Sources:** `src/option.c`, `src/config.h`, `dnsmasq.conf.example`  
+**Primary Sources:** `src/config/options.rs`, `src/config/constants.rs`, `src/config/feature_flags.rs`, `dnsmasq.conf.example`  
 **Total Configuration Options:** 350+ directives  
 **Compile-Time Options:** 20+ feature flags  
 **Numeric Constants:** 40+ performance and limit values
