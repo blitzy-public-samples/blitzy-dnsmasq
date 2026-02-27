@@ -1,8 +1,9 @@
 // Core module — daemon runtime infrastructure.
 //
-// Contains the event loop, signal handling, logging, utilities, and daemon
+// Contains the event loop, signal handling, logging, utilities, metrics, and daemon
 // state management that form the foundation of the dnsmasq runtime.
 
+pub mod metrics;
 pub mod logging;
 pub mod signal;
 pub mod event_loop;
