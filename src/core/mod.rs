@@ -9,3 +9,4 @@ pub mod logging;
 pub mod signal;
 pub mod event_loop;
 pub mod prng;
+pub mod util;
