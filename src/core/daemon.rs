@@ -38,23 +38,13 @@ use crate::core::metrics::MetricsStore;
 use crate::core::prng::Prng;
 
 // ---------------------------------------------------------------------------
-// Exit code constants (dnsmasq.h lines 384-391)
+// Exit code constants — canonical definitions in types::dns, re-exported here
+// for backward compatibility with consumers importing from core::daemon.
 // ---------------------------------------------------------------------------
 
-/// Process exited successfully.
-pub const EC_GOOD: i32 = 0;
-/// Bad configuration (parse error, invalid options).
-pub const EC_BADCONF: i32 = 1;
-/// Network error (socket creation, binding failure).
-pub const EC_BADNET: i32 = 2;
-/// File system error (missing lease file, permission denied).
-pub const EC_FILE: i32 = 3;
-/// Memory allocation failure.
-pub const EC_NOMEM: i32 = 4;
-/// Miscellaneous / unclassified error.
-pub const EC_MISC: i32 = 5;
-/// Offset added to exit code when error occurs during initialisation.
-pub const EC_INIT_OFFSET: i32 = 10;
+pub use crate::types::dns::{
+    EC_BADCONF, EC_BADNET, EC_FILE, EC_GOOD, EC_INIT_OFFSET, EC_MISC, EC_NOMEM,
+};
 
 // ---------------------------------------------------------------------------
 // Numeric constants from config.h
@@ -260,11 +250,52 @@ pub const OPT_DO_0X20: usize = 75;
 pub const OPT_AUTH_LOG: usize = 76;
 /// Enable DHCP leasequery (RFC 4388) support.
 pub const OPT_LEASEQUERY: usize = 77;
+
+// -------------------------------------------------------------------------
+// Extended OPT_* constants (78+) — additional flags used by the Rust config
+// parser that do not have C `OPT_*` equivalents. These extend the flag space
+// beyond the C codebase's 78 flags while remaining within the same [u32; 3]
+// backing store (capacity = 96 bits).
+// -------------------------------------------------------------------------
+
+/// Filter type-A (IPv4) DNS responses.
+pub const OPT_FILTER_A: usize = 78;
+/// Filter type-AAAA (IPv6) DNS responses.
+pub const OPT_FILTER_AAAA: usize = 79;
+/// Enable dynamic BOOTP address allocation.
+pub const OPT_BOOTP_DYNAMIC: usize = 80;
+/// TFTP uses address-prefix path (generic).
+pub const OPT_TFTP_APREF: usize = 81;
+/// Enable connmark allowlist — create new allowlist entries.
+pub const OPT_CMARK_ALST_NEW: usize = 82;
+/// Disable DHCPv4-over-DHCPv6 (RFC 7341).
+pub const OPT_NO_4OVER6: usize = 83;
+/// Enable serving stale cache entries (RFC 8767).
+pub const OPT_STALE_CACHE: usize = 84;
+/// Do not return additional AAAA resource records.
+pub const OPT_NORR6: usize = 85;
+/// Allow rebinding to localhost addresses.
+pub const OPT_REBIND_LOCALHOST: usize = 86;
+/// Allow rebinding for specific domain suffixes.
+pub const OPT_REBIND_DOMAIN_OK: usize = 87;
+/// Enable NAT-PMP port mapping protocol support.
+pub const OPT_NAT_PMP: usize = 88;
+/// Ignore specific upstream DNS response addresses.
+pub const OPT_IGNORE_ADDR: usize = 89;
+/// Cache DNSSEC validation results.
+pub const OPT_CACHE_DNSSEC: usize = 90;
+/// Do not derive DNS hostnames from DHCP client info.
+pub const OPT_NO_DHCP_HOSTNAME: usize = 91;
+/// Return NXDOMAIN for names in authoritative zones with no match.
+pub const OPT_AUTH_NXDOMAIN: usize = 92;
+/// Proxy DNSSEC flag to upstream without local signature validation.
+pub const OPT_DNSSEC_NO_SIGN: usize = 93;
+
 /// Sentinel value marking the end of the option range (not a valid option).
-pub const OPT_LAST: usize = 78;
+pub const OPT_LAST: usize = 94;
 
 /// Number of u32 words needed to store all option flags as a bitfield.
-/// `OPT_LAST.div_ceil(32)` = 3 for 78 flags.
+/// `OPT_LAST.div_ceil(32)` = 3 for 94 flags (78 C-compatible + 16 extended).
 /// Matches C `OPTION_SIZE = ((OPT_LAST/OPTION_BITS)+((OPT_LAST%OPTION_BITS)!=0))`.
 const OPTION_WORDS: usize = OPT_LAST.div_ceil(32);
 
@@ -273,6 +304,9 @@ const OPTION_WORDS: usize = OPT_LAST.div_ceil(32);
 // ---------------------------------------------------------------------------
 
 /// Daemon option flags, replacing the C `options[OPTION_SIZE]` bitfield array.
+///
+/// This is the **canonical OptionFlags type** used by both the config parser
+/// (`config::options`) and the runtime daemon state (`DaemonState`).
 ///
 /// In C (dnsmasq.h lines 393-474):
 /// ```c
@@ -284,12 +318,14 @@ const OPTION_WORDS: usize = OPT_LAST.div_ceil(32);
 ///
 /// In Rust, we use a fixed-size `[u32; 3]` array with the same bit-manipulation
 /// semantics. Each flag is identified by its index (`OPT_*` constants) and
-/// stored as a single bit in the corresponding word.
+/// stored as a single bit in the corresponding word. The Rust version extends
+/// the flag space with indices 78-93 for additional flags used by the config
+/// parser that do not have C equivalents.
 ///
 /// ## Bit Layout
-/// - Word 0 (`bits[0]`): flags 0..31
-/// - Word 1 (`bits[1]`): flags 32..63
-/// - Word 2 (`bits[2]`): flags 64..77 (upper bits unused)
+/// - Word 0 (`bits[0]`): flags 0..31  (C-compatible)
+/// - Word 1 (`bits[1]`): flags 32..63 (C-compatible)
+/// - Word 2 (`bits[2]`): flags 64..93 (64-77 C-compatible, 78-93 Rust-extended)
 #[derive(Debug, Clone)]
 pub struct OptionFlags {
     /// Backing storage: 3 × u32 = 96 bits, of which 78 are used.
@@ -1053,13 +1089,26 @@ mod tests {
 
     #[test]
     fn option_flags_set_get_clear_bit_77() {
-        // Last valid bit
+        // Last C-compatible bit
         let mut flags = OptionFlags::new();
         assert!(!flags.get(OPT_LEASEQUERY));
         flags.set(OPT_LEASEQUERY);
         assert!(flags.get(OPT_LEASEQUERY));
         flags.clear(OPT_LEASEQUERY);
         assert!(!flags.get(OPT_LEASEQUERY));
+    }
+
+    #[test]
+    fn option_flags_set_get_clear_extended_bit_93() {
+        // Last extended flag — OPT_DNSSEC_NO_SIGN (93)
+        let mut flags = OptionFlags::new();
+        assert!(!flags.get(OPT_DNSSEC_NO_SIGN));
+        flags.set(OPT_DNSSEC_NO_SIGN);
+        assert!(flags.get(OPT_DNSSEC_NO_SIGN));
+        // Verify no cross-contamination with neighbours
+        assert!(!flags.get(OPT_AUTH_NXDOMAIN)); // bit 92
+        flags.clear(OPT_DNSSEC_NO_SIGN);
+        assert!(!flags.get(OPT_DNSSEC_NO_SIGN));
     }
 
     #[test]
@@ -1211,6 +1260,7 @@ mod tests {
 
     #[test]
     fn opt_constants_match_c() {
+        // C-compatible OPT_* constants (indices 0-77) must match dnsmasq.h exactly
         assert_eq!(OPT_BOGUSPRIV, 0);
         assert_eq!(OPT_FILTER, 1);
         assert_eq!(OPT_LOG, 2);
@@ -1225,12 +1275,16 @@ mod tests {
         assert_eq!(OPT_UMBRELLA, 63);
         assert_eq!(OPT_CACHE_RR, 71);
         assert_eq!(OPT_LEASEQUERY, 77);
-        assert_eq!(OPT_LAST, 78);
+        // Extended Rust flags (78-93) — beyond C's OPT_LAST=78
+        assert_eq!(OPT_FILTER_A, 78);
+        assert_eq!(OPT_DNSSEC_NO_SIGN, 93);
+        // Sentinel includes both C-compatible and extended flags
+        assert_eq!(OPT_LAST, 94);
     }
 
     #[test]
     fn option_words_constant_is_three() {
-        // 78 flags / 32 bits per word = 2.4375 → 3 words
+        // 94 flags / 32 bits per word = 2.9375 → 3 words (capacity = 96 bits)
         assert_eq!(OPTION_WORDS, 3);
     }
 

@@ -6,7 +6,7 @@
 //!
 //! Key transformations from C:
 //! - `setjmp`/`longjmp` error recovery → `Result<T, ConfigError>` with `thiserror`
-//! - `options[]` bitmask array → `OptionFlags` via `bitflags!` macro
+//! - `options[]` bitmask array → `OptionFlags` (canonical type from `core::daemon`)
 //! - `LOPT_*` `#define` constants → `LongOption` enum
 //! - Global `struct daemon` → decomposed `DaemonConfig` with nested domain structs
 //! - Builder pattern for config construction: `ConfigBuilder::new().parse_cli().parse_file().build()`
@@ -19,12 +19,47 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use bitflags::bitflags;
 use log::{debug, info, warn};
 use thiserror::Error;
 
 use crate::config::constants;
 use crate::config::feature_flags;
+
+// Import the canonical OptionFlags type and OPT_* constants from core::daemon.
+// This eliminates the previous duplicate bitflags! definition that was incompatible
+// with daemon.rs's version, ensuring a single unified OptionFlags type is used
+// for both config parsing and runtime daemon state.
+#[allow(unused_imports)]
+use crate::core::daemon::{
+    OptionFlags,
+    OPT_ADD_MAC, OPT_ALL_SERVERS, OPT_AUTH_LOG, OPT_AUTH_NXDOMAIN,
+    OPT_BOGUSPRIV, OPT_BOOTP_DYNAMIC,
+    OPT_CACHE_DNSSEC, OPT_CACHE_RR, OPT_CLEVERBIND, OPT_CLIENT_SUBNET,
+    OPT_CMARK_ALST_EN, OPT_CMARK_ALST_NEW, OPT_CONNTRACK, OPT_CONSEC_ADDR,
+    OPT_DBUS, OPT_DEBUG, OPT_DHCP_FQDN, OPT_DNSSEC_DEBUG, OPT_DNSSEC_IGN_NS,
+    OPT_DNSSEC_NO_SIGN, OPT_DNSSEC_PROXY, OPT_DNSSEC_TIME, OPT_DNSSEC_VALID,
+    OPT_DO_0X20, OPT_ETHERS, OPT_EXPAND, OPT_EXTRALOG,
+    OPT_FILTER, OPT_FILTER_A, OPT_FILTER_AAAA, OPT_FQDN_UPDATE,
+    OPT_IGNORE_ADDR, OPT_IGNORE_CLID,
+    OPT_LEASE_RENEW, OPT_LEASE_RO, OPT_LEASEQUERY,
+    OPT_LOCAL_REBIND, OPT_LOCAL_SERVICE, OPT_LOCALISE, OPT_LOCALMX,
+    OPT_LOCALHOST_SERVICE, OPT_LOG, OPT_LOG_DEBUG, OPT_LOG_OPTS,
+    OPT_LOG_PROTO, OPT_LOOP_DETECT,
+    OPT_MAC_B64, OPT_MAC_HEX,
+    OPT_NAT_PMP, OPT_NO_0X20, OPT_NO_4OVER6, OPT_NO_DHCP_HOSTNAME,
+    OPT_NO_FORK, OPT_NO_HOSTS, OPT_NO_IDENT, OPT_NO_NEG,
+    OPT_NO_OVERRIDE, OPT_NO_PING, OPT_NO_POLL, OPT_NO_REBIND,
+    OPT_NO_RESOLV, OPT_NODOTS_LOCAL, OPT_NORR, OPT_NORR6, OPT_NOWILD,
+    OPT_ORDER, OPT_RA, OPT_RAPID_COMMIT,
+    OPT_REBIND_DOMAIN_OK, OPT_REBIND_LOCALHOST, OPT_RELOAD,
+    OPT_RESOLV_DOMAIN, OPT_SCRIPT_ARP, OPT_SELFMX,
+    OPT_SINGLE_PORT, OPT_STALE_CACHE, OPT_STRIP_ECS, OPT_STRIP_MAC,
+    OPT_TFTP, OPT_TFTP_APREF, OPT_TFTP_APREF_IP, OPT_TFTP_APREF_MAC,
+    OPT_TFTP_LC, OPT_TFTP_NOBLOCK, OPT_TFTP_NO_FAIL, OPT_TFTP_SECURE,
+    OPT_UBUS, OPT_UMBRELLA, OPT_UMBRELLA_DEVID,
+    OPT_AUTHORITATIVE, OPT_QUIET_DHCP, OPT_QUIET_DHCP6,
+    OPT_QUIET_RA, OPT_QUIET_TFTP,
+};
 use crate::types::addr::{AllAddr, SocketAddress};
 #[allow(unused_imports)]
 use crate::types::dns::{
@@ -87,106 +122,10 @@ pub enum ConfigError {
     MissingArgument(String),
 }
 
-// ---------------------------------------------------------------------------
-// OptionFlags — replaces C options[] bitmask array (OPT_* in dnsmasq.h)
-// ---------------------------------------------------------------------------
-
-bitflags! {
-    /// Boolean option flags for daemon behavior.
-    ///
-    /// Replaces the C `options[]` array with `OPT_*` constants from dnsmasq.h
-    /// lines 393-471. Uses a 128-bit backing store to accommodate all 78 flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct OptionFlags: u128 {
-        const BOGUSPRIV        = 1 << 0;
-        const FILTER           = 1 << 1;
-        const LOG              = 1 << 2;
-        const SELFMX           = 1 << 3;
-        const NO_HOSTS         = 1 << 4;
-        const NO_POLL          = 1 << 5;
-        const DEBUG            = 1 << 6;
-        const FILTER_A         = 1 << 7;
-        const FILTER_AAAA      = 1 << 8;
-        const NOWILD           = 1 << 9;
-        const ROUTERADV        = 1 << 10;
-        const DBUS             = 1 << 11;
-        const UBUS             = 1 << 12;
-        const NO_RESOLV        = 1 << 13;
-        const EXPAND           = 1 << 14;
-        const LOCALMX          = 1 << 15;
-        const NO_NEG           = 1 << 16;
-        const NODOTS_LOCAL     = 1 << 17;
-        const BOOTP_DYNAMIC    = 1 << 18;
-        const DNSSEC_VALID     = 1 << 19;
-        const DNSSEC_TIME      = 1 << 20;
-        const DNSSEC_DEBUG     = 1 << 21;
-        const DNSSEC_IGN_NS    = 1 << 22;
-        const DNSSEC_NO_SIGN   = 1 << 23;
-        const TFTP_SECURE      = 1 << 24;
-        const TFTP_NOBLOCK     = 1 << 25;
-        const TFTP_APREF_IP    = 1 << 26;
-        const TFTP_APREF_MAC   = 1 << 27;
-        const TFTP_SINGLE_PORT = 1 << 28;
-        const TFTP_APREF       = 1 << 29;
-        const NO_PING          = 1 << 30;
-        const LOG_OPTS         = 1 << 31;
-        const LOG_ED           = 1 << 32;
-        const LOG_RO           = 1 << 33;
-        const LEASE_RO         = 1 << 34;
-        const DNAMEREQ         = 1 << 35;
-        const CLEVERBIND       = 1 << 36;
-        const SCRIPT_ARP       = 1 << 37;
-        const MAC_B64          = 1 << 38;
-        const MAC_HEX          = 1 << 39;
-        const CONSEC_ADDR      = 1 << 40;
-        const RAPID_COMMIT     = 1 << 41;
-        const NO_4OVER6        = 1 << 42;
-        const UMBRELLA         = 1 << 43;
-        const IGNORE_CLID      = 1 << 44;
-        const SINGLE_PORT      = 1 << 45;
-        const STALE_CACHE      = 1 << 46;
-        const NORR             = 1 << 47;
-        const NO_IDENT         = 1 << 48;
-        const STRIP_ECS        = 1 << 49;
-        const STRIP_MAC        = 1 << 50;
-        const NORR6            = 1 << 51;
-        const QUIET_DHCP       = 1 << 52;
-        const QUIET_DHCP6      = 1 << 53;
-        const QUIET_RA         = 1 << 54;
-        const QUIET_TFTP       = 1 << 55;
-        const EXTRALOG         = 1 << 56;
-        const LOCAL_REBIND     = 1 << 57;
-        const REBIND_LOCALHOST = 1 << 58;
-        const REBIND_DOMAIN_OK = 1 << 59;
-        const STOP_DNS_REBIND  = 1 << 60;
-        const ALL_SERVERS      = 1 << 61;
-        const CMARK_ALST_EN    = 1 << 62;
-        const CMARK_ALST_NEW   = 1 << 63;
-        const UMBRELLA_DEVID   = 1 << 64;
-        const NAT_PMP          = 1 << 65;
-        const ADD_MAC          = 1 << 66;
-        const ADD_SBNET        = 1 << 67;
-        const LOCAL_SERVICE    = 1 << 68;
-        const LOOP_DETECT      = 1 << 69;
-        const IGNORE_ADDR      = 1 << 70;
-        const CACHE_RR         = 1 << 71;
-        const CACHE_DNSSEC     = 1 << 72;
-        const NO_DHCP_HOSTNAME = 1 << 73;
-        const AUTH_NXDOMAIN    = 1 << 74;
-        const LEASEQUERY       = 1 << 75;
-    }
-}
-
-impl OptionFlags {
-    /// Set a flag conditionally.
-    pub fn set_flag(&mut self, flag: OptionFlags, val: bool) {
-        if val {
-            self.insert(flag);
-        } else {
-            self.remove(flag);
-        }
-    }
-}
+// OptionFlags is now imported from crate::core::daemon — the single canonical
+// type used by both config parsing and runtime state. The previous bitflags!
+// definition that existed here was removed to eliminate the type duplication
+// that blocked integration between config parsing and daemon state management.
 
 // ---------------------------------------------------------------------------
 // LongOption — replaces LOPT_* #defines from option.c lines 200-332
@@ -909,7 +848,7 @@ impl Default for DaemonConfig {
                 lua_script: None,
                 notify_script: None,
             },
-            options: OptionFlags::empty(),
+            options: OptionFlags::new(),
         }
     }
 }
@@ -1292,7 +1231,7 @@ impl ConfigBuilder {
         let mut config = self.config;
 
         // Post-processing: if no resolv files specified, use the default
-        if config.dns.resolv_files.is_empty() && !config.options.contains(OptionFlags::NO_RESOLV) {
+        if config.dns.resolv_files.is_empty() && !config.options.get(OPT_NO_RESOLV) {
             config.dns.resolv_files.push(ResolvConf {
                 name: constants::RESOLVFILE.to_string(),
                 is_default: true,
@@ -1307,7 +1246,7 @@ impl ConfigBuilder {
         }
 
         // If no hosts file specified and not disabled, add default
-        if config.dns.hosts_files.is_empty() && !config.options.contains(OptionFlags::NO_HOSTS) {
+        if config.dns.hosts_files.is_empty() && !config.options.get(OPT_NO_HOSTS) {
             config.dns.hosts_files.push(HostsFile {
                 fname: constants::HOSTSFILE.to_string(),
                 flags: HostsFileFlags::empty(),
@@ -1324,7 +1263,7 @@ impl ConfigBuilder {
 
         // DNSSEC requires cache
         #[cfg(feature = "dnssec")]
-        if config.options.contains(OptionFlags::DNSSEC_VALID) && config.dns.cache_size == 0 {
+        if config.options.get(OPT_DNSSEC_VALID) && config.dns.cache_size == 0 {
             return Err(ConfigError::ConflictingOptions(
                 "DNSSEC requires DNS cache (cache-size > 0)".to_string(),
             ));
@@ -1778,67 +1717,67 @@ impl ConfigBuilder {
             // ---------------------------------------------------------------
             id if id == short_opt_id('b') => {
                 // --bogus-priv
-                self.config.options.insert(OptionFlags::BOGUSPRIV);
+                self.config.options.set(OPT_BOGUSPRIV);
                 Ok(())
             }
             id if id == short_opt_id('f') => {
                 // --filterwin2k
-                self.config.options.insert(OptionFlags::FILTER);
+                self.config.options.set(OPT_FILTER);
                 Ok(())
             }
             id if id == short_opt_id('q') => {
                 // --log-queries
-                self.config.options.insert(OptionFlags::LOG);
+                self.config.options.set(OPT_LOG);
                 Ok(())
             }
             id if id == short_opt_id('e') => {
                 // --selfmx
-                self.config.options.insert(OptionFlags::SELFMX);
+                self.config.options.set(OPT_SELFMX);
                 Ok(())
             }
             id if id == short_opt_id('h') => {
                 // --no-hosts
-                self.config.options.insert(OptionFlags::NO_HOSTS);
+                self.config.options.set(OPT_NO_HOSTS);
                 Ok(())
             }
             id if id == short_opt_id('n') => {
                 // --no-poll
-                self.config.options.insert(OptionFlags::NO_POLL);
+                self.config.options.set(OPT_NO_POLL);
                 Ok(())
             }
             id if id == short_opt_id('d') => {
                 // --no-daemon
-                self.config.options.insert(OptionFlags::DEBUG);
+                self.config.options.set(OPT_DEBUG);
                 Ok(())
             }
             id if id == short_opt_id('k') => {
                 // --keep-in-foreground (same as debug for our purposes)
-                self.config.options.insert(OptionFlags::DEBUG);
+                self.config.options.set(OPT_DEBUG);
                 Ok(())
             }
             id if id == short_opt_id('R') => {
                 // --no-resolv
-                self.config.options.insert(OptionFlags::NO_RESOLV);
+                self.config.options.set(OPT_NO_RESOLV);
                 Ok(())
             }
             id if id == short_opt_id('E') => {
                 // --expand-hosts
-                self.config.options.insert(OptionFlags::EXPAND);
+                self.config.options.set(OPT_EXPAND);
                 Ok(())
             }
             id if id == short_opt_id('L') => {
                 // --localmx
-                self.config.options.insert(OptionFlags::LOCALMX);
+                self.config.options.set(OPT_LOCALMX);
                 Ok(())
             }
             id if id == short_opt_id('N') => {
                 // --no-negcache
-                self.config.options.insert(OptionFlags::NO_NEG);
+                self.config.options.set(OPT_NO_NEG);
                 Ok(())
             }
             id if id == short_opt_id('D') => {
                 // --domain-needed
-                self.config.options.insert(OptionFlags::NODOTS_LOCAL);
+                self.config.options.set(OPT_NODOTS_LOCAL);
                 Ok(())
             }
             id if id == short_opt_id('o') => {
@@ -1849,7 +1788,7 @@ impl ConfigBuilder {
             id if id == short_opt_id('z') => {
                 // --bind-interfaces
                 self.config.network.bind_mode = BindMode::BindInterfaces;
-                self.config.options.insert(OptionFlags::NOWILD);
+                self.config.options.set(OPT_NOWILD);
                 Ok(())
             }
             id if id == short_opt_id('Z') => {
@@ -2367,16 +2306,16 @@ impl ConfigBuilder {
             }
             id if id == LongOption::LogRo as u16 => {
                 // --log-dhcp
-                self.config.options.insert(OptionFlags::LOG_OPTS);
+                self.config.options.set(OPT_LOG_OPTS);
                 Ok(())
             }
             id if id == LongOption::LogDebug as u16 => {
-                self.config.options.insert(OptionFlags::LOG);
-                self.config.options.insert(OptionFlags::LOG_OPTS);
+                self.config.options.set(OPT_LOG);
+                self.config.options.set(OPT_LOG_OPTS);
                 Ok(())
             }
             id if id == LongOption::ExtraLog as u16 => {
-                self.config.options.insert(OptionFlags::EXTRALOG);
+                self.config.options.set(OPT_EXTRALOG);
                 Ok(())
             }
 
@@ -2395,7 +2334,7 @@ impl ConfigBuilder {
                 Ok(())
             }
             id if id == LongOption::Secure as u16 => {
-                self.config.options.insert(OptionFlags::TFTP_SECURE);
+                self.config.options.set(OPT_TFTP_SECURE);
                 Ok(())
             }
             id if id == LongOption::TftpMax as u16 => {
@@ -2408,7 +2347,7 @@ impl ConfigBuilder {
                 Ok(())
             }
             id if id == LongOption::NoBlock as u16 => {
-                self.config.options.insert(OptionFlags::TFTP_NOBLOCK);
+                self.config.options.set(OPT_TFTP_NOBLOCK);
                 Ok(())
             }
             id if id == LongOption::TftpMtu as u16 => {
@@ -2445,20 +2384,20 @@ impl ConfigBuilder {
                 Ok(())
             }
             id if id == LongOption::SinglePort as u16 => {
-                self.config.options.insert(OptionFlags::SINGLE_PORT);
+                self.config.options.set(OPT_SINGLE_PORT);
                 Ok(())
             }
             id if id == LongOption::TftpAprefMac as u16 => {
-                self.config.options.insert(OptionFlags::TFTP_APREF_MAC);
+                self.config.options.set(OPT_TFTP_APREF_MAC);
                 Ok(())
             }
             id if id == LongOption::Prefix as u16 => {
                 // --tftp-unique-root
-                self.config.options.insert(OptionFlags::TFTP_APREF);
+                self.config.options.set(OPT_TFTP_APREF);
                 if value == "ip" {
-                    self.config.options.insert(OptionFlags::TFTP_APREF_IP);
+                    self.config.options.set(OPT_TFTP_APREF_IP);
                 } else if value == "mac" {
-                    self.config.options.insert(OptionFlags::TFTP_APREF_MAC);
+                    self.config.options.set(OPT_TFTP_APREF_MAC);
                 }
                 Ok(())
             }
@@ -2475,26 +2414,26 @@ impl ConfigBuilder {
             id if id == LongOption::DnssecCheck as u16 => {
                 #[cfg(feature = "dnssec")]
                 {
-                    self.config.options.insert(OptionFlags::DNSSEC_VALID);
+                    self.config.options.set(OPT_DNSSEC_VALID);
                 }
                 #[cfg(not(feature = "dnssec"))]
                 warn!("DNSSEC not compiled in");
                 Ok(())
             }
             id if id == LongOption::DnssecTime as u16 => {
-                self.config.options.insert(OptionFlags::DNSSEC_TIME);
+                self.config.options.set(OPT_DNSSEC_TIME);
                 Ok(())
             }
             id if id == LongOption::DnssecDebug as u16 => {
-                self.config.options.insert(OptionFlags::DNSSEC_DEBUG);
+                self.config.options.set(OPT_DNSSEC_DEBUG);
                 Ok(())
             }
             id if id == LongOption::DnssecNoSign as u16 => {
-                self.config.options.insert(OptionFlags::DNSSEC_NO_SIGN);
+                self.config.options.set(OPT_DNSSEC_NO_SIGN);
                 Ok(())
             }
             id if id == LongOption::DnssecIgnoreNs as u16 => {
-                self.config.options.insert(OptionFlags::DNSSEC_IGN_NS);
+                self.config.options.set(OPT_DNSSEC_IGN_NS);
                 Ok(())
             }
             id if id == LongOption::DnssecTimestamp as u16 => {
@@ -2517,7 +2456,7 @@ impl ConfigBuilder {
                 Ok(())
             }
             id if id == LongOption::ProxyDnssec as u16 => {
-                self.config.options.insert(OptionFlags::DNSSEC_VALID);
+                self.config.options.set(OPT_DNSSEC_VALID);
                 Ok(())
             }
             id if id == LongOption::DnssecLimitWork as u16 => {
@@ -2537,7 +2476,7 @@ impl ConfigBuilder {
                 Ok(())
             }
             id if id == LongOption::NoCacheDnssec as u16 => {
-                self.config.options.insert(OptionFlags::CACHE_DNSSEC);
+                self.config.options.set(OPT_CACHE_DNSSEC);
                 Ok(())
             }
             id if id == LongOption::DnssecCacheLimit as u16 => {
@@ -2601,29 +2540,29 @@ impl ConfigBuilder {
 
             // --- DNS rebind options ---
             id if id == LongOption::LocalRebind as u16 => {
-                self.config.options.insert(OptionFlags::LOCAL_REBIND);
+                self.config.options.set(OPT_LOCAL_REBIND);
                 Ok(())
             }
             id if id == LongOption::RebindLocalhost as u16 => {
-                self.config.options.insert(OptionFlags::REBIND_LOCALHOST);
+                self.config.options.set(OPT_REBIND_LOCALHOST);
                 Ok(())
             }
             id if id == LongOption::RebindDomainOk as u16 => {
-                self.config.options.insert(OptionFlags::REBIND_DOMAIN_OK);
+                self.config.options.set(OPT_REBIND_DOMAIN_OK);
                 Ok(())
             }
             id if id == LongOption::StopDnsRebind as u16 => {
-                self.config.options.insert(OptionFlags::STOP_DNS_REBIND);
+                self.config.options.set(OPT_NO_REBIND);
                 Ok(())
             }
 
             // --- Server selection ---
             id if id == LongOption::AllServers as u16 => {
-                self.config.options.insert(OptionFlags::ALL_SERVERS);
+                self.config.options.set(OPT_ALL_SERVERS);
                 Ok(())
             }
             id if id == LongOption::LocalService as u16 => {
-                self.config.options.insert(OptionFlags::LOCAL_SERVICE);
+                self.config.options.set(OPT_LOCAL_SERVICE);
                 Ok(())
             }
 
@@ -2631,7 +2570,7 @@ impl ConfigBuilder {
             id if id == LongOption::LoopDetect as u16 => {
                 #[cfg(feature = "loop_detect")]
                 {
-                    self.config.options.insert(OptionFlags::LOOP_DETECT);
+                    self.config.options.set(OPT_LOOP_DETECT);
                 }
                 #[cfg(not(feature = "loop_detect"))]
                 warn!("Loop detection not compiled in");
@@ -2680,11 +2619,11 @@ impl ConfigBuilder {
                 Ok(())
             }
             id if id == LongOption::ConnmarkAllowlistEnable as u16 => {
-                self.config.options.insert(OptionFlags::CMARK_ALST_EN);
+                self.config.options.set(OPT_CMARK_ALST_EN);
                 Ok(())
             }
             id if id == LongOption::ConnmarkAllowlistNew as u16 => {
-                self.config.options.insert(OptionFlags::CMARK_ALST_NEW);
+                self.config.options.set(OPT_CMARK_ALST_NEW);
                 Ok(())
             }
 
@@ -2705,7 +2644,7 @@ impl ConfigBuilder {
 
             // --- Router Advertisement ---
             id if id == LongOption::Ra as u16 => {
-                self.config.options.insert(OptionFlags::ROUTERADV);
+                self.config.options.set(OPT_RA);
                 Ok(())
             }
             id if id == LongOption::RaParam as u16 => {
@@ -2837,43 +2776,43 @@ impl ConfigBuilder {
                 Ok(())
             }
             id if id == LongOption::QuietDhcp as u16 => {
-                self.config.options.insert(OptionFlags::QUIET_DHCP);
+                self.config.options.set(OPT_QUIET_DHCP);
                 Ok(())
             }
             id if id == LongOption::QuietDhcp6 as u16 => {
-                self.config.options.insert(OptionFlags::QUIET_DHCP6);
+                self.config.options.set(OPT_QUIET_DHCP6);
                 Ok(())
             }
             id if id == LongOption::QuietRa as u16 => {
-                self.config.options.insert(OptionFlags::QUIET_RA);
+                self.config.options.set(OPT_QUIET_RA);
                 Ok(())
             }
             id if id == LongOption::QuietTftp as u16 => {
-                self.config.options.insert(OptionFlags::QUIET_TFTP);
+                self.config.options.set(OPT_QUIET_TFTP);
                 Ok(())
             }
             id if id == LongOption::Quiet4Over6 as u16 => {
-                self.config.options.insert(OptionFlags::NO_4OVER6);
+                self.config.options.set(OPT_NO_4OVER6);
                 Ok(())
             }
             id if id == LongOption::RapidCommit as u16 => {
-                self.config.options.insert(OptionFlags::RAPID_COMMIT);
+                self.config.options.set(OPT_RAPID_COMMIT);
                 Ok(())
             }
             id if id == LongOption::ConsecAddr as u16 => {
-                self.config.options.insert(OptionFlags::CONSEC_ADDR);
+                self.config.options.set(OPT_CONSEC_ADDR);
                 Ok(())
             }
             id if id == LongOption::BootPDynamic as u16 => {
-                self.config.options.insert(OptionFlags::BOOTP_DYNAMIC);
+                self.config.options.set(OPT_BOOTP_DYNAMIC);
                 Ok(())
             }
             id if id == LongOption::DhcpIgnoreClid as u16 => {
-                self.config.options.insert(OptionFlags::IGNORE_CLID);
+                self.config.options.set(OPT_IGNORE_CLID);
                 Ok(())
             }
             id if id == LongOption::DhcpIgnoreHostname as u16 => {
-                self.config.options.insert(OptionFlags::NO_DHCP_HOSTNAME);
+                self.config.options.set(OPT_NO_DHCP_HOSTNAME);
                 Ok(())
             }
             id if id == LongOption::DhcpNoDns as u16 => {
@@ -2883,95 +2822,95 @@ impl ConfigBuilder {
 
             // --- Misc boolean flags ---
             id if id == LongOption::NormRep as u16 => {
-                self.config.options.insert(OptionFlags::NORR);
+                self.config.options.set(OPT_NORR);
                 Ok(())
             }
             id if id == LongOption::NormRep6 as u16 => {
-                self.config.options.insert(OptionFlags::NORR6);
+                self.config.options.set(OPT_NORR6);
                 Ok(())
             }
             id if id == LongOption::NoIdent as u16 => {
-                self.config.options.insert(OptionFlags::NO_IDENT);
+                self.config.options.set(OPT_NO_IDENT);
                 Ok(())
             }
             id if id == LongOption::StripEcs as u16 => {
-                self.config.options.insert(OptionFlags::STRIP_ECS);
+                self.config.options.set(OPT_STRIP_ECS);
                 Ok(())
             }
             id if id == LongOption::StripMac as u16 => {
-                self.config.options.insert(OptionFlags::STRIP_MAC);
+                self.config.options.set(OPT_STRIP_MAC);
                 Ok(())
             }
             id if id == LongOption::ScriptArp as u16 => {
-                self.config.options.insert(OptionFlags::SCRIPT_ARP);
+                self.config.options.set(OPT_SCRIPT_ARP);
                 Ok(())
             }
             id if id == LongOption::NatPmp as u16 => {
-                self.config.options.insert(OptionFlags::NAT_PMP);
+                self.config.options.set(OPT_NAT_PMP);
                 Ok(())
             }
             id if id == LongOption::FilterA as u16 => {
-                self.config.options.insert(OptionFlags::FILTER_A);
+                self.config.options.set(OPT_FILTER_A);
                 Ok(())
             }
             id if id == LongOption::FilterAAAA as u16 => {
-                self.config.options.insert(OptionFlags::FILTER_AAAA);
+                self.config.options.set(OPT_FILTER_AAAA);
                 Ok(())
             }
             id if id == LongOption::AuthNxdomain as u16 => {
-                self.config.options.insert(OptionFlags::AUTH_NXDOMAIN);
+                self.config.options.set(OPT_AUTH_NXDOMAIN);
                 Ok(())
             }
             id if id == LongOption::LeaseQuery as u16 => {
-                self.config.options.insert(OptionFlags::LEASEQUERY);
+                self.config.options.set(OPT_LEASEQUERY);
                 Ok(())
             }
 
             // --- Stale cache ---
             id if id == LongOption::StaleCache as u16 => {
-                self.config.options.insert(OptionFlags::STALE_CACHE);
+                self.config.options.set(OPT_STALE_CACHE);
                 Ok(())
             }
 
             // --- Bind mode ---
             id if id == LongOption::Dynamic as u16 => {
                 self.config.network.bind_mode = BindMode::BindDynamic;
-                self.config.options.insert(OptionFlags::CLEVERBIND);
+                self.config.options.set(OPT_CLEVERBIND);
                 Ok(())
             }
 
             // --- Add-MAC / Add-Subnet ---
             id if id == LongOption::AddMac as u16 => {
-                self.config.options.insert(OptionFlags::ADD_MAC);
+                self.config.options.set(OPT_ADD_MAC);
                 if value == "base64" {
-                    self.config.options.insert(OptionFlags::MAC_B64);
+                    self.config.options.set(OPT_MAC_B64);
                 } else if value == "text" {
-                    self.config.options.insert(OptionFlags::MAC_HEX);
+                    self.config.options.set(OPT_MAC_HEX);
                 }
                 Ok(())
             }
             id if id == LongOption::AddSubnet as u16 => {
-                self.config.options.insert(OptionFlags::ADD_SBNET);
+                self.config.options.set(OPT_CLIENT_SUBNET);
                 Ok(())
             }
 
             // --- Umbrella ---
             id if id == LongOption::Umbrella as u16 => {
-                self.config.options.insert(OptionFlags::UMBRELLA);
+                self.config.options.set(OPT_UMBRELLA);
                 Ok(())
             }
             id if id == LongOption::UmbrellaDevId as u16 => {
-                self.config.options.insert(OptionFlags::UMBRELLA_DEVID);
+                self.config.options.set(OPT_UMBRELLA_DEVID);
                 Ok(())
             }
 
             // --- Cache RR ---
             id if id == LongOption::CacheRr as u16 => {
-                self.config.options.insert(OptionFlags::CACHE_RR);
+                self.config.options.set(OPT_CACHE_RR);
                 Ok(())
             }
             id if id == LongOption::IgnoreAddr as u16 => {
-                self.config.options.insert(OptionFlags::IGNORE_ADDR);
+                self.config.options.set(OPT_IGNORE_ADDR);
                 Ok(())
             }
 
@@ -3043,9 +2982,9 @@ impl ConfigBuilder {
             id if id == LongOption::ServAuth as u16 => {
                 // --enable-dbus / --enable-ubus
                 #[cfg(feature = "dbus")]
-                self.config.options.insert(OptionFlags::DBUS);
+                self.config.options.set(OPT_DBUS);
                 #[cfg(feature = "ubus")]
-                self.config.options.insert(OptionFlags::UBUS);
+                self.config.options.set(OPT_UBUS);
                 Ok(())
             }
             id if id == LongOption::Reload as u16 => {
@@ -3137,22 +3076,22 @@ impl ConfigBuilder {
                 Ok(())
             }
             id if id == LongOption::Stale as u16 => {
-                self.config.options.insert(OptionFlags::STALE_CACHE);
+                self.config.options.set(OPT_STALE_CACHE);
                 Ok(())
             }
             id if id == LongOption::NormRepV6 as u16 => {
-                self.config.options.insert(OptionFlags::NORR6);
+                self.config.options.set(OPT_NORR6);
                 Ok(())
             }
             id if id == LongOption::LocalRebindV6 as u16 || id == LongOption::RebindLocalAll as u16 => {
-                self.config.options.insert(OptionFlags::LOCAL_REBIND);
+                self.config.options.set(OPT_LOCAL_REBIND);
                 Ok(())
             }
             id if id == LongOption::DynHost as u16 => {
                 Ok(())
             }
             id if id == LongOption::Log4 as u16 || id == LongOption::Log6 as u16 => {
-                self.config.options.insert(OptionFlags::LOG);
+                self.config.options.set(OPT_LOG);
                 Ok(())
             }
             id if id == LongOption::EncapVendor as u16 => {
@@ -3166,11 +3105,14 @@ impl ConfigBuilder {
             }
 
             // ---------------------------------------------------------------
-            // Catch-all for unhandled option IDs
+            // Catch-all — return error for unrecognized option IDs
             // ---------------------------------------------------------------
             _ => {
-                debug!("Unhandled option id {} at {}:{}", option_id, file, line);
-                Ok(())
+                warn!("Unrecognized option id {} at {}:{}", option_id, file, line);
+                Err(ConfigError::UnknownOption(format!(
+                    "unhandled option id {} at {}:{}",
+                    option_id, file, line
+                )))
             }
         }
     }

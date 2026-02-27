@@ -15,7 +15,7 @@
 //!
 //! ## Source
 //! - Primary: `src/util.c` — DNS name validation, hostname comparison, I/O helpers
-//! - Secondary: `src/pattern.c` — conntrack DNS pattern validation and matching
+//! - Secondary: `src/pattern.c` — DNS pattern validation and matching (general-purpose)
 
 use std::cmp::Ordering;
 use std::io::{self, ErrorKind};
@@ -700,10 +700,10 @@ pub fn sa_len(addr: &SocketAddress) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Pattern Validation (from pattern.c — conntrack feature)
+// Pattern Validation (from pattern.c — general-purpose DNS utilities)
 // ---------------------------------------------------------------------------
 
-/// Validate a DNS hostname against RFC 1123 requirements for conntrack filtering.
+/// Validate a DNS hostname against RFC 1123 requirements.
 ///
 /// Enforces strict hostname validation including:
 /// - Total length 1–253 characters
@@ -721,7 +721,6 @@ pub fn sa_len(addr: &SocketAddress) -> usize {
 ///
 /// # Source
 /// Port of `src/pattern.c` `is_valid_dns_name()` lines 264–351.
-#[cfg(feature = "conntrack")]
 pub fn is_valid_dns_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     if bytes.is_empty() {
@@ -830,7 +829,6 @@ pub fn is_valid_dns_name(name: &str) -> bool {
 ///
 /// # Source
 /// Port of `src/pattern.c` `is_valid_dns_name_pattern()` lines 422–528.
-#[cfg(feature = "conntrack")]
 pub fn is_valid_dns_name_pattern(pattern: &str) -> bool {
     let bytes = pattern.as_bytes();
     if bytes.is_empty() {
@@ -955,7 +953,6 @@ pub fn is_valid_dns_name_pattern(pattern: &str) -> bool {
 ///
 /// # Source
 /// Port of `src/pattern.c` `is_dns_name_matching_pattern()` lines 618–646.
-#[cfg(feature = "conntrack")]
 pub fn is_dns_name_matching_pattern(name: &str, pattern: &str) -> bool {
     let mut n_iter = name.split('.');
     let mut p_iter = pattern.split('.');
@@ -978,7 +975,6 @@ pub fn is_dns_name_matching_pattern(name: &str, pattern: &str) -> bool {
 /// Implements the efficient backtracking algorithm from `src/pattern.c`
 /// `is_string_matching_glob_pattern()` (lines 144–202). `*` matches
 /// zero or more characters within the label.
-#[cfg(feature = "conntrack")]
 fn glob_match_label(value: &str, pattern: &str) -> bool {
     let v_bytes = value.as_bytes();
     let p_bytes = pattern.as_bytes();
@@ -1016,33 +1012,6 @@ fn glob_match_label(value: &str, pattern: &str) -> bool {
         return false;
     }
     true
-}
-
-// Provide stub implementations for non-conntrack builds so the exports
-// always exist at the module level (callers guard calls with cfg).
-
-/// Validate a DNS hostname against RFC 1123 requirements.
-///
-/// Stub: always returns `false` when `conntrack` feature is not enabled.
-#[cfg(not(feature = "conntrack"))]
-pub fn is_valid_dns_name(_name: &str) -> bool {
-    false
-}
-
-/// Validate a DNS hostname pattern with wildcard support.
-///
-/// Stub: always returns `false` when `conntrack` feature is not enabled.
-#[cfg(not(feature = "conntrack"))]
-pub fn is_valid_dns_name_pattern(_pattern: &str) -> bool {
-    false
-}
-
-/// Match a DNS hostname against a validated pattern.
-///
-/// Stub: always returns `false` when `conntrack` feature is not enabled.
-#[cfg(not(feature = "conntrack"))]
-pub fn is_dns_name_matching_pattern(_name: &str, _pattern: &str) -> bool {
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1415,10 +1384,12 @@ mod tests {
         assert_eq!(sa_len(&addr), std::mem::size_of::<libc::sockaddr_in6>());
     }
 
-    // -- conntrack pattern tests --
+    // -- DNS name pattern validation tests --
+    // These tests were previously gated behind #[cfg(feature = "conntrack")]
+    // but DNS name validation is a general-purpose utility needed by DNS
+    // forwarding, caching, and config parsing — not conntrack-specific.
 
-    #[cfg(feature = "conntrack")]
-    mod conntrack_tests {
+    mod dns_pattern_tests {
         use super::super::*;
 
         #[test]
