@@ -13,3 +13,7 @@ pub mod v4;
 pub mod v6;
 #[cfg(feature = "dhcp6")]
 pub mod radv;
+
+// Privilege-separated script helper process
+#[cfg(feature = "script")]
+pub mod helper;
