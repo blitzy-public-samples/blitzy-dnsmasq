@@ -9,4 +9,5 @@
 //! # Submodules
 //! - `wire_format` — DNS wire-format encoding/decoding roundtrip tests
 
+mod dns_cache;
 mod wire_format;
