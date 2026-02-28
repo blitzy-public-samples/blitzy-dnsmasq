@@ -817,6 +817,10 @@ fn test_full_dora_cycle_end_to_end() {
     offer.options[6] = DhcpMessageType::Offer.as_u8();
     offer.options[7] = OPTION_END;
 
+    // Verify the offer packet was constructed correctly before proceeding.
+    assert_eq!(offer.op, BOOTREPLY, "Offer must be a BOOTREPLY");
+    assert_eq!(get_message_type(&offer), Some(DhcpMessageType::Offer));
+
     // Step 3: REQUEST selecting the offered IP
     let request = build_request_packet(&TEST_MAC, TEST_XID, offered_ip, TEST_SERVER_IP);
     assert_eq!(get_message_type(&request), Some(DhcpMessageType::Request));

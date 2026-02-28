@@ -77,16 +77,27 @@ pub enum WireError {
     /// Packet is shorter than expected at the given offset.
     #[error("packet too short at offset {offset}: need {needed}, have {available}")]
     PacketTooShort {
+        /// Byte offset within the packet where the read was attempted.
         offset: usize,
+        /// Number of bytes the parser required at the offset.
         needed: usize,
+        /// Number of bytes actually remaining in the packet.
         available: usize,
     },
     /// DNS name exceeds maximum length.
     #[error("name too long: {length} > {max}")]
-    NameTooLong { length: usize, max: usize },
+    NameTooLong {
+        /// Actual length of the DNS name in bytes.
+        length: usize,
+        /// Maximum allowed length (typically 255 per RFC 1035).
+        max: usize,
+    },
     /// Single label exceeds 63 bytes.
     #[error("label too long: {length} > 63")]
-    LabelTooLong { length: usize },
+    LabelTooLong {
+        /// Actual length of the label in bytes.
+        length: usize,
+    },
     /// Compression pointer loop detected.
     #[error("compression pointer loop detected at offset {0}")]
     PointerLoop(usize),
@@ -98,7 +109,10 @@ pub enum WireError {
     Truncated,
     /// Buffer overflow during write.
     #[error("buffer overflow: cannot add {needed} bytes")]
-    BufferOverflow { needed: usize },
+    BufferOverflow {
+        /// Number of bytes that could not be written due to insufficient buffer space.
+        needed: usize,
+    },
     /// Invalid DNS name encoding.
     #[error("invalid DNS name: {0}")]
     InvalidName(String),
@@ -130,12 +144,19 @@ pub enum RrData<'a> {
     Txt(&'a [u8]),
     /// SOA record — all 7 fields.
     Soa {
+        /// Primary master name server for the zone.
         mname: &'a str,
+        /// Email address of the zone administrator (in DNS name form).
         rname: &'a str,
+        /// Zone serial number.
         serial: u32,
+        /// Refresh interval in seconds.
         refresh: u32,
+        /// Retry interval in seconds.
         retry: u32,
+        /// Expire time in seconds.
         expire: u32,
+        /// Minimum TTL for negative caching (RFC 2308).
         minimum: u32,
     },
     /// NS record — authoritative name server.

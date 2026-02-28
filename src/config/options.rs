@@ -92,14 +92,22 @@ pub enum ConfigError {
     /// A parse error at a specific file and line.
     #[error("configuration error at {file}:{line}: {message}")]
     ParseError {
+        /// Path to the configuration file containing the error.
         file: String,
+        /// One-based line number where the error was detected.
         line: usize,
+        /// Human-readable description of the parse error.
         message: String,
     },
 
     /// An option was provided with an invalid value.
     #[error("invalid option '{option}': {reason}")]
-    InvalidOption { option: String, reason: String },
+    InvalidOption {
+        /// The option name or flag that received an invalid value.
+        option: String,
+        /// Explanation of why the provided value is invalid.
+        reason: String,
+    },
 
     /// Two or more options conflict with each other.
     #[error("conflicting options: {0}")]
@@ -108,7 +116,9 @@ pub enum ConfigError {
     /// An I/O error while reading a configuration file.
     #[error("I/O error reading {path}: {source}")]
     IoError {
+        /// Filesystem path of the configuration file that caused the I/O error.
         path: String,
+        /// The underlying I/O error from the operating system.
         #[source]
         source: std::io::Error,
     },
@@ -133,11 +143,13 @@ pub enum ConfigError {
 
 /// Long option identifiers for dnsmasq configuration directives.
 ///
-/// Each variant corresponds to a `LOPT_*` constant in the C source.
-/// Values start at 256 to avoid overlap with single-character short options.
+/// Each variant corresponds to a `LOPT_*` constant in the C source
+/// (`option.c` lines 200–332). Values start at 256 to avoid overlap
+/// with single-character short options. Variant names are direct
+/// translations of the C `LOPT_*` identifiers and are self-documenting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, missing_docs)]
 pub enum LongOption {
     Reload = 256,
     NoNames = 257,

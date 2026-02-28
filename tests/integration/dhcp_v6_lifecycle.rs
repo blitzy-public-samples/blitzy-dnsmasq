@@ -35,8 +35,7 @@ use std::time::Duration;
 
 // Library crate imports — accessing the dnsmasq public API.
 use dnsmasq::config::constants::{DEFLEASE, MAXLEASES};
-use dnsmasq::dhcp::common::Protocol;
-use dnsmasq::dhcp::lease::{LeaseDatabase, LeaseError};
+use dnsmasq::dhcp::lease::LeaseDatabase;
 use dnsmasq::dhcp::protocol_v6::{
     Dhcp6MessageType, Dhcp6StatusCode,
     DHCPV6_CLIENT_PORT, DHCPV6_SERVER_PORT,
@@ -49,13 +48,8 @@ use dnsmasq::dhcp::protocol_v6::{
     OPTION6_DOMAIN_SEARCH, OPTION6_FQDN,
 };
 use dnsmasq::dhcp::v6::outpacket::Dhcpv6OutPacket;
-use dnsmasq::dhcp::v6::rfc3315::{Dhcpv6Error, Dhcpv6State, RelayMessage};
-use dnsmasq::dhcp::v6::server::Dhcp6ServerError;
+use dnsmasq::dhcp::v6::rfc3315::Dhcpv6State;
 use dnsmasq::types::addr::{AllAddr, SocketAddress};
-use dnsmasq::types::dhcp::{
-    DhcpConfig, DhcpConfigFlags, DhcpContext, DhcpContextFlags, DhcpLease,
-    DhcpNetId, DhcpOption, LeaseFlags,
-};
 
 // ============================================================================
 // Helper Constants

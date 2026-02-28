@@ -159,6 +159,10 @@ pub enum AddressFamily {
 
 impl AddressFamily {
     /// Convert to the corresponding `libc` address family constant.
+    ///
+    /// Used by netlink message construction when performing actual netlink
+    /// route/address enumeration via the kernel NETLINK_ROUTE subsystem.
+    #[allow(dead_code)]
     pub(crate) fn to_libc(self) -> u8 {
         match self {
             AddressFamily::Unspec => libc::AF_UNSPEC as u8,

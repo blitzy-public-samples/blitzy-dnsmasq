@@ -64,32 +64,43 @@ pub enum InterfaceError {
     /// Socket creation failed for the given address.
     #[error("Socket creation failed for {addr}: {source}")]
     SocketCreation {
+        /// The address for which socket creation was attempted.
         addr: String,
+        /// The underlying I/O error from the operating system.
         source: std::io::Error,
     },
 
     /// Socket bind failed for the given address.
     #[error("Socket bind failed for {addr}: {source}")]
     SocketBind {
+        /// The address to which the bind was attempted.
         addr: String,
+        /// The underlying I/O error from the operating system.
         source: std::io::Error,
     },
 
     /// A configured interface was not found on the system.
     #[error("Interface {name} not found")]
-    InterfaceNotFound { name: String },
+    InterfaceNotFound {
+        /// Name of the interface that was not found.
+        name: String,
+    },
 
     /// Multicast group join failed on a specific interface.
     #[error("Multicast join failed on interface {interface}: {source}")]
     MulticastJoinFailed {
+        /// Name of the network interface on which the join failed.
         interface: String,
+        /// The underlying I/O error from the operating system.
         source: std::io::Error,
     },
 
     /// Setting a socket option failed.
     #[error("Failed to set socket option {option}: {source}")]
     SetOptFailed {
+        /// Name of the socket option that failed to be set.
         option: String,
+        /// The underlying I/O error from the operating system.
         source: std::io::Error,
     },
 

@@ -126,31 +126,54 @@ pub enum TftpServerError {
 
     /// File not found for the requested path.
     #[error("file not found: {path}")]
-    FileNotFound { path: String },
+    FileNotFound {
+        /// Resolved filesystem path that was not found.
+        path: String,
+    },
 
     /// Access denied due to permission checks.
     #[error("access denied: {path}: {reason}")]
-    AccessDenied { path: String, reason: String },
+    AccessDenied {
+        /// Filesystem path that was denied access.
+        path: String,
+        /// Explanation of why access was denied.
+        reason: String,
+    },
 
     /// Path traversal attempt detected.
     #[error("path traversal detected in: {path}")]
-    PathTraversal { path: String },
+    PathTraversal {
+        /// The requested path that contained a traversal attempt.
+        path: String,
+    },
 
     /// Maximum connection limit reached.
     #[error("connection limit reached ({max})")]
-    ConnectionLimit { max: usize },
+    ConnectionLimit {
+        /// The configured maximum number of simultaneous TFTP connections.
+        max: usize,
+    },
 
     /// Invalid TFTP packet received.
     #[error("invalid TFTP packet: {reason}")]
-    InvalidPacket { reason: String },
+    InvalidPacket {
+        /// Description of the packet validation failure.
+        reason: String,
+    },
 
     /// Write request rejected (server is read-only).
     #[error("write request rejected from {client}")]
-    WriteRejected { client: String },
+    WriteRejected {
+        /// Remote client address that attempted the write request.
+        client: String,
+    },
 
     /// Bad option negotiation.
     #[error("bad TFTP option: {reason}")]
-    BadOption { reason: String },
+    BadOption {
+        /// Description of the option negotiation failure.
+        reason: String,
+    },
 }
 
 /// Errors specific to block preparation (get_block).
