@@ -46,7 +46,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -926,7 +926,7 @@ impl ForwardingEngine {
     /// Replaces C `tcp_request()` from `src/forward.c` line 4051.
     pub fn tcp_request(
         &mut self,
-        confd: RawFd,
+        confd: OwnedFd,
         now: Instant,
         source_addr: &SocketAddress,
         local_addr: &AllAddr,
@@ -948,20 +948,19 @@ impl ForwardingEngine {
         // Suppress unused parameter warnings for parameters needed in full impl.
         let _ = (local_addr, netmask);
 
-        // Set receive timeout on the client TCP socket. We use BorrowedFd since
-        // the caller owns the fd and we only borrow it for this option.
+        // Set receive timeout on the client TCP socket. We use as_fd() to
+        // borrow the OwnedFd safely — no unsafe needed.
         {
             use nix::sys::socket::{setsockopt, sockopt};
-            use std::os::fd::BorrowedFd;
             let tv = nix::sys::time::TimeVal::new(
                 timeout.as_secs() as i64,
                 timeout.subsec_micros() as i64,
             );
-            // SAFETY: confd is a valid file descriptor passed from the event loop
-            // listener accept. We borrow it for the duration of this setsockopt call.
-            let borrowed = unsafe { BorrowedFd::borrow_raw(confd) };
-            let _ = setsockopt(&borrowed, sockopt::ReceiveTimeout, &tv);
+            let _ = setsockopt(&confd.as_fd(), sockopt::ReceiveTimeout, &tv);
         }
+
+        // Obtain the raw fd for helper functions that still operate on RawFd.
+        let raw_fd = confd.as_raw_fd();
 
         loop {
             if queries_processed >= TCP_MAX_QUERIES {
@@ -974,7 +973,7 @@ impl ForwardingEngine {
 
             // Read 2-byte length prefix (RFC 1035 Section 4.2.2).
             let mut len_buf = [0u8; 2];
-            match tcp_read_with_timeout(confd, &mut len_buf) {
+            match tcp_read_with_timeout(raw_fd, &mut len_buf) {
                 Ok(2) => {}
                 Ok(0) => {
                     debug!(
@@ -1011,7 +1010,7 @@ impl ForwardingEngine {
 
             // Read the DNS message.
             let mut msg_buf = vec![0u8; msg_len];
-            match tcp_read_with_timeout(confd, &mut msg_buf) {
+            match tcp_read_with_timeout(raw_fd, &mut msg_buf) {
                 Ok(n) if n == msg_len => {}
                 Ok(n) => {
                     warn!(
@@ -1042,7 +1041,7 @@ impl ForwardingEngine {
             }
 
             // Forward to upstream over TCP.
-            match self.tcp_forward_and_relay(confd, &msg_buf, msg_len, source_addr, now, state) {
+            match self.tcp_forward_and_relay(raw_fd, &msg_buf, msg_len, source_addr, now, state) {
                 Ok(()) => {
                     state
                         .metrics
@@ -1054,15 +1053,15 @@ impl ForwardingEngine {
                     // Send SERVFAIL back to client.
                     let mut servfail = msg_buf.clone();
                     setup_servfail_response(&mut servfail, SERVFAIL);
-                    let _ = tcp_send_response(confd, &servfail);
+                    let _ = tcp_send_response(raw_fd, &servfail);
                 }
             }
 
             queries_processed += 1;
         }
 
-        // Close the TCP connection.
-        let _ = nix::unistd::close(confd);
+        // OwnedFd auto-closes on drop — no manual close needed.
+        // (Replaces C: close(confd) at forward.c line ~4060)
 
         debug!(
             "tcp_request: closed connection from {} after {} queries",

@@ -411,6 +411,7 @@ impl LinuxNetlink {
     /// # Safety
     ///
     /// Caller must ensure `ptr` points to valid memory of at least `len` bytes.
+    // SAFETY: Caller validates ptr and len from netlink message bounds.
     unsafe fn parse_rtattr(ptr: *const u8, len: usize) -> Vec<(u16, Vec<u8>)> {
         let rta_hdr_size = 4usize;
         let mut attrs = Vec::new();
@@ -496,6 +497,8 @@ impl LinuxNetlink {
                 ])
             };
 
+            // SAFETY: payload_ptr is valid for payload_len bytes (from netlink msg).
+            // Adding 8 stays within bounds since payload_len >= 8 (checked above).
             let attrs_ptr = unsafe { payload_ptr.add(8) };
             let attrs_len = payload_len.saturating_sub(8);
             // SAFETY: attrs_ptr points within the validated payload buffer.
@@ -594,6 +597,7 @@ impl LinuxNetlink {
             let hw_type = unsafe {
                 u16::from_ne_bytes([*payload_ptr.add(2), *payload_ptr.add(3)]) as u32
             };
+            // SAFETY: Offsets 4..7 are within the 16-byte ifinfomsg (verified above).
             let if_index = unsafe {
                 u32::from_ne_bytes([
                     *payload_ptr.add(4),
@@ -1062,8 +1066,10 @@ impl NetworkBackend for LinuxNetlink {
                         // Byte 0 is the ndmsg family field. Offset 12 starts the rtattr
                         // chain. parse_rtattr reads within attrs_len bounds.
                         let neigh_family = unsafe { *payload_ptr } as i32;
+                        // SAFETY: payload_ptr + 12 within bounds (payload_len >= 12).
                         let attrs_ptr = unsafe { payload_ptr.add(12) };
                         let attrs_len = payload_len.saturating_sub(12);
+                        // SAFETY: attrs_ptr/attrs_len within validated payload bounds.
                         let attrs = unsafe { Self::parse_rtattr(attrs_ptr, attrs_len) };
 
                         let mut ip_data: Option<&Vec<u8>> = None;

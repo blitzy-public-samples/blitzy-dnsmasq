@@ -365,10 +365,8 @@ impl IpsetManager {
         let socket_fd = if old_kernel {
             // Legacy API: raw IPv4 socket for setsockopt/getsockopt operations.
             // C: socket(AF_INET, SOCK_RAW, IPPROTO_RAW) at line 280.
+            // SAFETY: socket() is a standard POSIX syscall; return value checked below.
             let raw_fd = unsafe {
-                // SAFETY: socket() is a standard POSIX system call. We check the
-                // return value for errors immediately. The resulting fd is wrapped
-                // in OwnedFd for RAII lifetime management below.
                 libc::socket(
                     libc::AF_INET,
                     libc::SOCK_RAW | libc::SOCK_CLOEXEC,
@@ -378,12 +376,9 @@ impl IpsetManager {
             if raw_fd < 0 {
                 return Err(IpsetError::SocketCreationFailed(io::Error::last_os_error()));
             }
-            unsafe {
-                // SAFETY: raw_fd is a valid file descriptor (non-negative,
-                // checked above). OwnedFd takes exclusive ownership and will
-                // close it on drop.
-                OwnedFd::from_raw_fd(raw_fd)
-            }
+            // SAFETY: raw_fd is a valid fd (non-negative, checked above).
+            // OwnedFd takes exclusive ownership and closes it on drop.
+            unsafe { OwnedFd::from_raw_fd(raw_fd) }
         } else {
             // Modern API: netlink socket for NETLINK_NETFILTER ipset protocol.
             // C: socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER) at line 285,
@@ -651,11 +646,9 @@ impl IpsetManager {
         req_get[8..8 + setname.len()].copy_from_slice(setname.as_bytes());
 
         let mut size = IP_SET_REQ_ADT_GET_SIZE as libc::socklen_t;
+        // SAFETY: fd is a valid socket owned by IpsetManager. req_get matches
+        // the kernel ip_set_req_adt_get layout. size is initialized correctly.
         let rc = unsafe {
-            // SAFETY: fd is a valid socket owned by IpsetManager. req_get is a
-            // properly sized stack buffer matching the kernel's ip_set_req_adt_get
-            // struct layout. `size` is initialized to the buffer length. The
-            // kernel writes back into req_get and updates size on success.
             libc::getsockopt(
                 fd,
                 libc::SOL_IP,
@@ -694,10 +687,9 @@ impl IpsetManager {
         let ip_host: u32 = u32::from(*ipaddr);
         req_adt[8..12].copy_from_slice(&ip_host.to_ne_bytes());
 
+        // SAFETY: fd is a valid socket owned by IpsetManager. req_adt matches
+        // the kernel ip_set_req_adt layout for add/delete operations.
         let rc = unsafe {
-            // SAFETY: fd is a valid socket owned by IpsetManager. req_adt is a
-            // properly sized stack buffer matching the kernel's ip_set_req_adt
-            // struct layout. The kernel reads req_adt to perform the operation.
             libc::setsockopt(
                 fd,
                 libc::SOL_IP,

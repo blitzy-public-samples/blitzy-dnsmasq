@@ -299,6 +299,7 @@ impl EventDesc {
 /// # Safety
 /// Caller must ensure this is called from a context where errno is meaningful.
 /// The returned pointer is valid for the lifetime of the current thread.
+// SAFETY: Returns thread-local errno pointer; caller ensures signal context.
 #[cfg(target_os = "linux")]
 #[inline(always)]
 unsafe fn errno_location() -> *mut libc::c_int {
@@ -311,6 +312,7 @@ unsafe fn errno_location() -> *mut libc::c_int {
 ///
 /// # Safety
 /// Caller must ensure this is called from a context where errno is meaningful.
+// SAFETY: Returns thread-local errno pointer; caller ensures signal context.
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
 #[inline(always)]
 unsafe fn errno_location() -> *mut libc::c_int {
@@ -399,13 +401,14 @@ extern "C" fn signal_handler(sig: libc::c_int) {
 
         let pipe_fd = PIPE_WRITE.load(Ordering::SeqCst);
         if pipe_fd >= 0 {
-            // SAFETY: write() is async-signal-safe per POSIX.1-2008.
-            // We write exactly sizeof(EventDesc) = 12 bytes, which is well
+            // Write exactly sizeof(EventDesc) = 12 bytes, which is well
             // below PIPE_BUF (4096 on Linux), guaranteeing atomic write.
             // The pipe is non-blocking, so this either succeeds or fails
             // without blocking. We intentionally ignore the return value
             // because there's nothing we can do about write failure in a
             // signal handler — the event will simply be lost (same as C).
+            // SAFETY: write() is async-signal-safe per POSIX.1-2008.
+            // pipe_fd is a valid fd set during initialization.
             unsafe {
                 libc::write(
                     pipe_fd,
@@ -518,12 +521,11 @@ impl SignalHandler {
             SigSet::empty(),
         );
 
-        // SAFETY: sigaction() is safe when called with valid Signal values
-        // and a valid SigAction. The signal_handler function has the correct
-        // extern "C" fn(c_int) signature. This is one of the explicitly
-        // permitted unsafe blocks per AAP Section 0.7.1, required because
-        // installing signal handlers is inherently unsafe — it modifies
-        // process-wide signal disposition.
+        // sigaction() modifies process-wide signal disposition. The signal_handler
+        // function has the correct extern "C" fn(c_int) signature. This is one of
+        // the explicitly permitted unsafe blocks per AAP Section 0.7.1.
+        // SAFETY: All Signal values are valid POSIX signals, and handler_action/
+        // ignore_action are well-formed SigAction structs.
         unsafe {
             nix::sys::signal::sigaction(Signal::SIGUSR1, &handler_action)?;
             nix::sys::signal::sigaction(Signal::SIGUSR2, &handler_action)?;
@@ -771,7 +773,8 @@ impl Drop for SignalHandler {
         ];
 
         for sig in &signals {
-            // Ignore errors during cleanup — we're in a destructor.
+            // SAFETY: Restoring default signal disposition is safe for all listed
+            // valid POSIX signals. Errors ignored during cleanup (destructor).
             let _ = unsafe { nix::sys::signal::sigaction(*sig, &default_action) };
         }
 

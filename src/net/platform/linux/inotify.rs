@@ -41,10 +41,10 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
+use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify, WatchDescriptor};
 use log::{debug, info, warn};
 use thiserror::Error;
 
@@ -61,15 +61,6 @@ use crate::types::dns::HostsFileFlags;
 /// Mirrors the POSIX `MAXSYMLINKS` constant from `<sys/param.h>` (typically 20 on Linux).
 /// Prevents infinite loops when circular symlinks are encountered.
 const MAXSYMLINKS: usize = 20;
-
-/// Size of the buffer used for reading inotify events.
-///
-/// Each inotify event is `sizeof(struct inotify_event) + name_len`, where `name_len`
-/// can be up to `NAME_MAX + 1` (256 bytes on Linux). A 4096-byte buffer can hold
-/// multiple events per `read()` call.
-///
-/// Replaces C: `#define INOTIFY_SZ (sizeof(struct inotify_event) + NAME_MAX + 1)`
-const INOTIFY_BUFFER_SIZE: usize = 4096;
 
 // ===========================================================================
 // InotifyError — replaces C die() calls with Result-based error propagation
@@ -478,7 +469,8 @@ impl InotifyManager {
     pub fn new(config: &DaemonConfig) -> Result<Self, InotifyError> {
         // Create inotify instance. The inotify crate automatically sets
         // IN_NONBLOCK | IN_CLOEXEC, matching C: inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
-        let inotify = Inotify::init().map_err(InotifyError::InitFailed)?;
+        let inotify = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC)
+            .map_err(|e| InotifyError::InitFailed(io::Error::from_raw_os_error(e as i32)))?;
 
         // Copy dynamic directory data from configuration for later use.
         // We store our own state rather than mutating the config.
@@ -573,19 +565,22 @@ impl InotifyManager {
             //                               IN_CLOSE_WRITE | IN_MOVED_TO);
             let wd = manager
                 .inotify
-                .watches()
-                .add(&dir_str, WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO)
+                .add_watch(
+                    dir_str.as_str(),
+                    AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_MOVED_TO,
+                )
                 .map_err(|e| {
                     // ENOENT means directory doesn't exist — special error message.
                     // C equivalent (inotify.c lines 265-266):
                     //   if (res->wd == -1 && errno == ENOENT)
                     //     die(_("directory %s for resolv-file is missing..."), ...)
-                    if e.raw_os_error() == Some(libc::ENOENT) {
+                    let io_err = io::Error::from_raw_os_error(e as i32);
+                    if e == nix::errno::Errno::ENOENT {
                         InotifyError::DirectoryMissing(resolv.name.clone())
                     } else {
                         InotifyError::WatchFailed {
                             path: resolv.name.clone(),
-                            source: e,
+                            source: io_err,
                         }
                     }
                 })?;
@@ -614,7 +609,7 @@ impl InotifyManager {
     /// C equivalent: `daemon->inotifyfd` exposed for the `poll()` event loop.
     #[inline]
     pub fn fd(&self) -> RawFd {
-        self.inotify.as_raw_fd()
+        self.inotify.as_fd().as_raw_fd()
     }
 
     /// Set up inotify watches for dynamic directories and read pre-existing files.
@@ -679,9 +674,9 @@ impl InotifyManager {
             //     dd->flags |= AH_WD_DONE;
             //   }
             if !self.dynamic_dirs[dir_idx].wd_done {
-                match self.inotify.watches().add(
-                    &dir_path,
-                    WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO | WatchMask::DELETE,
+                match self.inotify.add_watch(
+                    dir_path.as_str(),
+                    AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_DELETE,
                 ) {
                     Ok(wd) => {
                         self.dynamic_dirs[dir_idx].wd = Some(wd);
@@ -807,26 +802,27 @@ impl InotifyManager {
     ) -> Result<bool, InotifyError> {
         let mut hit = false;
 
-        // Use a local buffer to avoid borrow conflicts between self.inotify and
-        // self.dynamic_dirs during event processing.
-        let mut buffer = vec![0u8; INOTIFY_BUFFER_SIZE];
-
-        // Outer loop: keep reading events until WouldBlock (non-blocking fd).
+        // Outer loop: keep reading events until EAGAIN (non-blocking fd).
         // C equivalent (inotify.c lines 587-682): while(1) { read(); for(events) ... }
         loop {
             // Read one batch of events and collect into owned data.
-            // We must collect before processing because the Events iterator borrows
-            // the buffer, but processing needs mutable access to self.dynamic_dirs.
-            let collected: Vec<(WatchDescriptor, EventMask, Option<String>)> = {
-                match self.inotify.read_events(&mut buffer) {
+            // nix::sys::inotify::Inotify::read_events() returns Vec<InotifyEvent>
+            // with owned OsString names, so no buffer needed.
+            let collected: Vec<(WatchDescriptor, AddWatchFlags, Option<String>)> = {
+                match self.inotify.read_events() {
                     Ok(events) => events
+                        .into_iter()
                         .map(|e| {
                             let name = e.name.map(|n| n.to_string_lossy().into_owned());
                             (e.wd, e.mask, name)
                         })
                         .collect(),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(InotifyError::ReadFailed(e)),
+                    Err(nix::errno::Errno::EAGAIN) => break,
+                    Err(e) => {
+                        return Err(InotifyError::ReadFailed(
+                            io::Error::from_raw_os_error(e as i32),
+                        ))
+                    }
                 }
             };
 
@@ -849,7 +845,7 @@ impl InotifyManager {
                 }
 
                 // Log the event, noting if it refers to a directory (ISDIR flag).
-                if mask.contains(EventMask::ISDIR) {
+                if mask.contains(AddWatchFlags::IN_ISDIR) {
                     debug!(
                         "inotify: directory event on wd={:?} mask={:?} name='{}'",
                         wd, mask, name
@@ -910,7 +906,7 @@ impl InotifyManager {
                         let removed = handler.cache_remove_uid(index);
 
                         // Log the event type.
-                        if mask.contains(EventMask::DELETE) {
+                        if mask.contains(AddWatchFlags::IN_DELETE) {
                             info!("inotify: {} removed", fname);
                         } else {
                             info!("inotify: {} new or modified", fname);
@@ -927,7 +923,7 @@ impl InotifyManager {
                         // C equivalent (inotify.c lines 636-637):
                         //   if (!(in->mask & IN_DELETE))
                         //     read_hostsfile(ah->fname, ah->index, 0, NULL, 0);
-                        if !mask.contains(EventMask::DELETE) {
+                        if !mask.contains(AddWatchFlags::IN_DELETE) {
                             handler.read_hostsfile(&fname, index);
                         }
 
@@ -937,7 +933,7 @@ impl InotifyManager {
                         {
                             handler.dhcp_propagate_changes(now);
                         }
-                    } else if !mask.contains(EventMask::DELETE) {
+                    } else if !mask.contains(AddWatchFlags::IN_DELETE) {
                         // DHCP directory processing (non-DELETE events only).
                         // C equivalent (inotify.c lines 650-677), behind #ifdef HAVE_DHCP.
                         // This branch handles directories with AH_DHCP_HST or AH_DHCP_OPT flags

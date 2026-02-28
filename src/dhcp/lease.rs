@@ -256,13 +256,10 @@ impl LeaseDatabase {
             // to get initial state, or operate without a lease database.
             #[cfg(feature = "script")]
             if let Some(cmd) = lease_change_command {
-                // Execute "<script> init" and read leases from stdout
-                match std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(format!("{} init", cmd))
-                    .stdout(std::process::Stdio::piped())
-                    .spawn()
-                {
+                // Execute "<script> init" through the helper module for privilege
+                // separation consistency — all script execution is centralized in
+                // the helper module per AAP Section 0.7.2.
+                match crate::dhcp::helper::run_init_script(cmd) {
                     Ok(child) => {
                         if let Some(stdout) = child.stdout {
                             let reader = BufReader::new(stdout);
@@ -271,9 +268,9 @@ impl LeaseDatabase {
                             }
                         }
                     }
-                    Err(e) => {
+                    Err(_e) => {
                         return Err(LeaseError::ScriptFailed {
-                            code: e.raw_os_error().unwrap_or(-1),
+                            code: -1,
                         });
                     }
                 }

@@ -181,6 +181,16 @@ pub enum HelperError {
     /// Buffer serialization error during event queuing.
     #[error("buffer serialization error")]
     BufferError,
+
+    /// Script execution failed when spawning via the helper module.
+    #[error("failed to execute script '{path}': {source}")]
+    ScriptExecFailed {
+        /// Path to the script that could not be executed.
+        path: String,
+        /// Underlying I/O error from process spawn.
+        #[source]
+        source: io::Error,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1530,6 +1540,44 @@ impl<'a> ExtraDataIter<'a> {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Privileged script execution for lease initialization
+// ---------------------------------------------------------------------------
+
+/// Execute a lease-change script in "init" mode and return a reader over its stdout.
+///
+/// This function provides a centralized, privilege-aware entry point for running
+/// the lease initialization script, ensuring all script execution goes through the
+/// helper module. During initialization (before the helper process is forked), the
+/// main process still has sufficient privileges.
+///
+/// The script is invoked as `sh -c "<script_path> init"` and its stdout is captured
+/// so the caller can parse the initial lease state from the output.
+///
+/// # Arguments
+/// * `script_path` — Path to the lease-change script to execute.
+///
+/// # Returns
+/// A `ChildStdout` handle from which the caller reads initial lease data, or a
+/// `HelperError` if the process could not be spawned.
+///
+/// # Source Reference
+/// Replaces direct `Command::new("sh")` in `lease.c` `lease_init()` (lines 433-450)
+/// by routing through the helper module for privilege separation consistency.
+pub fn run_init_script(script_path: &str) -> Result<std::process::Child, HelperError> {
+    use std::process::{Command, Stdio};
+
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("{} init", script_path))
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| HelperError::ScriptExecFailed {
+            path: script_path.to_owned(),
+            source: e,
+        })
 }
 
 // ---------------------------------------------------------------------------

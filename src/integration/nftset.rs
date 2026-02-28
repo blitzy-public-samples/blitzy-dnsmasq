@@ -99,6 +99,9 @@ struct NftCtx {
 /// Matches the C constant `NFT_CTX_DEFAULT` from libnftables.
 const NFT_CTX_DEFAULT: u32 = 0;
 
+// SAFETY: These are FFI declarations for libnftables (linked via pkg-config).
+// The function signatures match the C API exactly. All callers must ensure
+// pointers are valid and contexts are properly allocated before use.
 unsafe extern "C" {
     /// Allocate and initialize a new nftables context.
     ///
@@ -512,7 +515,8 @@ pub fn add_to_nftset(
     // `nft_run_cmd_from_buffer` reads from the buffer synchronously and does
     // not take ownership or store the pointer beyond the call duration.
     //
-    // This matches C line 373: ret = nft_run_cmd_from_buffer(ctx, cmd_buf);
+    // SAFETY: ctx is a valid non-null nftables context (see invariants above);
+    // c_cmd.as_ptr() is a valid null-terminated C string. Matches C line 373.
     let ret = unsafe { nft_run_cmd_from_buffer(state.ctx, c_cmd.as_ptr()) };
 
     // Step 5: Handle errors — retrieve and log first line of error message.
@@ -532,7 +536,8 @@ pub fn add_to_nftset(
         // execution or context destruction. We copy the data out immediately
         // (into a Rust String), so there is no dangling reference risk.
         //
-        // This matches C line 374: err = nft_ctx_get_error_buffer(ctx);
+        // SAFETY: ctx is valid and non-null (see above). We copy the error
+        // string immediately so no dangling reference risk exists.
         let error_msg = unsafe {
             let err_ptr = nft_ctx_get_error_buffer(state.ctx);
             if err_ptr.is_null() {
