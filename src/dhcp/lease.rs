@@ -954,10 +954,15 @@ impl LeaseDatabase {
         }
 
         // Update IAID for DHCPv6
-        if lease.iaid != iaid {
-            lease.iaid = iaid;
-            changed = true;
+        #[cfg(feature = "dhcp6")]
+        {
+            if lease.iaid != iaid {
+                lease.iaid = iaid;
+                changed = true;
+            }
         }
+        // Suppress unused parameter warning when dhcp6 feature is not enabled
+        let _ = iaid;
 
         if changed {
             lease.flags |= LeaseFlags::CHANGED;
@@ -1680,6 +1685,7 @@ impl Default for DhcpLease {
             new_prefixlen: 0,
             agent_id: Vec::new(),
             vendorclass: Vec::new(),
+            #[cfg(feature = "dhcp6")]
             vendorclass_count: 0,
             #[cfg(feature = "dhcp6")]
             addr6: Ipv6Addr::UNSPECIFIED,

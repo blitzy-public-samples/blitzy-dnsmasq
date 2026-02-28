@@ -131,9 +131,10 @@ pub fn check_name(name: &str) -> CheckNameResult {
 
     let mut dotgap: usize = 0;
     let mut nowhite = false;
-    let mut idn_encode = false;
     #[allow(unused_mut)]
-    let mut has_ucase = false;
+    let mut idn_encode = false;
+    #[allow(unused_mut, unused_assignments)]
+    let mut _has_ucase = false;
 
     for c in name.chars() {
         if c == '.' {
@@ -159,7 +160,7 @@ pub fn check_name(name: &str) -> CheckNameResult {
             } else if c != ' ' {
                 nowhite = true;
                 if c.is_ascii_uppercase() {
-                    has_ucase = true;
+                    _has_ucase = true;
                 }
             }
         }
@@ -173,7 +174,7 @@ pub fn check_name(name: &str) -> CheckNameResult {
     // With IDN feature, uppercase also triggers IDN encoding
     #[cfg(feature = "idn")]
     {
-        idn_encode = idn_encode || has_ucase;
+        idn_encode = idn_encode || _has_ucase;
     }
 
     if idn_encode {

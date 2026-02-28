@@ -86,13 +86,16 @@ pub mod dns;
 /// DHCP-specific type definitions for DHCPv4, DHCPv6, Router Advertisement,
 /// TFTP, and lease management.
 ///
-/// This module is feature-gated: it is only compiled when the `dhcp` or `dhcp6`
-/// Cargo feature is enabled, mirroring the C `#ifdef HAVE_DHCP` guard.
+/// This module is feature-gated: it is compiled when the `dhcp`, `dhcp6`, or
+/// `tftp` Cargo feature is enabled. The `tftp` feature requires access to
+/// TFTP-specific types ([`TftpPrefix`], `ACTION_TFTP`) that reside in this
+/// module because TFTP prefix configuration and helper actions are defined
+/// alongside DHCP types in the C source (`dnsmasq.h`).
 ///
 /// Contains [`DhcpLease`], [`DhcpConfig`], [`DhcpContext`], [`DhcpOption`],
 /// and all associated flag types, relay types, TFTP transfer types, and
 /// Router Advertisement interface types.
-#[cfg(any(feature = "dhcp", feature = "dhcp6"))]
+#[cfg(any(feature = "dhcp", feature = "dhcp6", feature = "tftp"))]
 pub mod dhcp;
 
 /// Network-related type definitions for interface enumeration, socket management,
@@ -183,8 +186,10 @@ pub use dhcp::{
     LeaseFlags, PxeService, RaInterface,
 };
 
-// TFTP types from the dhcp module, gated by both dhcp and tftp features.
-#[cfg(all(any(feature = "dhcp", feature = "dhcp6"), feature = "tftp"))]
+// TFTP types from the dhcp module. Available when tftp feature is enabled,
+// since the dhcp module is now also compiled for tftp-only builds to provide
+// TFTP-specific types (TftpPrefix, TftpFile, TftpTransfer, ACTION_TFTP).
+#[cfg(feature = "tftp")]
 pub use dhcp::{TftpFile, TftpTransfer};
 
 // ===========================================================================

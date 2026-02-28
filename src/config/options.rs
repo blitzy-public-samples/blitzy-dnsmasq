@@ -3711,6 +3711,9 @@ fn parse_mac_addr(s: &str) -> Vec<u8> {
 }
 
 /// Decode a hex string into bytes.
+///
+/// Used by DNSSEC trust anchor parsing to decode hex-encoded DS record digests.
+#[cfg(feature = "dnssec")]
 fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
     if s.len() % 2 != 0 {
         return Err(());

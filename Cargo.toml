@@ -53,7 +53,7 @@ ipset = ["dep:netlink-packet-core"]
 nftset = []
 
 # Linux netlink platform networking (NETLINK_ROUTE interface/route monitoring)
-netlink = ["dep:netlink-packet-route", "dep:netlink-sys"]
+netlink = ["dep:netlink-packet-route", "dep:netlink-sys", "dep:netlink-packet-core"]
 
 # inotify file monitoring (HAVE_INOTIFY) - Linux only
 inotify_monitor = ["dep:inotify"]
