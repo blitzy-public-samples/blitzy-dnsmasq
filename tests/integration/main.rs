@@ -9,8 +9,11 @@
 //! # Submodules
 //! - `wire_format` — DNS wire-format encoding/decoding roundtrip tests
 //! - `dns_forwarding` — end-to-end DNS query forwarding tests
+//! - `dhcp_v4_lifecycle` — DHCPv4 DORA lifecycle tests (feature-gated: dhcp)
 
 mod config_parsing;
+#[cfg(feature = "dhcp")]
+mod dhcp_v4_lifecycle;
 mod dns_cache;
 mod dns_forwarding;
 mod wire_format;
