@@ -11,6 +11,7 @@
 //! - `dns_forwarding` — end-to-end DNS query forwarding tests
 //! - `dhcp_v4_lifecycle` — DHCPv4 DORA lifecycle tests (feature-gated: dhcp)
 //! - `dhcp_v6_lifecycle` — DHCPv6 SOLICIT/REPLY lifecycle tests (feature-gated: dhcp6)
+//! - `dnssec_validation` — DNSSEC trust chain validation tests (feature-gated: dnssec)
 
 mod config_parsing;
 #[cfg(feature = "dhcp")]
@@ -19,4 +20,6 @@ mod dhcp_v4_lifecycle;
 mod dhcp_v6_lifecycle;
 mod dns_cache;
 mod dns_forwarding;
+#[cfg(feature = "dnssec")]
+mod dnssec_validation;
 mod wire_format;
