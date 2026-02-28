@@ -14,10 +14,12 @@
 //! controlled by the parent `dhcp` module's conditional compilation.
 
 pub mod outpacket;
+pub mod rfc3315;
 pub mod server;
 
 // Re-export primary public types for convenient access.
 pub use outpacket::Dhcpv6OutPacket;
+pub use rfc3315::{dhcp6_reply, Dhcpv6Error, Dhcpv6State, RelayMessage};
 pub use server::{
     address6_allocate, address6_available, address6_valid, config_find_by_address6,
     dhcp6_init, dhcp6_packet, dhcp_construct_contexts, get_client_mac, make_duid,
