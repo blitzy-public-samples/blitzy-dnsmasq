@@ -25,7 +25,7 @@
 //! - `src/dnsmasq.h` line 535 (`RR_IMDATALEN`)
 
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 // ---------------------------------------------------------------------------
 // CnameTarget enum
@@ -343,6 +343,19 @@ impl SocketAddress {
     pub fn new_v6(addr: Ipv6Addr, port: u16, flowinfo: u32, scope_id: u32) -> Self {
         SocketAddress::V6(SocketAddrV6::new(addr, port, flowinfo, scope_id))
     }
+
+    /// Check if this socket address matches a given IP address (ignoring port).
+    ///
+    /// Used for RFC 5452 anti-spoofing validation: ensures that a DNS response
+    /// originates from the expected upstream server's IP address.
+    #[inline]
+    pub fn matches_ip(&self, ip: &IpAddr) -> bool {
+        match (self, ip) {
+            (SocketAddress::V4(sa), IpAddr::V4(v4)) => sa.ip() == v4,
+            (SocketAddress::V6(sa), IpAddr::V6(v6)) => sa.ip() == v6,
+            _ => false,
+        }
+    }
 }
 
 impl From<SocketAddrV4> for SocketAddress {
@@ -395,7 +408,7 @@ impl fmt::Display for SocketAddress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
     // -- AllAddr tests --
 

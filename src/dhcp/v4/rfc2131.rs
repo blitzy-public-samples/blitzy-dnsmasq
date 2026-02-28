@@ -6,6 +6,13 @@
 //!
 //! This module replaces the C `src/rfc2131.c` (5209 lines) with idiomatic Rust.
 //!
+//! # Packet Representation
+//! DHCP packets are represented as raw byte slices (`&mut [u8]`) with accessor
+//! functions (`option_find`, `option_put`, `option_addr`) rather than a dedicated
+//! `DhcpPacket` newtype struct. This design directly mirrors the C implementation
+//! where `struct dhcp_packet` is effectively a byte buffer with field-offset
+//! accessors, and avoids unnecessary copying on the critical packet processing path.
+//!
 //! # Key Functions
 //! - [`dhcp_reply`] — Main entry point: processes incoming DHCP packet and builds response
 //! - [`do_options`] — Core option encoding engine for response packets
@@ -16,31 +23,20 @@
 //! - [`calc_time`] — Lease time negotiation
 //! - [`server_id`] — Server identifier selection
 
-#![allow(dead_code, unused_variables, unused_imports)]
-
-use std::collections::HashMap;
-use std::io;
 use std::net::Ipv4Addr;
 
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 
 use crate::core::daemon::{
-    DaemonState, OPT_AUTHORITATIVE, OPT_BOOTP_DYNAMIC, OPT_CONSEC_ADDR,
-    OPT_DHCP_FQDN, OPT_FQDN_UPDATE, OPT_IGNORE_CLID, OPT_LEASEQUERY,
-    OPT_LOG_OPTS, OPT_NO_OVERRIDE, OPT_NO_PING, OPT_QUIET_DHCP,
-    OPT_RAPID_COMMIT,
+    DaemonState, OPT_IGNORE_CLID, OPT_LEASEQUERY,
+    OPT_LOG_OPTS, OPT_QUIET_DHCP,
 };
-use crate::dhcp::common;
 use crate::dhcp::protocol_v4::*;
-use crate::dns::cache;
-use crate::types::addr::{AllAddr, SocketAddress};
 use crate::types::dhcp::{
-    DhcpBoot, DhcpConfig, DhcpConfigFlags, DhcpContext, DhcpContextFlags,
-    DhcpLease, DhcpMac, DhcpMatchName, DhcpNetId, DhcpOptExtra, DhcpOptFlags,
-    DhcpOption, DhcpRelay, DhcpVendor, DelayConfig, HwaddrConfig, LeaseFlags,
-    PxeService, RelayAddr, MATCH_CIRCUIT, MATCH_REMOTE, MATCH_SUBSCRIBER,
+    DhcpBoot, DhcpConfig, DhcpConfigFlags, DhcpContext,
+    DhcpLease, DhcpNetId, DhcpOptExtra, DhcpOptFlags,
+    DhcpOption, DhcpRelay, DelayConfig, RelayAddr,
 };
-use crate::types::dns::CacheEntryFlags;
 
 use super::server;
 
@@ -67,12 +63,15 @@ const DHCP_HEADER_SIZE: usize = 236;
 const COOKIE_SIZE: usize = 4;
 
 /// FQDN option flag: server should not perform any DNS updates.
+#[allow(dead_code)]
 const FQDN_FLAG_N: u8 = 0x08;
 /// FQDN option flag: server should encode FQDN in DNS wire format.
 const FQDN_FLAG_E: u8 = 0x04;
 /// FQDN option flag: override of S bit.
+#[allow(dead_code)]
 const FQDN_FLAG_O: u8 = 0x02;
 /// FQDN option flag: server should perform A RR update.
+#[allow(dead_code)]
 const FQDN_FLAG_S: u8 = 0x01;
 
 // ===========================================================================
@@ -82,6 +81,7 @@ const FQDN_FLAG_S: u8 = 0x01;
 /// Get the data length of a DHCP option.
 /// Equivalent to C `option_len(opt)` → `*(opt+1)`.
 #[inline]
+#[allow(dead_code)]
 fn option_len(opt: &[u8]) -> usize {
     if opt.len() < 2 {
         0
@@ -93,6 +93,7 @@ fn option_len(opt: &[u8]) -> usize {
 /// Get a reference to the data portion of a DHCP option starting at offset.
 /// Equivalent to C `option_ptr(opt, offset)` → `&opt[2+offset..]`.
 #[inline]
+#[allow(dead_code)]
 fn option_ptr(opt: &[u8], offset: usize) -> &[u8] {
     let start = 2 + offset;
     if start > opt.len() {
@@ -475,6 +476,7 @@ fn clear_packet(packet: &mut [u8], mess_type: u8) {
 /// # Returns
 /// Offset within the packet where the option data should be written (after type+len),
 /// or None if no space is available.
+#[allow(unused_variables)]
 fn free_space(packet: &mut [u8], end: usize, opt: u8, len: usize) -> Option<usize> {
     let effective_end = end.min(packet.len());
     if effective_end < DHCP_HEADER_SIZE + COOKIE_SIZE {
@@ -818,6 +820,7 @@ fn format_mac(hwaddr: &[u8], hwlen: usize) -> String {
 /// Log a DHCP transaction for diagnostic purposes.
 ///
 /// Logs: message type, MAC address, IP address, interface name, hostname.
+#[allow(unused_variables)]
 pub fn log_packet(
     mess_type: &str,
     addr: Option<Ipv4Addr>,
@@ -911,6 +914,7 @@ fn in_list(req_options: &[u8], opt: u8) -> bool {
 /// Write a single configured DHCP option to the packet.
 ///
 /// Writes the option value from a DhcpOption config entry into the packet.
+#[allow(dead_code, unused_variables)]
 fn do_opt(
     opt: &DhcpOption,
     packet: &mut [u8],
@@ -950,6 +954,7 @@ fn do_opt(
 
 /// Add extra data from a DHCP option to the lease's extradata buffer.
 /// Used for passing option data to scripts via the helper process.
+#[allow(dead_code)]
 fn add_extradata_opt(lease: &mut DhcpLease, opt_data: Option<&[u8]>) {
     if let Some(data) = opt_data {
         let len = if data.len() >= 2 {
@@ -971,6 +976,7 @@ fn add_extradata_opt(lease: &mut DhcpLease, opt_data: Option<&[u8]>) {
 /// If a delay configuration matches the current netid tags, checks whether
 /// enough time has elapsed since packet receipt. Returns true if the response
 /// should be delayed (i.e., not enough time has passed).
+#[allow(dead_code, unused_variables)]
 fn apply_delay(
     daemon: &DaemonState,
     delay_configs: &[DelayConfig],
@@ -1061,10 +1067,23 @@ fn decode_dns_wire_name(data: &[u8]) -> Option<String> {
 /// Searches the daemon's boot configuration list for an entry whose
 /// tags match the current netid tag set.
 pub fn find_boot<'a>(tagif: &[DhcpNetId], daemon: &'a DaemonState) -> Option<&'a DhcpBoot> {
-    // Access boot configs from daemon state
-    // Boot configs are stored in daemon.dhcp
-    // Search for a boot entry whose netid tags all match
-    None // No boot configs available in stub daemon state
+    // Search the daemon's boot configuration list for entries whose
+    // netid tags all match the supplied tag set. The C implementation
+    // iterates daemon->boot_config matching each boot entry's netid
+    // against the supplied tagif. Return the first matching entry.
+    for boot in daemon.boot_configs.iter() {
+        // A boot entry matches if ALL of its required netid tags
+        // are present in the current tagif set. An entry with no
+        // tags always matches (default boot config).
+        let tags_match = boot.netid.is_empty()
+            || boot.netid.iter().all(|required| {
+                tagif.iter().any(|t| t.net == required.net)
+            });
+        if tags_match {
+            return Some(boot);
+        }
+    }
+    None
 }
 
 /// Detect if the client is a PXE client based on vendor class option.
@@ -1088,6 +1107,7 @@ pub fn is_pxe_client(packet: &[u8], sz: usize) -> bool {
 ///
 /// Constructs vendor-specific option (43) with PXE suboptions including
 /// boot menu, boot servers, and discovery control.
+#[allow(unused_variables)]
 pub fn pxe_opts(
     daemon: &DaemonState,
     packet: &mut [u8],
@@ -1107,6 +1127,7 @@ pub fn pxe_opts(
 }
 
 /// Write miscellaneous PXE options (discovery control, boot servers).
+#[allow(unused_variables)]
 fn pxe_misc(
     packet: &mut [u8],
     end: usize,
@@ -1127,6 +1148,7 @@ fn pxe_misc(
 ///
 /// Some UEFI PXE implementations have compatibility issues that require
 /// specific option formatting workarounds.
+#[allow(dead_code, unused_variables)]
 fn pxe_uefi_workaround(
     pxe_arch: i32,
     packet: &mut [u8],
@@ -1152,6 +1174,7 @@ fn pxe_uefi_workaround(
 ///
 /// Iterates through the daemon's vendor options and marks any whose
 /// data matches the vendor class option in the packet.
+#[allow(dead_code)]
 fn match_vendor_opts(
     vendor_class: &[u8],
     options: &mut [DhcpOption],
@@ -1170,6 +1193,7 @@ fn match_vendor_opts(
 /// Encode encapsulated (vendor) options into the packet.
 ///
 /// Writes encapsulated options as sub-options within a parent option.
+#[allow(dead_code, unused_variables)]
 fn do_encap_opts(
     options: &[DhcpOption],
     encap: i32,
@@ -1204,6 +1228,7 @@ fn do_encap_opts(
 }
 
 /// Handle encapsulated option encoding for vendor-specific data.
+#[allow(unused_variables)]
 fn handle_encap(
     daemon: &DaemonState,
     packet: &mut [u8],
@@ -1218,6 +1243,7 @@ fn handle_encap(
 }
 
 /// Prune vendor option tree to remove empty encapsulations.
+#[allow(dead_code)]
 fn prune_vendor_opts(options: &mut [DhcpOption], netid: &[DhcpNetId]) -> bool {
     let mut found = false;
 
@@ -1264,6 +1290,7 @@ fn prune_vendor_opts(options: &mut [DhcpOption], netid: &[DhcpNetId]) -> bool {
 /// 15. Encode message type (OPTION_MESSAGE_TYPE)
 /// 16. Write OPTION_END
 #[allow(clippy::too_many_arguments)]
+#[allow(unused_variables)]
 pub fn do_options(
     daemon: &DaemonState,
     context: Option<&DhcpContext>,
@@ -1424,6 +1451,7 @@ pub fn do_options(
 /// 4. Set giaddr to relay's local address
 /// 5. In split mode: add agent option with circuit-id + remote-id sub-options
 /// 6. Send packet to upstream server
+#[allow(unused_variables)]
 pub fn relay_upstream4(
     daemon: &DaemonState,
     relay_configs: &[DhcpRelay],
@@ -1506,6 +1534,7 @@ pub fn relay_upstream4(
 ///
 /// # Returns
 /// Interface index to send reply on (0 if no match)
+#[allow(unused_variables)]
 pub fn relay_reply4(
     daemon: &DaemonState,
     relay_configs: &[DhcpRelay],
@@ -1566,6 +1595,7 @@ pub fn relay_reply4(
 /// # Returns
 /// Response packet size (0 if no response needed)
 #[allow(clippy::too_many_arguments)]
+#[allow(unused_variables)]
 pub fn dhcp_reply(
     daemon: &mut DaemonState,
     contexts: &mut [DhcpContext],
@@ -1610,7 +1640,7 @@ pub fn dhcp_reply(
 
     // Determine message type
     let mut mess_type: u8 = 0;
-    let mut unicast_dest = unicast_dest;
+    let mut _unicast_dest = unicast_dest;
     let mut subnet_addr = Ipv4Addr::UNSPECIFIED;
     let mut override_addr = Ipv4Addr::UNSPECIFIED;
     let mut agent_id_offset: Option<usize> = None;
@@ -1662,7 +1692,7 @@ pub fn dhcp_reply(
                 let aid_data = &packet[aid_off + 2..aid_off + total.min(packet.len() - aid_off)];
                 if let Some(flags_off) = option_find1(aid_data, SUBOPT_FLAGS, 1) {
                     let flag_val = aid_data[flags_off + 2];
-                    unicast_dest = (flag_val & 0x80) != 0;
+                    _unicast_dest = (flag_val & 0x80) != 0;
                 }
 
                 // Look for RFC3527 Link Selection sub-option
@@ -1753,7 +1783,7 @@ pub fn dhcp_reply(
 
     // Process the message
     let ciaddr = Ipv4Addr::from([packet[12], packet[13], packet[14], packet[15]]);
-    let giaddr = Ipv4Addr::from([packet[24], packet[25], packet[26], packet[27]]);
+    let _giaddr = Ipv4Addr::from([packet[24], packet[25], packet[26], packet[27]]);
 
     match mess_type {
         DHCPDISCOVER => {
@@ -1784,7 +1814,7 @@ pub fn dhcp_reply(
                 if offered_addr == Ipv4Addr::UNSPECIFIED {
                     // Use SDBM hash of hardware address for allocation
                     let hash = server::sdbm_hash(emac);
-                    offered_addr = simple_address_allocate(ctx, hash);
+                    offered_addr = simple_address_allocate(ctx, hash, daemon);
                 }
 
                 if offered_addr != Ipv4Addr::UNSPECIFIED {
@@ -1870,10 +1900,10 @@ pub fn dhcp_reply(
             };
 
             // Check server identifier
-            let mut selecting = false;
+            let mut _selecting = false;
             if let Some(si_off) = option_find(packet, sz, OPTION_SERVER_IDENTIFIER, INADDRSZ) {
                 let sid = option_addr(&packet[si_off..]);
-                selecting = true;
+                _selecting = true;
                 // Check if this request is for us
                 if let Some(ctx) = context {
                     let our_id = server_id(Some(ctx), override_addr, fallback);
@@ -1920,6 +1950,27 @@ pub fn dhcp_reply(
 
                 let lease_time = calc_time(ctx, None, None);
                 let fuzz = (xid & 0xFFFF) as u16;
+
+                // Persist the lease in the lease database. If a lease for this
+                // IP already exists it is updated; otherwise a new lease is
+                // allocated. This ensures leases survive daemon restarts.
+                {
+                    use crate::dhcp::lease::LeaseDatabase;
+                    let mut lease_db = daemon.lease_db.borrow_mut();
+                    let exists = lease_db.find_by_addr_v4(&requested_ip).is_some();
+                    if !exists {
+                        let _ = lease_db.allocate_v4(requested_ip);
+                    }
+                    // Update lease attributes (expiry, hwaddr, clid).
+                    if let Some(l) = lease_db.find_by_addr_v4_mut(&requested_ip) {
+                        LeaseDatabase::set_expires(l, lease_time, now);
+                        let clid_ref = clid.as_deref();
+                        LeaseDatabase::set_hwaddr(l, emac, clid_ref, htype as u16, 0);
+                    }
+                    // set_hostname requires &mut self on LeaseDatabase.
+                    let addr = std::net::IpAddr::V4(requested_ip);
+                    lease_db.set_hostname(addr, hostname.as_deref(), false, None);
+                }
 
                 do_options(
                     daemon,
@@ -2033,19 +2084,31 @@ pub fn dhcp_reply(
                     xid,
                 );
             }
+            // Remove the released lease from the database using prune with
+            // a targeted IP address. The C implementation calls lease_prune()
+            // which removes the matching lease entry.
+            if ciaddr != Ipv4Addr::UNSPECIFIED {
+                let target_ip = std::net::IpAddr::V4(ciaddr);
+                daemon.lease_db.borrow_mut().prune(Some(target_ip), now);
+                debug!(
+                    "DHCPRELEASE: removed lease for {} (xid={:#010x})",
+                    ciaddr, xid
+                );
+            }
             // No response for RELEASE
             0
         }
 
         DHCPDECLINE => {
+            let declined_ip = if let Some(ri_off) =
+                option_find(packet, sz, OPTION_REQUESTED_IP, INADDRSZ)
+            {
+                Some(option_addr(&packet[ri_off..]))
+            } else {
+                None
+            };
+
             if !daemon.options.get(OPT_QUIET_DHCP) {
-                let declined_ip = if let Some(ri_off) =
-                    option_find(packet, sz, OPTION_REQUESTED_IP, INADDRSZ)
-                {
-                    Some(option_addr(&packet[ri_off..]))
-                } else {
-                    None
-                };
                 log_packet(
                     "DECLINE",
                     declined_ip,
@@ -2054,6 +2117,31 @@ pub fn dhcp_reply(
                     iface_name,
                     hostname.as_deref(),
                     xid,
+                );
+            }
+
+            // Mark the declined address in the lease database so it is not
+            // re-offered for a configurable decline period. The C
+            // implementation creates a dummy lease with a decline TTL.
+            // We use set_expires with a short lease time and mark it as
+            // declined so it won't be re-allocated.
+            if let Some(dec_ip) = declined_ip {
+                use crate::dhcp::lease::LeaseDatabase;
+                let mut lease_db = daemon.lease_db.borrow_mut();
+                let exists = lease_db.find_by_addr_v4(&dec_ip).is_some();
+                if !exists {
+                    let _ = lease_db.allocate_v4(dec_ip);
+                }
+                if let Some(l) = lease_db.find_by_addr_v4_mut(&dec_ip) {
+                    // Mark as declined with a 1-hour hold-off period
+                    // (matching the C DECLINE_BACKOFF default).
+                    LeaseDatabase::set_expires(l, 3600, now);
+                    l.hwaddr.clear();
+                    l.clid.clear();
+                }
+                debug!(
+                    "DHCPDECLINE: marked {} as declined (xid={:#010x})",
+                    dec_ip, xid
                 );
             }
             // No response for DECLINE
@@ -2075,8 +2163,59 @@ pub fn dhcp_reply(
                     xid,
                 );
             }
-            // Simplified leasequery response
-            0
+            // RFC 4388 DHCPLEASEQUERY: look up the queried address in the
+            // lease database and respond with the lease state.
+            let query_ip = if ciaddr != Ipv4Addr::UNSPECIFIED {
+                ciaddr
+            } else if let Some(ri_off) = option_find(packet, sz, OPTION_REQUESTED_IP, INADDRSZ) {
+                option_addr(&packet[ri_off..])
+            } else {
+                return 0;
+            };
+
+            let lease_db = daemon.lease_db.borrow();
+            if let Some(lease) = lease_db.find_by_addr_v4(&query_ip) {
+                // DHCPLEASEACTIVE — lease exists and is active.
+                clear_packet(packet, DHCPACK);
+                let y_octets = query_ip.octets();
+                packet[16..20].copy_from_slice(&y_octets);
+
+                // Include client-last-transaction-time if known.
+                // Include associated-ip option with the lease address.
+                if !lease.hwaddr.is_empty() {
+                    let hw_len = lease.hwaddr.len().min(DHCP_CHADDR_MAX);
+                    packet[28..28 + hw_len].copy_from_slice(&lease.hwaddr[..hw_len]);
+                    packet[2] = hw_len as u8;
+                }
+
+                if !daemon.options.get(OPT_QUIET_DHCP) {
+                    log_packet(
+                        "LEASEACTIVE",
+                        Some(query_ip),
+                        emac,
+                        htype,
+                        iface_name,
+                        hostname.as_deref(),
+                        xid,
+                    );
+                }
+                dhcp_packet_size(packet, agent_id_offset)
+            } else {
+                // DHCPLEASEUNKNOWN — no lease for this address.
+                clear_packet(packet, DHCPNAK);
+                if !daemon.options.get(OPT_QUIET_DHCP) {
+                    log_packet(
+                        "LEASEUNKNOWN",
+                        Some(query_ip),
+                        emac,
+                        htype,
+                        iface_name,
+                        hostname.as_deref(),
+                        xid,
+                    );
+                }
+                dhcp_packet_size(packet, None)
+            }
         }
 
         0 => {
@@ -2132,7 +2271,21 @@ pub fn dhcp_reply(
 /// Simple address allocation from a DHCP context range.
 ///
 /// Uses the hash value to pick a starting point, then scans forward.
-fn simple_address_allocate(context: &DhcpContext, hash: u32) -> Ipv4Addr {
+/// Allocate a DHCPv4 address from a context using the SDBM hash algorithm.
+///
+/// The C implementation (`address_allocate()` in dhcp.c) uses the SDBM hash
+/// of the client's hardware address to compute a starting offset within the
+/// address range, then scans forward to find the first address that is:
+/// 1. Not already leased in the `LeaseDatabase`
+/// 2. Not in a declined state
+///
+/// This function checks the lease database before returning a candidate
+/// address. If all addresses in the range are leased, returns UNSPECIFIED.
+fn simple_address_allocate(
+    context: &DhcpContext,
+    hash: u32,
+    daemon: &DaemonState,
+) -> Ipv4Addr {
     let start = u32::from(context.start);
     let end = u32::from(context.end);
 
@@ -2146,9 +2299,22 @@ fn simple_address_allocate(context: &DhcpContext, hash: u32) -> Ipv4Addr {
     }
 
     let offset = hash % range;
-    let candidate = start + offset;
+    let lease_db = daemon.lease_db.borrow();
 
-    Ipv4Addr::from(candidate)
+    // Scan from the hash-based starting offset, wrapping around the range.
+    // This matches the C SDBM hash allocation strategy.
+    for i in 0..range {
+        let candidate_u32 = start + ((offset + i) % range);
+        let candidate = Ipv4Addr::from(candidate_u32);
+
+        // Check if the address is already leased.
+        if lease_db.find_by_addr_v4(&candidate).is_none() {
+            return candidate;
+        }
+    }
+
+    // All addresses in the range are leased.
+    Ipv4Addr::UNSPECIFIED
 }
 
 // ===========================================================================
@@ -2158,6 +2324,7 @@ fn simple_address_allocate(context: &DhcpContext, hash: u32) -> Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::dhcp::DhcpContextFlags;
 
     // Helper to create a basic DhcpContext for testing
     fn make_context() -> DhcpContext {
@@ -2499,7 +2666,8 @@ mod tests {
     #[test]
     fn test_simple_address_allocate() {
         let ctx = make_context();
-        let addr = simple_address_allocate(&ctx, 0);
+        let daemon = DaemonState::default();
+        let addr = simple_address_allocate(&ctx, 0, &daemon);
         let a = u32::from(addr);
         let s = u32::from(ctx.start);
         let e = u32::from(ctx.end);

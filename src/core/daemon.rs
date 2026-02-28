@@ -491,6 +491,14 @@ pub struct DnsConfig {
     pub server_array_size: i32,
     /// High-water mark for server array population. C: `daemon->serverarrayhwm`
     pub server_array_hwm: i32,
+    /// Sorted server array for upstream DNS server selection.
+    /// Built by `server_match::build_server_array()` from the linked server list.
+    /// C: `daemon->serverarray`
+    pub servers: Vec<crate::types::dns::ServerEntry>,
+    /// IPv4 UDP socket FD for upstream queries. C: `daemon->fd`
+    pub server_fd4: Option<i32>,
+    /// IPv6 UDP socket FD for upstream queries. C: `daemon->fd6`
+    pub server_fd6: Option<i32>,
     /// D-Bus service name override. C: `daemon->dbus_name`
     pub dbus_name: Option<String>,
     /// UBus object name override. C: `daemon->ubus_name`
@@ -582,6 +590,9 @@ impl Default for DnsConfig {
             server_has_wildcard: false,
             server_array_size: 0,
             server_array_hwm: 0,
+            servers: Vec::new(),
+            server_fd4: None,
+            server_fd6: None,
             dbus_name: None,
             ubus_name: None,
             filter_rr: Vec::new(),
@@ -1011,6 +1022,17 @@ pub struct DaemonState {
     /// PRNG instance for DNS transaction IDs, port randomization, DHCP XIDs.
     /// `RefCell` because PRNG is mutated during query processing.
     pub prng: RefCell<Prng>,
+
+    /// Lease database for DHCPv4/v6 lease persistence.
+    /// `RefCell` because lease state is mutated during DHCP message processing
+    /// while sharing a `&DaemonState` reference.
+    #[cfg(feature = "dhcp")]
+    pub lease_db: RefCell<crate::dhcp::lease::LeaseDatabase>,
+
+    /// PXE/UEFI boot configuration entries.
+    /// Populated from `dhcp-boot` config directives by the option parser.
+    #[cfg(feature = "dhcp")]
+    pub boot_configs: Vec<crate::types::dhcp::DhcpBoot>,
 }
 
 impl DaemonState {
@@ -1042,6 +1064,10 @@ impl DaemonState {
             #[cfg(feature = "tftp")]
             tftp: TftpConfig::default(),
             prng: RefCell::new(Prng::new()),
+            #[cfg(feature = "dhcp")]
+            lease_db: RefCell::new(crate::dhcp::lease::LeaseDatabase::new(None, None)),
+            #[cfg(feature = "dhcp")]
+            boot_configs: Vec::new(),
         }
     }
 

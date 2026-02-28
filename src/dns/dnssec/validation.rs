@@ -38,8 +38,8 @@ use crate::dns::dnssec::crypto::{
     hash_find, verify, CryptoError, HashFunction,
 };
 use crate::dns::protocol::{
-    C_IN, HB3_RD, HB4_CD, INADDRSZ, IN6ADDRSZ, MAXDNAME, NOERROR, NXDOMAIN, RRFIXEDSZ,
-    SERVFAIL, T_A, T_AAAA, T_ANY, T_CNAME, T_DNAME, T_DNSKEY, T_DS, T_NS, T_NSEC, T_NSEC3,
+    C_IN, HB3_RD, HB4_CD, MAXDNAME, NOERROR, NXDOMAIN, RRFIXEDSZ,
+    SERVFAIL, T_ANY, T_CNAME, T_DNAME, T_DNSKEY, T_DS, T_NS, T_NSEC, T_NSEC3,
     T_RRSIG, T_SOA,
 };
 use crate::dns::rrfilter::{from_wire, rrfilter_desc, to_wire};
@@ -166,46 +166,38 @@ const TIMESTAMP_EPOCH: u64 = 1_420_070_400;
 /// Errors encountered during DNSSEC validation.
 ///
 /// Replaces C `setjmp`/`longjmp` error recovery with idiomatic Rust
-/// `Result<T, DnssecError>` propagation.
-#[derive(Debug, Clone)]
+/// `Result<T, DnssecError>` propagation. Uses `thiserror` derive macro
+/// per AAP convention (consistent with other error types in the codebase).
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum DnssecError {
     /// Malformed DNS packet (truncated, invalid pointers, bad structure).
+    #[error("malformed DNS packet")]
     BadPacket,
     /// Validation work counter (DNSSEC_LIMIT_WORK) exhausted.
+    #[error("DNSSEC work limit exceeded")]
     WorkLimitExceeded,
     /// Cryptographic operation counter (DNSSEC_LIMIT_CRYPTO) exhausted.
+    #[error("DNSSEC crypto limit exceeded")]
     CryptoLimitExceeded,
     /// Signature failure counter (DNSSEC_LIMIT_SIG_FAIL) exhausted.
+    #[error("DNSSEC sig-fail limit exceeded")]
     SigFailLimitExceeded,
     /// No RRSIG covering the queried RRset.
+    #[error("no RRSIG for RRset")]
     NoSignature,
     /// Timestamp validation failure (clock rollback or invalid time).
+    #[error("DNSSEC timestamp validation failed")]
     InvalidTimestamp,
     /// DNSSEC algorithm not supported by this implementation.
+    #[error("unsupported DNSSEC algorithm")]
     UnsupportedAlgorithm,
     /// NSEC/NSEC3 non-existence proof failed.
+    #[error("NSEC/NSEC3 proof failed")]
     NonExistenceProofFailed,
     /// NSEC3 iteration count exceeds configured limit.
+    #[error("NSEC3 iterations exceeded limit")]
     Nsec3IterationsExceeded,
 }
-
-impl std::fmt::Display for DnssecError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DnssecError::BadPacket => write!(f, "malformed DNS packet"),
-            DnssecError::WorkLimitExceeded => write!(f, "DNSSEC work limit exceeded"),
-            DnssecError::CryptoLimitExceeded => write!(f, "DNSSEC crypto limit exceeded"),
-            DnssecError::SigFailLimitExceeded => write!(f, "DNSSEC sig-fail limit exceeded"),
-            DnssecError::NoSignature => write!(f, "no RRSIG for RRset"),
-            DnssecError::InvalidTimestamp => write!(f, "DNSSEC timestamp validation failed"),
-            DnssecError::UnsupportedAlgorithm => write!(f, "unsupported DNSSEC algorithm"),
-            DnssecError::NonExistenceProofFailed => write!(f, "NSEC/NSEC3 proof failed"),
-            DnssecError::Nsec3IterationsExceeded => write!(f, "NSEC3 iterations exceeded limit"),
-        }
-    }
-}
-
-impl std::error::Error for DnssecError {}
 
 // ===========================================================================
 // DnssecStatus — Validation result with additional context
@@ -2163,11 +2155,9 @@ pub fn dnssec_validate_reply(
     // Collect CNAME and DNAME targets in the answer section.
     // CNAME (T_CNAME) provides a canonical name redirect.
     // DNAME (T_DNAME) provides a domain name delegation per RFC 6672.
-    // Track A (T_A), AAAA (T_AAAA), NS (T_NS), SOA (T_SOA) records for
-    // type bitmap validation and non-existence proofs.
+    // Track CNAME targets for following delegation chains. NS (T_NS) and
+    // SOA (T_SOA) tracking is done inline in the validation loop below.
     let mut cname_targets: Vec<String> = Vec::new();
-    let mut _has_a = false;
-    let mut _has_aaaa = false;
     {
         let mut scan = cursor;
         for _ in 0..header.ancount {
@@ -2178,9 +2168,27 @@ pub fn dnssec_validate_reply(
             if scan + RRFIXEDSZ > plen {
                 break;
             }
-            let rr_type = read_u16(packet, scan).unwrap_or(0);
-            let rr_class = read_u16(packet, scan + 2).unwrap_or(0);
-            let rdlen = read_u16(packet, scan + 8).unwrap_or(0) as usize;
+            let rr_type = match read_u16(packet, scan) {
+                Some(v) => v,
+                None => {
+                    log::trace!("dnssec pre-scan: parse error reading rr_type at offset {}", scan);
+                    return STAT_BOGUS | (DNSSEC_FAIL_BADPACKET << 8);
+                }
+            };
+            let rr_class = match read_u16(packet, scan + 2) {
+                Some(v) => v,
+                None => {
+                    log::trace!("dnssec pre-scan: parse error reading rr_class at offset {}", scan + 2);
+                    return STAT_BOGUS | (DNSSEC_FAIL_BADPACKET << 8);
+                }
+            };
+            let rdlen = match read_u16(packet, scan + 8) {
+                Some(v) => v as usize,
+                None => {
+                    log::trace!("dnssec pre-scan: parse error reading rdlen at offset {}", scan + 8);
+                    return STAT_BOGUS | (DNSSEC_FAIL_BADPACKET << 8);
+                }
+            };
             let rdata_offset = scan + RRFIXEDSZ;
 
             // Validate class is Internet (C_IN)
@@ -2188,10 +2196,6 @@ pub fn dnssec_validate_reply(
                 scan = rdata_offset + rdlen;
                 continue;
             }
-
-            // Track record types present in the answer
-            if rr_type == T_A && rdlen == INADDRSZ { _has_a = true; }
-            if rr_type == T_AAAA && rdlen == IN6ADDRSZ { _has_aaaa = true; }
 
             // Collect CNAME targets
             if rr_type == T_CNAME && rdata_offset + rdlen <= plen {
@@ -2217,7 +2221,7 @@ pub fn dnssec_validate_reply(
     // Validate each RRset in answer + authority sections
     let mut rr_idx = 0;
     let mut validated_cursor = cursor;
-    let all_secure = true;
+    let mut all_secure = true;
     let mut found_insecure = false;
 
     for section in 0..2u16 {
@@ -2234,9 +2238,27 @@ pub fn dnssec_validate_reply(
                 return STAT_BOGUS | (DNSSEC_FAIL_BADPACKET << 8);
             }
 
-            let rr_type = read_u16(packet, validated_cursor).unwrap_or(0);
-            let rr_class = read_u16(packet, validated_cursor + 2).unwrap_or(0);
-            let rdlen = read_u16(packet, validated_cursor + 8).unwrap_or(0) as usize;
+            let rr_type = match read_u16(packet, validated_cursor) {
+                Some(v) => v,
+                None => {
+                    log::trace!("dnssec validate: parse error reading rr_type at offset {}", validated_cursor);
+                    return STAT_BOGUS | (DNSSEC_FAIL_BADPACKET << 8);
+                }
+            };
+            let rr_class = match read_u16(packet, validated_cursor + 2) {
+                Some(v) => v,
+                None => {
+                    log::trace!("dnssec validate: parse error reading rr_class at offset {}", validated_cursor + 2);
+                    return STAT_BOGUS | (DNSSEC_FAIL_BADPACKET << 8);
+                }
+            };
+            let rdlen = match read_u16(packet, validated_cursor + 8) {
+                Some(v) => v as usize,
+                None => {
+                    log::trace!("dnssec validate: parse error reading rdlen at offset {}", validated_cursor + 8);
+                    return STAT_BOGUS | (DNSSEC_FAIL_BADPACKET << 8);
+                }
+            };
             let rdata_offset = validated_cursor + RRFIXEDSZ;
 
             if rdata_offset + rdlen > plen {
@@ -2320,6 +2342,7 @@ pub fn dnssec_validate_reply(
                 return STAT_ABANDONED;
             } else if stat_isequal(result, STAT_INSECURE) {
                 found_insecure = true;
+                all_secure = false;
             } else {
                 // STAT_BOGUS
                 if check_unsigned {
@@ -2327,6 +2350,7 @@ pub fn dnssec_validate_reply(
                     let zs = zone_status(&rr_name, rr_class, keyname, now, cache);
                     if stat_isequal(zs, STAT_INSECURE) {
                         found_insecure = true;
+                        all_secure = false;
                         rr_idx += 1;
                         continue;
                     }
@@ -2382,9 +2406,12 @@ pub fn dnssec_validate_reply(
 /// All others: ones-complement checksum over DNSKEY RDATA.
 pub fn dnskey_keytag(algo: u8, flags: u16, key: &[u8]) -> u16 {
     if algo == 1 {
-        // RSAMD5 legacy algorithm
+        // Algorithm 1 (RSAMD5) has a different (older) keytag calculation.
+        // Per RFC 4034 Appendix B.1 and C dnsmasq implementation:
+        //   key[keylen-4] is the most significant byte (×256)
+        //   key[keylen-3] is the least significant byte
         if key.len() >= 4 {
-            return ((key[key.len() - 3] as u16) << 8) | (key[key.len() - 4] as u16);
+            return ((key[key.len() - 4] as u16) << 8) | (key[key.len() - 3] as u16);
         }
         return 0;
     }
@@ -2556,6 +2583,7 @@ pub fn setup_timestamp(daemon: &mut DaemonState) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::protocol::T_A;
 
     #[test]
     fn test_count_labels() {

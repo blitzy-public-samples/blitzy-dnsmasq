@@ -151,10 +151,10 @@
 //! let mut builder = ConfigBuilder::new();
 //! builder.parse_cli(&args);
 //! builder.parse_file("/etc/dnsmasq.conf", true);
-//! let config: DaemonConfig = builder.build().expect("valid configuration");
+//! let _config: DaemonConfig = builder.build().expect("valid configuration");
 //!
 //! // Initialize daemon state
-//! let daemon = DaemonState::new(config);
+//! let daemon = DaemonState::new();
 //! ```
 
 // ============================================================================

@@ -482,12 +482,20 @@ pub fn slaac_ping_reply(
         None => return false,
     };
 
-    // Validate the identifier matches our ping_id (C line 522)
-    // Note: PingPacket stores identifier in network byte order via new_echo_request,
-    // and from_bytes reads it as big-endian. get_ping_id() returns host-order.
-    // The C code stores ping_id in host order and the struct field is also host order
-    // on the wire (the kernel handles ICMPv6 checksum but not byte-swapping of
-    // identifier). We compare the raw network-order values for consistency.
+    // Validate the identifier matches our ping_id (C line 522).
+    //
+    // Byte-order contract:
+    //   - `get_ping_id()` returns a host-order u16 (initialized from rand16()).
+    //   - `PingPacket::new_echo_request()` stores the identifier in network
+    //     (big-endian) byte order in the on-wire ICMPv6 echo packet.
+    //   - `PingPacket::from_bytes()` reads the identifier field as big-endian,
+    //     so `ping.identifier` is in **network** byte order.
+    //   - We therefore convert our host-order ID to big-endian with `.to_be()`
+    //     before comparison, ensuring both sides are in the same byte order.
+    //
+    // On big-endian systems `.to_be()` is a no-op, on little-endian it swaps.
+    // This is safe on all architectures because both values are compared in
+    // the same (network) byte order.
     let our_id = get_ping_id().to_be();
     if ping.identifier != our_id {
         return false;

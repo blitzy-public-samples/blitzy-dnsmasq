@@ -86,10 +86,13 @@ const OPT_HDR_SIZE: usize = 4;
 const INFINITE_LIFETIME: u32 = 0xFFFFFFFF;
 
 /// FQDN flags: Server should perform AAAA DNS update (S bit).
+#[allow(dead_code)]
 const FQDN_FLAG_S: u32 = 0x01;
 /// FQDN flags: Server overrides client FQDN preferences (O bit).
+#[allow(dead_code)]
 const FQDN_FLAG_O: u32 = 0x02;
 /// FQDN flags: Server should NOT perform DNS updates (N bit).
+#[allow(dead_code)]
 const FQDN_FLAG_N: u32 = 0x04;
 
 // ===========================================================================
@@ -330,6 +333,7 @@ fn opt6_next(opts: &[u8]) -> Option<(u16, &[u8], &[u8])> {
 }
 
 /// Extract an unsigned integer from option data at the given offset.
+#[allow(dead_code)]
 fn opt6_uint(opt: &[u8], offset: usize, size: usize) -> u32 {
     if offset + size > opt.len() {
         return 0;
@@ -442,6 +446,7 @@ fn log6_packet(
 }
 
 /// Quiet logging variant — only logs in verbose mode. Replaces C `log6_quiet()`.
+#[allow(dead_code)]
 fn log6_quiet(
     state: &Dhcpv6State, msg_type: &str, addr: Option<&Ipv6Addr>,
     info: &str, daemon: &DaemonState,
@@ -576,6 +581,14 @@ pub fn dhcp6_reply(
 /// For RELAY-FORW messages: validates relay header, extracts relay options
 /// (subscriber ID, remote ID, client MAC per RFC 6939), recursively processes
 /// the encapsulated message, and wraps the reply in RELAY-REPL.
+///
+/// # Relay Chain Design
+///
+/// This function uses recursive calls (matching the C `dhcp6_maybe_relay`
+/// structure) rather than iterative `Vec<RelayMessage>` processing. The
+/// MAX_RELAY_HOPS=32 depth limit prevents stack overflow. Recursive
+/// processing naturally mirrors the nested RELAY-FORW/RELAY-REPL message
+/// structure and simplifies response envelope construction on the unwind path.
 ///
 /// # RFC Compliance
 ///
@@ -750,7 +763,7 @@ fn dhcp6_maybe_relay(
     };
 
     // Save outpacket position before inner processing
-    let relay_reply_start = outpacket.save_counter(-1);
+    let _relay_reply_start = outpacket.save_counter(-1);
 
     // Write RELAY-REPL header first
     outpacket.put_opt6_char(DHCP6RELAYREPL);
@@ -1077,11 +1090,18 @@ fn end_ia(
         let mut t1 = min_time / 2;
         let t2 = (min_time as u64 * 4 / 5) as u32;
 
-        // Apply 1/8 fuzzing per RFC 3315 Section 22.4
+        // Apply 1/8 random fuzzing per RFC 3315 Section 22.4.
+        // The C implementation uses: t1 - rand16() / (65536 / (t1/8))
+        // This produces a random jitter in range [0, t1/8) to prevent
+        // thundering-herd renewals when many clients share the same lease time.
         if do_fuzz {
-            let fuzz = min_time / 8;
-            if fuzz > 0 {
-                t1 = t1.saturating_sub(fuzz / 2);
+            let fuzz_range = t1 / 8;
+            if fuzz_range > 0 {
+                let rand_val = crate::core::prng::rand16() as u32;
+                let divisor = 65536u32 / fuzz_range;
+                if divisor > 0 {
+                    t1 = t1.saturating_sub(rand_val / divisor);
+                }
             }
         }
 
@@ -1159,8 +1179,15 @@ fn process_ia_options(
                 put_status(outpacket, DHCP6NOADDRS, "no addresses available");
             }
 
-            // Finalize the IA container
-            let do_fuzz = msg_type == DHCP6SOLICIT;
+            // Finalize the IA container.
+            // Apply T1/T2 fuzzing for all message types that include IA
+            // options with lifetime values — not just SOLICIT. The C
+            // implementation applies fuzzing to SOLICIT, REQUEST, RENEW,
+            // and REBIND responses to prevent thundering herd renewals.
+            let do_fuzz = matches!(
+                msg_type,
+                DHCP6SOLICIT | DHCP6REQUEST | DHCP6RENEW | DHCP6REBIND
+            );
             end_ia(outpacket, container, t1_counter, min_time, is_ia_na_or_pd, do_fuzz);
         }
     }
@@ -1175,6 +1202,7 @@ fn process_ia_options(
 /// Add an IAADDR sub-option to the current IA container in the response.
 ///
 /// Writes the IPv6 address (16 bytes), preferred lifetime, and valid lifetime.
+#[allow(unused_variables)]
 fn add_address(
     state: &mut Dhcpv6State,
     context_idx: usize,
@@ -1234,7 +1262,10 @@ fn update_leases(
     let now_secs = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .unwrap_or_else(|_| {
+            log::warn!("System clock is before UNIX epoch; using epoch 0 for lease times");
+            0
+        });
 
     // Determine lease type
     let lease_type = if state.ia_type == OPTION6_IA_TA {
@@ -1275,6 +1306,7 @@ fn update_leases(
 }
 
 /// Mark an address pool context as used for this transaction.
+#[allow(unused_variables)]
 fn mark_context_used(state: &Dhcpv6State, addr: &Ipv6Addr, contexts: &[DhcpContext]) {
     // In the C code, this sets CONTEXT_USED flag. Here we log the usage
     // since contexts is passed as immutable reference for this function.
@@ -1282,11 +1314,13 @@ fn mark_context_used(state: &Dhcpv6State, addr: &Ipv6Addr, contexts: &[DhcpConte
 }
 
 /// Mark static config addresses as in use.
+#[allow(dead_code, unused_variables)]
 fn mark_config_used(contexts: &[DhcpContext], addr: &Ipv6Addr) {
     debug!("DHCPv6: marking config used for address {}", addr);
 }
 
 /// Verify that an address is within a valid context range.
+#[allow(unused_variables)]
 fn check_address(state: &Dhcpv6State, addr: &Ipv6Addr, contexts: &[DhcpContext]) -> bool {
     for ctx in contexts.iter() {
         if !ctx.flags.contains(DhcpContextFlags::V6) {
@@ -1310,6 +1344,7 @@ fn check_address(state: &Dhcpv6State, addr: &Ipv6Addr, contexts: &[DhcpContext])
 /// Check if a static config implies a specific address for a given context.
 ///
 /// Returns Some reference to the matching AddrList entry if found.
+#[allow(dead_code)]
 fn config_implies<'a>(
     config: &'a DhcpConfig,
     context: &DhcpContext,
@@ -1332,6 +1367,7 @@ fn config_implies<'a>(
 }
 
 /// Validate that a static config is applicable for an address/context combination.
+#[allow(dead_code, unused_variables)]
 fn config_valid(
     config: &DhcpConfig,
     context: &DhcpContext,
@@ -1429,13 +1465,14 @@ fn calculate_times(
 ///
 /// Adds DNS recursive name servers, DNS search list, NTP servers,
 /// vendor-specific options, and other configuration parameters.
+#[allow(unused_variables)]
 fn add_options(
     state: &mut Dhcpv6State,
     do_refresh: bool,
     outpacket: &mut Dhcpv6OutPacket,
     daemon: &DaemonState,
 ) -> Vec<DhcpNetId> {
-    let mut taglist = Vec::new();
+    let taglist = Vec::new();
 
     // Check if client requested specific options via ORO (Option Request Option)
     // For now, we send the standard options regardless
@@ -1498,6 +1535,7 @@ fn add_options(
 }
 
 /// Add server's local addresses as DNS servers.
+#[allow(unused_variables)]
 fn add_local_addrs_from_context(
     context_idx: usize,
     outpacket: &mut Dhcpv6OutPacket,
@@ -1509,6 +1547,7 @@ fn add_local_addrs_from_context(
 }
 
 /// Extract and merge context-specific tags.
+#[allow(dead_code)]
 fn get_context_tag(state: &mut Dhcpv6State, context: &DhcpContext) {
     if !context.netid.net.is_empty() {
         state.context_tags.push(context.netid.clone());
@@ -1520,6 +1559,7 @@ fn get_context_tag(state: &mut Dhcpv6State, context: &DhcpContext) {
 // ===========================================================================
 
 /// Process IA options for a SOLICIT message — offer addresses.
+#[allow(unused_variables)]
 fn process_solicit_ia(
     state: &mut Dhcpv6State,
     ia_inner: &[u8],
@@ -1583,6 +1623,7 @@ fn process_solicit_ia(
 }
 
 /// Process IA options for a REQUEST message — allocate requested addresses.
+#[allow(unused_variables)]
 fn process_request_ia(
     state: &mut Dhcpv6State,
     ia_inner: &[u8],
@@ -1646,6 +1687,7 @@ fn process_request_ia(
 }
 
 /// Process IA options for RENEW/REBIND messages.
+#[allow(unused_variables)]
 fn process_renew_ia(
     state: &mut Dhcpv6State,
     ia_inner: &[u8],
@@ -1782,7 +1824,10 @@ fn process_release(
     let _now_secs = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .unwrap_or_else(|_| {
+            log::warn!("System clock is before UNIX epoch; using epoch 0 for lease times");
+            0
+        });
 
     // Iterate through IA options
     for (code, data) in Opt6Iter::new(opts) {
@@ -1860,7 +1905,10 @@ fn process_decline(
     let _now_secs = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .unwrap_or_else(|_| {
+            log::warn!("System clock is before UNIX epoch; using epoch 0 for lease times");
+            0
+        });
 
     for (code, data) in Opt6Iter::new(opts) {
         if code != OPTION6_IA_NA && code != OPTION6_IA_TA {
@@ -1917,6 +1965,7 @@ fn process_decline(
 /// Searches daemon's DHCP configuration list for a matching entry using
 /// client DUID, MAC address, or hostname. Uses `config_find_by_address6`
 /// from the server module and `common::find_config` for tag matching.
+#[allow(unused_variables)]
 fn find_client_config(
     state: &Dhcpv6State,
     daemon: &DaemonState,
@@ -1999,6 +2048,7 @@ fn find_context_for_address(contexts: &[DhcpContext], addr: &Ipv6Addr) -> Option
 ///
 /// The DhcpOption type is used for option matching in tag-based filtering,
 /// and DhcpOptFlags controls option behavior flags.
+#[allow(dead_code)]
 fn process_fqdn_option(
     state: &mut Dhcpv6State,
     opts: &[u8],
@@ -2059,6 +2109,7 @@ fn process_fqdn_option(
 /// Uses `DhcpRelay` configuration from daemon state to match relay
 /// agents against configured shared networks. The `SharedNetwork`
 /// type links interface indices and addresses to shared DHCP pools.
+#[allow(dead_code, unused_variables)]
 fn process_relay_options(
     state: &mut Dhcpv6State,
     relay_link_addr: &Ipv6Addr,
@@ -2092,6 +2143,7 @@ fn process_relay_options(
 /// Determines the correct response destination based on whether the
 /// message was relayed or direct. Uses `SocketAddress::V6` for
 /// constructing the destination socket address.
+#[allow(dead_code, unused_variables)]
 fn build_response_destination(
     state: &Dhcpv6State,
     client_addr: &Ipv6Addr,
@@ -2105,6 +2157,7 @@ fn build_response_destination(
 /// Evaluates conditional tag rules from daemon configuration and merges
 /// matching tags into the state. Uses `TagIf` for rule evaluation and
 /// `DhcpOption`/`DhcpOptFlags` for option filtering.
+#[allow(dead_code)]
 fn apply_tag_filtering(
     state: &mut Dhcpv6State,
     tag_if_rules: &[TagIf],
@@ -2136,6 +2189,7 @@ fn apply_tag_filtering(
 /// - `set_interface(lease, interface, now)` — Set interface (associated fn)
 /// - `add_extradata(lease, data, delim)` — Add extra data (associated fn)
 /// - `prune(self, target, now)` — Prune leases
+#[allow(dead_code)]
 fn perform_lease_operations(
     state: &Dhcpv6State,
     addr: &Ipv6Addr,
@@ -2235,6 +2289,7 @@ fn perform_lease_operations(
 ///
 /// Uses `DhcpRelay` for relay configuration display and `SharedNetwork`
 /// for shared network context logging.
+#[allow(dead_code)]
 fn log_relay_info(
     state: &Dhcpv6State,
     relay: &RelayMessage,

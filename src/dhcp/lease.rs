@@ -762,6 +762,14 @@ impl LeaseDatabase {
         self.leases_v4.get(addr)
     }
 
+    /// Look up an existing DHCPv4 lease by IP address and return a mutable reference.
+    ///
+    /// Used by the DHCP protocol engine to update lease attributes (expiry,
+    /// hardware address, hostname) when processing DHCPREQUEST messages.
+    pub fn find_by_addr_v4_mut(&mut self, addr: &Ipv4Addr) -> Option<&mut DhcpLease> {
+        self.leases_v4.get_mut(addr)
+    }
+
     /// Find a DHCPv4 lease by client identifier or hardware address.
     ///
     /// If a client ID is provided, search by client ID first. Otherwise,

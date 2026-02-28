@@ -508,6 +508,9 @@ pub struct ForwardRecord {
     pub additional_sources: Vec<ForwardRecordSource>,
     /// Server index, `None` means free.
     pub sentto: Option<usize>,
+    /// Address of the server this query was sent to (for RFC 5452 anti-spoofing validation).
+    /// Stored at send time so reply_query() can verify responses come from the expected source.
+    pub sentto_addr: Option<SocketAddress>,
     /// Rewritten transaction ID for the upstream query.
     pub new_id: u16,
     /// Non-zero to forward to all servers.
