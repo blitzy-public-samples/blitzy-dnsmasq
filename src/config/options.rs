@@ -286,12 +286,14 @@ pub enum LongOption {
     DnsDomain = 388,
     ExtraLog = 389,
     StickyOrder = 390,
+    /// `--test` — validate configuration syntax and exit without starting the daemon.
+    Test = 391,
 }
 
 impl LongOption {
     /// Convert a u16 value to a LongOption, if valid.
     pub fn from_u16(val: u16) -> Option<LongOption> {
-        if !(256..=390).contains(&val) {
+        if !(256..=391).contains(&val) {
             return None;
         }
         match val {
@@ -430,6 +432,7 @@ impl LongOption {
             388 => Some(LongOption::DnsDomain),
             389 => Some(LongOption::ExtraLog),
             390 => Some(LongOption::StickyOrder),
+            391 => Some(LongOption::Test),
             _ => None,
         }
     }
@@ -895,6 +898,7 @@ fn build_option_table() -> HashMap<String, (u16, bool)> {
     // Short options mapped to long-form names (from C opts[] array)
     ins("version", short_opt_id('v'), false);
     ins("help", short_opt_id('w'), false);
+    ins("test", LongOption::Test as u16, false);
     ins("no-hosts", short_opt_id('h'), false);
     ins("no-poll", short_opt_id('n'), false);
     ins("no-resolv", short_opt_id('R'), false);
@@ -1721,6 +1725,11 @@ impl ConfigBuilder {
             }
             id if id == short_opt_id('w') => {
                 self.show_help = true;
+                Ok(())
+            }
+            id if id == LongOption::Test as u16 => {
+                // --test: validate configuration syntax and exit.
+                self.test_mode = true;
                 Ok(())
             }
 
