@@ -22,7 +22,7 @@
 //! - DNS name lookups are **case-insensitive** per RFC 4343.
 //! - DHCP tests are gated with `#[cfg(feature = "dhcp")]`.
 //! - Zero `unsafe` blocks in test code.
-//! - TTL-based expiration tests use `std::thread::sleep` for reliable timing.
+//! - TTL-based expiration tests use `Instant` arithmetic for deterministic timing.
 
 use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -677,9 +677,11 @@ fn test_ttl_expiration() {
         )
         .unwrap();
 
-    // Wait for TTL to elapse (2s provides reliable margin).
-    std::thread::sleep(Duration::from_secs(2));
-    let after = Instant::now();
+    // Simulate time advancement by computing a future Instant rather than using
+    // thread::sleep, avoiding timing-dependent flakiness on slow CI runners.
+    // The cache uses the passed-in Instant to compute epoch-based TTD comparisons,
+    // so advancing the Instant by more than the TTL is sufficient.
+    let after = now + Duration::from_secs(2);
 
     // find_by_name skips expired entries.
     let results = cache.find_by_name("expiring.example.com", after, CacheEntryFlags::IPV4);

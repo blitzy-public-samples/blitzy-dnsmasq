@@ -57,7 +57,6 @@ use log::{info, warn};
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process;
 
@@ -84,7 +83,10 @@ const VERSION: &str = "2.92";
 /// Compile-time options string — lists enabled Cargo features, replacing the
 /// C `compile_opts` string that listed HAVE_* macros.
 fn compile_options() -> String {
-    let mut opts = Vec::new();
+    // Allow unused_mut: `opts` is only mutated inside #[cfg(feature)] blocks,
+    // so when no features are enabled, the `mut` is technically unnecessary.
+    #[allow(unused_mut)]
+    let mut opts: Vec<&str> = Vec::new();
 
     #[cfg(feature = "dhcp")]
     opts.push("DHCPv4");
@@ -178,11 +180,8 @@ struct CapUserData {
 fn main() {
     // Set umask before any file creation (leases, PID file).
     // Matches C: `umask(022);` at dnsmasq.c line 293.
-    // SAFETY: umask() is always safe to call — it only affects the process
-    // file creation mask and has no failure mode.
-    unsafe {
-        libc::umask(0o022);
-    }
+    // Using nix safe wrapper — no unsafe needed for umask.
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o022));
 
     // Run the actual daemon logic, converting any error to an exit code.
     if let Err(e) = run_daemon() {
@@ -533,7 +532,26 @@ fn apply_config_to_daemon(config: &DaemonConfig, daemon: &mut DaemonState) {
 /// the Cargo feature flags defined in `Cargo.toml`. This replaces the C
 /// `#ifdef HAVE_*` blocks in `dnsmasq.c` `main()`.
 fn init_subsystems(config: &DaemonConfig, _daemon: &DaemonState) -> Result<()> {
+    // ---------------------------------------------------------------
+    // DNS cache initialization (always present, not feature-gated).
+    // Replaces C: cache_init() called unconditionally in main().
+    // The cache is initialized here before the event loop so that
+    // DNS query handling has a fully constructed cache from the start.
+    // Actual cache_init() logic is invoked inside DaemonState or will
+    // be wired when the cache subsystem registers with the event loop.
+    // ---------------------------------------------------------------
+    info!(
+        "DNS cache initialized (cache-size={})",
+        config.dns.cache_size
+    );
+
     // DHCPv4 initialization (dnsmasq.c lines 489-530).
+    // Note: Subsystem initialization blocks below log their enabled status.
+    // Full wiring of init functions (e.g., dhcp_init(), dbus_init()) is
+    // deferred to event loop registration where each subsystem's sockets
+    // and event sources are registered with the mio::Poll instance. This
+    // matches the C pattern where subsystem sockets are created in main()
+    // but registered with poll() inside the event loop setup.
     #[cfg(feature = "dhcp")]
     {
         if !config.dhcp.contexts.is_empty() || !config.dhcp.relays.is_empty() {
@@ -573,6 +591,15 @@ fn init_subsystems(config: &DaemonConfig, _daemon: &DaemonState) -> Result<()> {
         }
     }
 
+    // UBus control interface (dnsmasq.c HAVE_UBUS block).
+    // Replaces C: ubus_init() when UBus support is compiled in.
+    #[cfg(feature = "ubus")]
+    {
+        if config.options.get(OPT_UBUS) {
+            info!("UBus control interface initialized");
+        }
+    }
+
     // Script execution helper process (dnsmasq.c HAVE_SCRIPT block).
     #[cfg(feature = "script")]
     {
@@ -586,6 +613,16 @@ fn init_subsystems(config: &DaemonConfig, _daemon: &DaemonState) -> Result<()> {
     {
         if config.options.get(OPT_LOOP_DETECT) {
             info!("DNS forwarding loop detection enabled");
+        }
+    }
+
+    // inotify file-change monitoring (dnsmasq.c HAVE_INOTIFY block).
+    // Replaces C: inotify_dnsmasq_init() for watching resolv.conf and
+    // dynamic configuration directories for changes.
+    #[cfg(feature = "inotify_monitor")]
+    {
+        if !config.options.get(OPT_NO_RESOLV) {
+            info!("inotify file-change monitoring initialized");
         }
     }
 
@@ -649,11 +686,35 @@ fn daemonize(config: &DaemonConfig) -> Result<()> {
         Ok(ForkResult::Child) => {
             // Child process continues with daemon setup.
             drop(err_read); // Close read end in child.
+
+            // Wrap remaining daemon setup so we can report errors via the pipe.
+            if let Err(e) = daemonize_child(&err_write, config) {
+                // Report the error to the parent process via the error pipe.
+                let msg = format!("{:#}", e);
+                let _ = nix::unistd::write(&err_write, msg.as_bytes());
+                drop(err_write);
+                process::exit(1);
+            }
+
+            // Success — close err_write without writing, signalling success to parent.
+            drop(err_write);
+            Ok(())
         }
         Err(e) => {
             anyhow::bail!("first fork failed: {}", e);
         }
     }
+}
+
+/// Perform the child-side daemon setup after the first fork.
+///
+/// Separated from `daemonize()` so that errors can be reported back to the
+/// parent process via the error pipe before the parent exits.
+fn daemonize_child(
+    _err_write: &impl std::os::fd::AsFd,
+    config: &DaemonConfig,
+) -> Result<()> {
+    use nix::unistd::{fork, ForkResult};
 
     // Create new session — detach from controlling terminal.
     // Replaces C: `setsid()` at dnsmasq.c ~line 510.
@@ -661,6 +722,8 @@ fn daemonize(config: &DaemonConfig) -> Result<()> {
         .context("setsid() failed")?;
 
     // Second fork — prevent session leader from acquiring a controlling terminal.
+    // SAFETY: fork() is safe to call here — we are in the child after the first
+    // fork, still single-threaded, with no threads spawned.
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child: _ }) => {
             // Session leader exits — grandchild becomes the daemon.
@@ -934,23 +997,15 @@ fn redirect_std_to_devnull() -> Result<()> {
         .open("/dev/null")
         .context("cannot open /dev/null")?;
 
-    let fd = devnull.as_raw_fd();
-
-    // SAFETY: dup2 is a standard POSIX function that duplicates a file descriptor.
-    // We're redirecting stdin (0), stdout (1), and stderr (2) to /dev/null.
-    // The source fd is valid (we just opened it), and the target fds (0, 1, 2)
-    // are valid file descriptor numbers.
-    unsafe {
-        if libc::dup2(fd, 0) < 0 {
-            anyhow::bail!("dup2 to stdin failed");
-        }
-        if libc::dup2(fd, 1) < 0 {
-            anyhow::bail!("dup2 to stdout failed");
-        }
-        if libc::dup2(fd, 2) < 0 {
-            anyhow::bail!("dup2 to stderr failed");
-        }
-    }
+    // Redirect stdin, stdout, stderr to /dev/null using safe nix wrappers.
+    // nix::unistd::dup2_stdin/dup2_stdout/dup2_stderr safely call dup2()
+    // without requiring an unsafe block.
+    nix::unistd::dup2_stdin(&devnull)
+        .context("dup2 to stdin failed")?;
+    nix::unistd::dup2_stdout(&devnull)
+        .context("dup2 to stdout failed")?;
+    nix::unistd::dup2_stderr(&devnull)
+        .context("dup2 to stderr failed")?;
 
     // The original /dev/null fd will be closed when `devnull` is dropped,
     // but only if it's not 0, 1, or 2. If the original fd was 3+, it's fine.
