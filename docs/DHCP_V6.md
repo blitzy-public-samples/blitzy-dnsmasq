@@ -33,13 +33,13 @@ Dnsmasq implements both DHCPv6 server functionality (RFC 3315) and IPv6 Router A
 
 | File | Purpose |
 |------|---------|
-| `src/dhcp6.c` | Main DHCPv6 server logic, address allocation, context management |
-| `src/rfc3315.c` | DHCPv6 protocol message handling per RFC 3315 |
-| `src/outpacket.c` | DHCPv6 option encoding and packet buffer management |
-| `src/radv.c` | Router Advertisement transmission (ICMPv6 RA messages) |
-| `src/slaac.c` | SLAAC address confirmation and duplicate detection |
-| `src/dhcp6-protocol.h` | DHCPv6 protocol constants and message structures |
-| `src/radv-protocol.h` | Router Advertisement protocol constants |
+| `src/dhcp/v6/server.rs` | Main DHCPv6 server logic, address allocation, context management |
+| `src/dhcp/v6/rfc3315.rs` | DHCPv6 protocol message handling per RFC 3315 |
+| `src/dhcp/v6/outpacket.rs` | DHCPv6 option encoding and packet buffer management |
+| `src/dhcp/radv/server.rs` | Router Advertisement transmission (ICMPv6 RA messages) |
+| `src/dhcp/radv/slaac.rs` | SLAAC address confirmation and duplicate detection |
+| `src/dhcp/protocol_v6.rs` | DHCPv6 protocol constants and message structures |
+| `src/dhcp/radv/protocol.rs` | Router Advertisement protocol constants |
 
 ### Default Configuration Parameters
 
@@ -47,7 +47,7 @@ Dnsmasq implements both DHCPv6 server functionality (RFC 3315) and IPv6 Router A
 |-----------|---------------|--------|-------------|
 | DHCPv6 Server Port | 547 | `DHCPV6_SERVER_PORT` | Server listens on UDP port 547 |
 | DHCPv6 Client Port | 546 | `DHCPV6_CLIENT_PORT` | Responses sent to UDP port 546 |
-| Default Lease Time | 86400 seconds (24 hours) | `DEFLEASE6` (config.h:51) | Much longer than DHCPv4 due to IPv6 address abundance |
+| Default Lease Time | 86400 seconds (24 hours) | `DEFLEASE6` in `src/config/constants.rs` | Much longer than DHCPv4 due to IPv6 address abundance |
 | Minimum Refresh Time | 600 seconds (10 minutes) | RFC 4242 | Minimum lease refresh interval |
 
 ---
@@ -127,7 +127,7 @@ The `ra-only` keyword configures Router Advertisement without DHCPv6 server func
 
 ## DHCPv6 Message Processing Flow
 
-DHCPv6 uses a series of message exchanges between clients and servers. The implementation in `src/rfc3315.c` handles all DHCPv6 message types.
+DHCPv6 uses a series of message exchanges between clients and servers. The implementation in `src/dhcp/v6/rfc3315.rs` handles all DHCPv6 message types.
 
 ### Four-Message Exchange (Stateful)
 
@@ -149,26 +149,26 @@ sequenceDiagram
 
 ### Message Type Handling
 
-Source: `src/rfc3315.c`, function `dhcp6_no_relay()` (lines ~600-1200)
+Source: `src/dhcp/v6/rfc3315.rs`, function `Rfc3315Handler::process_message()`
 
-The main message processing logic uses a switch statement to route DHCPv6 messages:
+The main message processing logic uses a match expression to route DHCPv6 messages:
 
 | Message Type | Value | Handler | Purpose |
 |--------------|-------|---------|---------|
-| SOLICIT | 1 | Case at line ~700 | Client seeks available servers and addresses |
+| SOLICIT | 1 | SOLICIT match arm | Client seeks available servers and addresses |
 | ADVERTISE | 2 | (Server→Client) | Server offers address (sent by dnsmasq) |
-| REQUEST | 3 | Case at line ~900 | Client requests specific address |
-| CONFIRM | 4 | Case at line ~1050 | Client confirms addresses still valid |
-| RENEW | 5 | Case at line ~950 | Client extends existing lease |
-| REBIND | 6 | Case at line ~950 | Client seeks any server to extend lease |
+| REQUEST | 3 | REQUEST match arm | Client requests specific address |
+| CONFIRM | 4 | CONFIRM match arm | Client confirms addresses still valid |
+| RENEW | 5 | RENEW match arm | Client extends existing lease |
+| REBIND | 6 | REBIND match arm | Client seeks any server to extend lease |
 | REPLY | 7 | (Server→Client) | Server response (sent by dnsmasq) |
-| RELEASE | 8 | Case at line ~1100 | Client releases address |
-| DECLINE | 9 | Case at line ~1150 | Client declines offered address |
-| INFORMATION-REQUEST | 11 | Case at line ~1000 | Stateless request for configuration only |
+| RELEASE | 8 | RELEASE match arm | Client releases address |
+| DECLINE | 9 | DECLINE match arm | Client declines offered address |
+| INFORMATION-REQUEST | 11 | INFORMATION-REQUEST match arm | Stateless request for configuration only |
 
 ### SOLICIT Processing
 
-Source: `src/rfc3315.c:700-850` (approximate)
+Source: `src/dhcp/v6/rfc3315.rs`, SOLICIT handler
 
 1. **Receive SOLICIT message** from client on UDP port 547
 2. **Extract IA_NA options** (Identity Association for Non-temporary Addresses)
@@ -179,18 +179,18 @@ Source: `src/rfc3315.c:700-850` (approximate)
 
 ### REQUEST Processing
 
-Source: `src/rfc3315.c:900-950` (approximate)
+Source: `src/dhcp/v6/rfc3315.rs`, REQUEST handler
 
 1. **Receive REQUEST message** following ADVERTISE
 2. **Validate server DUID** matches dnsmasq's DUID
 3. **Allocate address** from pool for requested IA_NA
-4. **Create lease** in lease database (`src/lease.c`)
+4. **Create lease** in lease database (`src/dhcp/lease.rs`)
 5. **Register hostname in DNS cache** if hostname provided
 6. **Send REPLY** with confirmed address assignment, lease lifetime (T1/T2 timers)
 
 ### RENEW/REBIND Processing
 
-Source: `src/rfc3315.c:950-1000` (approximate)
+Source: `src/dhcp/v6/rfc3315.rs`, RENEW/REBIND handler
 
 Both RENEW and REBIND extend existing leases:
 
@@ -205,7 +205,7 @@ Processing:
 
 ### INFORMATION-REQUEST Processing (Stateless)
 
-Source: `src/rfc3315.c:1000-1050` (approximate)
+Source: `src/dhcp/v6/rfc3315.rs`, INFORMATION-REQUEST handler
 
 For stateless DHCPv6 (O=1, M=0):
 
@@ -218,7 +218,7 @@ For stateless DHCPv6 (O=1, M=0):
 
 ### CONFIRM Processing
 
-Source: `src/rfc3315.c:1050-1100` (approximate)
+Source: `src/dhcp/v6/rfc3315.rs`, CONFIRM handler
 
 Clients use CONFIRM after network reconnection to validate addresses:
 
@@ -230,7 +230,7 @@ Clients use CONFIRM after network reconnection to validate addresses:
 
 ### RELEASE Processing
 
-Source: `src/rfc3315.c:1100-1150` (approximate)
+Source: `src/dhcp/v6/rfc3315.rs`, RELEASE handler
 
 1. **Receive RELEASE** from client
 2. **Remove lease** from database
@@ -240,7 +240,7 @@ Source: `src/rfc3315.c:1100-1150` (approximate)
 
 ### DECLINE Processing
 
-Source: `src/rfc3315.c:1150-1200` (approximate)
+Source: `src/dhcp/v6/rfc3315.rs`, DECLINE handler
 
 Clients send DECLINE if duplicate address detected:
 
@@ -264,7 +264,7 @@ DHCPv6 uses **Identity Associations (IA)** to manage address assignments. Each I
 
 ### Address Selection Algorithm
 
-Source: `src/dhcp6.c`, function `address6_allocate()` (approximate line 400-600)
+Source: `src/dhcp/v6/server.rs`, function `Dhcpv6Server::allocate_address()`
 
 The address allocation algorithm:
 
@@ -288,7 +288,7 @@ DHCPv6 leases include multiple time values:
 | **T1 (Renewal Time)** | Valid / 2 | Client sends RENEW to original server at T1 |
 | **T2 (Rebind Time)** | Valid * 4/5 | Client broadcasts REBIND to any server at T2 |
 
-Configuration: `DEFLEASE6` in `src/config.h:51`, default 86400 seconds (24 hours)
+Configuration: `DEFLEASE6` in `src/config/constants.rs`, default 86400 seconds (24 hours)
 
 ### Address Pool Configuration
 
@@ -306,7 +306,7 @@ dhcp-host=id:00:01:00:01:xx:xx:xx:xx,2001:db8:1::50,[client-hostname]
 
 ### Lease Database Integration
 
-Source: `src/lease.c`
+Source: `src/dhcp/lease.rs`
 
 DHCPv6 leases are stored in the same lease database as DHCPv4:
 
@@ -329,7 +329,7 @@ Integration with DNS:
 
 ### IA_PD Snooping in Relay Mode
 
-Source: `src/rfc3315.c`, function `relay_reply6()` (lines ~450-550)
+Source: `src/dhcp/v6/rfc3315.rs`, function `Rfc3315Handler::relay_reply()`
 
 When operating as a DHCPv6 relay, dnsmasq can monitor prefix delegation:
 
@@ -358,7 +358,7 @@ Router Advertisement (RA) is essential for IPv6 autoconfiguration. Dnsmasq imple
 
 ### Router Advertisement Message Structure
 
-Source: `src/radv.c`, function `send_ra()` (approximate lines 300-600)
+Source: `src/dhcp/radv/server.rs`, function `RadvServer::send_ra()`
 
 RA messages include:
 
@@ -373,7 +373,7 @@ RA messages include:
 
 ### Prefix Information Option
 
-Source: `src/radv-protocol.h`, struct definitions
+Source: `src/dhcp/radv/protocol.rs`, struct definitions
 
 Each prefix includes:
 
@@ -396,7 +396,7 @@ Flags:
 
 ### RDNSS Option (Recursive DNS Server)
 
-Source: RFC 6106, implemented in `src/radv.c:400-450` (approximate)
+Source: RFC 6106, implemented in `src/dhcp/radv/server.rs`
 
 Dnsmasq automatically includes its own IPv6 address as RDNSS:
 
@@ -412,7 +412,7 @@ struct rdnss_opt {
 
 ### RA Transmission Timing
 
-Source: `src/radv.c:200-250` (approximate)
+Source: `src/dhcp/radv/server.rs`
 
 Router Advertisements are transmitted:
 - **Periodic unsolicited**: Every 200-600 seconds (randomized per RFC 4861)
@@ -463,7 +463,7 @@ dhcp-range=2001:db8:1::,ra-names,64
 
 ### Stateless Address Autoconfiguration
 
-Source: `src/slaac.c`
+Source: `src/dhcp/radv/slaac.rs`
 
 SLAAC allows clients to self-assign IPv6 addresses from advertised prefixes. The process:
 
@@ -477,7 +477,7 @@ SLAAC allows clients to self-assign IPv6 addresses from advertised prefixes. The
 
 ### SLAAC Confirmation in Dnsmasq
 
-Source: `src/slaac.c`, function `slaac_add_addrs()` (approximate)
+Source: `src/dhcp/radv/slaac.rs`, function `SlaacProber::add_addrs()`
 
 Dnsmasq performs SLAAC address confirmation:
 
@@ -542,7 +542,7 @@ sequenceDiagram
 
 ### Rapid Commit Processing
 
-Source: `src/rfc3315.c`, SOLICIT case (approximate lines 700-850)
+Source: `src/dhcp/v6/rfc3315.rs`, SOLICIT case
 
 Logic flow:
 
@@ -582,32 +582,32 @@ dhcp-range=2001:db8:1::100,2001:db8:1::1ff,slaac,rapid-commit,64,24h
 
 ### Outpacket Buffer Management
 
-Source: `src/outpacket.c`
+Source: `src/dhcp/v6/outpacket.rs`
 
 DHCPv6 uses a sophisticated option encoding system. The `outpacket` module manages a buffer for constructing DHCPv6 replies.
 
 #### Core Data Structure
 
-```c
-struct dhcp_outpacket {
-    size_t len;              // Current buffer length
-    size_t capacity;         // Total buffer capacity
-    unsigned char *buf;      // Option buffer
-};
+```rust
+pub struct OutpacketBuilder {
+    len: usize,              // Current buffer length
+    capacity: usize,         // Total buffer capacity
+    buf: Vec<u8>,            // Option buffer
+}
 ```
 
 #### Key Functions
 
-| Function | Purpose | Source Location |
-|----------|---------|-----------------|
-| `reset_outpacket()` | Initialize buffer for new reply | outpacket.c:50-60 (approx) |
-| `save_outpacket()` | Save position for nested options | outpacket.c:70-80 (approx) |
-| `end_outpacket()` | Finalize option length field | outpacket.c:90-100 (approx) |
-| `put_opt6()` | Add simple option to buffer | outpacket.c:110-130 (approx) |
-| `put_opt6_string()` | Add string option | outpacket.c:140-160 (approx) |
-| `put_opt6_char()` | Add single byte | outpacket.c:170-180 (approx) |
-| `put_opt6_short()` | Add 16-bit value | outpacket.c:190-200 (approx) |
-| `put_opt6_long()` | Add 32-bit value | outpacket.c:210-220 (approx) |
+| Function | Purpose | Source Module |
+|----------|---------|--------------|
+| `OutpacketBuilder::reset()` | Initialize buffer for new reply | `src/dhcp/v6/outpacket.rs` |
+| `OutpacketBuilder::save()` | Save position for nested options | `src/dhcp/v6/outpacket.rs` |
+| `OutpacketBuilder::end()` | Finalize option length field | `src/dhcp/v6/outpacket.rs` |
+| `OutpacketBuilder::put_opt()` | Add simple option to buffer | `src/dhcp/v6/outpacket.rs` |
+| `OutpacketBuilder::put_opt_string()` | Add string option | `src/dhcp/v6/outpacket.rs` |
+| `OutpacketBuilder::put_opt_char()` | Add single byte | `src/dhcp/v6/outpacket.rs` |
+| `OutpacketBuilder::put_opt_short()` | Add 16-bit value | `src/dhcp/v6/outpacket.rs` |
+| `OutpacketBuilder::put_opt_long()` | Add 32-bit value | `src/dhcp/v6/outpacket.rs` |
 
 ### DHCPv6 Option Format
 
@@ -625,7 +625,7 @@ DHCPv6 options use Type-Length-Value (TLV) encoding:
 
 ### Standard DHCPv6 Options
 
-Source: `src/dhcp6-protocol.h`
+Source: `src/dhcp/protocol_v6.rs`
 
 Commonly used options:
 
@@ -648,38 +648,37 @@ Commonly used options:
 
 ### Option Construction Example
 
-Source: `src/rfc3315.c`, function `add_options()` (lines 1400-1550 approximate)
+Source: `src/dhcp/v6/rfc3315.rs`, function `Rfc3315Handler::add_options()`
 
 Building a REPLY message with multiple options:
 
-```c
+```rust
 // 1. Add Server DUID
-put_opt6(OPTION_SERVERID, daemon->duid_len);
-put_opt6_data(daemon->duid, daemon->duid_len);
+builder.put_opt(OPTION_SERVERID, &daemon_state.duid);
 
 // 2. Add DNS Servers (OPTION_DNS_SERVER)
-if (daemon->dns_server_addrs) {
-    put_opt6(OPTION_DNS_SERVER, 16 * num_servers);
-    for (each server)
-        put_opt6_data(&server->addr, 16);  // IPv6 address = 16 bytes
+if let Some(ref dns_servers) = daemon_state.dns_server_addrs {
+    let addrs: Vec<u8> = dns_servers.iter()
+        .flat_map(|s| s.octets())
+        .collect();
+    builder.put_opt(OPTION_DNS_SERVER, &addrs);  // IPv6 address = 16 bytes each
 }
 
 // 3. Add Domain Search List (OPTION_DOMAIN_SEARCH)
-put_opt6(OPTION_DOMAIN_SEARCH, encoded_domain_length);
-put_opt6_data(encoded_domains, length);
+builder.put_opt(OPTION_DOMAIN_SEARCH, &encoded_domains);
 
 // 4. Add IA_NA with address
-save_outpacket();  // Save position for length calculation
-put_opt6_long(OPTION_IA_NA);
-put_opt6_long(iaid);           // IAID from client
-put_opt6_long(t1_time);        // T1 renewal time
-put_opt6_long(t2_time);        // T2 rebind time
+builder.save();  // Save position for length calculation
+builder.put_opt_long(OPTION_IA_NA);
+builder.put_opt_long(iaid);           // IAID from client
+builder.put_opt_long(t1_time);        // T1 renewal time
+builder.put_opt_long(t2_time);        // T2 rebind time
     // Nested OPTION_IAADDR
-    put_opt6(OPTION_IAADDR, 24);
-    put_opt6_data(&client_addr, 16);   // IPv6 address
-    put_opt6_long(preferred_lifetime);
-    put_opt6_long(valid_lifetime);
-end_outpacket();   // Calculate and write IA_NA length
+    builder.put_opt(OPTION_IAADDR, &iaaddr_data);
+    builder.put_opt_data(&client_addr.octets());   // IPv6 address
+    builder.put_opt_long(preferred_lifetime);
+    builder.put_opt_long(valid_lifetime);
+builder.end();   // Calculate and write IA_NA length
 ```
 
 ### Nested Options
@@ -777,7 +776,7 @@ dhcp-range=interface:eth1,2001:db8:4::,ra-only,64
 
 ### DHCPv6 Option Configuration
 
-Source: Configuration examples from `dnsmasq.conf.example` lines 191-220 (approximate)
+Source: Configuration examples from `dnsmasq.conf.example`
 
 #### Common DHCPv6 Options
 
@@ -888,7 +887,7 @@ All required message types implemented:
 
 #### DUID Types (Section 9)
 
-Source: `src/dhcp6.c`, function `make_duid()` (approximate lines 100-200)
+Source: `src/dhcp/v6/server.rs`, function `Dhcpv6Server::make_duid()`
 
 Dnsmasq generates Server DUID:
 
@@ -900,7 +899,7 @@ Client DUIDs accepted in all formats.
 
 #### Options Implemented
 
-Source: `src/dhcp6-protocol.h`
+Source: `src/dhcp/protocol_v6.rs`
 
 Core options per RFC 3315:
 - ✅ Client Identifier (1)
@@ -930,7 +929,7 @@ Extended options:
 
 #### Lease Timers (Section 22.4)
 
-Default values source: `src/config.h:51`
+Default values source: `src/config/constants.rs`
 
 - **Valid Lifetime**: 86400 seconds (24 hours, DEFLEASE6)
 - **Preferred Lifetime**: 86400 seconds (same as valid)
@@ -972,7 +971,7 @@ Configurable via `ra-param` directive.
 
 ### RDNSS Option Compliance (RFC 6106)
 
-Source: `src/radv.c`, RDNSS implementation (approximate lines 400-500)
+Source: `src/dhcp/radv/server.rs`, RDNSS implementation
 
 RDNSS option fields:
 - **Type**: 25
@@ -1106,18 +1105,18 @@ For advanced prefix delegation, enterprise-scale deployments, or complex multi-t
 ## References
 
 ### Source Files
-- `src/dhcp6.c` - DHCPv6 server implementation, address allocation, context management
-- `src/rfc3315.c` - DHCPv6 protocol message handling, main message loop
-- `src/outpacket.c` - DHCPv6 option encoding, packet buffer management
-- `src/radv.c` - Router Advertisement transmission, RDNSS option construction
-- `src/slaac.c` - SLAAC address confirmation, duplicate address detection
-- `src/dhcp6-protocol.h` - DHCPv6 protocol constants, option codes, message types
-- `src/radv-protocol.h` - Router Advertisement protocol structures, ICMPv6 constants
-- `src/config.h` - Compile-time defaults (DEFLEASE6 at line 51)
-- `src/lease.c` - Lease database management (shared with DHCPv4)
+- `src/dhcp/v6/server.rs` - DHCPv6 server implementation, address allocation, context management
+- `src/dhcp/v6/rfc3315.rs` - DHCPv6 protocol message handling, main message loop
+- `src/dhcp/v6/outpacket.rs` - DHCPv6 option encoding, packet buffer management
+- `src/dhcp/radv/server.rs` - Router Advertisement transmission, RDNSS option construction
+- `src/dhcp/radv/slaac.rs` - SLAAC address confirmation, duplicate address detection
+- `src/dhcp/protocol_v6.rs` - DHCPv6 protocol constants, option codes, message types
+- `src/dhcp/radv/protocol.rs` - Router Advertisement protocol structures, ICMPv6 constants
+- `src/config/constants.rs` - Compile-time defaults (DEFLEASE6)
+- `src/dhcp/lease.rs` - Lease database management (shared with DHCPv4)
 
 ### Configuration
-- `dnsmasq.conf.example` - Complete configuration examples (lines 191-220 for DHCPv6)
+- `dnsmasq.conf.example` - Complete configuration examples for DHCPv6
 
 ### RFCs
 - RFC 3315 - Dynamic Host Configuration Protocol for IPv6 (DHCPv6)
@@ -1134,4 +1133,4 @@ For advanced prefix delegation, enterprise-scale deployments, or complex multi-t
 - `docs/DHCP_V4.md` - DHCPv4 implementation details
 - `docs/ARCHITECTURE.md` - System architecture and event loop
 - `docs/DNS_FORWARDING.md` - DNS integration for DHCPv6 hostname registration
-- `docs/BUILDING.md` - Compilation flags (HAVE_DHCP6)
+- `docs/BUILDING.md` - Cargo feature flags (`dhcp6`)

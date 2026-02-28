@@ -1,0 +1,115 @@
+[package]
+name = "dnsmasq"
+version = "2.92.0"
+edition = "2024"
+rust-version = "1.93"
+authors = ["Simon Kelley <simon@thekelleys.org.uk>"]
+description = "Lightweight DNS forwarder, DHCP server, TFTP server, and Router Advertisement daemon"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/thekelleys/dnsmasq"
+readme = "README.md"
+build = "build.rs"
+
+[[bin]]
+name = "dnsmasq"
+path = "src/main.rs"
+
+[lib]
+name = "dnsmasq"
+path = "src/lib.rs"
+
+[features]
+# Default features match C defaults from config.h lines 845-846
+default = ["dhcp", "dhcp6", "tftp", "script", "auth", "ipset", "loop_detect", "dump"]
+
+# DHCPv4 support (HAVE_DHCP)
+dhcp = []
+
+# DHCPv6 support (HAVE_DHCP6) - requires dhcp
+dhcp6 = ["dhcp"]
+
+# DNSSEC validation (HAVE_DNSSEC) - uses ring crate
+dnssec = ["dep:ring"]
+
+# D-Bus control interface (HAVE_DBUS) - requires libdbus-1
+dbus = ["dep:dbus"]
+
+# OpenWrt UBus interface (HAVE_UBUS)
+ubus = []
+
+# TFTP server (HAVE_TFTP)
+tftp = []
+
+# Script execution for lease events (HAVE_SCRIPT)
+script = []
+
+# Authoritative DNS (HAVE_AUTH)
+auth = []
+
+# Linux ipset integration (HAVE_IPSET) - uses netlink message construction
+ipset = ["dep:netlink-packet-core"]
+
+# nftables set population (HAVE_NFTSET) - requires libnftables
+nftset = []
+
+# Linux netlink platform networking (NETLINK_ROUTE interface/route monitoring)
+netlink = ["dep:netlink-packet-route", "dep:netlink-sys", "dep:netlink-packet-core"]
+
+# inotify file monitoring (HAVE_INOTIFY) - Linux only
+# Uses nix::sys::inotify (safe wrapper) instead of the standalone inotify crate
+# to avoid pulling in the tokio async runtime as a transitive dependency.
+inotify_monitor = []
+
+# Conntrack mark retrieval (HAVE_CONNTRACK) - requires libnetfilter_conntrack
+conntrack = []
+
+# DNS forwarding loop detection (HAVE_LOOP)
+loop_detect = []
+
+# Pcap packet dumping (HAVE_DUMPFILE)
+dump = ["dep:pcap-file"]
+
+# IDNA internationalized domain names (HAVE_LIBIDN2)
+idn = ["dep:idna"]
+
+[dependencies]
+# Core dependencies (always required)
+mio = { version = "1.1.0", features = ["os-poll", "os-ext", "net"] }
+nix = { version = "0.30.1", features = ["signal", "socket", "net", "ioctl", "process", "fs", "poll", "user", "uio", "inotify"] }
+libc = "0.2.171"
+log = "0.4.27"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+bitflags = "2.9.0"
+thiserror = "2.0.12"
+anyhow = "1.0.98"
+bytes = "1.10.1"
+cfg-if = "1.0.0"
+socket2 = { version = "0.5.9", features = ["all"] }
+rand = "0.9.1"
+
+# Optional dependencies (feature-gated)
+ring = { version = "0.17.14", optional = true }
+dbus = { version = "0.9.7", optional = true }
+pcap-file = { version = "2.0.0", optional = true }
+idna = { version = "1.0.3", optional = true }
+
+# Netlink dependencies (Linux-specific, optional)
+netlink-packet-core = { version = "0.7.0", optional = true }
+netlink-packet-route = { version = "0.21.0", optional = true }
+netlink-sys = { version = "0.8.7", optional = true }
+
+[build-dependencies]
+cc = "1.2.16"
+pkg-config = "0.3.31"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

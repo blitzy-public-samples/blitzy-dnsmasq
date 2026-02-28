@@ -31,12 +31,12 @@
 The dnsmasq DHCPv4 server provides complete Dynamic Host Configuration Protocol functionality conforming to **RFC 2131** (Dynamic Host Configuration Protocol). The implementation supports both static lease reservations and dynamic address allocation from configured pools, with seamless DNS integration for automatic hostname resolution.
 
 **Primary Source Files:**
-- `src/dhcp.c` - Core DHCPv4 server logic, address allocation, socket management
-- `src/rfc2131.c` - RFC 2131 protocol implementation, message type processing
-- `src/dhcp-common.c` - Shared DHCP utilities, option parsing, tag matching
-- `src/lease.c` - Lease database management, persistence, script invocation
-- `src/dhcp-protocol.h` - DHCPv4 protocol constants and packet structure definitions
-- `src/helper.c` - External script execution for lease change events
+- `src/dhcp/v4/server.rs` - Core DHCPv4 server logic, address allocation, socket management
+- `src/dhcp/v4/rfc2131.rs` - RFC 2131 protocol implementation, message type processing
+- `src/dhcp/common.rs` - Shared DHCP utilities, option parsing, tag matching
+- `src/dhcp/lease.rs` - Lease database management, persistence, script invocation
+- `src/dhcp/protocol_v4.rs` - DHCPv4 protocol constants and packet structure definitions
+- `src/dhcp/helper.rs` - External script execution for lease change events
 
 **Key Capabilities:**
 - Full RFC 2131 DHCP protocol with four-phase message exchange (DISCOVER→OFFER→REQUEST→ACK)
@@ -63,7 +63,7 @@ The dnsmasq DHCPv4 server provides complete Dynamic Host Configuration Protocol 
 
 The DHCPv4 implementation embodies dnsmasq's core design principles:
 
-**Resource Efficiency**: Designed for embedded systems and small networks, supporting up to 1000 concurrent leases (MAXLEASES in `src/config.h:40`) with minimal memory footprint.
+**Resource Efficiency**: Designed for embedded systems and small networks, supporting up to 1000 concurrent leases (MAXLEASES in `src/config/constants.rs`) with minimal memory footprint.
 
 **Operational Simplicity**: Zero-configuration defaults enable immediate deployment, while extensive configuration options support complex enterprise scenarios when needed.
 
@@ -81,28 +81,28 @@ DHCP (Dynamic Host Configuration Protocol) automates TCP/IP configuration for ne
 
 **Core Protocol Elements:**
 
-```c
-/* DHCP Packet Structure - Source: src/dhcp-protocol.h:19-42 */
-struct dhcp_packet {
-  u8 op;              /* Message op code / message type (1=BOOTREQUEST, 2=BOOTREPLY) */
-  u8 htype;           /* Hardware address type (1=Ethernet) */
-  u8 hlen;            /* Hardware address length (6 for Ethernet MAC) */
-  u8 hops;            /* Relay agent hop count */
-  u32 xid;            /* Transaction ID (random value from client) */
-  u16 secs;           /* Seconds elapsed since client began process */
-  u16 flags;          /* Flags (bit 0: broadcast flag) */
-  struct in_addr ciaddr;  /* Client IP address (filled in by client in BOUND state) */
-  struct in_addr yiaddr;  /* 'Your' IP address (server's address offer to client) */
-  struct in_addr siaddr;  /* Server IP address (next server to use in bootstrap) */
-  struct in_addr giaddr;  /* Relay agent IP address */
-  u8 chaddr[16];      /* Client hardware address (MAC address in first 6 bytes) */
-  u8 sname[64];       /* Optional server host name (null-terminated string) */
-  u8 file[128];       /* Boot file name (for network boot) */
-  u8 options[312];    /* Optional parameters field (magic cookie + options) */
-};
+```rust
+/// DHCP Packet Structure - Source: src/dhcp/protocol_v4.rs
+pub struct DhcpPacket {
+    pub op: u8,               // Message op code / message type (1=BOOTREQUEST, 2=BOOTREPLY)
+    pub htype: u8,            // Hardware address type (1=Ethernet)
+    pub hlen: u8,             // Hardware address length (6 for Ethernet MAC)
+    pub hops: u8,             // Relay agent hop count
+    pub xid: u32,             // Transaction ID (random value from client)
+    pub secs: u16,            // Seconds elapsed since client began process
+    pub flags: u16,           // Flags (bit 0: broadcast flag)
+    pub ciaddr: Ipv4Addr,     // Client IP address (filled in by client in BOUND state)
+    pub yiaddr: Ipv4Addr,     // 'Your' IP address (server's address offer to client)
+    pub siaddr: Ipv4Addr,     // Server IP address (next server to use in bootstrap)
+    pub giaddr: Ipv4Addr,     // Relay agent IP address
+    pub chaddr: [u8; 16],     // Client hardware address (MAC address in first 6 bytes)
+    pub sname: [u8; 64],      // Optional server host name (null-terminated string)
+    pub file: [u8; 128],      // Boot file name (for network boot)
+    pub options: [u8; 312],   // Optional parameters field (magic cookie + options)
+}
 ```
 
-**Message Types** (defined in `src/dhcp-protocol.h:44-60`):
+**Message Types** (defined in `src/dhcp/protocol_v4.rs`):
 - **DHCPDISCOVER (1)**: Client broadcasts to discover available DHCP servers
 - **DHCPOFFER (2)**: Server unicasts/broadcasts an IP address offer to client
 - **DHCPREQUEST (3)**: Client requests offered IP or renews existing lease
@@ -249,44 +249,39 @@ sequenceDiagram
 5. **DHCPACK Confirmation**: Server confirms lease and triggers DNS registration and script execution
 6. **Alternative DHCPNAK**: Server rejects request if address unavailable or configuration invalid
 
-**Integration Points** (Source: `src/dhcp.c`, `src/lease.c`):
+**Integration Points** (Source: `src/dhcp/v4/server.rs`, `src/dhcp/lease.rs`):
 
-- **DNS Integration**: Lease assignment triggers immediate DNS cache update via `cache_add_dhcp_entry()`
-- **Script Execution**: Lease changes invoke configured script via `queue_script()` in `src/helper.c`
-- **ARP Cache Consultation**: Address conflict detection uses `find_mac()` from `src/arp.c`
+- **DNS Integration**: Lease assignment triggers immediate DNS cache update via `DnsCache::add_dhcp_entry()`
+- **Script Execution**: Lease changes invoke configured script via `Helper::queue_script()` in `src/dhcp/helper.rs`
+- **ARP Cache Consultation**: Address conflict detection uses `find_mac()` from `src/net/arp.rs`
 
 ### Server Processing Logic
 
-The dnsmasq server processes incoming messages based on message type, implementing the server's side of the state machine. Key processing occurs in `src/rfc2131.c:dhcp_reply()`.
+The dnsmasq server processes incoming messages based on message type, implementing the server's side of the state machine. Key processing occurs in `Dhcpv4Server::handle_reply()` in `src/dhcp/v4/rfc2131.rs`.
 
-**Message Processing Flow** (Source: `src/rfc2131.c:380-900`):
+**Message Processing Flow** (Source: `src/dhcp/v4/rfc2131.rs`):
 
-```c
-/* Simplified message processing dispatch - actual implementation in dhcp_reply() */
-switch (mess_type) {
-  case DHCPDISCOVER:
-    /* Find available address, create DHCPOFFER */
-    break;
-  
-  case DHCPREQUEST:
-    /* Validate request, send DHCPACK or DHCPNAK */
-    break;
-  
-  case DHCPDECLINE:
-    /* Mark address as in-use, blacklist temporarily */
-    break;
-  
-  case DHCPRELEASE:
-    /* Release lease, update lease database */
-    break;
-  
-  case DHCPINFORM:
-    /* Return configuration parameters without address allocation */
-    break;
-  
-  case DHCPLEASEQUERY:
-    /* Return lease information for external query (v2.92+) */
-    break;
+```rust
+// Simplified message processing dispatch - actual implementation in Dhcpv4Server::handle_reply()
+match mess_type {
+    DhcpMessageType::Discover => {
+        // Find available address, create DHCPOFFER
+    }
+    DhcpMessageType::Request => {
+        // Validate request, send DHCPACK or DHCPNAK
+    }
+    DhcpMessageType::Decline => {
+        // Mark address as in-use, blacklist temporarily
+    }
+    DhcpMessageType::Release => {
+        // Release lease, update lease database
+    }
+    DhcpMessageType::Inform => {
+        // Return configuration parameters without address allocation
+    }
+    DhcpMessageType::LeaseQuery => {
+        // Return lease information for external query (v2.92+)
+    }
 }
 ```
 
@@ -298,7 +293,7 @@ switch (mess_type) {
 
 **Purpose**: Client initiates address acquisition by broadcasting DHCPDISCOVER to discover available DHCP servers.
 
-**Server Processing Steps** (Source: `src/rfc2131.c:550-650`):
+**Server Processing Steps** (Source: `src/dhcp/v4/rfc2131.rs`):
 
 1. **Identify Client**:
    - Extract client hardware address (chaddr) from packet
@@ -330,20 +325,20 @@ switch (mess_type) {
 
 **Example DHCPOFFER Construction** (Simplified):
 
-```c
-/* Source: src/rfc2131.c - DHCPDISCOVER case */
-mess->op = BOOTREPLY;
-mess->yiaddr = offered_address;
-mess->siaddr = server_ip;  /* For PXE boot */
+```rust
+// Source: src/dhcp/v4/rfc2131.rs - DHCPDISCOVER case
+mess.op = BOOTREPLY;
+mess.yiaddr = offered_address;
+mess.siaddr = server_ip;  // For PXE boot
 
-/* Add required options */
-option_put(mess, end, OPTION_MESSAGE_TYPE, 1, DHCPOFFER);
-option_put_addr(mess, end, OPTION_SERVER_IDENTIFIER, server_id);
-option_put(mess, end, OPTION_LEASE_TIME, 4, htonl(lease_time));
-option_put_addr(mess, end, OPTION_SUBNET_MASK, netmask);
-option_put_addr(mess, end, OPTION_ROUTER, gateway);
-option_put_addr(mess, end, OPTION_DNS_SERVER, dns_server);
-/* ... additional options ... */
+// Add required options
+option_put(&mut mess, &mut end, OPTION_MESSAGE_TYPE, &[DHCPOFFER as u8]);
+option_put_addr(&mut mess, &mut end, OPTION_SERVER_IDENTIFIER, server_id);
+option_put(&mut mess, &mut end, OPTION_LEASE_TIME, &lease_time.to_be_bytes());
+option_put_addr(&mut mess, &mut end, OPTION_SUBNET_MASK, netmask);
+option_put_addr(&mut mess, &mut end, OPTION_ROUTER, gateway);
+option_put_addr(&mut mess, &mut end, OPTION_DNS_SERVER, dns_server);
+// ... additional options ...
 ```
 
 ### DHCPREQUEST Processing
@@ -372,7 +367,7 @@ option_put_addr(mess, end, OPTION_DNS_SERVER, dns_server);
    - Requested IP in Option 50
    - ciaddr is 0.0.0.0
 
-**Server Processing Steps** (Source: `src/rfc2131.c:700-850`):
+**Server Processing Steps** (Source: `src/dhcp/v4/rfc2131.rs`):
 
 1. **Validate Request**:
    - Check if request is for this server (server identifier matches if present)
@@ -402,7 +397,7 @@ option_put_addr(mess, end, OPTION_DNS_SERVER, dns_server);
    - Client returns to INIT state
 
 **DHCPACK Triggering Actions**:
-- Commit lease to lease database (`src/lease.c:lease_update_file()`)
+- Commit lease to lease database (`LeaseManager::update_file()` in `src/dhcp/lease.rs`)
 - Add hostname to DNS cache if provided
 - Execute lease-change script with "add" or "old" action
 - Send gratuitous ARP to announce address assignment (prevents conflicts)
@@ -411,7 +406,7 @@ option_put_addr(mess, end, OPTION_DNS_SERVER, dns_server);
 
 **Purpose**: Client detected IP address conflict (received ARP response for offered address during ARP probe).
 
-**Server Processing Steps** (Source: `src/rfc2131.c:900-950`):
+**Server Processing Steps** (Source: `src/dhcp/v4/rfc2131.rs`):
 
 1. **Mark Address as Conflicted**:
    - Add address to temporary blacklist
@@ -428,7 +423,7 @@ option_put_addr(mess, end, OPTION_DNS_SERVER, dns_server);
 
 **Purpose**: Client voluntarily releases its IP address back to the server (e.g., on shutdown, network disconnect).
 
-**Server Processing Steps** (Source: `src/rfc2131.c:950-1000`):
+**Server Processing Steps** (Source: `src/dhcp/v4/rfc2131.rs`):
 
 1. **Validate Release**:
    - Verify client is authorized to release this address
@@ -448,7 +443,7 @@ option_put_addr(mess, end, OPTION_DNS_SERVER, dns_server);
 
 **Purpose**: Client already has IP address (static or from another DHCP server) but needs configuration parameters.
 
-**Server Processing Steps** (Source: `src/rfc2131.c:1000-1050`):
+**Server Processing Steps** (Source: `src/dhcp/v4/rfc2131.rs`):
 
 1. **Validate Request**:
    - Check if client's IP (in ciaddr) is on appropriate network segment
@@ -477,7 +472,7 @@ The dnsmasq address allocation algorithm balances several competing priorities:
 - **Conflict Avoidance**: Verify address availability before offering
 - **Fair Distribution**: Allocate addresses fairly across clients
 
-**Allocation Hierarchy** (Source: `src/dhcp.c:address_allocate()`):
+**Allocation Hierarchy** (Source: `Dhcpv4Server::allocate_address()` in `src/dhcp/v4/server.rs`):
 
 ```mermaid
 flowchart TD
@@ -516,7 +511,7 @@ dhcp-host=11:22:33:44:55:66,192.168.1.50,workstation1,infinite
 dhcp-host=11:22:33:44:55:66,aa:bb:cc:dd:ee:ff,192.168.1.50,dualboot
 ```
 
-**Static Allocation Logic** (Source: `src/dhcp.c:config_find_by_address()`):
+**Static Allocation Logic** (Source: `DhcpConfig::find_by_address()` in `src/dhcp/v4/server.rs`):
 
 1. Extract client MAC address from DHCP packet chaddr field
 2. Search `dhcp-host` configurations for matching MAC
@@ -550,7 +545,7 @@ dhcp-range=192.168.1.100,192.168.1.150,12h
 dhcp-range=192.168.1.151,192.168.1.200,24h
 ```
 
-**Dynamic Allocation Process** (Source: `src/dhcp.c:address_available()`):
+**Dynamic Allocation Process** (Source: `Dhcpv4Server::address_available()` in `src/dhcp/v4/server.rs`):
 
 1. **Check Existing Lease**:
    - If client has active lease, offer same IP if still within pool range
@@ -604,7 +599,7 @@ Address conflicts occur when multiple devices attempt to use the same IP address
 
 **Conflict Detection Methods**:
 
-1. **Ping Test Before Offer** (Source: `src/dhcp.c:icmp_ping()`):
+1. **Ping Test Before Offer** (Source: `Dhcpv4Server::icmp_ping()` in `src/dhcp/v4/server.rs`):
    - Server sends ICMP Echo Request to proposed IP before offering
    - If Echo Reply received, address is in use (conflict)
    - Marks address as unavailable, tries next address in pool
@@ -629,7 +624,7 @@ Address conflicts occur when multiple devices attempt to use the same IP address
 dhcp-ping-timeout=2
 ```
 
-**Conflict Resolution Process** (Source: `src/rfc2131.c:1100-1150`):
+**Conflict Resolution Process** (Source: `src/dhcp/v4/rfc2131.rs`):
 
 1. **Server Detects Conflict** (via ping response):
    - Abandon offering this address
@@ -697,7 +692,7 @@ dhcp-ping-timeout=2
 
 ### Lease Lifecycle Management
 
-**Lease Creation** (Source: `src/lease.c:lease_allocate()`):
+**Lease Creation** (Source: `LeaseManager::allocate()` in `src/dhcp/lease.rs`):
 
 1. **Initial Allocation**:
    - Client sends DHCPREQUEST, server decides to grant
@@ -720,7 +715,7 @@ dhcp-ping-timeout=2
    - Pass lease details as arguments and environment variables
    - Non-blocking execution (fork + exec)
 
-**Lease Renewal** (Source: `src/lease.c:lease_update_from_configs()`):
+**Lease Renewal** (Source: `LeaseManager::update_from_configs()` in `src/dhcp/lease.rs`):
 
 1. **Client Sends DHCPREQUEST**:
    - During RENEWING (T1) or REBINDING (T2) state
@@ -737,7 +732,7 @@ dhcp-ping-timeout=2
 
 **Lease Expiration**:
 
-1. **Periodic Expiration Check** (Source: `src/lease.c:lease_prune()`):
+1. **Periodic Expiration Check** (Source: `LeaseManager::prune()` in `src/dhcp/lease.rs`):
    - Main event loop periodically checks for expired leases
    - Typically every 60 seconds
 
@@ -765,10 +760,11 @@ dhcp-ping-timeout=2
 
 ### Lease Time Configuration
 
-**Default Lease Time** (Source: `src/config.h:50`):
+**Default Lease Time** (Source: `src/config/constants.rs`):
 
-```c
-#define DEFLEASE 3600  /* Default lease time: 1 hour (3600 seconds) */
+```rust
+/// Default lease time: 1 hour (3600 seconds)
+pub const DEFLEASE: u32 = 3600;
 ```
 
 **Configuration Options** (from `dnsmasq.conf.example:154-161`):
@@ -802,10 +798,11 @@ dhcp-host=11:22:33:44:55:66,192.168.1.50,infinite
 
 ### Maximum Lease Limit
 
-**Compile-Time Limit** (Source: `src/config.h:40`):
+**Compile-Time Limit** (Source: `src/config/constants.rs`):
 
-```c
-#define MAXLEASES 1000  /* Maximum number of DHCP leases */
+```rust
+/// Maximum number of DHCP leases
+pub const MAXLEASES: usize = 1000;
 ```
 
 **Enforcement**:
@@ -855,33 +852,33 @@ DHCP options extend the protocol beyond basic address assignment, providing netw
 - **Option 0**: Pad (no length/value, used for alignment)
 - **Option 255**: End (marks end of option list)
 
-**Comprehensive Option Support** (Source: `src/dhcp-protocol.h:62-222`):
+**Comprehensive Option Support** (Source: `src/dhcp/protocol_v4.rs`):
 
-```c
-/* Common DHCP options - subset of 161 defined options */
-#define OPTION_NETMASK         1   /* Subnet Mask */
-#define OPTION_ROUTER          3   /* Default Gateway */
-#define OPTION_DNSSERVER       6   /* DNS Servers */
-#define OPTION_HOSTNAME        12  /* Client Hostname */
-#define OPTION_DOMAINNAME      15  /* Domain Name */
-#define OPTION_BROADCAST       28  /* Broadcast Address */
-#define OPTION_REQUESTED_IP    50  /* Requested IP Address */
-#define OPTION_LEASE_TIME      51  /* IP Address Lease Time */
-#define OPTION_MESSAGE_TYPE    53  /* DHCP Message Type */
-#define OPTION_SERVER_IDENTIFIER 54 /* Server Identifier */
-#define OPTION_REQUESTED_OPTIONS 55 /* Parameter Request List */
-#define OPTION_MESSAGE         56  /* Error Message */
-#define OPTION_MAXMESSAGE      57  /* Maximum DHCP Message Size */
-#define OPTION_T1              58  /* Renewal Time Value (T1) */
-#define OPTION_T2              59  /* Rebinding Time Value (T2) */
-#define OPTION_VENDOR_ID       60  /* Vendor Class Identifier */
-#define OPTION_CLIENT_ID       61  /* Client Identifier */
-#define OPTION_SNAME           66  /* TFTP Server Name */
-#define OPTION_FILENAME        67  /* Boot File Name */
-#define OPTION_USER_CLASS      77  /* User Class Information */
-#define OPTION_AGENT_ID        82  /* Relay Agent Information */
-#define OPTION_CLIENT_ARCH     93  /* Client System Architecture */
-#define OPTION_VENDOR_IDENT_OPT 125 /* Vendor-Identifying Vendor Options */
+```rust
+/// Common DHCP options - subset of 161 defined options
+pub const OPTION_NETMASK: u8 = 1;            // Subnet Mask
+pub const OPTION_ROUTER: u8 = 3;             // Default Gateway
+pub const OPTION_DNSSERVER: u8 = 6;          // DNS Servers
+pub const OPTION_HOSTNAME: u8 = 12;          // Client Hostname
+pub const OPTION_DOMAINNAME: u8 = 15;        // Domain Name
+pub const OPTION_BROADCAST: u8 = 28;         // Broadcast Address
+pub const OPTION_REQUESTED_IP: u8 = 50;      // Requested IP Address
+pub const OPTION_LEASE_TIME: u8 = 51;        // IP Address Lease Time
+pub const OPTION_MESSAGE_TYPE: u8 = 53;      // DHCP Message Type
+pub const OPTION_SERVER_IDENTIFIER: u8 = 54; // Server Identifier
+pub const OPTION_REQUESTED_OPTIONS: u8 = 55; // Parameter Request List
+pub const OPTION_MESSAGE: u8 = 56;           // Error Message
+pub const OPTION_MAXMESSAGE: u8 = 57;        // Maximum DHCP Message Size
+pub const OPTION_T1: u8 = 58;               // Renewal Time Value (T1)
+pub const OPTION_T2: u8 = 59;               // Rebinding Time Value (T2)
+pub const OPTION_VENDOR_ID: u8 = 60;        // Vendor Class Identifier
+pub const OPTION_CLIENT_ID: u8 = 61;        // Client Identifier
+pub const OPTION_SNAME: u8 = 66;            // TFTP Server Name
+pub const OPTION_FILENAME: u8 = 67;         // Boot File Name
+pub const OPTION_USER_CLASS: u8 = 77;       // User Class Information
+pub const OPTION_AGENT_ID: u8 = 82;         // Relay Agent Information
+pub const OPTION_CLIENT_ARCH: u8 = 93;      // Client System Architecture
+pub const OPTION_VENDOR_IDENT_OPT: u8 = 125; // Vendor-Identifying Vendor Options
 ```
 
 ### Standard DHCP Options Configuration
@@ -952,7 +949,7 @@ dhcp-option=vendor:MSFT,2,1i  # Microsoft vendor option
 
 ### Option Processing Logic
 
-**Client Option Request** (Source: `src/rfc2131.c:do_options()`):
+**Client Option Request** (Source: `Dhcpv4Server::do_options()` in `src/dhcp/v4/rfc2131.rs`):
 
 1. **Client Includes Option 55** (Parameter Request List):
    - Lists option codes client wants to receive
@@ -980,11 +977,11 @@ dhcp-option=vendor:MSFT,2,1i  # Microsoft vendor option
 
 When option space (312 bytes) exhausted, server may use sname and file fields for additional options.
 
-```
-/* Option overload values */
-#define OPTION_OVERLOAD_FILE   1  /* file field contains options */
-#define OPTION_OVERLOAD_SNAME  2  /* sname field contains options */
-#define OPTION_OVERLOAD_BOTH   3  /* both fields contain options */
+```rust
+/// Option overload values
+pub const OPTION_OVERLOAD_FILE: u8 = 1;   // file field contains options
+pub const OPTION_OVERLOAD_SNAME: u8 = 2;  // sname field contains options
+pub const OPTION_OVERLOAD_BOTH: u8 = 3;   // both fields contain options
 ```
 
 ### Advanced Option Configuration
@@ -1024,7 +1021,7 @@ dhcp-option=tag:printer,option:router,192.168.1.254
 
 One of dnsmasq's most powerful features is seamless DNS-DHCP integration, automatically registering DHCP client hostnames in the DNS namespace.
 
-**Registration Process** (Source: `src/lease.c:lease_update_dns()` and `src/cache.c:cache_add_dhcp_entry()`):
+**Registration Process** (Source: `LeaseManager::update_dns()` in `src/dhcp/lease.rs` and `DnsCache::add_dhcp_entry()` in `src/dns/cache.rs`):
 
 1. **Hostname Extraction**:
    - Client includes hostname in DHCP Option 12 (Host Name)
@@ -1143,7 +1140,7 @@ dhcp-option=tag:guest,option:dns-server,8.8.8.8
 
 The lease-change script mechanism enables external integration and automation workflows triggered by DHCP lease events.
 
-**Script Invocation Triggers** (Source: `src/lease.c:queue_script()` and `src/helper.c`):
+**Script Invocation Triggers** (Source: `Helper::queue_script()` in `src/dhcp/lease.rs` and `src/dhcp/helper.rs`):
 
 1. **"add" Action**: New lease created (first-time assignment)
 2. **"old" Action**: Existing lease renewed
@@ -1155,13 +1152,13 @@ The lease-change script mechanism enables external integration and automation wo
 # Execute script on lease changes
 dhcp-script=/usr/local/bin/lease-notify
 
-# Or use Lua script (requires HAVE_LUASCRIPT compile flag)
+# Or use Lua script (requires Cargo feature "script")
 dhcp-luascript=/usr/local/bin/lease-notify.lua
 ```
 
 ### Script Invocation Details
 
-**Command-Line Arguments** (Source: `src/helper.c:create_helper()`):
+**Command-Line Arguments** (Source: `Helper::create()` in `src/dhcp/helper.rs`):
 
 ```bash
 /usr/local/bin/lease-notify <action> <mac> <ip> <hostname> [<client_id>]
@@ -1174,7 +1171,7 @@ dhcp-luascript=/usr/local/bin/lease-notify.lua
 - **hostname**: Client hostname (or "*" if not provided)
 - **client_id**: DHCP client identifier from Option 61 (optional, "*" if not present)
 
-**Environment Variables** (Source: `src/lease.c:lease_update_file()`):
+**Environment Variables** (Source: `LeaseManager::update_file()` in `src/dhcp/lease.rs`):
 
 ```bash
 DNSMASQ_LEASE_LENGTH=86400          # Lease duration in seconds
@@ -1188,7 +1185,7 @@ DNSMASQ_SUPPLIED_HOSTNAME=workstation1  # Hostname from client (before any trans
 
 ### Script Execution Architecture
 
-**Helper Process Model** (Source: `src/helper.c`):
+**Helper Process Model** (Source: `src/dhcp/helper.rs`):
 
 1. **Privileged Helper Process**:
    - dnsmasq forks helper process at startup
@@ -1283,7 +1280,7 @@ echo "${TIMESTAMP} ${ACTION} ${MAC} ${IP} ${HOSTNAME}" >> /var/log/dhcp-tracking
 
 ### Lua Script Integration
 
-**Advantages of Lua Scripts** (HAVE_LUASCRIPT compile flag):
+**Advantages of Lua Scripts** (Cargo feature `"script"`):
 - No fork/exec overhead (embedded interpreter)
 - Faster execution for high-frequency events
 - Access to internal dnsmasq state (via Lua API)
@@ -1478,7 +1475,7 @@ dhcp-boot=pxelinux.0,server,192.168.1.1
 dhcp-host=11:22:33:44:55:66,192.168.1.50,infinite
 ```
 
-**BOOTP Processing** (Source: `src/rfc2131.c:is_bootp()`):
+**BOOTP Processing** (Source: `Dhcpv4Server::is_bootp()` in `src/dhcp/v4/rfc2131.rs`):
 - Detected by absence of DHCP message type option (Option 53)
 - Server responds with BOOTREPLY instead of DHCPOFFER/DHCPACK
 - No lease database entry (infinite lease assumed)
@@ -1493,7 +1490,7 @@ dhcp-host=11:22:33:44:55:66,192.168.1.50,infinite
 - Dual-stacked environments (IPv4 manual, IPv6 DHCP)
 - Troubleshooting network configuration
 
-**Processing** (Source: `src/rfc2131.c:1000-1050`):
+**Processing** (Source: `src/dhcp/v4/rfc2131.rs`):
 1. Client sends DHCPINFORM with ciaddr set to current IP
 2. Server validates IP is on appropriate subnet
 3. Server constructs DHCPACK with options but no yiaddr
@@ -1532,7 +1529,7 @@ dhcp-option=15,example.com
 3. Client receives ARP response (address in use!)
 4. Client sends DHCPDECLINE to server
 
-**Server Response** (Source: `src/rfc2131.c:900-950`):
+**Server Response** (Source: `src/dhcp/v4/rfc2131.rs`):
 1. Log conflict: "DHCPDECLINE of <ip> from <mac>"
 2. Mark address as temporarily unavailable (60-second blacklist)
 3. Remove tentative lease if created
@@ -1678,7 +1675,7 @@ dhcp-boot=tag:ia64_efi,efi/bootia64.efi
 
 ### PXE Boot Options
 
-**DHCP Options for PXE** (from `src/dhcp-protocol.h:93-96`):
+**DHCP Options for PXE** (from `src/dhcp/protocol_v4.rs`):
 - **Option 60**: Vendor Class Identifier ("PXEClient")
 - **Option 66**: TFTP Server Name (sname field alternative)
 - **Option 67**: Boot File Name (file field alternative)
@@ -1769,7 +1766,7 @@ dhcp-relay=192.168.1.254,192.168.1.0/24
 dhcp-relay=192.168.2.254,192.168.2.0/24
 ```
 
-**Relay Processing** (Source: `src/rfc2131.c:relay_reply()`):
+**Relay Processing** (Source: `Dhcpv4Server::relay_reply()` in `src/dhcp/v4/rfc2131.rs`):
 1. Receive DHCP message with giaddr ≠ 0.0.0.0
 2. Identify network segment from giaddr
 3. Allocate address from appropriate pool
@@ -1803,7 +1800,7 @@ dhcp-relay=192.168.1.254,192.168.1.0/24,52  # Option 82 relay
 
 DHCPv4 Leasequery (added in dnsmasq v2.92) enables external systems to query active DHCP lease information without accessing the lease database file.
 
-**Query Message Types** (Source: `src/dhcp-protocol.h:57-60`):
+**Query Message Types** (Source: `src/dhcp/protocol_v4.rs`):
 - **DHCPLEASEQUERY (10)**: Query request
 - **DHCPLEASEUNASSIGNED (11)**: Response - IP not currently leased
 - **DHCPLEASEUNKNOWN (12)**: Response - cannot answer query (e.g., not authoritative)
@@ -1938,11 +1935,13 @@ dnsmasq --log-queries  # Log DNS queries (including DHCP hostnames)
 
 ## Performance and Limits
 
-### Compile-Time Limits (Source: `src/config.h`)
+### Compile-Time Limits (Source: `src/config/constants.rs`)
 
-```c
-#define MAXLEASES 1000  /* Maximum concurrent DHCP leases (line 40) */
-#define DEFLEASE 3600   /* Default lease time: 1 hour (line 50) */
+```rust
+/// Maximum concurrent DHCP leases
+pub const MAXLEASES: usize = 1000;
+/// Default lease time: 1 hour
+pub const DEFLEASE: u32 = 3600;
 ```
 
 **MAXLEASES Tuning**:
@@ -2265,7 +2264,7 @@ DHCP Packet:
 
 **Document Version**: 1.0  
 **Based on**: dnsmasq version 2.92  
-**Primary Source Files**: src/dhcp.c, src/rfc2131.c, src/lease.c, src/dhcp-protocol.h  
+**Primary Source Files**: src/dhcp/v4/server.rs, src/dhcp/v4/rfc2131.rs, src/dhcp/lease.rs, src/dhcp/protocol_v4.rs  
 **RFC Standards**: RFC 2131, RFC 2132, RFC 4039, RFC 4388  
 **Word Count**: ~12,000 words (target: 2000+ words exceeded)
 

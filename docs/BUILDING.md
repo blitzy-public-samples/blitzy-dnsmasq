@@ -1,6 +1,6 @@
 # Building dnsmasq
 
-**Version:** 2.92  
+**Version:** 2.92 (Rust rewrite)  
 **Copyright:** © 2000-2025 Simon Kelley  
 **License:** GPL-2.0-or-later
 
@@ -9,306 +9,286 @@
 - [Overview](#overview)
 - [Platform Support](#platform-support)
 - [Required Dependencies](#required-dependencies)
-- [Optional Dependencies](#optional-dependencies)
+- [Optional Dependencies and Feature Flags](#optional-dependencies-and-feature-flags)
 - [Basic Build Instructions](#basic-build-instructions)
-- [Feature Selection with COPTS](#feature-selection-with-copts)
+- [Feature Selection with Cargo](#feature-selection-with-cargo)
+- [Dependency Detection](#dependency-detection)
 - [Cross-Compilation](#cross-compilation)
 - [Platform-Specific Instructions](#platform-specific-instructions)
 - [Static vs Dynamic Linking](#static-vs-dynamic-linking)
 - [Binary Size Optimization](#binary-size-optimization)
 - [Build Troubleshooting](#build-troubleshooting)
 - [Build System Architecture](#build-system-architecture)
+- [Advanced Build Topics](#advanced-build-topics)
+- [Summary](#summary)
 
 ---
 
 ## Overview
 
-Dnsmasq uses a straightforward build system based on GNU Make and standard C compilation tools. The build process is designed for maximum portability across Unix-like operating systems, with platform-specific adaptations handled automatically through feature detection.
+Dnsmasq is a lightweight DNS forwarder, DHCP server, TFTP server, and Router Advertisement daemon. The Rust rewrite uses Cargo as its build system, providing a modern, reproducible build workflow with automatic dependency resolution, feature-gated compilation, and built-in cross-compilation support.
 
 The build system supports:
-- **Modular compilation**: Enable only required features via compile-time flags
-- **Automatic dependency detection**: Uses pkg-config for library discovery
-- **Platform adaptation**: Automatically detects and adapts to Linux, BSD, Solaris, macOS, and Android
-- **Minimal external dependencies**: Core functionality requires only standard C library
-- **Size optimization**: Feature selection produces executables ranging from 100KB (minimal) to 500KB (full-featured)
+- **Modular compilation**: Rust module hierarchy organized by functional domain (DNS, DHCP, TFTP, platform abstraction, integration)
+- **Feature selection via Cargo feature flags**: Enable or disable subsystems at compile time
+- **Automatic dependency resolution**: Cargo fetches and compiles Rust crate dependencies from crates.io
+- **Platform adaptation**: Conditional compilation via `#[cfg(target_os)]` and `#[cfg(target_arch)]` for Linux, BSD, and macOS
+- **Minimal external dependencies**: Core functionality requires only the Rust standard library and well-established crates
+- **Built-in testing**: Unit and integration tests via `cargo test`
 
-**Build Time:** Typical compilation completes in under 30 seconds on modern hardware.
+**Key Build Files:**
+
+| File | Purpose |
+|------|---------|
+| `Cargo.toml` | Root workspace manifest with dependencies, feature flags, and build profiles |
+| `rust-toolchain.toml` | Pinned Rust toolchain version (1.93.1 stable, edition 2024) |
+| `build.rs` | Build script for platform detection and optional native library linking via pkg-config |
+| `.cargo/config.toml` | Cross-compilation profiles for x86-64 and ARM64 Linux targets |
+
+**Build Time:** Typical compilation completes in 1–3 minutes on modern hardware (first build). Subsequent incremental builds complete in seconds.
 
 ---
 
 ## Platform Support
 
-Dnsmasq compiles and runs on the following operating systems and architectures:
+Dnsmasq compiles and runs on the following operating systems and architectures using Rust target triples.
 
-### Supported Operating Systems
+### Supported Targets
 
-| Operating System | Status | Platform-Specific Code | Notes |
-|-----------------|--------|----------------------|-------|
-| **Linux** (glibc) | Fully Supported | `src/netlink.c` for interface monitoring | Primary development platform |
-| **Linux** (uclibc/musl) | Fully Supported | Same as glibc | Common in embedded systems |
-| **FreeBSD** | Fully Supported | `src/bpf.c` for BPF interface | Requires BPF device access |
-| **OpenBSD** | Fully Supported | `src/bpf.c` for BPF interface | Requires BPF device access |
-| **NetBSD** | Fully Supported | `src/bpf.c` for BPF interface | Requires BPF device access |
-| **DragonFly BSD** | Fully Supported | `src/bpf.c` for BPF interface | Requires BPF device access |
-| **macOS/Darwin** | Fully Supported | `src/bpf.c` for BPF interface | See [macOS Instructions](#macos) |
-| **Solaris/OpenSolaris** | Fully Supported | Requires special libraries | See [Solaris Instructions](#solaris) |
-| **Android (AOSP)** | Fully Supported | Special build system | See [Android Instructions](#android) |
+| Target Triple | OS / Architecture | Platform Backend | Status |
+|--------------|-------------------|-----------------|--------|
+| `x86_64-unknown-linux-gnu` | Linux x86-64 (glibc) | `src/net/platform/linux/netlink.rs` | **Primary target** |
+| `aarch64-unknown-linux-gnu` | Linux ARM64 (glibc) | `src/net/platform/linux/netlink.rs` | **Primary target** |
+| `armv7-unknown-linux-gnueabihf` | Linux ARM32 (glibc) | `src/net/platform/linux/netlink.rs` | Fully supported |
+| `x86_64-unknown-linux-musl` | Linux x86-64 (musl) | `src/net/platform/linux/netlink.rs` | Static builds |
+| `aarch64-unknown-linux-musl` | Linux ARM64 (musl) | `src/net/platform/linux/netlink.rs` | Static builds |
+| `x86_64-unknown-freebsd` | FreeBSD x86-64 | `src/net/platform/bsd/bpf.rs` | Fully supported |
+| `x86_64-apple-darwin` | macOS x86-64 | `src/net/platform/bsd/bpf.rs` | Fully supported |
+| `aarch64-apple-darwin` | macOS Apple Silicon | `src/net/platform/bsd/bpf.rs` | Fully supported |
+| `x86_64-unknown-openbsd` | OpenBSD x86-64 | `src/net/platform/bsd/bpf.rs` | Conditional support |
 
-### Supported Architectures
+### Platform-Specific Code
 
-- **x86** (32-bit Intel/AMD)
-- **x86-64** (64-bit Intel/AMD)
-- **ARM** (ARMv5, ARMv6, ARMv7, ARMv8/AArch64)
-- **MIPS** (MIPS32, MIPS64, both big and little endian)
-- **PowerPC** (32-bit and 64-bit)
-- **RISC-V** (32-bit and 64-bit)
-- **Other architectures** supported by the operating system and compiler
+Platform-specific code uses Rust conditional compilation attributes:
 
-**Endianness:** Both big-endian and little-endian architectures are fully supported.
+- **Linux platform backend**: `#[cfg(target_os = "linux")]` — netlink route/address monitoring, ipset, inotify, conntrack
+- **BSD platform backend**: `#[cfg(target_os = "freebsd")]`, `#[cfg(target_os = "macos")]` — BPF raw packets, PF_ROUTE, PF tables
+- **Architecture-specific**: `#[cfg(target_arch = "x86_64")]`, `#[cfg(target_arch = "aarch64")]` — used where hardware-specific behavior differs (ioctl constants, struct padding)
+
+**Endianness:** Both big-endian and little-endian architectures are fully supported via Rust's `u16::to_be_bytes()` / `u16::from_be_bytes()` and related methods.
 
 ---
 
 ## Required Dependencies
 
-The following components are required to build dnsmasq from source:
+The following components are required to build dnsmasq from source.
 
-### Core Build Tools
+### Rust Toolchain
 
-| Component | Minimum Version | Purpose | Installation |
-|-----------|----------------|---------|--------------|
-| **GCC** or **Clang** | GCC 4.7+ / Clang 3.4+ | C compiler with C99 support | `apt-get install gcc` (Debian/Ubuntu)<br>`yum install gcc` (RHEL/CentOS)<br>`pkg install gcc` (FreeBSD) |
-| **GNU Make** | 3.81+ | Build orchestration | `apt-get install make`<br>`yum install make`<br>Pre-installed on BSDs |
-| **pkg-config** | 0.29+ | Library detection | `apt-get install pkg-config`<br>`yum install pkgconfig`<br>`pkg install pkgconf` (FreeBSD) |
+| Component | Version | Purpose | Installation |
+|-----------|---------|---------|--------------|
+| **Rust** (stable) | 1.93.1 | Compiler and standard library | Via `rustup` (see below) |
+| **Cargo** | (bundled with Rust) | Build system and package manager | Included with Rust |
+| **Rust Edition** | 2024 | Language edition for latest features | Pinned in `rust-toolchain.toml` |
+
+The exact Rust version is pinned in `rust-toolchain.toml` at the repository root:
+
+```toml
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+```
+
+When you run any `cargo` or `rustc` command inside the repository, `rustup` automatically downloads and uses the pinned toolchain version.
+
+### Installing Rust
+
+Install Rust via `rustup` (the official Rust toolchain installer):
+
+```bash
+# Linux / macOS
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Follow prompts to add Rust to your PATH
+source "$HOME/.cargo/env"
+
+# Verify installation
+rustc --version   # Should show: rustc 1.93.1
+cargo --version   # Should show: cargo 1.93.1
+```
+
+### Build-Time System Dependencies
+
+A C compiler is required at build time because the `ring` cryptographic crate compiles assembly routines via the `cc` crate:
+
+| Component | Purpose | Required For |
+|-----------|---------|--------------|
+| **GCC** or **Clang** | C compiler for `ring` crate assembly | All builds |
+| **pkg-config** | Native library detection | Only when `dbus`, `nftset`, or `conntrack` features are enabled |
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install build-essential pkg-config
+
+# RHEL/CentOS/Fedora
+sudo dnf install gcc pkg-config
+
+# FreeBSD
+pkg install pkgconf
+
+# macOS (Xcode command-line tools provide cc)
+xcode-select --install
+```
 
 ### System Requirements
 
-- **POSIX-compliant operating system**: Full POSIX.1-2008 API support
-- **Standard C library**: glibc 2.17+, uclibc-ng 1.0.0+, musl 1.1.0+, or BSD libc
-- **POSIX sockets API**: For network operations
-- **POSIX signals**: For daemon control and configuration reload
-
-**Note on BSD Make:** BSD pmake is supported but GNU Make is recommended for full build system features including internationalization targets.
+- **POSIX-compliant operating system**: Linux, FreeBSD, macOS, or OpenBSD
+- **Network stack**: POSIX sockets API for network operations
+- **Internet access**: Required for first build (Cargo downloads crate dependencies from crates.io)
 
 ---
 
-## Optional Dependencies
+## Optional Dependencies and Feature Flags
 
-Optional features require additional libraries. The build system automatically detects available libraries via pkg-config and enables corresponding features.
+Dnsmasq uses Cargo feature flags for compile-time feature selection. Features replace the C `HAVE_*` / `NO_*` preprocessor macros that were previously set via the `COPTS` variable.
 
-### D-Bus Control Interface
+### Cargo Feature Flag Reference
 
-**Library:** libdbus-1  
-**Minimum Version:** 1.12.0  
-**Compile Flag:** `HAVE_DBUS`  
-**Purpose:** Enables programmatic control via D-Bus system bus
+The following table maps every Cargo feature flag to its legacy C equivalent:
 
-**Installation:**
+| Cargo Feature | Replaces C Macro | Description | Default | Native Library Required |
+|---|---|---|---|---|
+| `dhcp` | `HAVE_DHCP` | DHCPv4 server | ✅ Yes | None |
+| `dhcp6` | `HAVE_DHCP6` | DHCPv6 server and Router Advertisements | ✅ Yes | None |
+| `dnssec` | `HAVE_DNSSEC` | DNSSEC validation (RFC 4033/4034/4035) | No | None — uses `ring` crate |
+| `dbus` | `HAVE_DBUS` | D-Bus system bus control interface | No | `libdbus-1-dev` |
+| `ubus` | `HAVE_UBUS` | OpenWrt UBus control interface | No | `libubus-dev`, `libubox-dev` |
+| `tftp` | `HAVE_TFTP` | Read-only TFTP server (RFC 1350/2349) | ✅ Yes | None |
+| `script` | `HAVE_SCRIPT` | Script execution for lease events | ✅ Yes | None |
+| `auth` | `HAVE_AUTH` | Authoritative DNS zone serving | ✅ Yes | None |
+| `ipset` | `HAVE_IPSET` | Linux ipset integration via netlink | ✅ Yes | None — uses netlink crate |
+| `nftset` | `HAVE_NFTSET` | nftables set population | No | `libnftables-dev` |
+| `conntrack` | `HAVE_CONNTRACK` | Netfilter conntrack mark retrieval | No | `libnetfilter-conntrack-dev` |
+| `idn` | `HAVE_LIBIDN2` | IDNA 2008 internationalized domain names | No | None — uses `idna` crate |
+| `inotify_monitor` | `HAVE_INOTIFY` | Linux inotify file-change monitoring | No | None (Linux only) |
+| `netlink` | (Linux netlink) | Netlink route/address monitoring | No | None — uses netlink crates |
+| `loop_detect` | `HAVE_LOOP` | DNS forwarding loop detection | ✅ Yes | None |
+| `dump` | `HAVE_DUMPFILE` | Pcap packet capture for debugging | ✅ Yes | None — uses `pcap-file` crate |
+
+**Default features** (enabled unless `--no-default-features` is specified):
+`dhcp`, `dhcp6`, `tftp`, `script`, `auth`, `ipset`, `loop_detect`, `dump`
+
+### Key Changes from C Build
+
+- **DNSSEC no longer requires Nettle or GnuTLS.** The Rust rewrite uses the pure-Rust `ring` crate for all cryptographic operations (RSA, ECDSA P-256/P-384, Ed25519). No system crypto libraries are needed.
+- **IDN support no longer requires libidn2.** The Rust rewrite uses the pure-Rust `idna` crate for IDNA 2008 support. No system IDN library is needed.
+- **Feature flags are additive.** Use `--features` to enable additional features, or `--no-default-features` to start from a minimal base and add only what you need.
+
+### Native Library Requirements
+
+The following features require native system libraries. These are detected at build time by `build.rs` using the `pkg-config` crate:
+
+#### D-Bus Control Interface (`dbus` feature)
+
 ```bash
 # Debian/Ubuntu
-apt-get install libdbus-1-dev
+sudo apt-get install libdbus-1-dev
 
 # RHEL/CentOS/Fedora
-yum install dbus-devel
+sudo dnf install dbus-devel
+
+# Arch Linux
+sudo pacman -S dbus
 
 # FreeBSD
 pkg install dbus
-
-# macOS (via Homebrew)
-brew install d-bus
 ```
 
-**Provides:**
-- Cache query and manipulation methods
-- Upstream server reconfiguration
-- Lease information retrieval
-- Service: `uk.org.thekelleys.dnsmasq`
-- Policy file: `/etc/dbus-1/system.d/dnsmasq.conf`
+**Error if missing:** `Warning: D-Bus feature enabled but libdbus-1 not found`
 
----
+#### nftables Set Integration (`nftset` feature)
 
-### Internationalized Domain Name (IDN) Support
-
-#### IDN 2008 (Recommended)
-
-**Library:** libidn2  
-**Minimum Version:** 2.0.0  
-**Compile Flag:** `HAVE_LIBIDN2`  
-**Purpose:** IDNA2008 internationalized domain name support
-
-**Installation:**
 ```bash
 # Debian/Ubuntu
-apt-get install libidn2-dev
-
-# RHEL/CentOS/Fedora
-yum install libidn2-devel
-
-# FreeBSD
-pkg install libidn2
-```
-
-**Standards:** RFC 5891 (IDNA2008)
-
-#### IDN 2003 (Legacy)
-
-**Library:** libidn  
-**Minimum Version:** 1.33  
-**Compile Flag:** `HAVE_IDN`  
-**Purpose:** IDNA2003 internationalized domain name support (legacy)
-
-**Installation:**
-```bash
-# Debian/Ubuntu
-apt-get install libidn11-dev
-
-# RHEL/CentOS/Fedora
-yum install libidn-devel
-```
-
-**Note:** `HAVE_IDN` and `HAVE_LIBIDN2` are mutually exclusive. IDN 2008 (`HAVE_LIBIDN2`) is recommended for new deployments.
-
----
-
-### DNSSEC Validation
-
-**Libraries:** nettle, hogweed  
-**Minimum Version:** nettle 3.4, hogweed 3.4  
-**Compile Flag:** `HAVE_DNSSEC`  
-**Purpose:** Cryptographic validation of DNS responses
-
-**Installation:**
-```bash
-# Debian/Ubuntu
-apt-get install nettle-dev
-
-# RHEL/CentOS/Fedora
-yum install nettle-devel
-
-# FreeBSD
-pkg install nettle
-
-# macOS (via Homebrew)
-brew install nettle
-```
-
-**Optional:** libgmp (GNU Multi-Precision arithmetic library) for enhanced crypto performance. Automatically detected if available.
-
-**Provides:**
-- RRSIG signature verification
-- DNSKEY and DS record validation
-- NSEC/NSEC3 denial-of-existence proofs
-- Trust anchor management
-
-**Standards:** RFC 4033, 4034, 4035 (DNSSEC)
-
----
-
-### Connection Tracking Integration
-
-**Library:** libnetfilter_conntrack  
-**Minimum Version:** 1.0.6  
-**Compile Flag:** `HAVE_CONNTRACK`  
-**Purpose:** Linux netfilter connection tracking mark preservation
-
-**Installation:**
-```bash
-# Debian/Ubuntu
-apt-get install libnetfilter-conntrack-dev
-
-# RHEL/CentOS/Fedora
-yum install libnetfilter_conntrack-devel
-```
-
-**Platform:** Linux only  
-**Kernel Requirements:** CONFIG_NF_CONNTRACK enabled
-
-**Provides:**
-- Connection tracking mark queries
-- Mark preservation across NAT
-- Integration with policy-based routing
-
----
-
-### nftables Set Integration
-
-**Library:** libnftables  
-**Minimum Version:** 0.9.0  
-**Compile Flag:** `HAVE_NFTSET`  
-**Purpose:** Populates nftables sets with resolved IP addresses
-
-**Installation:**
-```bash
-# Debian/Ubuntu
-apt-get install libnftables-dev
+sudo apt-get install libnftables-dev
 
 # RHEL/CentOS/Fedora (RHEL 8+)
-yum install nftables-devel
+sudo dnf install nftables-devel
 
-# FreeBSD (nftables support experimental)
-pkg install nftables
+# Arch Linux
+sudo pacman -S nftables
 ```
 
-**Platform:** Linux primary, FreeBSD experimental  
-**Kernel Requirements:** CONFIG_NF_TABLES enabled
+**Platform:** Linux only (requires `CONFIG_NF_TABLES` kernel support)  
+**Error if missing:** `Warning: nftset feature enabled but libnftables not found`
 
-**Provides:**
-- Dynamic nftables set population
-- Domain-based firewall rules
-- Integration with nftables packet filtering
+#### Conntrack Mark Retrieval (`conntrack` feature)
 
----
-
-### Lua Scripting Support
-
-**Library:** Lua  
-**Minimum Version:** 5.2 (5.3+ recommended)  
-**Compile Flag:** `HAVE_LUASCRIPT`  
-**Purpose:** Embedded Lua interpreter for DHCP event scripts
-
-**Installation:**
 ```bash
 # Debian/Ubuntu
-apt-get install liblua5.3-dev
+sudo apt-get install libnetfilter-conntrack-dev
 
 # RHEL/CentOS/Fedora
-yum install lua-devel
+sudo dnf install libnetfilter_conntrack-devel
 
-# FreeBSD
-pkg install lua53
-
-# macOS (via Homebrew)
-brew install lua
+# Arch Linux
+sudo pacman -S libnetfilter_conntrack
 ```
 
-**Lua Version Selection:** Set `LUA` make variable to specify version (e.g., `LUA=lua5.3`)
+**Platform:** Linux only (requires `CONFIG_NF_CONNTRACK` kernel support)  
+**Error if missing:** `Warning: conntrack feature enabled but libnetfilter_conntrack not found`
 
-**Provides:**
-- DHCP lease event handling via Lua functions
-- Reduced process creation overhead vs external scripts
-- Access to lease details (MAC, IP, hostname)
+#### UBus Control Interface (`ubus` feature)
 
----
-
-### UBus Control Interface (OpenWrt)
-
-**Libraries:** libubus, libubox  
-**Minimum Version:** OpenWrt 19.07+  
-**Compile Flag:** `HAVE_UBUS`  
-**Purpose:** Native OpenWrt/LEDE control interface
-
-**Installation:**
 ```bash
-# OpenWrt/LEDE build system
-# Automatically included in OpenWrt SDK
+# OpenWrt build system
+opkg install libubus-dev libubox-dev
 ```
 
 **Platform:** OpenWrt/LEDE only
 
-**Provides:**
-- Cache management via UBus
-- Lease query via UBus
-- Integration with LuCI web interface
-- Low memory footprint IPC
+### Crate Dependencies
+
+The following Rust crates are automatically fetched from crates.io by Cargo. No manual installation is required.
+
+#### Core Dependencies (always included)
+
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| `mio` | 1.1.0 | Poll-based I/O event loop (epoll/kqueue abstraction) |
+| `nix` | 0.30.1 | Safe POSIX API bindings (signals, sockets, ioctl, fork) |
+| `libc` | 0.2.171 | Low-level C FFI types and constants |
+| `log` | 0.4.27 | Logging facade for syslog integration |
+| `tracing` | 0.1.41 | Structured diagnostic logging |
+| `tracing-subscriber` | 0.3.19 | Log subscriber for syslog output formatting |
+| `bitflags` | 2.9.0 | Type-safe bitflag definitions for DNS/DHCP option flags |
+| `thiserror` | 2.0.12 | Derive macro for custom error types |
+| `anyhow` | 1.0.98 | Ergonomic error handling for binary entry point |
+| `bytes` | 1.10.1 | Efficient byte buffer management for packet construction |
+| `cfg-if` | 1.0.0 | Conditional compilation helpers |
+| `socket2` | 0.5.9 | Extended socket options (SO_REUSEPORT, SO_BINDTODEVICE, multicast) |
+| `rand` | 0.9.1 | CSPRNG for transaction IDs and port randomization |
+
+#### Optional Dependencies (feature-gated)
+
+| Crate | Version | Enabled By Feature |
+|-------|---------|-------------------|
+| `ring` | 0.17.14 | `dnssec` — DNSSEC cryptographic verification |
+| `dbus` | 0.9.7 | `dbus` — D-Bus system bus FFI bindings |
+| `inotify` | 0.11.0 | `inotify_monitor` — Linux inotify file monitoring |
+| `pcap-file` | 2.0.0 | `dump` — Pcap file writing for packet capture |
+| `idna` | 1.0.3 | `idn` — IDNA 2008 domain name processing |
+| `netlink-packet-core` | 0.7.0 | `ipset` — Netlink message construction for ipset |
+| `netlink-packet-route` | 0.21.0 | `netlink` — Route/address netlink messages |
+| `netlink-sys` | 0.8.7 | `netlink` — Netlink socket management |
+
+#### Build Dependencies
+
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| `cc` | 1.2.16 | C compiler detection for `ring` assembly compilation |
+| `pkg-config` | 0.3.31 | Native library detection for optional features |
 
 ---
 
@@ -316,276 +296,348 @@ brew install lua
 
 ### Quick Start (Default Configuration)
 
-For a standard build with automatic feature detection:
+Build dnsmasq with the default feature set (DHCPv4, DHCPv6, TFTP, auth DNS, scripting, ipset, loop detection, packet dump):
 
 ```bash
-# Extract source
-tar xzf dnsmasq-2.92.tar.gz
-cd dnsmasq-2.92
+# Clone or extract source
+cd dnsmasq
 
-# Build with all auto-detected features
-make
+# Build in debug mode (fast compile, includes debug info)
+cargo build
 
-# Install (requires root)
-make install
+# Build in release mode (optimized)
+cargo build --release
+
+# Output binary location
+ls -lh target/release/dnsmasq
 ```
 
-**Default Installation Paths:**
+### Installation
+
+```bash
+# Install to ~/.cargo/bin/dnsmasq
+cargo install --path .
+
+# Or manually copy the release binary
+sudo cp target/release/dnsmasq /usr/local/sbin/dnsmasq
+
+# Verify installation
+dnsmasq --version
+```
+
+**Default Installation Paths (manual copy):**
 - Binary: `/usr/local/sbin/dnsmasq`
-- Man page: `/usr/local/share/man/man8/dnsmasq.8`
-- Configuration: User must create `/etc/dnsmasq.conf` (optional)
+- Configuration: User must create `/etc/dnsmasq.conf` (see `dnsmasq.conf.example`)
+- Trust anchors: `/usr/share/dnsmasq/trust-anchors.conf` (for DNSSEC)
 
-### Customizing Installation Paths
+### Build Profiles
 
-Override installation directories with make variables:
+| Profile | Command | Optimizations | Debug Info | Use Case |
+|---------|---------|--------------|------------|----------|
+| Debug | `cargo build` | None (`opt-level = 0`) | Full | Development and debugging |
+| Release | `cargo build --release` | Full (`opt-level = 3`, LTO) | Stripped | Production deployment |
+| Release + Debug | See below | Full | Included | Profiling |
 
-```bash
-make install \
-  PREFIX=/opt/dnsmasq \
-  BINDIR=/opt/dnsmasq/bin \
-  MANDIR=/opt/dnsmasq/man
+To build a release binary with debug info for profiling, add to `Cargo.toml`:
+
+```toml
+[profile.release]
+debug = true
 ```
 
-**Available Path Variables:**
+Then build with:
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `PREFIX` | `/usr/local` | Installation prefix |
-| `BINDIR` | `$(PREFIX)/sbin` | Executable location |
-| `MANDIR` | `$(PREFIX)/share/man` | Man page location |
-| `LOCALEDIR` | `$(PREFIX)/share/locale` | Translation files |
-| `DESTDIR` | (empty) | Staging directory for packaging |
-
-**Example for system-wide installation:**
 ```bash
-make install PREFIX=/usr
-# Installs to /usr/sbin/dnsmasq
+cargo build --release
+```
+
+### Running Tests
+
+```bash
+# Run all unit tests (default features)
+cargo test
+
+# Run all tests including feature-gated ones
+cargo test --all-features
+
+# Run a specific integration test module
+cargo test --test integration -- dns_forwarding
+
+# Run tests with output visible
+cargo test -- --nocapture
+
+# Run tests for a specific module
+cargo test dns::cache
 ```
 
 ---
 
-## Feature Selection with COPTS
+## Feature Selection with Cargo
 
-The `COPTS` make variable controls compile-time feature selection by passing C preprocessor flags to the compiler.
+Cargo feature flags control which subsystems are compiled into the binary. This replaces the C build system's `COPTS` variable with `-DHAVE_*` and `-DNO_*` flags.
 
 ### Feature Selection Syntax
 
 ```bash
-make COPTS="<flags>"
+# Enable additional features (on top of defaults)
+cargo build --release --features "dnssec,dbus"
+
+# Disable all default features, start from scratch
+cargo build --release --no-default-features
+
+# Disable defaults, then enable specific features
+cargo build --release --no-default-features --features "dhcp,tftp"
+
+# Enable ALL features
+cargo build --release --all-features
 ```
-
-Where `<flags>` is a space-separated list of:
-- **Feature enables**: `-DHAVE_<FEATURE>`
-- **Feature disables**: `-DNO_<FEATURE>`
-- **Custom values**: `-D<CONSTANT>=<value>`
-
-### Common Feature Flags
-
-#### Core Service Features
-
-| Flag | Default | Purpose |
-|------|---------|---------|
-| `HAVE_DHCP` | ON | DHCPv4 and DHCPv6 server |
-| `HAVE_DHCP6` | ON | DHCPv6 and Router Advertisement |
-| `HAVE_TFTP` | ON | TFTP server for network boot |
-| `HAVE_AUTH` | ON | Authoritative DNS mode |
-| `HAVE_SCRIPT` | ON | External script execution |
-| `HAVE_LOOP` | ON | DNS forwarding loop detection |
-| `HAVE_INOTIFY` | ON (Linux) | Configuration file monitoring |
-
-#### Optional Features (require libraries)
-
-| Flag | Library Required | Purpose |
-|------|-----------------|---------|
-| `HAVE_DBUS` | libdbus-1 | D-Bus control interface |
-| `HAVE_UBUS` | libubus, libubox | UBus control (OpenWrt) |
-| `HAVE_IDN` | libidn | IDN 2003 support |
-| `HAVE_LIBIDN2` | libidn2 | IDN 2008 support (preferred) |
-| `HAVE_DNSSEC` | nettle, hogweed | DNSSEC validation |
-| `HAVE_CONNTRACK` | libnetfilter_conntrack | Connection tracking |
-| `HAVE_IPSET` | (kernel support) | Linux ipset integration |
-| `HAVE_NFTSET` | libnftables | nftables set integration |
-| `HAVE_LUASCRIPT` | lua | Lua scripting support |
-| `HAVE_DUMPFILE` | (none) | Packet capture to pcap |
-
-#### Feature Negation Flags
-
-| Flag | Effect |
-|------|--------|
-| `NO_DHCP` | Disables all DHCP functionality (DHCPv4, DHCPv6, RA) |
-| `NO_TFTP` | Disables TFTP server |
-| `NO_SCRIPT` | Disables script execution hooks |
-| `NO_INOTIFY` | Disables inotify file monitoring (Linux) |
-| `NO_AUTH` | Disables authoritative DNS mode |
-| `NO_LOOP` | Disables forwarding loop detection |
-| `NO_ID` | Disables process ID file creation |
-| `NO_GMP` | Disables GMP library (DNSSEC crypto optimization) |
-
----
 
 ### Feature Selection Examples
 
-#### Minimal DNS-only Build
+#### Default Build (Standard Deployment)
 
-Create the smallest possible binary containing only DNS forwarding and caching:
+Build with default features (DHCPv4, DHCPv6, TFTP, auth, scripting, ipset, loop detection, dump):
 
 ```bash
-make COPTS="-DNO_DHCP -DNO_TFTP -DNO_SCRIPT -DNO_AUTH -DNO_INOTIFY -DNO_LOOP -DNO_ID"
+cargo build --release
 ```
 
-**Result:** ~100KB executable (stripped)  
-**Capabilities:** DNS forwarding, DNS caching, `/etc/hosts` integration  
-**Excluded:** All DHCP, TFTP, scripting, auth DNS
+**Capabilities:** DNS forwarding, DNS caching, DHCPv4/v6, TFTP, authoritative DNS, script hooks, ipset, loop detection, packet dump
 
-#### DNSSEC-enabled Build
+#### Minimal DNS-Only Build
+
+Build the smallest possible binary containing only DNS forwarding and caching:
+
+```bash
+cargo build --release --no-default-features
+```
+
+**Capabilities:** DNS forwarding, DNS caching, `/etc/hosts` integration  
+**Excluded:** All DHCP, TFTP, scripting, auth DNS, ipset, loop detection, dump
+
+#### DNSSEC-Enabled Build
 
 Build with DNSSEC validation support:
 
 ```bash
-make COPTS="-DHAVE_DNSSEC"
+cargo build --release --features dnssec
 ```
 
-**Requirements:** nettle and hogweed libraries installed  
-**Provides:** Cryptographic DNS response validation  
+**Requirements:** None — the `ring` crate provides all cryptographic functionality  
+**Provides:** RRSIG signature verification, DNSKEY/DS validation, NSEC/NSEC3 proofs  
 **Trust Anchors:** `trust-anchors.conf` must be present at runtime
 
-#### Full-featured Build with D-Bus
+#### Full-Featured Build with D-Bus and DNSSEC
 
-Build with all auto-detected features plus D-Bus:
+Build with all features including optional D-Bus and DNSSEC:
 
 ```bash
-make COPTS="-DHAVE_DBUS -DHAVE_DNSSEC -DHAVE_IDN2"
+cargo build --release --all-features
 ```
 
 **Requirements:**
-- libdbus-1-dev
-- nettle-dev
-- libidn2-dev
+- `libdbus-1-dev` (for D-Bus feature)
+- `libnftables-dev` (for nftset feature)
+- `libnetfilter-conntrack-dev` (for conntrack feature)
 
-#### DHCP and TFTP Only (No DNS)
+#### D-Bus + DNSSEC Build
 
-Build for PXE boot server without DNS functionality:
-
-```bash
-make COPTS="-DHAVE_TFTP"
-# DHCP is enabled by default
-```
-
-**Note:** This configuration is unusual. DHCP typically requires DNS for hostname registration.
-
-#### Embedded System Build (OpenWrt/LEDE)
-
-Typical configuration for resource-constrained routers:
+Build with specific optional features:
 
 ```bash
-make COPTS="-DHAVE_UBUS -DHAVE_IPSET -DNO_SCRIPT -DNO_INOTIFY" LUA=lua5.3
+cargo build --release --features "dbus,dnssec"
 ```
 
-**Rationale:**
-- UBus integration for LuCI web interface
-- ipset for firewall integration
-- Disabled script execution (security)
-- Disabled inotify (not needed with UBus control)
+**Requirements:** `libdbus-1-dev` installed
+
+#### No DHCP (DNS + TFTP Only)
+
+Build without any DHCP functionality:
+
+```bash
+cargo build --release --no-default-features --features "tftp,auth,script,loop_detect"
+```
+
+#### Embedded System Build
+
+Minimal build for resource-constrained devices:
+
+```bash
+cargo build --release --no-default-features --target aarch64-unknown-linux-gnu
+```
+
+**Rationale:** Smallest binary footprint for embedded Linux devices with only DNS forwarding and caching.
 
 ---
 
-### Dependency Detection Mechanism
+## Dependency Detection
 
-The build system uses `bld/pkg-wrapper` to automatically detect library availability via pkg-config:
+Cargo handles dependency resolution automatically for all Rust crate dependencies. Native system libraries (required only for certain optional features) are detected at build time by `build.rs`.
 
-```bash
-# From Makefile lines 55-71
-dbus_cflags = `echo $(COPTS) | $(top)/bld/pkg-wrapper HAVE_DBUS $(PKG_CONFIG) --cflags dbus-1`
-dbus_libs =   `echo $(COPTS) | $(top)/bld/pkg-wrapper HAVE_DBUS $(PKG_CONFIG) --libs dbus-1`
+### How Cargo Dependency Resolution Works
+
+1. **Cargo reads `Cargo.toml`** — parses the `[dependencies]` and `[features]` sections
+2. **Resolves dependency graph** — downloads and caches crate sources from crates.io in `~/.cargo/registry/`
+3. **Runs `build.rs`** — executes the build script for platform detection and native library linking
+4. **Compiles dependency tree** — builds all crate dependencies before the main project
+5. **Compiles `src/` modules** — compiles the dnsmasq source with `#[cfg(feature = "...")]` gates applied
+6. **Links binary** — produces `target/release/dnsmasq` (or `target/debug/dnsmasq`)
+
+### How `build.rs` Handles Native Libraries
+
+The `build.rs` build script uses the `pkg-config` crate to detect native system libraries at build time. It runs automatically when you invoke `cargo build`.
+
+**What `build.rs` does:**
+
+1. **Platform detection**: Emits `cargo:rustc-cfg` directives based on `target_os` and `target_arch`
+2. **Native library detection**: For features requiring system libraries (`dbus`, `nftset`, `conntrack`), probes via pkg-config
+3. **Linker directives**: Emits `cargo:rustc-link-lib=` to link native libraries
+4. **Error reporting**: Prints clear warnings if a required native library is missing
+
+**Example — D-Bus detection in `build.rs`:**
+
+```rust
+#[cfg(feature = "dbus")]
+{
+    if let Err(e) = pkg_config::probe_library("dbus-1") {
+        eprintln!("Warning: D-Bus feature enabled but libdbus-1 not found: {}", e);
+    }
+}
 ```
 
-**How it works:**
-1. If `HAVE_<FEATURE>` appears in `COPTS`, the wrapper invokes pkg-config
-2. If library is found, flags are passed to compiler/linker
-3. If library is missing, build fails with error message
-4. If `HAVE_<FEATURE>` is not in `COPTS`, feature is skipped silently
+### Cargo.toml `[features]` Section
 
-**Manual Library Specification:**
+The `[features]` section in `Cargo.toml` defines all available feature flags and their dependencies:
 
-If pkg-config detection fails, specify libraries manually:
+```toml
+[features]
+default = ["dhcp", "dhcp6", "tftp", "script", "auth", "ipset", "loop_detect", "dump"]
 
-```bash
-make COPTS="-DHAVE_DBUS" LIBS="-ldbus-1"
+dhcp = []
+dhcp6 = ["dhcp"]          # DHCPv6 requires DHCPv4
+dnssec = ["dep:ring"]      # Enables ring crate for crypto
+dbus = ["dep:dbus"]        # Enables dbus crate FFI
+tftp = []
+auth = []
+ipset = ["dep:netlink-packet-core"]
+# ... (see Cargo.toml for complete list)
 ```
 
 ---
 
 ## Cross-Compilation
 
-Cross-compilation for embedded systems and alternative architectures is supported through standard make variables.
+Rust provides first-class cross-compilation support through `rustup` target management and `.cargo/config.toml` linker configuration.
 
-### Cross-Compilation Variables
+### Cross-Compilation Workflow
 
-| Variable | Purpose | Example |
-|----------|---------|---------|
-| `CC` | C compiler | `arm-linux-gnueabihf-gcc` |
-| `CFLAGS` | Compiler flags | `-march=armv7-a -mfpu=neon` |
-| `LDFLAGS` | Linker flags | `-static` |
-| `PKG_CONFIG` | pkg-config tool | `arm-linux-gnueabihf-pkg-config` |
-| `PKG_CONFIG_PATH` | Library search path | `/opt/arm-sdk/lib/pkgconfig` |
-
-### Cross-Compilation Example: ARM Linux
-
-Build for ARM-based embedded device:
+1. **Install the target toolchain:**
 
 ```bash
-# Set cross-compilation environment
-export CC=arm-linux-gnueabihf-gcc
-export CFLAGS="-march=armv7-a -mfpu=neon -O2"
-export LDFLAGS="-static"
-export PKG_CONFIG=arm-linux-gnueabihf-pkg-config
-export PKG_CONFIG_PATH=/opt/arm-sdk/usr/lib/pkgconfig
-
-# Build with minimal features
-make COPTS="-DNO_SCRIPT -DNO_INOTIFY -DNO_AUTH"
-
-# Result: Static ARM binary
-file src/dnsmasq
-# src/dnsmasq: ELF 32-bit LSB executable, ARM, statically linked
+rustup target add aarch64-unknown-linux-gnu
 ```
 
-### Cross-Compilation Example: MIPS OpenWrt
-
-Using OpenWrt SDK toolchain:
+2. **Install the cross-compilation linker:**
 
 ```bash
-# OpenWrt SDK environment
-export STAGING_DIR=/opt/openwrt-sdk/staging_dir
-export PATH=$STAGING_DIR/toolchain-mips_24kc_gcc-8.4.0_musl/bin:$PATH
-export CC=mips-openwrt-linux-gcc
-export CFLAGS="-Os -pipe -mips32r2 -mtune=24kc"
-export LDFLAGS=""
+# Debian/Ubuntu
+sudo apt-get install gcc-aarch64-linux-gnu
 
-# Build for OpenWrt
-make COPTS="-DHAVE_UBUS -DHAVE_IPSET -DNO_SCRIPT" LUA=lua5.3
-
-# Result: MIPS binary for OpenWrt
+# RHEL/CentOS/Fedora
+sudo dnf install gcc-aarch64-linux-gnu
 ```
 
-### Cross-Compilation Troubleshooting
+3. **Configure the linker in `.cargo/config.toml`:**
 
-**Problem:** pkg-config finds host libraries instead of target libraries
-
-**Solution:** Set `PKG_CONFIG_PATH` and `PKG_CONFIG_LIBDIR`:
-
-```bash
-export PKG_CONFIG_PATH=/opt/target-sdk/usr/lib/pkgconfig
-export PKG_CONFIG_LIBDIR=/opt/target-sdk/usr/lib/pkgconfig
-unset PKG_CONFIG_SYSTEM_LIBRARY_PATH
-unset PKG_CONFIG_SYSTEM_INCLUDE_PATH
+```toml
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
 ```
 
-**Problem:** Linker finds wrong libraries
-
-**Solution:** Use `LDFLAGS` to specify library search path:
+4. **Build for the target:**
 
 ```bash
-export LDFLAGS="-L/opt/target-sdk/usr/lib -Wl,-rpath-link,/opt/target-sdk/usr/lib"
+cargo build --release --target aarch64-unknown-linux-gnu
+```
+
+5. **Output binary:**
+
+```bash
+ls -lh target/aarch64-unknown-linux-gnu/release/dnsmasq
+file target/aarch64-unknown-linux-gnu/release/dnsmasq
+# dnsmasq: ELF 64-bit LSB pie executable, ARM aarch64, ...
+```
+
+### Cross-Compilation Targets
+
+#### ARM64 Linux (aarch64)
+
+```bash
+rustup target add aarch64-unknown-linux-gnu
+cargo build --release --target aarch64-unknown-linux-gnu
+```
+
+**Linker:** `aarch64-linux-gnu-gcc` (install via `apt install gcc-aarch64-linux-gnu`)
+
+#### ARM32 Linux (armv7)
+
+```bash
+rustup target add armv7-unknown-linux-gnueabihf
+cargo build --release --target armv7-unknown-linux-gnueabihf
+```
+
+**Linker:** `arm-linux-gnueabihf-gcc` (install via `apt install gcc-arm-linux-gnueabihf`)
+
+#### MIPS Linux (OpenWrt)
+
+```bash
+rustup target add mips-unknown-linux-musl
+cargo build --release --target mips-unknown-linux-musl
+```
+
+Or for little-endian MIPS:
+
+```bash
+rustup target add mipsel-unknown-linux-musl
+cargo build --release --target mipsel-unknown-linux-musl
+```
+
+### Cross-Compilation with Features
+
+Features work identically when cross-compiling:
+
+```bash
+cargo build --release --target aarch64-unknown-linux-gnu --features "dnssec,dbus"
+```
+
+**Note:** When the `dbus` or other native-library features are enabled during cross-compilation, ensure the target architecture's development libraries are available and that `PKG_CONFIG_PATH` points to the cross-compiled library pkgconfig files.
+
+### C Compiler Requirement for `ring`
+
+The `ring` crate requires a C compiler (via the `cc` build crate) to compile assembly routines for cryptographic operations. When cross-compiling with the `dnssec` feature, ensure the cross-compilation C compiler is available.
+
+For cross-compilation, the `cc` crate automatically uses the linker specified in `.cargo/config.toml` to find the appropriate C compiler.
+
+### `.cargo/config.toml` Reference
+
+The repository includes pre-configured cross-compilation profiles:
+
+```toml
+# ARM64 (aarch64) cross-compilation
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+```
+
+You can add additional target profiles as needed:
+
+```toml
+# ARM32 cross-compilation
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+
+# MIPS cross-compilation (OpenWrt)
+[target.mips-unknown-linux-musl]
+linker = "mips-linux-musl-gcc"
 ```
 
 ---
@@ -596,341 +648,276 @@ export LDFLAGS="-L/opt/target-sdk/usr/lib -Wl,-rpath-link,/opt/target-sdk/usr/li
 
 Linux is the primary development platform with full feature support.
 
-**Standard Build:**
-```bash
-make
-make install PREFIX=/usr
-```
-
-**Distribution-Specific Notes:**
-
 #### Debian/Ubuntu
 
-Install build dependencies:
+**Install Rust and build dependencies:**
+
 ```bash
-apt-get install build-essential pkg-config \
-  libdbus-1-dev libidn2-dev nettle-dev \
-  libnetfilter-conntrack-dev libnftables-dev
+# Install C compiler (required for ring crate assembly)
+sudo apt-get install build-essential pkg-config
+
+# Install Rust via rustup
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# Build dnsmasq
+cargo build --release
+```
+
+**Optional native libraries (only for features that require them):**
+
+```bash
+# D-Bus control interface (--features dbus)
+sudo apt-get install libdbus-1-dev
+
+# nftables set integration (--features nftset)
+sudo apt-get install libnftables-dev
+
+# Conntrack mark retrieval (--features conntrack)
+sudo apt-get install libnetfilter-conntrack-dev
+```
+
+**Full-featured build:**
+
+```bash
+sudo apt-get install libdbus-1-dev libnftables-dev libnetfilter-conntrack-dev
+cargo build --release --all-features
 ```
 
 #### RHEL/CentOS/Fedora
 
-Install build dependencies:
+**Install Rust and build dependencies:**
+
 ```bash
-yum install gcc make pkgconfig \
-  dbus-devel libidn2-devel nettle-devel \
-  libnetfilter_conntrack-devel nftables-devel
+# Install C compiler (required for ring crate)
+sudo dnf install gcc pkg-config
+
+# Install Rust via rustup
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# Build dnsmasq
+cargo build --release
 ```
 
-**Note:** RHEL 7 and earlier use iptables/ipset instead of nftables.
+**Optional native libraries:**
+
+```bash
+# D-Bus (--features dbus)
+sudo dnf install dbus-devel
+
+# nftables (--features nftset, RHEL 8+)
+sudo dnf install nftables-devel
+
+# Conntrack (--features conntrack)
+sudo dnf install libnetfilter_conntrack-devel
+```
+
+#### Arch Linux
+
+```bash
+# Install Rust (system package or rustup)
+sudo pacman -S rust
+
+# Or via rustup
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Build dnsmasq
+cargo build --release
+```
+
+**Optional native libraries:**
+
+```bash
+sudo pacman -S dbus libnftables libnetfilter_conntrack
+```
 
 ---
 
 ### FreeBSD
 
-FreeBSD uses BPF (Berkeley Packet Filter) for raw packet access.
+FreeBSD uses BPF (Berkeley Packet Filter) for raw packet access. The platform backend is `src/net/platform/bsd/bpf.rs`.
 
-**Build Commands:**
+**Install Rust and build:**
+
 ```bash
-# Install dependencies
-pkg install nettle libidn2
+# Install Rust via pkg or rustup
+pkg install rust
 
-# Build (GNU make required)
-gmake
+# Or via rustup
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Install
-gmake install PREFIX=/usr/local
+# Build dnsmasq
+cargo build --release
 ```
 
 **Platform-Specific Behavior:**
-- Uses BPF instead of Linux netlink (`src/bpf.c`)
+- Uses BPF instead of Linux netlink (`src/net/platform/bsd/bpf.rs`)
 - Requires `/dev/bpf` device access for DHCP
 - Service management via `rc.d` scripts
 
-**Service Installation:**
+**Optional native libraries:**
+
 ```bash
-# Copy rc.d script
-cp contrib/FreeBSD/rc.d/dnsmasq /usr/local/etc/rc.d/
-
-# Enable in /etc/rc.conf
-echo 'dnsmasq_enable="YES"' >> /etc/rc.conf
-
-# Start service
-service dnsmasq start
+# D-Bus (--features dbus)
+pkg install dbus
 ```
 
 ---
 
 ### OpenBSD
 
-OpenBSD provides tight security integration with BPF and unveil/pledge support.
+**Install Rust and build:**
 
-**Build Commands:**
 ```bash
-# Install dependencies (as root)
-pkg_add nettle libidn2
+# Install Rust
+pkg_add rust
 
-# Build (GNU make required)
-gmake
-
-# Install
-gmake install PREFIX=/usr/local
+# Build dnsmasq
+cargo build --release
 ```
 
 **Security Notes:**
 - Privilege separation via `_dnsmasq` user (create before running)
 - BPF filter socket requires root or appropriate group membership
-- Consider using OpenBSD packet filter (PF) integration
-
----
-
-### NetBSD
-
-**Build Commands:**
-```bash
-# Install dependencies via pkgsrc
-pkgin install nettle libidn2 gmake
-
-# Build
-gmake
-
-# Install
-gmake install PREFIX=/usr/pkg
-```
+- Platform backend: `src/net/platform/bsd/bpf.rs`
 
 ---
 
 ### macOS
 
-macOS uses BPF for packet capture and launchd for service management.
+macOS uses BPF for packet capture. The platform backend is `src/net/platform/bsd/bpf.rs`.
 
-**Install Dependencies via Homebrew:**
-```bash
-brew install nettle libidn2
-```
-
-**Build Commands:**
-```bash
-make
-
-# Install to /usr/local
-make install PREFIX=/usr/local
-```
-
-**launchd Service Integration:**
-
-Install launchd plist for automatic startup:
+**Install Rust and build:**
 
 ```bash
-# Copy launchd plist
-cp contrib/MacOSX-launchd/uk.org.thekelleys.dnsmasq.plist \
-   /Library/LaunchDaemons/
+# Install Xcode command-line tools (provides C compiler for ring)
+xcode-select --install
 
-# Set permissions
-chown root:wheel /Library/LaunchDaemons/uk.org.thekelleys.dnsmasq.plist
-chmod 644 /Library/LaunchDaemons/uk.org.thekelleys.dnsmasq.plist
+# Install Rust via rustup (recommended)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
 
-# Load service
-launchctl load /Library/LaunchDaemons/uk.org.thekelleys.dnsmasq.plist
+# Or via Homebrew
+brew install rust
 
-# Start service
-launchctl start uk.org.thekelleys.dnsmasq
+# Build dnsmasq
+cargo build --release
 ```
 
 **macOS-Specific Notes:**
 - System Integrity Protection (SIP) may prevent binding to port 53
-- Consider using high port (e.g., 5353) or disabling SIP for development
+- Consider using a high port (e.g., 5353) or configuring SIP for development
 - BPF device limit: macOS limits number of `/dev/bpf*` devices (check `sysctl debug.bpf_maxdevices`)
 
----
-
-### Solaris/OpenSolaris
-
-Solaris requires additional system libraries for socket operations.
-
-**Build Commands:**
-```bash
-# Install dependencies (Solaris 11+)
-pkg install gcc nettle libidn2 pkg-config
-
-# Build with Solaris libraries
-make CFLAGS="-O2 -Wall" LIBS="-lsocket -lnsl -lposix4"
-
-# Install
-make install PREFIX=/opt/dnsmasq
-```
-
-**Automatic Library Detection:**
-
-The Makefile automatically adds Solaris libraries (line 69):
-```makefile
-sunos_libs = `if uname | grep SunOS >/dev/null 2>&1; then echo -lsocket -lnsl -lposix4; fi`
-```
-
-**Service Management Framework (SMF):**
-
-Solaris uses SMF for service management:
+**Optional native libraries (via Homebrew):**
 
 ```bash
-# Import SMF manifest
-svccfg import contrib/Solaris10/dnsmasq.xml
-
-# Enable service
-svcadm enable svc:/network/dnsmasq:default
-
-# Check status
-svcs dnsmasq
+# D-Bus (--features dbus)
+brew install dbus
 ```
-
-**SMF Manifest Location:** `contrib/Solaris10/dnsmasq.xml`
 
 ---
 
-### Android
+### Android (NDK Cross-Compilation)
 
-Android builds use the Android Open Source Project (AOSP) build system.
-
-**Build File:** `bld/Android.mk`
-
-**AOSP Build Integration:**
-
-```makefile
-# From bld/Android.mk
-LOCAL_PATH := external/dnsmasq/src
-LOCAL_MODULE := dnsmasq
-LOCAL_CFLAGS := -O2 -g -W -Wall -D__ANDROID__ -DNO_TFTP -DNO_SCRIPT
-LOCAL_SYSTEM_SHARED_LIBRARIES := libc
-```
-
-**Android-Specific Configuration:**
-- **TFTP disabled:** `-DNO_TFTP` (Android security policy)
-- **Script execution disabled:** `-DNO_SCRIPT` (Android security policy)
-- **Platform detection:** `-D__ANDROID__`
-- **Installation path:** `/system/bin/dnsmasq` or `/system/xbin/dnsmasq`
-
-**Building within AOSP:**
-
-1. Place dnsmasq source in `external/dnsmasq/`
-2. Build via AOSP build system:
-   ```bash
-   cd /path/to/aosp
-   source build/envsetup.sh
-   lunch <target>
-   make dnsmasq
-   ```
-3. Binary located at: `out/target/product/<device>/system/bin/dnsmasq`
-
-**Android NDK Build:**
-
-For standalone NDK builds:
+Rust supports Android targets for cross-compilation via the Android NDK:
 
 ```bash
-# Set NDK environment
-export NDK_ROOT=/opt/android-ndk-r25c
-export CC=$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang
-export CFLAGS="-O2 -D__ANDROID__ -DNO_TFTP -DNO_SCRIPT"
-export LDFLAGS="-static"
+# Install Android target
+rustup target add aarch64-linux-android
 
-# Build
-make COPTS="-DNO_DHCP6 -DNO_AUTH -DNO_INOTIFY"
+# Configure linker in .cargo/config.toml
+# [target.aarch64-linux-android]
+# linker = "/path/to/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
+
+# Build minimal (DNS-only) for Android
+cargo build --release --no-default-features --target aarch64-linux-android
 ```
+
+**Note:** Android builds typically use `--no-default-features` for security (no TFTP, no script execution).
 
 ---
 
 ## Static vs Dynamic Linking
 
-The build system supports both dynamic (default) and static linking.
-
 ### Dynamic Linking (Default)
 
-Dynamic linking produces smaller binaries that depend on system shared libraries:
+The standard `cargo build --release` produces a dynamically-linked binary:
 
 ```bash
-make
-# Result: ~300-400KB binary (stripped)
+cargo build --release
+
+# Check dynamic dependencies
+ldd target/release/dnsmasq
 ```
 
 **Advantages:**
 - Smaller binary size
-- Shared library updates benefit all programs
-- Reduced memory usage (shared library code)
+- Benefits from shared library security updates
+- Standard deployment for most Linux distributions
 
 **Disadvantages:**
 - Requires shared libraries at runtime
-- Library version mismatches can cause issues
-- Not suitable for rescue environments
-
-**Check Dynamic Dependencies:**
-```bash
-ldd src/dnsmasq
-# linux-vdso.so.1
-# libdbus-1.so.3 => /usr/lib/x86_64-linux-gnu/libdbus-1.so.3
-# libnettle.so.7 => /usr/lib/x86_64-linux-gnu/libnettle.so.7
-# libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
-```
+- Not suitable for rescue environments or containers without shared libraries
 
 ---
 
-### Static Linking
+### Static Linking with musl
 
-Static linking produces self-contained binaries with no external library dependencies:
+For fully static binaries with no runtime library dependencies, build against the musl C library:
 
 ```bash
-make LDFLAGS="-static"
-# Result: ~1-2MB binary (stripped)
+# Install musl target
+rustup target add x86_64-unknown-linux-musl
+
+# Build static binary
+cargo build --release --target x86_64-unknown-linux-musl
+
+# Verify static linking
+ldd target/x86_64-unknown-linux-musl/release/dnsmasq
+# Output: "not a dynamic executable" (fully static)
+file target/x86_64-unknown-linux-musl/release/dnsmasq
+# dnsmasq: ELF 64-bit LSB executable, x86-64, statically linked, ...
+```
+
+**ARM64 static build:**
+
+```bash
+rustup target add aarch64-unknown-linux-musl
+cargo build --release --target aarch64-unknown-linux-musl
 ```
 
 **Advantages:**
-- Self-contained executable
-- No runtime library dependencies
-- Suitable for embedded systems and rescue environments
-- Consistent behavior across different systems
+- Self-contained executable — no runtime dependencies
+- Ideal for containers, embedded systems, and rescue environments
+- Consistent behavior across different Linux distributions
 
 **Disadvantages:**
 - Larger binary size
 - No benefit from shared library security updates
-- Increased memory usage (no shared library code)
-
-**Verify Static Linking:**
-```bash
-ldd src/dnsmasq
-# not a dynamically linked executable (statically linked)
-```
+- D-Bus feature may not work with musl (libdbus requires glibc)
 
 ---
 
-### Partial Static Linking
+### Static Linking of Native Dependencies
 
-Link some libraries statically while keeping others dynamic:
+When optional features require native libraries (D-Bus, nftset, conntrack), static linking of those specific libraries can be configured through the `pkg-config` crate in `build.rs`:
 
 ```bash
-# Static nettle, dynamic glibc
-make LDFLAGS="-static-libgcc -Wl,-Bstatic -lnettle -lhogweed -Wl,-Bdynamic"
+# Force static linking of pkg-config detected libraries
+RUSTFLAGS="-C target-feature=+crt-static" cargo build --release
 ```
 
-**Use Case:** Embed optional libraries statically while using system libc dynamically.
+**Note:** This approach may not work for all native libraries. Prefer the musl target for fully static builds.
 
----
+### RUSTFLAGS for Linker Options
 
-### Static Linking with pkg-config
-
-The `bld/pkg-wrapper` script handles static library flags:
+Additional linker options can be passed via the `RUSTFLAGS` environment variable:
 
 ```bash
-# From bld/pkg-wrapper (line 18-23)
-if [ -z "$CHECK" ] || echo "$COPTS" | grep -q "$CHECK"; then
-  if echo "$COPTS" | grep -q -- "--static"; then
-    pkg-config --static "$@"
-  else
-    pkg-config "$@"
-  fi
-fi
-```
-
-**Enable static pkg-config flags:**
-```bash
-make COPTS="-DHAVE_DNSSEC --static"
-# Automatically uses pkg-config --static for library detection
+# Pass additional linker flags
+RUSTFLAGS="-C link-args=-Wl,--gc-sections" cargo build --release
 ```
 
 ---
@@ -943,89 +930,97 @@ Optimize binary size for embedded systems and size-constrained deployments.
 
 #### 1. Feature Selection
 
-Disable unnecessary features via `COPTS`:
+Disable unnecessary features to reduce code size:
 
 ```bash
-# DNS-only configuration
-make COPTS="-DNO_DHCP -DNO_TFTP -DNO_SCRIPT -DNO_AUTH -DNO_INOTIFY -DNO_LOOP"
+# DNS-only (smallest possible)
+cargo build --release --no-default-features
+
+# DNS + DHCP only
+cargo build --release --no-default-features --features "dhcp,dhcp6"
 ```
 
-**Impact:** Reduces code size by 50-70% compared to full build.
+**Impact:** Feature selection is the most effective size reduction technique. Each disabled feature eliminates its entire module from the binary.
 
-#### 2. Compiler Optimization Flags
+#### 2. Cargo Release Profile Optimization
 
-Use size-optimized compilation:
+Configure size optimization in `Cargo.toml`:
 
-```bash
-# Optimize for size (-Os)
-make CFLAGS="-Os -Wall"
+```toml
+[profile.release]
+opt-level = "s"       # Optimize for size (or "z" for minimal size)
+lto = true            # Link-time optimization (cross-crate dead code elimination)
+strip = "symbols"     # Strip debug symbols from binary
+panic = "abort"       # Abort on panic instead of unwinding (saves ~10-20KB)
+codegen-units = 1     # Single codegen unit (slower compile, better optimization)
 ```
 
-**Comparison:**
-- `-O2` (default): Speed-optimized, ~350KB
-- `-Os`: Size-optimized, ~280KB
-- `-O3`: Aggressive speed, ~420KB
-- `-Oz` (Clang): Ultra size, ~250KB
+**Optimization levels:**
+- `opt-level = 3` — Speed-optimized (default release)
+- `opt-level = "s"` — Size-optimized
+- `opt-level = "z"` — Aggressively size-optimized (may be slower)
 
 #### 3. Strip Debug Symbols
 
-Remove debugging information:
+Stripping is configured in the release profile (`strip = "symbols"`) or can be done manually:
 
 ```bash
-# Build
-make
+# Manual strip after build
+strip target/release/dnsmasq
 
-# Strip symbols
-strip --strip-all src/dnsmasq
-
-# Check size
-ls -lh src/dnsmasq
+# Check resulting size
+ls -lh target/release/dnsmasq
 ```
 
-**Impact:** Reduces size by 30-50% (debug symbols are large).
+#### 4. Abort on Panic
 
-#### 4. Link-Time Optimization (LTO)
+Replacing the default panic unwind mechanism with abort saves binary size:
 
-Enable LTO for additional size reduction:
-
-```bash
-make CFLAGS="-Os -flto" LDFLAGS="-flto"
+```toml
+[profile.release]
+panic = "abort"
 ```
 
-**Impact:** Additional 10-20% size reduction through cross-file optimization.
+**Impact:** Saves approximately 10–20KB by removing unwinding tables and cleanup code.
 
-#### 5. Static Linking with Size Optimization
+#### 5. Single Codegen Unit
 
-Combine static linking with size optimization:
-
-```bash
-make CFLAGS="-Os -flto" LDFLAGS="-static -flto -Wl,--gc-sections"
+```toml
+[profile.release]
+codegen-units = 1
 ```
 
-**Flags Explained:**
-- `-Os`: Optimize for size
-- `-flto`: Link-time optimization
-- `-static`: Static linking
-- `-Wl,--gc-sections`: Remove unused sections
+**Impact:** Allows LLVM to perform more aggressive optimizations across the entire crate. Increases compile time but produces smaller and faster binaries.
 
 ---
 
 ### Size Comparison Table
 
-| Configuration | Size (stripped) | Features |
-|--------------|----------------|----------|
-| Full build (dynamic, -O2) | ~350KB | All features enabled |
-| Full build (static, -O2) | ~1.8MB | All features, static libs |
-| Minimal (dynamic, -Os) | ~100KB | DNS-only, no optional libs |
-| Minimal (static, -Os) | ~800KB | DNS-only, static libc |
-| Embedded optimized | ~120KB | DHCP+DNS, uclibc, -Os |
-| Android build | ~250KB | No TFTP/script, Bionic libc |
+Approximate binary sizes for different configurations (Linux x86-64):
 
-**Target Size Goals:**
-- **Ultra-minimal:** <100KB (DNS forwarding only, no DHCP)
-- **Minimal:** 100-150KB (DNS+DHCP, no optional features)
-- **Standard:** 250-350KB (most features, dynamic linking)
-- **Full-featured:** 400-500KB (all features, dynamic linking)
+| Configuration | Approx. Size | Features |
+|--------------|-------------|----------|
+| Minimal (DNS-only, `--no-default-features`, `opt-level="z"`, stripped) | ~1.5–2 MB | DNS forwarding and caching only |
+| Default features (release, stripped) | ~3–4 MB | DHCP, TFTP, auth, scripting, ipset, loop detection, dump |
+| All features (release, stripped) | ~5–7 MB | All subsystems including DNSSEC, D-Bus, conntrack, nftset |
+| Minimal musl static | ~2–3 MB | DNS-only, fully static, no shared libraries |
+
+**Note:** Rust binaries are typically larger than equivalent C binaries because the Rust standard library is statically linked. This is a tradeoff for guaranteed memory safety and the elimination of runtime library dependencies.
+
+### Analyzing Binary Size
+
+Use `cargo-bloat` to identify which crates and functions contribute most to binary size:
+
+```bash
+# Install cargo-bloat
+cargo install cargo-bloat
+
+# Analyze by crate
+cargo bloat --release --crates
+
+# Analyze by function (top 20)
+cargo bloat --release -n 20
+```
 
 ---
 
@@ -1033,176 +1028,158 @@ make CFLAGS="-Os -flto" LDFLAGS="-static -flto -Wl,--gc-sections"
 
 ### Common Build Errors and Solutions
 
-#### Error: "pkg-config: command not found"
+#### Error: "linker `cc` not found"
 
 **Symptom:**
+
 ```
-/bin/sh: pkg-config: command not found
+error: linker `cc` not found
+  |
+  = note: No such file or directory (os error 2)
 ```
 
-**Cause:** pkg-config is not installed or not in PATH.
+**Cause:** No C compiler installed. The `ring` crate requires a C compiler for assembly compilation.
 
 **Solution:**
+
 ```bash
 # Debian/Ubuntu
-apt-get install pkg-config
+sudo apt-get install build-essential
 
-# RHEL/CentOS
-yum install pkgconfig
+# RHEL/CentOS/Fedora
+sudo dnf install gcc
 
-# FreeBSD
-pkg install pkgconf
+# macOS
+xcode-select --install
 ```
 
 ---
 
-#### Error: "Package dbus-1 was not found"
+#### Error: "failed to run custom build command for `ring`"
 
 **Symptom:**
+
 ```
-Package dbus-1 was not found in the pkg-config search path
+error: failed to run custom build command for `ring v0.17.14`
 ```
 
-**Cause:** D-Bus development headers not installed, but `HAVE_DBUS` is enabled.
+**Cause:** The `ring` crate's build script failed, usually because a C compiler or assembler is not available.
 
-**Solution 1:** Install D-Bus development package:
+**Solution:** Ensure a C compiler (GCC or Clang) is installed and in your `PATH`:
+
 ```bash
-# Debian/Ubuntu
-apt-get install libdbus-1-dev
+# Verify C compiler
+cc --version
 
-# RHEL/CentOS
-yum install dbus-devel
+# If missing, install build tools
+sudo apt-get install build-essential   # Debian/Ubuntu
+sudo dnf install gcc                   # Fedora/RHEL
 ```
 
-**Solution 2:** Build without D-Bus:
+---
+
+#### Error: "pkg-config not found" or "could not find native library `dbus-1`"
+
+**Symptom:**
+
+```
+error: could not find native static library `dbus-1`, perhaps an -L flag is missing?
+```
+
+**Cause:** A feature requiring a native library is enabled, but the library or pkg-config is not installed.
+
+**Solution 1:** Install the required native library (see [Native Library Requirements](#native-library-requirements)).
+
+**Solution 2:** Build without the feature that requires the library:
+
 ```bash
-make  # Omit HAVE_DBUS from COPTS
+# Build without D-Bus
+cargo build --release
+# (D-Bus is not a default feature, so omitting --features dbus is sufficient)
 ```
 
 **Solution 3:** Specify library path manually:
+
 ```bash
-make COPTS="-DHAVE_DBUS" \
-     PKG_CONFIG_PATH=/opt/dbus/lib/pkgconfig
+PKG_CONFIG_PATH=/opt/dbus/lib/pkgconfig cargo build --release --features dbus
 ```
 
 ---
 
-#### Error: "undefined reference to `nettle_sha256_init'"
+#### Error: "linking with `cc` failed" (Cross-Compilation)
 
 **Symptom:**
+
 ```
-dnssec.o: In function `hash_init':
-dnssec.c:123: undefined reference to `nettle_sha256_init'
+error: linking with `cc` failed: exit status: 1
+  |
+  = note: /usr/bin/ld: target/aarch64-unknown-linux-gnu/release/deps/dnsmasq-xxx.o:
+          file format not recognized
 ```
 
-**Cause:** DNSSEC enabled but nettle library not linked.
+**Cause:** The default linker (`cc`) is being used instead of the cross-compilation linker.
 
-**Solution 1:** Install nettle development package:
+**Solution:** Configure the cross-compilation linker in `.cargo/config.toml`:
+
+```toml
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+```
+
+And ensure the cross-compiler is installed:
+
 ```bash
-# Debian/Ubuntu
-apt-get install nettle-dev
-
-# RHEL/CentOS
-yum install nettle-devel
-```
-
-**Solution 2:** Disable DNSSEC:
-```bash
-make  # Omit HAVE_DNSSEC from COPTS
+sudo apt-get install gcc-aarch64-linux-gnu
 ```
 
 ---
 
-#### Error: "conntrack.c: No such file or directory"
+#### Error: "unresolved import"
 
 **Symptom:**
+
 ```
-make: *** No rule to make target 'conntrack.o', needed by 'dnsmasq'
+error[E0432]: unresolved import `crate::dhcp`
 ```
 
-**Cause:** Stale build with obsolete object file references.
+**Cause:** A module that is gated behind a Cargo feature flag is being referenced, but the feature is not enabled.
 
-**Solution:** Clean and rebuild:
+**Solution:** Enable the required feature:
+
 ```bash
-make clean
-make
+# If the error references dhcp modules
+cargo build --features dhcp
+
+# Or build with all features
+cargo build --all-features
 ```
+
+Check that feature dependencies are correct in `Cargo.toml` (e.g., `dhcp6` requires `dhcp`).
 
 ---
 
-#### Error: Platform-Specific Library Missing (Solaris)
+#### Error: "target `xxx` not found"
 
 **Symptom:**
+
 ```
-Undefined symbol: socket
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `aarch64-unknown-linux-gnu` target may not be installed
 ```
 
-**Cause:** Solaris requires explicit socket library linking.
+**Cause:** The Rust target triple is not installed via rustup.
 
-**Solution:** The Makefile handles this automatically, but if manual override is needed:
+**Solution:**
+
 ```bash
-make LIBS="-lsocket -lnsl -lposix4"
+rustup target add aarch64-unknown-linux-gnu
 ```
 
----
+List available targets:
 
-#### Error: Cross-Compilation Finds Wrong Libraries
-
-**Symptom:**
-```
-/usr/lib/x86_64-linux-gnu/libdbus-1.so: file not recognized: File format not recognized
-```
-
-**Cause:** pkg-config is finding host libraries instead of target cross-compiled libraries.
-
-**Solution:** Set pkg-config environment variables:
 ```bash
-export PKG_CONFIG_PATH=/opt/target-sdk/usr/lib/pkgconfig
-export PKG_CONFIG_LIBDIR=/opt/target-sdk/usr/lib/pkgconfig
-export PKG_CONFIG_SYSROOT_DIR=/opt/target-sdk
-
-make CC=arm-linux-gnueabihf-gcc
-```
-
----
-
-#### Warning: "implicit declaration of function"
-
-**Symptom:**
-```
-warning: implicit declaration of function 'getifaddrs'
-```
-
-**Cause:** Missing feature detection or platform incompatibility.
-
-**Solution:** Check that appropriate feature flags are enabled for your platform. This usually indicates a platform-specific API is unavailable.
-
-For BSD platforms:
-```bash
-make  # Should auto-detect BSD and use BPF instead
-```
-
----
-
-#### Error: "make: *** No rule to make target 'all-i18n'"
-
-**Symptom:**
-```
-make: *** No rule to make target 'all-i18n'
-```
-
-**Cause:** Internationalization requires GNU Make and gettext tools.
-
-**Solution 1:** Use basic build target:
-```bash
-make  # Instead of make all-i18n
-```
-
-**Solution 2:** Install GNU Make and gettext:
-```bash
-# FreeBSD
-pkg install gmake gettext-tools
-gmake all-i18n
+rustup target list
 ```
 
 ---
@@ -1212,278 +1189,285 @@ gmake all-i18n
 #### Enable Verbose Build Output
 
 ```bash
-make V=1
-# Shows full compiler and linker commands
+# Verbose Cargo output (shows all compiler invocations)
+cargo build -vv
+
+# Even more detail
+cargo build -vv 2>&1 | tee build.log
 ```
 
-#### Check Compiler Availability
+#### Check Rust Toolchain
 
 ```bash
-which gcc
-gcc --version
+# Verify Rust version
+rustc --version
+cargo --version
 
-# For cross-compilation
-which arm-linux-gnueabihf-gcc
-arm-linux-gnueabihf-gcc --version
+# Check installed targets
+rustup target list --installed
+
+# Check active toolchain
+rustup show
 ```
 
-#### Test pkg-config Detection
+#### Runtime Debugging
 
 ```bash
-# Test library detection
-pkg-config --exists dbus-1 && echo "Found" || echo "Not found"
-pkg-config --cflags dbus-1
-pkg-config --libs dbus-1
+# Run with debug logging enabled
+RUST_LOG=debug cargo run -- --no-daemon --log-queries
 
-# Check search path
-pkg-config --variable pc_path pkg-config
-```
+# Enable full panic backtraces
+RUST_BACKTRACE=1 cargo run -- --no-daemon
 
-#### Examine Build Options
-
-```bash
-# Check what features will be compiled
-make COPTS="-DHAVE_DBUS -DHAVE_DNSSEC" 2>&1 | grep -E "HAVE_|NO_"
+# Full backtrace with source locations
+RUST_BACKTRACE=full cargo run -- --no-daemon
 ```
 
 ---
 
 ## Build System Architecture
 
-### Build Flow Diagram
+### Cargo Build Flow
 
 ```mermaid
 flowchart TD
-    Start([make command]) --> ParseVars[Parse Make Variables:<br/>CC, CFLAGS, COPTS, PREFIX]
-    ParseVars --> DetectPlatform{Detect Platform:<br/>uname}
+    Start([cargo build --release --features ...]) --> ReadManifest[Read Cargo.toml:<br/>dependencies, features, profiles]
+    ReadManifest --> ResolveGraph[Resolve Dependency Graph:<br/>fetch crates from crates.io]
     
-    DetectPlatform -->|Linux| LinuxLibs[Add Linux-specific:<br/>netlink support]
-    DetectPlatform -->|BSD| BSDLibs[Add BSD-specific:<br/>BPF support]
-    DetectPlatform -->|Solaris| SolarisLibs[Add Solaris libs:<br/>-lsocket -lnsl -lposix4]
-    DetectPlatform -->|macOS| MacOSLibs[Add macOS-specific:<br/>BPF support]
+    ResolveGraph --> RunBuildScript[Run build.rs:<br/>platform detection,<br/>native lib linking via pkg-config]
     
-    LinuxLibs --> DetectDeps
-    BSDLibs --> DetectDeps
-    SolarisLibs --> DetectDeps
-    MacOSLibs --> DetectDeps
+    RunBuildScript --> CompileDeps[Compile Crate Dependencies:<br/>mio, nix, ring, bytes, etc.]
     
-    DetectDeps[Dependency Detection:<br/>bld/pkg-wrapper] --> CheckOpts{Check COPTS<br/>for HAVE_* flags}
+    CompileDeps --> CompileSrc[Compile src/ Module Tree:<br/>apply #[cfg feature] gates]
     
-    CheckOpts -->|HAVE_DBUS| DBus[pkg-config --cflags --libs dbus-1]
-    CheckOpts -->|HAVE_DNSSEC| DNSSEC[pkg-config --cflags --libs nettle hogweed]
-    CheckOpts -->|HAVE_LIBIDN2| IDN2[pkg-config --cflags --libs libidn2]
-    CheckOpts -->|HAVE_CONNTRACK| CT[pkg-config --cflags --libs libnetfilter_conntrack]
-    CheckOpts -->|HAVE_NFTSET| NFT[pkg-config --cflags --libs libnftables]
-    CheckOpts -->|HAVE_LUASCRIPT| LUA[pkg-config --cflags --libs lua]
-    CheckOpts -->|No optional libs| SkipOpt[Skip optional dependencies]
+    CompileSrc --> ApplyFeatures{Apply Feature Gates}
     
-    DBus --> CompileFlags
-    DNSSEC --> CompileFlags
-    IDN2 --> CompileFlags
-    CT --> CompileFlags
-    NFT --> CompileFlags
-    LUA --> CompileFlags
-    SkipOpt --> CompileFlags
+    ApplyFeatures -->|dhcp enabled| CompileDHCP[Compile src/dhcp/**/*.rs]
+    ApplyFeatures -->|dnssec enabled| CompileDNSSEC[Compile src/dns/dnssec/**/*.rs]
+    ApplyFeatures -->|tftp enabled| CompileTFTP[Compile src/integration/tftp.rs]
+    ApplyFeatures -->|dbus enabled| CompileDBUS[Compile src/integration/dbus.rs]
+    ApplyFeatures -->|Core modules| CompileCore[Compile src/core/**/*.rs,<br/>src/dns/**/*.rs,<br/>src/net/**/*.rs,<br/>src/types/**/*.rs]
     
-    CompileFlags[Assemble Compiler Flags:<br/>CFLAGS + build_cflags] --> CompileObjs[Compile Source Files:<br/>*.c → *.o]
+    CompileDHCP --> Link
+    CompileDNSSEC --> Link
+    CompileTFTP --> Link
+    CompileDBUS --> Link
+    CompileCore --> Link
     
-    CompileObjs --> CheckErrors{Compilation<br/>Success?}
-    CheckErrors -->|No| Error([Build Failed])
-    CheckErrors -->|Yes| LinkFlags[Assemble Linker Flags:<br/>LDFLAGS + build_libs]
-    
-    LinkFlags --> LinkBinary[Link Executable:<br/>*.o → dnsmasq]
-    LinkBinary --> LinkCheck{Link<br/>Success?}
-    
-    LinkCheck -->|No| Error
-    LinkCheck -->|Yes| Complete([Build Complete:<br/>src/dnsmasq])
+    Link[Link Binary] --> Output([target/release/dnsmasq])
     
     style Start fill:#e1f5ff
-    style Complete fill:#e1ffe1
-    style Error fill:#ffe1e1
-    style DetectDeps fill:#fff4e1
-    style CompileFlags fill:#fff4e1
-    style LinkFlags fill:#fff4e1
+    style Output fill:#e1ffe1
+    style RunBuildScript fill:#fff4e1
+    style ApplyFeatures fill:#fff4e1
 ```
 
----
-
-### Dependency Detection Flow
+### Feature Gate Compilation Flow
 
 ```mermaid
 flowchart TD
-    Start([bld/pkg-wrapper invoked]) --> ParseArgs[Parse Arguments:<br/>HAVE_FLAG, PKG_NAME]
-    ParseArgs --> CheckCOPTS{HAVE_FLAG<br/>in COPTS?}
+    Feature([Cargo feature enabled]) --> CfgGate[#[cfg feature = ...] applied]
     
-    CheckCOPTS -->|No| Silent([Exit silently:<br/>feature disabled])
-    CheckCOPTS -->|Yes| CheckStatic{--static<br/>in COPTS?}
+    CfgGate --> ModuleCompile[Feature module compiled]
+    CfgGate --> TypesInclude[Related types included]
+    CfgGate --> TestsCompile[Feature tests compiled]
     
-    CheckStatic -->|Yes| StaticPC[Run:<br/>pkg-config --static]
-    CheckStatic -->|No| DynamicPC[Run:<br/>pkg-config]
+    ModuleCompile --> Example1[Example: dhcp feature →<br/>src/dhcp/ modules compiled]
+    TypesInclude --> Example2[Example: dhcp feature →<br/>src/types/dhcp.rs included]
+    TestsCompile --> Example3[Example: dhcp feature →<br/>tests/integration/dhcp_*.rs compiled]
     
-    StaticPC --> PCCheck{pkg-config<br/>success?}
-    DynamicPC --> PCCheck
-    
-    PCCheck -->|No| PCError([Exit with error:<br/>Library not found])
-    PCCheck -->|Yes| OutputFlags[Output:<br/>Compiler/Linker Flags]
-    
-    OutputFlags --> Complete([Success:<br/>Flags added to build])
-    
-    style Start fill:#e1f5ff
-    style Complete fill:#e1ffe1
-    style Silent fill:#f0f0f0
-    style PCError fill:#ffe1e1
-    style CheckCOPTS fill:#fff4e1
-    style CheckStatic fill:#fff4e1
+    style Feature fill:#e1f5ff
+    style Example1 fill:#e1ffe1
+    style Example2 fill:#e1ffe1
+    style Example3 fill:#e1ffe1
 ```
 
-**Key Points:**
-- **Conditional Execution**: Features are only enabled if explicitly requested via `COPTS`
-- **Silent Failure**: If a feature is not requested, the wrapper exits silently (no error)
-- **Error on Missing**: If a feature is requested but library is missing, build fails with clear error
-- **Static Linking Support**: `--static` flag triggers `pkg-config --static` for correct static library flags
+### Rust Module Hierarchy
 
----
+The source code is organized into domain-specific modules (abbreviated — 71 `.rs` files total; see [docs/ARCHITECTURE.md](ARCHITECTURE.md) for full listing):
 
-### Compilation Process
-
-The build system compiles each `.c` source file to a `.o` object file, then links all objects into the final binary:
-
-**Compilation Rule** (from Makefile line 149-150):
-```makefile
-%.o: $(SRC)/%.c $(hdrs) $(copts_conf)
-	$(CC) $(CFLAGS) $(COPTS) $(RPM_OPT_FLAGS) $(build_cflags) $(version) -c $<
+```
+src/
+├── main.rs                      # Binary entry point (init, daemonize, event loop)
+├── lib.rs                       # Library root (module declarations, re-exports)
+├── config/                      # Configuration parsing
+│   ├── mod.rs                   # Config module root
+│   ├── options.rs               # CLI/config parser (160+ options, Result-based errors)
+│   ├── constants.rs             # Numeric defaults (CACHESIZ=150, MAXLEASES=1000, etc.)
+│   └── feature_flags.rs         # Feature flag documentation
+├── core/                        # Core runtime
+│   ├── daemon.rs                # DaemonState struct (decomposed from C global state)
+│   ├── event_loop.rs            # mio::Poll event loop
+│   ├── signal.rs                # Signal handling (self-pipe pattern)
+│   ├── logging.rs               # Async syslog (log/tracing facade)
+│   ├── util.rs                  # DNS name validation, I/O helpers
+│   ├── prng.rs                  # CSPRNG (replacing SURF PRNG)
+│   └── metrics.rs               # Metric definitions and reset
+├── dns/                         # DNS stack
+│   ├── protocol.rs              # Wire-format constants
+│   ├── wire.rs                  # DNS packet parsing/construction
+│   ├── cache.rs                 # DNS cache (HashMap + LRU)
+│   ├── forward.rs               # Forwarding engine (query state machine)
+│   ├── server_match.rs          # Domain pattern matching, server selection
+│   ├── edns.rs                  # EDNS0 OPT handling
+│   ├── rrfilter.rs              # RR filtering
+│   ├── auth.rs                  # Authoritative zone serving
+│   ├── domain.rs                # Synthetic hostnames, split-horizon
+│   ├── loop_detect.rs           # Forwarding loop detection
+│   └── dnssec/                  # DNSSEC validation (feature-gated)
+│       ├── validation.rs        # Trust chain validation
+│       └── crypto.rs            # ring-based crypto (RSA, ECDSA, EdDSA)
+├── dhcp/                        # DHCP stack (feature-gated)
+│   ├── common.rs                # Shared DHCP utilities
+│   ├── v4/                      # DHCPv4
+│   │   ├── server.rs            # DHCPv4 core
+│   │   └── rfc2131.rs           # DHCPv4 protocol (DORA cycle)
+│   ├── v6/                      # DHCPv6
+│   │   ├── server.rs            # DHCPv6 core
+│   │   ├── rfc3315.rs           # DHCPv6 protocol
+│   │   └── outpacket.rs         # DHCPv6 option serialization
+│   ├── lease.rs                 # Lease persistence
+│   ├── radv/                    # Router Advertisements
+│   │   ├── server.rs            # RA construction
+│   │   └── slaac.rs             # SLAAC address probing
+│   └── helper.rs                # Privilege-separated script helper
+├── net/                         # Network layer
+│   ├── interface.rs             # Interface enumeration
+│   ├── socket.rs                # Upstream socket pool
+│   ├── arp.rs                   # ARP/neighbor cache
+│   └── platform/                # Platform abstraction
+│       ├── linux/               # Linux-specific (#[cfg(target_os = "linux")])
+│       │   ├── netlink.rs       # Netlink route/address monitoring
+│       │   ├── ipset.rs         # Linux ipset via netlink
+│       │   ├── inotify.rs       # File-change monitoring
+│       │   └── conntrack.rs     # Conntrack mark retrieval
+│       └── bsd/                 # BSD-specific (#[cfg(target_os = "freebsd")])
+│           ├── bpf.rs           # BPF raw packets, PF_ROUTE
+│           └── pf_tables.rs     # PF table population
+├── integration/                 # External system interfaces
+│   ├── dbus.rs                  # D-Bus system bus (feature-gated)
+│   ├── ubus.rs                  # OpenWrt UBus (feature-gated)
+│   ├── nftset.rs                # nftables sets (feature-gated)
+│   └── tftp.rs                  # TFTP server (feature-gated)
+├── debug/                       # Debug utilities
+│   └── dump.rs                  # Pcap packet capture (feature-gated)
+└── types/                       # Shared type definitions
+    ├── addr.rs                  # AllAddr enum, SocketAddress enum
+    ├── dns.rs                   # DnsHeader, CacheEntry, ForwardRecord
+    ├── dhcp.rs                  # DhcpLease, DhcpConfig, DhcpOption
+    ├── network.rs               # InterfaceRecord, Listener, ServerEntry
+    └── ipv6.rs                  # IPv6 address helpers
 ```
 
-**Linking Rule** (from Makefile line 163-164):
-```makefile
-dnsmasq: $(objs)
-	$(CC) $(LDFLAGS) -o $@ $(objs) $(build_libs) $(LIBS)
-```
+### Incremental Compilation
 
-**Object Files** (from Makefile line 78-84):
-```
-cache.o rfc1035.o util.o option.o forward.o network.o dnsmasq.o
-dhcp.o lease.o rfc2131.o netlink.o dbus.o bpf.o helper.o tftp.o
-log.o conntrack.o dhcp6.o rfc3315.o dhcp-common.o outpacket.o
-radv.o slaac.o auth.o ipset.o pattern.o domain.o dnssec.o
-blockdata.o tables.o loop.o inotify.o poll.o rrfilter.o edns0.o
-arp.o crypto.o dump.o ubus.o metrics.o domain-match.o nftset.o
-```
+Cargo uses incremental compilation and fingerprinting to avoid unnecessary rebuilds:
 
-**Header Dependencies** (from Makefile line 86-87):
-```
-dnsmasq.h config.h dhcp-protocol.h dhcp6-protocol.h
-dns-protocol.h radv-protocol.h ip6addr.h metrics.h
-```
+- **Dependency caching**: Compiled crate dependencies are cached in `target/` and reused across builds
+- **Incremental compilation**: Only modified modules and their dependents are recompiled
+- **Build fingerprinting**: Cargo tracks file modifications, compiler flags, and feature flags to determine what needs rebuilding
+- **Parallel compilation**: Modules without dependencies on each other are compiled in parallel
 
-All object files depend on all headers, ensuring recompilation when headers change.
+To force a full rebuild:
 
----
-
-### Build Configuration Caching
-
-The build system caches the configuration to avoid unnecessary recompilation:
-
-**Configuration Checksum** (from Makefile line 74-76):
-```makefile
-sum = $(shell echo $(CC) -DDNSMASQ_COMPILE_FLAGS="$(CFLAGS)" \
-       -DDNSMASQ_COMPILE_OPTS $(COPTS) -E $(top)/$(SRC)/dnsmasq.h \
-       | md5sum | cut -f 1 -d ' ')
-copts_conf = .copts_$(sum)
-```
-
-**How it works:**
-1. Calculate MD5 hash of compiler, flags, and options
-2. Create marker file `.copts_<hash>`
-3. If configuration changes, hash changes, triggering rebuild
-4. Avoids full rebuild when unrelated files change
-
-**Clean Configuration Cache:**
 ```bash
-make clean
-# Removes .copts_* files and forces reconfiguration
+cargo clean
+cargo build --release
 ```
 
 ---
 
 ## Advanced Build Topics
 
-### Internationalization (i18n)
+### Static Analysis
 
-Build with translation support:
+Rust provides compile-time memory safety guarantees. Additional static analysis tools:
 
 ```bash
-# Requires GNU Make and gettext tools
-make all-i18n
+# Clippy — Rust linter with 500+ lint checks
+cargo clippy --all-features
+cargo clippy --all-features -- -W clippy::pedantic
 
-# Install with translations
-make install-i18n PREFIX=/usr
+# Miri — experimental interpreter for detecting undefined behavior
+cargo +nightly miri test
 ```
 
-**Translation Files:** Located in `po/` directory (`.po` files for each language)
+### Running Tests
 
-**Supported Languages:** Check `po/` directory for available translations.
-
----
-
-### Developer Build (Debug Symbols)
-
-Build with debugging symbols for development:
+The test suite includes unit tests (embedded in source modules via `#[cfg(test)]`) and integration tests (in `tests/`):
 
 ```bash
-make CFLAGS="-g -O0 -Wall -Wextra"
+# Run all unit tests with default features
+cargo test
+
+# Run all tests including feature-gated ones
+cargo test --all-features
+
+# Run a specific integration test module
+cargo test --test integration -- dns_forwarding
+
+# Run tests matching a name pattern
+cargo test dns::cache
+
+# Run tests with stdout/stderr visible
+cargo test -- --nocapture
+
+# Run tests with a specific number of threads
+cargo test -- --test-threads=1
 ```
 
-**Debug Flags:**
-- `-g`: Include debugging symbols
-- `-O0`: Disable optimization for easier debugging
-- `-Wall -Wextra`: Enable all warnings
+### Code Coverage
 
-**Debug with GDB:**
+Generate code coverage reports using `cargo-tarpaulin` or `cargo-llvm-cov`:
+
 ```bash
-gdb src/dnsmasq
+# Using cargo-tarpaulin
+cargo install cargo-tarpaulin
+cargo tarpaulin --all-features
+
+# Using cargo-llvm-cov (requires llvm-tools)
+cargo install cargo-llvm-cov
+cargo llvm-cov --all-features --html
+# Coverage report: target/llvm-cov/html/index.html
+```
+
+### Developer Build (Debug Mode)
+
+Debug builds include full debug information and no optimizations:
+
+```bash
+# Build in debug mode (default)
+cargo build
+
+# Run with debug logging and backtraces
+RUST_LOG=debug RUST_BACKTRACE=1 cargo run -- --no-daemon --log-queries
+```
+
+Debug builds include:
+- Full debug symbols for debugger integration (GDB, LLDB)
+- Runtime bounds checking and overflow detection
+- Debug assertions enabled
+
+**Debugging with GDB/LLDB:**
+
+```bash
+# GDB
+gdb target/debug/dnsmasq
 (gdb) run --no-daemon --log-queries
+
+# LLDB (macOS)
+lldb target/debug/dnsmasq
+(lldb) run -- --no-daemon --log-queries
 ```
 
----
-
-### Memory Debugging (Valgrind)
-
-Build for memory leak detection:
+### Benchmarking
 
 ```bash
-make CFLAGS="-g -O0"
+# Run benchmarks (requires nightly for built-in benchmarks)
+cargo +nightly bench
 
-# Run with valgrind
-valgrind --leak-check=full --show-leak-kinds=all \
-  src/dnsmasq --no-daemon --log-queries
-```
-
----
-
-### Code Coverage Analysis
-
-Build with coverage instrumentation:
-
-```bash
-# Build with coverage
-make CFLAGS="-g -O0 -fprofile-arcs -ftest-coverage" \
-     LDFLAGS="-fprofile-arcs"
-
-# Run tests
-src/dnsmasq --no-daemon --log-queries &
-DNSMASQ_PID=$!
-
-# Generate traffic (run test queries)
-dig @127.0.0.1 example.com
-
-# Stop daemon
-kill $DNSMASQ_PID
-
-# Generate coverage report
-gcov src/*.c
-lcov --capture --directory . --output-file coverage.info
-genhtml coverage.info --output-directory coverage-html
+# Or use criterion for stable Rust benchmarks
+cargo bench
 ```
 
 ---
@@ -1493,29 +1477,41 @@ genhtml coverage.info --output-directory coverage-html
 ### Quick Reference: Common Build Commands
 
 ```bash
-# Standard build with auto-detection
-make
+# Standard build (debug)
+cargo build
 
-# Full-featured build with optional libraries
-make COPTS="-DHAVE_DBUS -DHAVE_DNSSEC -DHAVE_LIBIDN2"
+# Release build with default features
+cargo build --release
+
+# Full-featured build (all subsystems)
+cargo build --release --all-features
 
 # Minimal DNS-only build
-make COPTS="-DNO_DHCP -DNO_TFTP -DNO_SCRIPT -DNO_AUTH"
+cargo build --release --no-default-features
 
-# Size-optimized build
-make CFLAGS="-Os -flto" LDFLAGS="-flto -Wl,--gc-sections"
+# DNSSEC + D-Bus build
+cargo build --release --features "dnssec,dbus"
 
-# Static build
-make LDFLAGS="-static"
+# Size-optimized build (configure opt-level="s" in Cargo.toml release profile)
+cargo build --release
 
-# Cross-compile for ARM
-make CC=arm-linux-gnueabihf-gcc LDFLAGS="-static"
+# Static build (musl, no runtime dependencies)
+cargo build --release --target x86_64-unknown-linux-musl
 
-# Install to system
-make install PREFIX=/usr
+# Cross-compile for ARM64
+cargo build --release --target aarch64-unknown-linux-gnu
+
+# Run all tests
+cargo test --all-features
+
+# Lint check
+cargo clippy --all-features
+
+# Install to ~/.cargo/bin
+cargo install --path .
 
 # Clean build artifacts
-make clean
+cargo clean
 ```
 
 ---
@@ -1524,11 +1520,12 @@ make clean
 
 | File | Purpose |
 |------|---------|
-| `Makefile` | Main build system configuration and rules |
-| `src/config.h` | Compile-time defaults and feature flags (480 lines) |
-| `bld/pkg-wrapper` | pkg-config wrapper for dependency detection (46 lines) |
-| `bld/Android.mk` | Android AOSP build system integration (27 lines) |
-| `bld/get-version` | Version string extraction script |
+| `Cargo.toml` | Workspace manifest with dependencies and feature flags |
+| `rust-toolchain.toml` | Pinned Rust 1.93.1 stable, edition 2024 |
+| `build.rs` | Platform detection, optional native library linking via pkg-config |
+| `.cargo/config.toml` | Cross-compilation profiles for x86-64 and ARM64 |
+| `src/config/constants.rs` | Compile-time numeric defaults (CACHESIZ, MAXLEASES, FTABSIZ, etc.) |
+| `src/config/feature_flags.rs` | Feature flag documentation and compile-time configuration |
 
 ---
 
@@ -1536,19 +1533,32 @@ make clean
 
 **Documentation:**
 - Build system: This document (`docs/BUILDING.md`)
-- Configuration: `dnsmasq.conf.example` (690 lines with inline documentation)
-- User manual: `man/dnsmasq.8` (man page)
+- Configuration: `dnsmasq.conf.example` (annotated configuration template)
+- Architecture: `docs/ARCHITECTURE.md`
 - Project website: http://www.thekelleys.org.uk/dnsmasq/
+
+**Diagnosing Build Issues:**
+
+```bash
+# Check Rust toolchain version
+rustc --version
+cargo --version
+
+# Verbose build output
+cargo build -vv
+
+# Check installed targets
+rustup target list --installed
+```
 
 **Reporting Build Issues:**
 - Mailing list: dnsmasq-discuss@lists.thekelleys.org.uk
-- Include: Platform, compiler version, build command, error output
-- Provide: `uname -a`, `gcc --version`, `make V=1` output
+- Include: Platform, `rustc --version`, `cargo --version`, build command, error output
+- Provide: `uname -a`, `rustup show`, `cargo build -vv` output
 
 ---
 
-**Document Version:** 1.0  
-**Based on:** dnsmasq 2.92 build system  
+**Document Version:** 2.0  
+**Based on:** dnsmasq 2.92 Rust rewrite  
 **Last Updated:** 2025  
 **Maintainer:** Simon Kelley
-

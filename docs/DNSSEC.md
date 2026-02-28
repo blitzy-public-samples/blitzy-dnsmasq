@@ -28,9 +28,9 @@ DNSSEC (Domain Name System Security Extensions) validation in dnsmasq provides c
 - NSEC and NSEC3 authenticated denial-of-existence proof validation
 - Trust anchor management with root zone KSK validation
 - DoS protection through configurable validation limits
-- Integration with Nettle cryptography library for signature operations
+- Integration with `ring` cryptography crate for signature operations
 
-**Implementation Location**: The DNSSEC validation logic is implemented primarily in `src/dnssec.c` (cryptographic validation) and `src/crypto.c` (cryptographic primitives using Nettle library).
+**Implementation Location**: The DNSSEC validation logic is implemented primarily in `src/dns/dnssec/validation.rs` (cryptographic validation) and `src/dns/dnssec/crypto.rs` (cryptographic primitives using `ring` crate).
 
 ## DNSSEC Architecture
 
@@ -90,16 +90,18 @@ flowchart TD
 
 ### Validation Entry Point
 
-The main entry point for DNSSEC validation is `dnssec_validate_reply()` in `src/dnssec.c`. This function is invoked for every DNS response when DNSSEC validation is enabled (compile-time flag `HAVE_DNSSEC` and runtime option `--dnssec`).
+The main entry point for DNSSEC validation is the standalone function `dnssec_validate_reply()` in `src/dns/dnssec/validation.rs`. This function is invoked for every DNS response when DNSSEC validation is enabled (Cargo feature `"dnssec"` and runtime option `--dnssec`).
 
-**Function**: `dnssec_validate_reply(time_t now, struct dns_header *header, size_t plen, char *name, ...)`
-**Source**: `src/dnssec.c` (primary validation orchestrator)
+**Function**: `pub fn dnssec_validate_reply(header: &mut DnsHeader, plen: usize, ...) -> Result<DnssecStatus, DnssecError>`
+**Source**: `src/dns/dnssec/validation.rs` (primary validation orchestrator)
 **Purpose**: Validate all RRsets in a DNS response, verify signatures, and determine the security status of the response (SECURE, INSECURE, or BOGUS).
+
+**Supporting struct**: `DnssecValidator` manages timestamp state for clock-rollback detection (`setup_timestamp()`, `is_check_date()`).
 
 **Validation Workflow**:
 1. Check if DNSSEC is requested (DO bit set in original query)
 2. Extract all RRsets and associated RRSIGs from the response
-3. For each RRset, invoke `validate_rrset()` to verify signatures
+3. For each RRset, invoke the standalone `validate_rrset()` function to verify signatures
 4. Validate DNSKEY records against DS records in parent zones
 5. Follow the chain of trust to root zone trust anchors
 6. Handle NSEC/NSEC3 proofs for non-existent names or types
@@ -184,16 +186,19 @@ DNSKEY records contain public keys used to verify RRSIG signatures. There are tw
 
 DS records in the parent zone contain a hash of the child zone's DNSKEY. This creates the cryptographic link between parent and child zones in the trust chain.
 
-**Validation Process** in `src/dnssec.c`:
-```c
+**Validation Process** in `src/dns/dnssec/validation.rs`:
+```rust
 // Validate DNSKEY against DS record (simplified)
-// Source: src/dnssec.c, validate_rrset() function
+// Source: src/dns/dnssec/validation.rs, validate_rrset()
 
-1. Retrieve cached DS record from parent zone
-2. Compute digest of child zone DNSKEY using specified hash algorithm
-3. Compare computed digest with DS record digest
-4. If match: DNSKEY is trusted, cache it for future validations
-5. If mismatch: Return BOGUS status
+// 1. Retrieve cached DS record from parent zone
+// 2. Compute digest of child zone DNSKEY using specified hash algorithm
+//    (via ring::digest)
+// 3. Compare computed digest with DS record digest
+// 4. If match: DNSKEY is trusted, cache it for future validations
+//    -> Ok(ValidationStatus::Secure)
+// 5. If mismatch: Return BOGUS status
+//    -> Err(DnssecError::Bogus)
 ```
 
 **4. RRSIG Records (Resource Record Signature)**
@@ -219,7 +224,7 @@ sequenceDiagram
     participant Dnsmasq as dnsmasq
     participant Cache as DNS Cache
     participant Upstream as Upstream DNS
-    participant Crypto as Nettle Crypto
+    participant Crypto as ring Crypto
     
     Client->>Dnsmasq: Query www.example.com A (DO bit set)
     Dnsmasq->>Cache: Check for cached validated A record
@@ -272,7 +277,7 @@ sequenceDiagram
 
 Before signature verification, the RRset (Resource Record Set) must be converted to a canonical form exactly as it was when the signature was created. This ensures that signature verification works correctly regardless of case variations or record ordering.
 
-**Source**: `src/dnssec.c`, `validate_rrset()` function (canonicalization logic integrated into validation)
+**Source**: `src/dns/dnssec/validation.rs`, `validate_rrset()` method (canonicalization logic integrated into validation)
 
 ### Canonicalization Steps
 
@@ -336,13 +341,13 @@ www.example.com.  3600  IN  A  192.0.2.2
 ```
 (Note: Owner names lowercased, records sorted, Original TTL from RRSIG used)
 
-**Implementation Detail** (from `src/dnssec.c`):
+**Implementation Detail** (from `src/dns/dnssec/validation.rs`):
 
 The canonicalization process is integrated into `validate_rrset()`:
 
-```c
+```rust
 // Simplified canonicalization logic
-// Source: src/dnssec.c, validate_rrset()
+// Source: src/dns/dnssec/validation.rs, validate_rrset()
 
 // 1. Extract RRSIG fields (type covered, algorithm, original TTL, etc.)
 // 2. Build canonical RRset by sorting records
@@ -350,15 +355,15 @@ The canonicalization process is integrated into `validate_rrset()`:
 //    - Convert owner name to lowercase wire format
 //    - Use original TTL from RRSIG (not current TTL)
 //    - Append RDATA in canonical form
-// 4. Compute digest of concatenated canonical form
-// 5. Pass digest and signature to verify() function
+// 4. Compute digest of concatenated canonical form using ring::digest
+// 5. Pass digest and signature to verify() method
 ```
 
 ## Signature Verification
 
 Signature verification is the cryptographic heart of DNSSEC validation, confirming that RRset data has not been modified and was signed by the legitimate zone operator.
 
-**Source**: `src/crypto.c` (cryptographic operations using Nettle library)
+**Source**: `src/dns/dnssec/crypto.rs` (cryptographic operations using `ring` crate)
 
 ### Verification Flow
 
@@ -374,10 +379,10 @@ flowchart LR
     H[DNSKEY Public Key] --> G
     D --> G
     
-    G -->|RSA| I[RSA Verify<br/>dnsmasq_rsa_verify]
-    G -->|ECDSA| J[ECDSA Verify<br/>dnsmasq_ecdsa_verify]
-    G -->|EdDSA| K[EdDSA Verify<br/>dnsmasq_eddsa_verify]
-    G -->|GOST| L[GOST Verify<br/>dnsmasq_gostdsa_verify]
+    G -->|RSA| I[RSA Verify<br/>crypto::rsa_verify]
+    G -->|ECDSA| J[ECDSA Verify<br/>crypto::ecdsa_verify]
+    G -->|EdDSA| K[EdDSA Verify<br/>crypto::eddsa_verify]
+    G -->|GOST| L[GOST Verify<br/>deferred — not supported by ring]
     
     I --> M{Signature Valid?}
     J --> M
@@ -393,56 +398,52 @@ flowchart LR
 
 ### Supported Algorithms
 
-Dnsmasq supports the following DNSSEC algorithms through the Nettle cryptography library:
+Dnsmasq supports the following DNSSEC algorithms through the `ring` cryptography crate:
 
 | Algorithm Number | Algorithm Name | Hash Function | Implementation |
 |-----------------|----------------|---------------|----------------|
-| 5 | RSA/SHA-1 | SHA-1 | `dnsmasq_rsa_verify` |
-| 7 | RSASHA1-NSEC3-SHA1 | SHA-1 | `dnsmasq_rsa_verify` |
-| 8 | RSA/SHA-256 | SHA-256 | `dnsmasq_rsa_verify` |
-| 10 | RSA/SHA-512 | SHA-512 | `dnsmasq_rsa_verify` |
-| 13 | ECDSA P-256/SHA-256 | SHA-256 | `dnsmasq_ecdsa_verify` |
-| 14 | ECDSA P-384/SHA-384 | SHA-384 | `dnsmasq_ecdsa_verify` |
-| 15 | Ed25519 | SHA-512 | `dnsmasq_eddsa_verify` |
-| 16 | Ed448 | SHAKE256 | `dnsmasq_eddsa_verify` |
-| 12 | GOST R 34.10-2012 | GOST R 34.11-2012 | `dnsmasq_gostdsa_verify` |
+| 5 | RSA/SHA-1 | SHA-1 | `rsa_verify` |
+| 7 | RSASHA1-NSEC3-SHA1 | SHA-1 | `rsa_verify` |
+| 8 | RSA/SHA-256 | SHA-256 | `rsa_verify` |
+| 10 | RSA/SHA-512 | SHA-512 | `rsa_verify` |
+| 13 | ECDSA P-256/SHA-256 | SHA-256 | `ecdsa_verify` |
+| 14 | ECDSA P-384/SHA-384 | SHA-384 | `ecdsa_verify` |
+| 15 | Ed25519 | SHA-512 | `eddsa_verify` |
+| 16 | Ed448 | SHAKE256 | *Not supported — returns `UnsupportedAlgorithm` (ring limitation)* |
+| 12 | GOST R 34.10-2012 | GOST R 34.11-2012 | *Deferred — GOST not supported by `ring`* |
 
 ### Verification Implementation
 
-**Main Verification Entry Point**: `verify(int algo, char *key, int keylen, unsigned char *sig, int siglen, unsigned char *digest, size_t digest_len, int algo_digest_len)`
+**Main Verification Entry Point**: `pub fn verify(algo: u8, key: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, CryptoError>`
 
-**Source**: `src/crypto.c`, lines 400-550
+**Source**: `src/dns/dnssec/crypto.rs`
 
-**Purpose**: Dispatcher function that selects the appropriate algorithm-specific verification function and performs signature validation.
+**Purpose**: Dispatcher function that selects the appropriate algorithm-specific verification logic via `verify_func()` and performs signature validation.
 
 **Algorithm Selection**:
-```c
-// Source: src/crypto.c, verify_func()
-// Returns function pointer to algorithm-specific verifier
+```rust
+// Source: src/dns/dnssec/crypto.rs, verify()
+// Uses verify_func() to obtain the algorithm-specific verifier
 
-static int (*verify_func(int algo))(struct blockdata *key_data, ...)
-{
-  switch (algo)
-    {
-    case 5: case 7: case 8: case 10:
-      return dnsmasq_rsa_verify;    // RSA variants
-    case 12:
-      return dnsmasq_gostdsa_verify; // GOST
-    case 13: case 14:
-      return dnsmasq_ecdsa_verify;   // ECDSA variants
-    case 15: case 16:
-      return dnsmasq_eddsa_verify;   // EdDSA variants
-    default:
-      return NULL;                    // Unsupported algorithm
+pub fn verify(algo: u8, key: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, CryptoError> {
+    match verify_func(algo) {
+        Some(func) => func(algo, key, sig, data),
+        None => Err(CryptoError::UnsupportedAlgorithm(algo)),
     }
 }
+
+// Internal dispatch: verify_func returns the appropriate function pointer
+// Algo 5,7,8,10 (RSA variants)  → rsa_verify()
+// Algo 13,14    (ECDSA variants) → ecdsa_verify()
+// Algo 15       (Ed25519)         → eddsa_verify()
+// Algo 16       (Ed448)           → UnsupportedAlgorithm (ring limitation)
 ```
 
 ### RSA Verification
 
-**Function**: `dnsmasq_rsa_verify(struct blockdata *key_data, unsigned int key_len, unsigned char *sig, size_t sig_len, unsigned char *digest, size_t digest_len, int algo)`
+**Function**: `fn rsa_verify(algo: u8, key: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, CryptoError>`
 
-**Source**: `src/crypto.c`, lines 100-150
+**Source**: `src/dns/dnssec/crypto.rs`
 
 **Supported Variants**:
 - **Algorithm 5**: RSA/SHA-1 (legacy, being phased out)
@@ -450,126 +451,123 @@ static int (*verify_func(int algo))(struct blockdata *key_data, ...)
 - **Algorithm 10**: RSA/SHA-512 (high security)
 
 **Implementation Details**:
-```c
+```rust
 // Simplified RSA verification logic
-// Source: src/crypto.c, dnsmasq_rsa_verify()
+// Source: src/dns/dnssec/crypto.rs, rsa_verify()
 
-1. Parse RSA public key from DNSKEY RDATA
-   - Extract public exponent (e)
-   - Extract modulus (n)
-   
-2. Initialize Nettle RSA public key structure
-   rsa_public_key_init(&key);
-   
-3. Import public key components
-   mpz_import(key.e, ...);  // Import exponent
-   mpz_import(key.n, ...);  // Import modulus
-   
-4. Select hash algorithm based on RRSIG algorithm field
-   - Algorithm 5/7: SHA-1
-   - Algorithm 8: SHA-256
-   - Algorithm 10: SHA-512
-   
-5. Verify signature
-   result = rsa_<hash>_verify_digest(&key, digest, sig);
-   
-6. Clean up
-   rsa_public_key_clear(&key);
-   
-7. Return result (1 = valid, 0 = invalid)
+// 1. Parse RSA public key from DNSKEY RDATA
+//    - Extract public exponent (e) and modulus (n)
+
+// 2. Select ring verification algorithm based on RRSIG algorithm field (u8)
+let algorithm = match algo {
+    5 | 7 =>  // RSASHA1 / RSASHA1-NSEC3-SHA1
+        &ring::signature::RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY,
+    8 =>      // RSASHA256
+        &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+    10 =>     // RSASHA512
+        &ring::signature::RSA_PKCS1_2048_8192_SHA512,
+    _ => return Err(CryptoError::UnsupportedAlgorithm(algo)),
+};
+
+// 3. Construct ring public key from DER-encoded components
+let public_key = ring::signature::UnparsedPublicKey::new(algorithm, key_bytes);
+
+// 4. Verify signature (ring handles cleanup via RAII)
+public_key.verify(data, sig)
+    .map_err(|_| CryptoError::SignatureVerificationFailed)
 ```
 
 ### ECDSA Verification
 
-**Function**: `dnsmasq_ecdsa_verify(struct blockdata *key_data, unsigned int key_len, unsigned char *sig, size_t sig_len, unsigned char *digest, int algo)`
+**Function**: `fn ecdsa_verify(algo: u8, key: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, CryptoError>`
 
-**Source**: `src/crypto.c`, lines 150-250
+**Source**: `src/dns/dnssec/crypto.rs`
 
 **Supported Curves**:
 - **Algorithm 13**: ECDSA P-256 with SHA-256
 - **Algorithm 14**: ECDSA P-384 with SHA-384
 
 **Implementation Details**:
-```c
+```rust
 // Simplified ECDSA verification logic
-// Source: src/crypto.c, dnsmasq_ecdsa_verify()
+// Source: src/dns/dnssec/crypto.rs, ecdsa_verify()
 
-1. Select elliptic curve based on algorithm
-   if (algo == 13)
-     ecc_curve = nettle_get_secp_256r1();  // P-256
-   else if (algo == 14)
-     ecc_curve = nettle_get_secp_384r1();  // P-384
-   
-2. Parse public key point (X, Y coordinates) from DNSKEY
-   
-3. Initialize ECC point structure
-   ecc_point_init(&key_point, ecc_curve);
-   
-4. Import public key coordinates
-   ecc_point_set(&key_point, X, Y);
-   
-5. Parse signature (R, S components)
-   
-6. Verify signature
-   result = ecdsa_verify(&key_point, digest_len, digest, &signature);
-   
-7. Clean up
-   ecc_point_clear(&key_point);
-   
-8. Return result
+// 1. Select ring ECDSA algorithm based on DNSSEC algorithm number (u8)
+let algorithm = match algo {
+    13 =>  // ECDSA P-256/SHA-256
+        &ring::signature::ECDSA_P256_SHA256_FIXED,
+    14 =>  // ECDSA P-384/SHA-384
+        &ring::signature::ECDSA_P384_SHA384_FIXED,
+    _ => return Err(CryptoError::UnsupportedAlgorithm(algo)),
+};
+
+// 2. Parse public key (X, Y coordinates) from DNSKEY RDATA
+//    ring expects the uncompressed point format: 0x04 || X || Y
+
+// 3. Construct ring public key
+let public_key = ring::signature::UnparsedPublicKey::new(algorithm, key_bytes);
+
+// 4. Parse signature (R, S components in fixed-size format)
+
+// 5. Verify signature (ring handles cleanup via RAII)
+public_key.verify(data, sig)
+    .map_err(|_| CryptoError::SignatureVerificationFailed)
 ```
 
 ### EdDSA Verification
 
-**Function**: `dnsmasq_eddsa_verify(struct blockdata *key_data, unsigned int key_len, unsigned char *sig, size_t sig_len, unsigned char *digest, size_t digest_len, int algo)`
+**Function**: `fn eddsa_verify(algo: u8, key: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, CryptoError>`
 
-**Source**: `src/crypto.c`, lines 250-350
+**Source**: `src/dns/dnssec/crypto.rs`
 
 **Supported Algorithms**:
 - **Algorithm 15**: Ed25519 (32-byte keys, 64-byte signatures)
-- **Algorithm 16**: Ed448 (57-byte keys, 114-byte signatures)
+- **Algorithm 16**: Ed448 — **not yet supported** (returns `CryptoError::UnsupportedAlgorithm`; the `ring` crate does not natively support Ed448)
 
 **Implementation Details**:
-```c
+```rust
 // Simplified EdDSA verification logic
-// Source: src/crypto.c, dnsmasq_eddsa_verify()
+// Source: src/dns/dnssec/crypto.rs, eddsa_verify()
 
-1. Select EdDSA variant
-   if (algo == 15)
-     // Ed25519: 32-byte key, 64-byte signature
-   else if (algo == 16)
-     // Ed448: 57-byte key, 114-byte signature
-   
-2. Extract public key from DNSKEY RDATA
-   
-3. Verify signature using Nettle EdDSA functions
-   if (algo == 15)
-     result = ed25519_sha512_verify(key, digest_len, digest, sig);
-   else
-     result = ed448_shake256_verify(key, digest_len, digest, sig);
-   
-4. Return result
+// 1. Only Ed25519 (algo 15) is supported
+// Algo 16 (Ed448) returns UnsupportedAlgorithm — ring lacks Ed448 support
+if algo != 15 {
+    return Err(CryptoError::UnsupportedAlgorithm(algo));
+}
+
+// 2. Ed25519: 32-byte key, 64-byte signature
+let public_key = ring::signature::UnparsedPublicKey::new(
+    &ring::signature::ED25519, key
+);
+
+// 3. Verify signature (ring handles cleanup via RAII)
+public_key.verify(data, sig)
+    .map_err(|_| CryptoError::SignatureVerificationFailed)
 ```
 
 ### Signature Validity Period Check
 
 In addition to cryptographic verification, DNSSEC requires time-based validity checks:
 
-```c
-// Source: src/dnssec.c, validate_rrset()
+```rust
+// Source: src/dns/dnssec/validation.rs, validate_rrset()
 // Check RRSIG inception and expiration times
 
 // RRSIG fields (from wire format):
 // - signature_inception: Start of validity period (Unix timestamp)
 // - signature_expiration: End of validity period (Unix timestamp)
 
-current_time = time(NULL);
+let current_time = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)?
+    .as_secs() as u32;
 
-if (current_time < signature_inception)
-  return STAT_BOGUS;  // Signature not yet valid
+if current_time < rrsig.signature_inception {
+    return Err(DnssecError::SignatureNotYetValid);
+}
 
-if (current_time >= signature_expiration)
-  return STAT_BOGUS;  // Signature expired
+if current_time >= rrsig.signature_expiration {
+    return Err(DnssecError::SignatureExpired);
+}
 
 // Proceed with cryptographic verification
 ```
@@ -578,7 +576,7 @@ if (current_time >= signature_expiration)
 
 NSEC (Next Secure) records provide authenticated denial of existence for DNS names and record types. When a query returns NXDOMAIN or NODATA, NSEC records prove that no data exists at the queried name.
 
-**Source**: `src/dnssec.c`, `prove_non_existence()` orchestrator and NSEC-specific handlers
+**Source**: `src/dns/dnssec/validation.rs`, `DnssecValidator::prove_non_existence()` orchestrator and NSEC-specific handlers
 
 ### NSEC Record Structure
 
@@ -649,55 +647,57 @@ foo.example.com.       NSEC z.example.com. A AAAA RRSIG NSEC
 
 ### NSEC Validation Implementation
 
-**Function**: `prove_non_existence()` orchestrator in `src/dnssec.c`
+**Method**: `DnssecValidator::prove_non_existence()` orchestrator in `src/dns/dnssec/validation.rs`
 
 **Purpose**: Determine if NSEC records in a response properly authenticate denial of existence.
 
 **Validation Steps**:
 
-```c
+```rust
 // Simplified NSEC validation logic
-// Source: src/dnssec.c, prove_non_existence()
+// Source: src/dns/dnssec/validation.rs, DnssecValidator::prove_non_existence()
 
-int prove_non_existence(struct dns_header *header, size_t plen, 
-                        char *name, int type, ...)
-{
-  // 1. Extract all NSEC records from response
-  nsec_records = extract_nsec_records(header, plen);
-  
-  // 2. Verify NSEC RRSIGs (signatures over NSEC records)
-  for (each nsec in nsec_records)
-    {
-      if (!validate_rrset(nsec, nsec_rrsig, DNSKEY))
-        return STAT_BOGUS;  // NSEC signature invalid
+impl DnssecValidator {
+    pub fn prove_non_existence(
+        &mut self,
+        header: &DnsHeader,
+        packet: &[u8],
+        name: &str,
+        query_type: QueryType,
+    ) -> Result<ValidationStatus, DnssecError> {
+        // 1. Extract all NSEC records from response
+        let nsec_records = self.extract_nsec_records(header, packet)?;
+
+        // 2. Verify NSEC RRSIGs (signatures over NSEC records)
+        for nsec in &nsec_records {
+            self.validate_rrset(nsec, &nsec.rrsig, &dnskey)?;
+            // Returns Err(DnssecError::Bogus) if NSEC signature invalid
+        }
+
+        // 3. Check NSEC coverage for queried name
+        match query_type {
+            QueryType::Nxdomain => {
+                // Find NSEC that spans queried name
+                // Verify: nsec_owner < queried_name < nsec_next
+                if self.find_spanning_nsec(&nsec_records, name).is_some() {
+                    return Ok(ValidationStatus::Secure); // NXDOMAIN authenticated
+                }
+                Err(DnssecError::Bogus) // No NSEC covers name
+            }
+            QueryType::Nodata => {
+                // Find NSEC for exact name match
+                if let Some(nsec) = self.find_nsec_for_name(&nsec_records, name) {
+                    // Check type bitmap
+                    if !nsec.type_in_bitmap(query_type) {
+                        return Ok(ValidationStatus::Secure); // Type absence authenticated
+                    }
+                }
+                Err(DnssecError::Bogus) // NSEC doesn't prove absence
+            }
+            // 4. Handle wildcard cases (additional logic)
+            _ => Err(DnssecError::Bogus), // Could not prove non-existence
+        }
     }
-  
-  // 3. Check NSEC coverage for queried name
-  if (type == NXDOMAIN)
-    {
-      // Find NSEC that spans queried name
-      // Verify: nsec_owner < queried_name < nsec_next
-      if (found_spanning_nsec)
-        return STAT_SECURE;  // NXDOMAIN authenticated
-      else
-        return STAT_BOGUS;   // No NSEC covers name
-    }
-  else if (type == NODATA)
-    {
-      // Find NSEC for exact name match
-      nsec = find_nsec_for_name(name);
-      
-      // Check type bitmap
-      if (nsec && !type_in_bitmap(nsec, requested_type))
-        return STAT_SECURE;  // Type absence authenticated
-      else
-        return STAT_BOGUS;   // NSEC doesn't prove absence
-    }
-  
-  // 4. Handle wildcard cases (additional logic)
-  // ...
-  
-  return STAT_BOGUS;  // Could not prove non-existence
 }
 ```
 
@@ -720,7 +720,7 @@ canonical_sort(nsec_owner) < canonical_sort(query_name) < canonical_sort(nsec_ne
 
 NSEC3 (Next Secure version 3) provides authenticated denial of existence while preventing zone enumeration by using cryptographic hashes of domain names instead of plaintext names.
 
-**Source**: `src/dnssec.c`, NSEC3-specific validation logic integrated into `prove_non_existence()`
+**Source**: `src/dns/dnssec/validation.rs`, NSEC3-specific validation logic integrated into `DnssecValidator::prove_non_existence()`
 
 ### NSEC3 vs. NSEC Comparison
 
@@ -789,22 +789,22 @@ Step 12: result = Base32-Hex-Encode(hash)
 To prevent denial-of-service attacks through computationally expensive hash iterations, dnsmasq enforces a strict iteration limit:
 
 **Limit**: `DNSSEC_LIMIT_NSEC3_ITERS = 150`
-**Source**: `src/config.h`, line 29
+**Source**: `src/config/constants.rs`
 
 **Validation Behavior**:
 - If NSEC3 record specifies iterations > 150: Validation FAILS (BOGUS)
 - Rationale: Excessive iterations can cause CPU exhaustion during validation
 - Current recommendations (RFC 9276): Maximum 100 iterations for 1024-bit keys, 150 for 2048-bit keys
 
-```c
-// Source: src/dnssec.c, NSEC3 iteration check
-#define NSEC3_MAX_ITERATIONS 150
+```rust
+// Source: src/dns/dnssec/validation.rs, NSEC3 iteration check
+// Constant defined in src/config/constants.rs
+pub const DNSSEC_LIMIT_NSEC3_ITERS: u32 = 150;
 
-if (nsec3_iterations > NSEC3_MAX_ITERATIONS)
-  {
+if nsec3_iterations > DNSSEC_LIMIT_NSEC3_ITERS {
     // Iteration count exceeds limit
-    return STAT_BOGUS;  // Reject validation
-  }
+    return Err(DnssecError::Bogus); // Reject validation
+}
 ```
 
 ### NSEC3 Proof Validation
@@ -869,56 +869,62 @@ NSEC3 supports "opt-out" for unsigned delegations (child zones that don't use DN
 
 ### NSEC3 Validation Implementation
 
-```c
+```rust
 // Simplified NSEC3 validation logic
-// Source: src/dnssec.c, prove_non_existence() with NSEC3 handling
+// Source: src/dns/dnssec/validation.rs, DnssecValidator::prove_non_existence()
+// with NSEC3 handling
 
-int validate_nsec3_proof(char *query_name, int query_type,
-                         struct nsec3_record *nsec3_records)
-{
-  // 1. Extract NSEC3 parameters (salt, iterations, algorithm)
-  salt = nsec3_records[0].salt;
-  iterations = nsec3_records[0].iterations;
-  
-  // 2. Enforce iteration limit
-  if (iterations > DNSSEC_LIMIT_NSEC3_ITERS)
-    return STAT_BOGUS;  // Too many iterations
-  
-  // 3. Compute hash of queried name
-  query_hash = nsec3_hash(query_name, salt, iterations);
-  
-  // 4. Find NSEC3 record covering query_hash
-  covering_nsec3 = find_covering_nsec3(query_hash, nsec3_records);
-  
-  if (!covering_nsec3)
-    return STAT_BOGUS;  // No NSEC3 covers query
-  
-  // 5. Verify NSEC3 RRSIG
-  if (!validate_rrset(covering_nsec3, nsec3_rrsig, DNSKEY))
-    return STAT_BOGUS;  // NSEC3 signature invalid
-  
-  // 6. Check proof type
-  if (query_type == NXDOMAIN)
-    {
-      // Verify query_hash falls between nsec3_owner and nsec3_next
-      if (nsec3_covers_name(covering_nsec3, query_hash))
-        return STAT_SECURE;  // NXDOMAIN authenticated
+impl DnssecValidator {
+    fn validate_nsec3_proof(
+        &mut self,
+        query_name: &str,
+        query_type: QueryType,
+        nsec3_records: &[Nsec3Record],
+    ) -> Result<ValidationStatus, DnssecError> {
+        // 1. Extract NSEC3 parameters (salt, iterations, algorithm)
+        let salt = &nsec3_records[0].salt;
+        let iterations = nsec3_records[0].iterations;
+
+        // 2. Enforce iteration limit
+        if iterations > DNSSEC_LIMIT_NSEC3_ITERS {
+            return Err(DnssecError::Bogus); // Too many iterations
+        }
+
+        // 3. Compute hash of queried name
+        let query_hash = nsec3_hash(query_name, salt, iterations);
+
+        // 4. Find NSEC3 record covering query_hash
+        let covering_nsec3 = self
+            .find_covering_nsec3(&query_hash, nsec3_records)
+            .ok_or(DnssecError::Bogus)?; // No NSEC3 covers query
+
+        // 5. Verify NSEC3 RRSIG
+        self.validate_rrset(covering_nsec3, &covering_nsec3.rrsig, &dnskey)?;
+
+        // 6. Check proof type
+        match query_type {
+            QueryType::Nxdomain => {
+                if covering_nsec3.covers_hash(&query_hash) {
+                    return Ok(ValidationStatus::Secure); // NXDOMAIN authenticated
+                }
+            }
+            QueryType::Nodata => {
+                if let Some(exact) = self.find_exact_nsec3(&query_hash, nsec3_records) {
+                    if !exact.type_in_bitmap(query_type) {
+                        return Ok(ValidationStatus::Secure); // Type absence authenticated
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // 7. Handle opt-out cases
+        if covering_nsec3.flags.contains(Nsec3Flags::OPT_OUT) {
+            return Ok(ValidationStatus::Insecure); // Opt-out delegation
+        }
+
+        Err(DnssecError::Bogus) // Could not prove non-existence
     }
-  else if (query_type == NODATA)
-    {
-      // Find exact match NSEC3
-      exact_nsec3 = find_exact_nsec3(query_hash, nsec3_records);
-      
-      // Check type bitmap
-      if (exact_nsec3 && !type_in_bitmap(exact_nsec3, query_type))
-        return STAT_SECURE;  // Type absence authenticated
-    }
-  
-  // 7. Handle opt-out cases
-  if (covering_nsec3->flags & NSEC3_OPT_OUT)
-    return STAT_INSECURE;  // Opt-out delegation
-  
-  return STAT_BOGUS;  // Could not prove non-existence
 }
 ```
 
@@ -926,7 +932,7 @@ int validate_nsec3_proof(char *query_name, int query_type,
 
 Trust anchors are the foundation of DNSSEC validation, representing pre-configured public keys or DS records that are explicitly trusted without further validation.
 
-**Source**: `trust-anchors.conf` (trust anchor storage), `src/dnssec.c` (trust anchor validation logic)
+**Source**: `trust-anchors.conf` (trust anchor storage), `src/dns/dnssec/validation.rs` (trust anchor validation logic)
 
 ### Root Zone Trust Anchors
 
@@ -951,30 +957,31 @@ Dnsmasq uses DS records for the DNS root zone (`.`) as trust anchors. These are 
 
 When validating a DNSKEY for the root zone, dnsmasq performs the following:
 
-```c
+```rust
 // Simplified trust anchor validation
-// Source: src/dnssec.c, validate_rrset() for root zone
+// Source: src/dns/dnssec/validation.rs, validate_rrset()
+// for root zone
 
 // 1. Retrieve root zone DNSKEY from DNS response
-root_dnskey = extract_dnskey(response, ".");
+let root_dnskey = self.extract_dnskey(response, ".")?;
 
-// 2. Compute digest of DNSKEY
-computed_digest = compute_ds_digest(root_dnskey, SHA256);
+// 2. Compute digest of DNSKEY using ring::digest
+let computed_digest = ring::digest::digest(
+    &ring::digest::SHA256,
+    &root_dnskey.to_ds_wire_format(),
+);
 
 // 3. Compare with trust anchor DS digest
-trust_anchor_digest = lookup_trust_anchor(".");
+let trust_anchor_digest = self.lookup_trust_anchor(".")?;
 
-if (computed_digest == trust_anchor_digest)
-  {
+if computed_digest.as_ref() == trust_anchor_digest.as_slice() {
     // Trust anchor matches
-    cache_dnskey(root_dnskey, STAT_SECURE);
-    return STAT_SECURE;
-  }
-else
-  {
+    self.cache.insert_dnskey(root_dnskey, ValidationStatus::Secure);
+    Ok(ValidationStatus::Secure)
+} else {
     // Trust anchor mismatch
-    return STAT_BOGUS;
-  }
+    Err(DnssecError::Bogus)
+}
 ```
 
 ### Trust Anchor Updates
@@ -1040,7 +1047,7 @@ internal. DS 12345 8 2 ABCD1234...
 
 DNSSEC validation can be computationally expensive, creating opportunities for denial-of-service attacks. Dnsmasq implements strict resource limits to prevent validation-based DoS.
 
-**Source**: `src/config.h` (limit definitions), `src/dnssec.c` (limit enforcement)
+**Source**: `src/config/constants.rs` (limit definitions), `src/dns/dnssec/validation.rs` (limit enforcement)
 
 ### Configured Limits
 
@@ -1051,14 +1058,18 @@ DNSSEC validation can be computationally expensive, creating opportunities for d
 | **Maximum Crypto Operations** | 200 | `DNSSEC_LIMIT_CRYPTO` | Limits total cryptographic operations per validation |
 | **Maximum NSEC3 Iterations** | 150 | `DNSSEC_LIMIT_NSEC3_ITERS` | Limits NSEC3 hash iteration count |
 
-**Definition Location**: `src/config.h`, lines 25-29
+**Definition Location**: `src/config/constants.rs`
 
-```c
-// Source: src/config.h, lines 25-29
-#define DNSSEC_LIMIT_WORK 40          /* Maximum queries during validation */
-#define DNSSEC_LIMIT_SIG_FAIL 20      /* Maximum signature failures */
-#define DNSSEC_LIMIT_CRYPTO 200       /* Maximum crypto operations */
-#define DNSSEC_LIMIT_NSEC3_ITERS 150  /* Maximum NSEC3 iterations */
+```rust
+// Source: src/config/constants.rs
+/// Maximum queries during validation
+pub const DNSSEC_LIMIT_WORK: u32 = 40;
+/// Maximum signature failures
+pub const DNSSEC_LIMIT_SIG_FAIL: u32 = 20;
+/// Maximum crypto operations
+pub const DNSSEC_LIMIT_CRYPTO: u32 = 200;
+/// Maximum NSEC3 iterations
+pub const DNSSEC_LIMIT_NSEC3_ITERS: u32 = 150;
 ```
 
 ### Limit Enforcement
@@ -1070,24 +1081,24 @@ DNSSEC validation can be computationally expensive, creating opportunities for d
 **Attack Scenario**: Malicious zone creates circular DNSKEY dependencies forcing validator to make hundreds of queries.
 
 **Enforcement**:
-```c
-// Source: src/dnssec.c, dnssec_validate_reply()
-static unsigned int queries_outstanding = 0;
+```rust
+// Source: src/dns/dnssec/validation.rs, DnssecValidator::validate_reply()
 
-int dnssec_validate_reply(...)
-{
-  queries_outstanding++;
-  
-  if (queries_outstanding > DNSSEC_LIMIT_WORK)
-    {
-      // Too many queries during validation
-      return STAT_BOGUS;
+impl DnssecValidator {
+    pub fn validate_reply(&mut self, /* ... */) -> Result<ValidationStatus, DnssecError> {
+        self.queries_outstanding += 1;
+
+        if self.queries_outstanding > DNSSEC_LIMIT_WORK {
+            // Too many queries during validation
+            return Err(DnssecError::ResourceLimitExceeded("queries"));
+        }
+
+        // Perform validation...
+        let status = self.do_validation(/* ... */)?;
+
+        self.queries_outstanding -= 1;
+        Ok(status)
     }
-  
-  // Perform validation...
-  
-  queries_outstanding--;
-  return validation_status;
 }
 ```
 
@@ -1100,33 +1111,33 @@ int dnssec_validate_reply(...)
 **Attack Scenario**: Response contains hundreds of invalid RRSIGs forcing validator to attempt verification for each.
 
 **Enforcement**:
-```c
-// Source: src/dnssec.c, validate_rrset()
-static unsigned int sig_fail_count = 0;
+```rust
+// Source: src/dns/dnssec/validation.rs, validate_rrset()
 
-int validate_rrset(...)
-{
-  for (each RRSIG in response)
-    {
-      if (!verify_signature(rrsig, dnskey, rrset))
-        {
-          sig_fail_count++;
-          
-          if (sig_fail_count > DNSSEC_LIMIT_SIG_FAIL)
-            {
-              // Too many signature failures
-              return STAT_BOGUS;
+impl DnssecValidator {
+    fn validate_rrset(&mut self, /* ... */) -> Result<ValidationStatus, DnssecError> {
+        for rrsig in response_rrsigs {
+            match self.crypto.verify_signature(&rrsig, &dnskey, &rrset) {
+                Ok(()) => {
+                    // Signature valid
+                    self.sig_fail_count = 0; // Reset on success
+                    return Ok(ValidationStatus::Secure);
+                }
+                Err(_) => {
+                    self.sig_fail_count += 1;
+
+                    if self.sig_fail_count > DNSSEC_LIMIT_SIG_FAIL {
+                        // Too many signature failures
+                        return Err(DnssecError::ResourceLimitExceeded("sig_fail"));
+                    }
+
+                    continue; // Try next RRSIG
+                }
             }
-          
-          continue;  // Try next RRSIG
         }
-      
-      // Signature valid
-      sig_fail_count = 0;  // Reset on success
-      return STAT_SECURE;
+
+        Err(DnssecError::Bogus) // All signatures failed
     }
-  
-  return STAT_BOGUS;  // All signatures failed
 }
 ```
 
@@ -1139,24 +1150,23 @@ int validate_rrset(...)
 **Attack Scenario**: Response designed to trigger maximum crypto work (large RRsets, many RRSIGs, complex algorithms).
 
 **Enforcement**:
-```c
-// Source: src/crypto.c, verify()
-static unsigned int crypto_ops = 0;
+```rust
+// Source: src/dns/dnssec/crypto.rs, verify()
 
-int verify(int algo, char *key, ...)
-{
-  crypto_ops++;
-  
-  if (crypto_ops > DNSSEC_LIMIT_CRYPTO)
+// Standalone functions in src/dns/dnssec/crypto.rs
+    pub fn verify(algo: u8, key: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, CryptoError>
+        -> Result<(), CryptoError>
     {
-      // Too many cryptographic operations
-      return 0;  // Verification failed
+        self.crypto_ops += 1;
+
+        if self.crypto_ops > DNSSEC_LIMIT_CRYPTO {
+            // Too many cryptographic operations
+            return Err(CryptoError::ResourceLimitExceeded);
+        }
+
+        // Perform signature verification via ring
+        self.algorithm_specific_verify(algo, key, sig, digest)
     }
-  
-  // Perform signature verification
-  result = algorithm_specific_verify(...);
-  
-  return result;
 }
 ```
 
@@ -1169,20 +1179,20 @@ int verify(int algo, char *key, ...)
 **Attack Scenario**: Zone configures NSEC3 with thousands of iterations forcing validator to perform expensive repeated hashing.
 
 **Enforcement**:
-```c
-// Source: src/dnssec.c, NSEC3 validation
-int validate_nsec3(struct nsec3_record *nsec3)
-{
-  if (nsec3->iterations > DNSSEC_LIMIT_NSEC3_ITERS)
-    {
-      // Iteration count exceeds limit
-      return STAT_BOGUS;
+```rust
+// Source: src/dns/dnssec/validation.rs, NSEC3 validation
+
+fn validate_nsec3(nsec3: &Nsec3Record) -> Result<ValidationStatus, DnssecError> {
+    if nsec3.iterations > DNSSEC_LIMIT_NSEC3_ITERS {
+        // Iteration count exceeds limit
+        return Err(DnssecError::Bogus);
     }
-  
-  // Compute NSEC3 hash with allowed iterations
-  hash = nsec3_hash(name, salt, nsec3->iterations);
-  
-  // Validate proof...
+
+    // Compute NSEC3 hash with allowed iterations
+    let hash = nsec3_hash(name, &nsec3.salt, nsec3.iterations);
+
+    // Validate proof...
+    Ok(ValidationStatus::Secure)
 }
 ```
 
@@ -1223,16 +1233,16 @@ int validate_nsec3(struct nsec3_record *nsec3)
 
 **Tuning Considerations**:
 
-The limits are compile-time constants defined in `src/config.h`. To adjust for specific deployment requirements:
+The limits are compile-time constants defined in `src/config/constants.rs`. To adjust for specific deployment requirements:
 
-1. **Edit** `src/config.h`:
-   ```c
-   #define DNSSEC_LIMIT_WORK 80  // Double query limit
+1. **Edit** `src/config/constants.rs`:
+   ```rust
+   pub const DNSSEC_LIMIT_WORK: u32 = 80; // Double query limit
    ```
 
 2. **Recompile** dnsmasq:
    ```bash
-   make COPTS="-DHAVE_DNSSEC"
+   cargo build --release --features dnssec
    ```
 
 3. **Test** with DNSSEC validation:
@@ -1246,7 +1256,7 @@ The limits are compile-time constants defined in `src/config.h`. To adjust for s
 
 DNSSEC validation results in one of three security states for each DNS response:
 
-**Source**: `src/dnssec.c` (validation state determination), `src/dnsmasq.h` (state constants)
+**Source**: `src/dns/dnssec/validation.rs` (validation state determination), `src/types/dns.rs` (state enum definitions)
 
 ### State Definitions
 
@@ -1269,23 +1279,27 @@ DNSSEC validation results in one of three security states for each DNS response:
 6. All resource limits respected (queries, crypto ops, etc.)
 
 **Implementation**:
-```c
-// Source: src/dnssec.c, validation success path
-#define STAT_SECURE 1
+```rust
+// Source: src/dns/dnssec/validation.rs, validation success path
 
-int dnssec_validate_reply(...)
-{
-  // Perform all validation checks
-  
-  if (all_checks_passed)
-    {
-      // Mark response as validated
-      header->ad = 1;  // Set Authenticated Data bit
-      
-      // Cache validated data
-      cache_insert(name, rrset, ttl, STAT_SECURE);
-      
-      return STAT_SECURE;
+/// DNSSEC validation status
+pub enum ValidationStatus {
+    Secure,
+    Insecure,
+    Bogus,
+}
+
+impl DnssecValidator {
+    pub fn validate_reply(&mut self, /* ... */) -> Result<ValidationStatus, DnssecError> {
+        // Perform all validation checks
+
+        // Mark response as validated
+        header.set_ad(true); // Set Authenticated Data bit
+
+        // Cache validated data
+        self.cache.insert(name, &rrset, ttl, ValidationStatus::Secure);
+
+        Ok(ValidationStatus::Secure)
     }
 }
 ```
@@ -1305,28 +1319,27 @@ int dnssec_validate_reply(...)
 3. **NSEC3 Opt-Out**: NSEC3 record with opt-out flag covers unsigned delegation
 
 **Implementation**:
-```c
-// Source: src/dnssec.c, insecure zone detection
-#define STAT_INSECURE 2
+```rust
+// Source: src/dns/dnssec/validation.rs, insecure zone detection
 
-int validate_rrset(...)
-{
-  // Check for DS record in parent zone
-  ds_record = find_ds(parent_zone, child_zone);
-  
-  if (!ds_record)
-    {
-      // No DS record → zone is insecure
-      return STAT_INSECURE;
+impl DnssecValidator {
+    fn validate_rrset(&mut self, /* ... */) -> Result<ValidationStatus, DnssecError> {
+        // Check for DS record in parent zone
+        let ds_record = self.find_ds(parent_zone, child_zone);
+
+        if ds_record.is_none() {
+            // No DS record → zone is insecure
+            return Ok(ValidationStatus::Insecure);
+        }
+
+        // Check for NSEC3 opt-out
+        if self.nsec3_opt_out_covers(query_name) {
+            return Ok(ValidationStatus::Insecure);
+        }
+
+        // Continue validation...
+        Ok(ValidationStatus::Secure)
     }
-  
-  // Check for NSEC3 opt-out
-  if (nsec3_opt_out_covers(query_name))
-    {
-      return STAT_INSECURE;
-    }
-  
-  // Continue validation...
 }
 ```
 
@@ -1353,27 +1366,28 @@ int validate_rrset(...)
 8. **Algorithm Unsupported**: RRSIG uses unsupported algorithm
 
 **Implementation**:
-```c
-// Source: src/dnssec.c, validation failure path
-#define STAT_BOGUS 0
+```rust
+// Source: src/dns/dnssec/validation.rs, validation failure path
 
-int dnssec_validate_reply(...)
-{
-  // Attempt validation
-  
-  if (signature_invalid || chain_broken || expired || ...)
-    {
-      // Validation failed
-      
-      // Log failure reason
-      my_syslog(LOG_WARNING, "DNSSEC validation failed: %s", reason);
-      
-      // Do NOT cache bogus data
-      
-      // Return SERVFAIL to client
-      header->rcode = SERVFAIL;
-      
-      return STAT_BOGUS;
+impl DnssecValidator {
+    pub fn validate_reply(&mut self, /* ... */) -> Result<ValidationStatus, DnssecError> {
+        // Attempt validation
+        match self.do_validation(/* ... */) {
+            Ok(status) => Ok(status),
+            Err(e) => {
+                // Validation failed
+
+                // Log failure reason
+                log::warn!("DNSSEC validation failed: {}", e);
+
+                // Do NOT cache bogus data
+
+                // Return SERVFAIL to client
+                header.set_rcode(RCode::ServFail);
+
+                Err(DnssecError::Bogus)
+            }
+        }
     }
 }
 ```
@@ -1460,177 +1474,163 @@ validation result: BOGUS (signature verification failed)
 
 ## Cryptographic Library Integration
 
-Dnsmasq relies on the Nettle cryptography library for all DNSSEC cryptographic operations. Nettle provides low-level cryptographic primitives optimized for performance and security.
+Dnsmasq relies on the `ring` cryptography crate for all DNSSEC cryptographic operations. `ring` provides safe, high-performance cryptographic primitives optimized for security-critical applications.
 
-**Source**: `src/crypto.c` (Nettle integration layer)
+**Source**: `src/dns/dnssec/crypto.rs` (`ring` integration layer)
 
-### Nettle Library Overview
+### ring Crate Overview
 
-**Nettle** is a low-level cryptographic library providing:
-- Cryptographic hash functions (SHA-1, SHA-256, SHA-384, SHA-512, SHAKE)
-- Public-key cryptography (RSA, ECDSA, EdDSA, GOST)
-- Big integer arithmetic (via GMP - GNU Multiple Precision Arithmetic Library)
+**`ring`** is a Rust cryptographic library providing:
+- Cryptographic hash functions (SHA-1, SHA-256, SHA-384, SHA-512) via `ring::digest`
+- Public-key signature verification (RSA, ECDSA, Ed25519) via `ring::signature`
+- No external C library dependencies beyond its own bundled assembly optimizations
 
-**Why Nettle**:
-- **Lightweight**: Minimal dependencies, suitable for embedded systems
-- **Portable**: Runs on all dnsmasq target platforms
-- **Well-Maintained**: Actively developed and security-audited
-- **DNSSEC-Focused**: Comprehensive support for all DNSSEC algorithms
+**Why `ring`**:
+- **Memory Safe**: Pure Rust API with no `unsafe` exposed to consumers
+- **Portable**: Supports x86-64, ARM64, and other Rust targets
+- **Well-Maintained**: Actively developed, widely audited, 334M+ downloads on crates.io
+- **DNSSEC-Suitable**: Comprehensive support for RSA, ECDSA P-256/P-384, and Ed25519 algorithms
 
-**Library Dependencies**:
-- **libnettle**: Core cryptographic algorithms
-- **libhogweed**: Public-key cryptography (RSA, DSA, ECDSA, EdDSA)
-- **libgmp**: Multi-precision arithmetic (optional, improves RSA performance)
+**Crate Dependencies**:
+- **`ring`**: Core cryptographic algorithms (bundled; no system library required)
 
-**Compile-Time Detection**:
-```makefile
-# Makefile, lines 58-71
-LIBS = $(shell pkg-config --libs nettle)
-CFLAGS += $(shell pkg-config --cflags nettle)
+**Cargo Feature Gate**:
+```toml
+# Cargo.toml
+[features]
+dnssec = ["ring"]
+
+[dependencies]
+ring = { version = "0.17", optional = true }
 ```
 
 **Build Requirement**:
 ```bash
-# Install Nettle development libraries (Debian/Ubuntu)
-sudo apt-get install libnettle-dev
-
-# Compile dnsmasq with DNSSEC support
-make COPTS="-DHAVE_DNSSEC"
+# Build dnsmasq with DNSSEC support
+cargo build --release --features dnssec
 ```
 
 ### Cryptographic Primitive Mapping
 
-| DNSSEC Algorithm | Nettle Function | Hash Function | Key Size |
-|-----------------|----------------|---------------|----------|
-| RSA/SHA-1 (5) | `rsa_sha1_verify_digest` | SHA-1 | 512-4096 bits |
-| RSA/SHA-256 (8) | `rsa_sha256_verify_digest` | SHA-256 | 1024-4096 bits |
-| RSA/SHA-512 (10) | `rsa_sha512_verify_digest` | SHA-512 | 1024-4096 bits |
-| ECDSA P-256 (13) | `ecdsa_verify` | SHA-256 | 256 bits |
-| ECDSA P-384 (14) | `ecdsa_verify` | SHA-384 | 384 bits |
-| Ed25519 (15) | `ed25519_sha512_verify` | SHA-512 | 256 bits |
-| Ed448 (16) | `ed448_shake256_verify` | SHAKE256 | 456 bits |
-| GOST (12) | `gost_dsa_verify` | GOST R 34.11-2012 | 512 bits |
+| DNSSEC Algorithm | `ring` Verification Algorithm | Hash Function | Key Size |
+|-----------------|-------------------------------|---------------|----------|
+| RSA/SHA-1 (5) | `ring::signature::RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY` | SHA-1 | 512-4096 bits |
+| RSA/SHA-256 (8) | `ring::signature::RSA_PKCS1_2048_8192_SHA256` | SHA-256 | 1024-4096 bits |
+| RSA/SHA-512 (10) | `ring::signature::RSA_PKCS1_2048_8192_SHA512` | SHA-512 | 1024-4096 bits |
+| ECDSA P-256 (13) | `ring::signature::ECDSA_P256_SHA256_FIXED` | SHA-256 | 256 bits |
+| ECDSA P-384 (14) | `ring::signature::ECDSA_P384_SHA384_FIXED` | SHA-384 | 384 bits |
+| Ed25519 (15) | `ring::signature::ED25519` | SHA-512 | 256 bits |
+| Ed448 (16) | *Deferred — `ring` does not support Ed448 natively* | SHAKE256 | 456 bits |
+| GOST (12) | *Deferred — `ring` does not support GOST algorithms* | GOST R 34.11-2012 | 512 bits |
 
-### Nettle API Usage Examples
+### ring API Usage Examples
 
 **RSA Signature Verification**:
-```c
-// Source: src/crypto.c, dnsmasq_rsa_verify()
-#include <nettle/rsa.h>
-#include <nettle/bignum.h>
+```rust
+// Source: src/dns/dnssec/crypto.rs, crypto::rsa_verify()
+use ring::signature;
 
-int dnsmasq_rsa_verify(unsigned char *key, size_t key_len,
-                       unsigned char *sig, size_t sig_len,
-                       unsigned char *digest, size_t digest_len)
-{
-  struct rsa_public_key rsa_key;
-  mpz_t signature;
-  
-  // Initialize RSA public key structure
-  rsa_public_key_init(&rsa_key);
-  mpz_init(signature);
-  
-  // Parse public key from DNSKEY RDATA
-  // DNSKEY format: exponent_length || exponent || modulus
-  mpz_import(rsa_key.e, exponent_len, 1, 1, 0, 0, exponent);
-  mpz_import(rsa_key.n, modulus_len, 1, 1, 0, 0, modulus);
-  
-  // Import signature
-  mpz_import(signature, sig_len, 1, 1, 0, 0, sig);
-  
-  // Verify signature based on algorithm
-  int result;
-  if (algorithm == 5 || algorithm == 7)  // RSA/SHA-1
-    result = rsa_sha1_verify_digest(&rsa_key, digest, signature);
-  else if (algorithm == 8)  // RSA/SHA-256
-    result = rsa_sha256_verify_digest(&rsa_key, digest, signature);
-  else if (algorithm == 10)  // RSA/SHA-512
-    result = rsa_sha512_verify_digest(&rsa_key, digest, signature);
-  
-  // Cleanup
-  mpz_clear(signature);
-  rsa_public_key_clear(&rsa_key);
-  
-  return result;  // 1 = valid, 0 = invalid
+// Standalone functions in src/dns/dnssec/crypto.rs
+    fn verify_rsa(
+        algo: u8,
+        key_data: &[u8],
+        sig: &[u8],
+        message: &[u8],
+    ) -> Result<(), CryptoError> {
+        // Select ring RSA algorithm based on DNSSEC algorithm number
+        let algorithm: &dyn signature::VerificationAlgorithm = match algo {
+            5 /* RSASHA1 */ | 7 /* RSASHA1-NSEC3 */ =>
+                &signature::RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY,
+            8 /* RSASHA256 */ =>
+                &signature::RSA_PKCS1_2048_8192_SHA256,
+            10 /* RSASHA512 */ =>
+                &signature::RSA_PKCS1_2048_8192_SHA512,
+            _ => return Err(CryptoError::UnsupportedAlgorithm(algo)),
+        };
+
+        // Parse RSA public key from DNSKEY RDATA
+        // DNSKEY format: exponent_length || exponent || modulus
+        let rsa_public_key_der = self.parse_rsa_dnskey(key_data)?;
+
+        // Verify signature using ring (no manual cleanup needed — RAII)
+        let public_key = signature::UnparsedPublicKey::new(algorithm, &rsa_public_key_der);
+        public_key
+            .verify(message, sig)
+            .map_err(|_| CryptoError::SignatureVerificationFailed)
+    }
 }
 ```
 
 **ECDSA Signature Verification**:
-```c
-// Source: src/crypto.c, dnsmasq_ecdsa_verify()
-#include <nettle/ecdsa.h>
-#include <nettle/ecc-curve.h>
+```rust
+// Source: src/dns/dnssec/crypto.rs, crypto::ecdsa_verify()
+use ring::signature;
 
-int dnsmasq_ecdsa_verify(unsigned char *key, size_t key_len,
-                         unsigned char *sig, size_t sig_len,
-                         unsigned char *digest, size_t digest_len,
-                         int algorithm)
-{
-  struct ecc_point public_key;
-  struct dsa_signature signature;
-  const struct ecc_curve *curve;
-  
-  // Select curve based on algorithm
-  if (algorithm == 13)  // ECDSA P-256
-    curve = nettle_get_secp_256r1();
-  else if (algorithm == 14)  // ECDSA P-384
-    curve = nettle_get_secp_384r1();
-  
-  // Initialize point and signature
-  ecc_point_init(&public_key, curve);
-  dsa_signature_init(&signature);
-  
-  // Parse public key (X and Y coordinates)
-  // DNSKEY format: X || Y (raw bytes, big-endian)
-  mpz_import(X, curve->p.size, 1, 1, 0, 0, key);
-  mpz_import(Y, curve->p.size, 1, 1, 0, 0, key + curve->p.size);
-  ecc_point_set(&public_key, X, Y);
-  
-  // Parse signature (R and S components)
-  mpz_import(signature.r, sig_len / 2, 1, 1, 0, 0, sig);
-  mpz_import(signature.s, sig_len / 2, 1, 1, 0, 0, sig + sig_len / 2);
-  
-  // Verify signature
-  int result = ecdsa_verify(&public_key, digest_len, digest, &signature);
-  
-  // Cleanup
-  ecc_point_clear(&public_key);
-  dsa_signature_clear(&signature);
-  
-  return result;
+// Standalone functions in src/dns/dnssec/crypto.rs
+    fn verify_ecdsa(
+        algo: u8,
+        key_data: &[u8],
+        sig: &[u8],
+        message: &[u8],
+    ) -> Result<(), CryptoError> {
+        // Select curve based on algorithm
+        let algorithm: &dyn signature::VerificationAlgorithm = match algo {
+            13 /* ECDSA-P256 */ =>
+                &signature::ECDSA_P256_SHA256_FIXED, // P-256
+            14 /* ECDSA-P384 */ =>
+                &signature::ECDSA_P384_SHA384_FIXED, // P-384
+            _ => return Err(CryptoError::UnsupportedAlgorithm(algo)),
+        };
+
+        // Parse public key (X and Y coordinates) from DNSKEY RDATA
+        // DNSKEY format: X || Y (raw bytes, big-endian)
+        // ring expects uncompressed point: 0x04 || X || Y
+        let mut uncompressed_key = Vec::with_capacity(1 + key_data.len());
+        uncompressed_key.push(0x04);
+        uncompressed_key.extend_from_slice(key_data);
+
+        // Verify signature (R and S in fixed-size concatenated format)
+        // No manual cleanup needed — RAII
+        let public_key = signature::UnparsedPublicKey::new(algorithm, &uncompressed_key);
+        public_key
+            .verify(message, sig)
+            .map_err(|_| CryptoError::SignatureVerificationFailed)
+    }
 }
 ```
 
 **EdDSA Signature Verification**:
-```c
-// Source: src/crypto.c, dnsmasq_eddsa_verify()
-#include <nettle/eddsa.h>
+```rust
+// Source: src/dns/dnssec/crypto.rs, crypto::eddsa_verify()
+use ring::signature;
 
-int dnsmasq_eddsa_verify(unsigned char *key, size_t key_len,
-                         unsigned char *sig, size_t sig_len,
-                         unsigned char *digest, size_t digest_len,
-                         int algorithm)
-{
-  int result;
-  
-  if (algorithm == 15)  // Ed25519
-    {
-      // Ed25519: 32-byte key, 64-byte signature
-      result = ed25519_sha512_verify(key,           // 32-byte public key
-                                      digest_len,    // Message length
-                                      digest,        // Message
-                                      sig);          // 64-byte signature
+// Standalone functions in src/dns/dnssec/crypto.rs
+    fn verify_eddsa(
+        algo: u8,
+        key_data: &[u8],
+        sig: &[u8],
+        message: &[u8],
+    ) -> Result<(), CryptoError> {
+        match algo {
+            15 /* Ed25519 */ => {
+                // Ed25519: 32-byte key, 64-byte signature
+                let public_key = signature::UnparsedPublicKey::new(
+                    &signature::ED25519,
+                    key_data, // 32-byte public key
+                );
+                public_key
+                    .verify(message, sig) // 64-byte signature
+                    .map_err(|_| CryptoError::SignatureVerificationFailed)
+            }
+            16 /* Ed448 */ => {
+                // Ed448: 57-byte key, 114-byte signature
+                // Note: ring does not natively support Ed448.
+                // Requires supplementary crate (e.g., ed448-goldilocks).
+                Err(CryptoError::UnsupportedAlgorithm(algo))
+            }
+            _ => Err(CryptoError::UnsupportedAlgorithm(algo)),
+        }
     }
-  else if (algorithm == 16)  // Ed448
-    {
-      // Ed448: 57-byte key, 114-byte signature
-      result = ed448_shake256_verify(key,           // 57-byte public key
-                                      digest_len,    // Message length
-                                      digest,        // Message
-                                      sig);          // 114-byte signature
-    }
-  
-  return result;
 }
 ```
 
@@ -1654,33 +1654,42 @@ int dnsmasq_eddsa_verify(unsigned char *key, size_t key_len,
 
 ### Error Handling
 
-**Nettle Function Return Values**:
-- **1**: Signature verification successful
-- **0**: Signature verification failed
+**`ring` Verification Return Values**:
+- **`Ok(())`**: Signature verification successful
+- **`Err(ring::error::Unspecified)`**: Signature verification failed
 
 **Dnsmasq Error Propagation**:
-```c
-// Source: src/crypto.c, verify()
-int verify(int algo, char *key, int keylen, unsigned char *sig, ...)
-{
-  int (*verify_func_ptr)(struct blockdata *, ...) = verify_func(algo);
-  
-  if (!verify_func_ptr)
-    {
-      // Unsupported algorithm
-      return 0;
+```rust
+// Source: src/dns/dnssec/crypto.rs, verify()
+
+// Standalone functions in src/dns/dnssec/crypto.rs
+    pub fn verify(
+        &mut self,
+        algo: u8 /* algorithm number */,
+        key: &[u8],
+        sig: &[u8],
+        message: &[u8],
+    ) -> Result<(), CryptoError> {
+        // Dispatch to algorithm-specific verifier
+        let result = match algo {
+            5 /* RSASHA1 */ | 7 /* RSASHA1-NSEC3 */
+            | 8 /* RSASHA256 */ | 10 /* RSASHA512 */ =>
+                self.verify_rsa(algo, key, sig, message),
+            13 /* ECDSA-P256 */ | 14 /* ECDSA-P384 */ =>
+                self.verify_ecdsa(algo, key, sig, message),
+            15 /* Ed25519 */ | 16 /* Ed448 */ =>
+                self.verify_eddsa(algo, key, sig, message),
+            _ => Err(CryptoError::UnsupportedAlgorithm(algo)),
+        };
+
+        if result.is_err() {
+            // Verification failed
+            // Caller (DnssecValidator) increments sig_fail_count
+            // and tries next RRSIG or returns Bogus
+        }
+
+        result
     }
-  
-  int result = verify_func_ptr(key_data, ...);
-  
-  if (result == 0)
-    {
-      // Verification failed
-      // Increment sig_fail_count in dnssec.c
-      // Try next RRSIG or return BOGUS
-    }
-  
-  return result;
 }
 ```
 
@@ -1726,20 +1735,17 @@ trust-anchor=/usr/share/dnsmasq/trust-anchors.conf
 log-queries
 ```
 
-**Source**: `dnsmasq.conf.example`, lines 1-150 (DNSSEC-related options documented)
+**Source**: `dnsmasq.conf.example` (DNSSEC-related options documented)
 
 ### Compile-Time Configuration
 
 **Build with DNSSEC Support**:
 ```bash
-# Install Nettle library
-sudo apt-get install libnettle-dev
-
-# Compile with DNSSEC enabled
-make COPTS="-DHAVE_DNSSEC"
+# Build with DNSSEC feature enabled (ring crate is fetched automatically by Cargo)
+cargo build --release --features dnssec
 
 # Install
-sudo make install
+cargo install --path . --features dnssec
 ```
 
 **Verify DNSSEC Support**:
@@ -1839,9 +1845,9 @@ sudo journalctl -u dnsmasq -f
 - **Cause**: Hitting validation limits (too many queries/crypto ops)
 - **Solution**: Investigate zone causing excessive work, adjust limits if legitimate
 
-**4. Nettle Library Missing**:
-- **Cause**: Nettle not installed or not detected at compile time
-- **Solution**: Install libnettle-dev and recompile
+**4. `ring` Crate Build Failure**:
+- **Cause**: Missing C compiler or assembly toolchain required by `ring` during build
+- **Solution**: Ensure `cc` (C compiler) and standard build tools are installed, then rebuild with `cargo build --features dnssec`
 
 ### Security Considerations
 
@@ -1871,7 +1877,7 @@ sudo journalctl -u dnsmasq -f
 - [DNS Forwarding and Caching](DNS_FORWARDING.md) - DNS query forwarding and cache integration
 - [Architecture Overview](ARCHITECTURE.md) - System architecture and component relationships
 - [Configuration Guide](CONFIGURATION.md) - Complete configuration options including DNSSEC settings
-- [Building Guide](BUILDING.md) - Compilation instructions with Nettle library dependencies
+- [Building Guide](BUILDING.md) - Compilation instructions with Cargo feature flags and `ring` crate dependency
 
 **External Resources**:
 - [RFC 4033](https://www.rfc-editor.org/rfc/rfc4033.html) - DNSSEC Introduction and Requirements
@@ -1879,11 +1885,11 @@ sudo journalctl -u dnsmasq -f
 - [RFC 4035](https://www.rfc-editor.org/rfc/rfc4035.html) - DNSSEC Protocol Modifications
 - [RFC 9276](https://www.rfc-editor.org/rfc/rfc9276.html) - NSEC3 Parameter Settings
 - [IANA DNSSEC Resources](https://www.iana.org/dnssec/) - Root zone trust anchors and KSK information
-- [Nettle Cryptography Library](https://www.lysator.liu.se/~nisse/nettle/) - Cryptographic library documentation
+- [ring Cryptography Crate](https://github.com/briansmith/ring) - Rust cryptographic library documentation
 
 ---
 
 **Document Version**: 1.0  
 **Last Updated**: Based on dnsmasq version 2.92  
 **Trust Anchor Current As Of**: July 2024  
-**Source Code References**: `src/dnssec.c`, `src/crypto.c`, `src/config.h`, `trust-anchors.conf`
+**Source Code References**: `src/dns/dnssec/validation.rs`, `src/dns/dnssec/crypto.rs`, `src/config/constants.rs`, `trust-anchors.conf`

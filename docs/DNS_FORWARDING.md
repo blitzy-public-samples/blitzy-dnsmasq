@@ -4,7 +4,7 @@
 
 The DNS forwarding engine is the core of dnsmasq's DNS resolution capabilities, implementing a lightweight DNS forwarder and cache that accepts queries from downstream clients, consults a local cache, and forwards cache misses to configured upstream recursive DNS servers. This document provides comprehensive technical documentation of the query forwarding implementation in dnsmasq version 2.92.
 
-**Source:** `/src/forward.c`, `/src/rfc1035.c`, `/src/network.c`, `/src/edns0.c`
+**Source:** `/src/dns/forward.rs`, `/src/dns/wire.rs`, `/src/net/interface.rs`, `/src/net/socket.rs`, `/src/dns/edns.rs`
 
 ### Purpose and Responsibilities
 
@@ -22,7 +22,7 @@ The DNS forwarding subsystem serves multiple critical functions:
 
 The forwarding implementation embodies several key design principles:
 
-**Stateful Query Tracking**: Each outstanding query is tracked using a `struct frec` (forward record) that maintains query state, upstream server information, client details, and timing information. The system supports up to 150 concurrent queries (FTABSIZ defined in `src/config.h:17`).
+**Stateful Query Tracking**: Each outstanding query is tracked using a `ForwardRecord` (forward record) that maintains query state, upstream server information, client details, and timing information. The system supports up to 150 concurrent queries (FTABSIZ defined in `src/config/constants.rs`).
 
 **Intelligent Server Selection**: The upstream server selection algorithm attempts to use servers known to be responsive while implementing failure detection and automatic failover to alternative servers.
 
@@ -52,7 +52,7 @@ stateDiagram-v2
 
 ### State Descriptions
 
-**IDLE State**: The forwarding engine awaits incoming queries. No active forward records (frec) are allocated for this query yet. The system monitors socket file descriptors for incoming DNS packets.
+**IDLE State**: The forwarding engine awaits incoming queries. No active forward records (`ForwardRecord`) are allocated for this query yet. The system monitors socket file descriptors for incoming DNS packets.
 
 **NEW State**: A DNS query has been received and validated. The system performs initial query processing including:
 - DNS packet header validation
@@ -62,7 +62,7 @@ stateDiagram-v2
 
 **CACHED State**: The query matches an entry in the local DNS cache. The cached record's TTL is validated, and if still valid, the cached answer is immediately returned to the client without upstream forwarding. This provides sub-millisecond response latency for cached entries.
 
-**FORWARDED State**: The query has been sent to an upstream DNS server and awaits a response. A forward record (struct frec) tracks:
+**FORWARDED State**: The query has been sent to an upstream DNS server and awaits a response. A `ForwardRecord` tracks:
 - Query ID and original client query details
 - Selected upstream server
 - Timestamp for timeout calculation
@@ -71,7 +71,7 @@ stateDiagram-v2
 
 **REPLIED State**: A response has been received from the upstream server. The system performs response validation, cache population (if appropriate), and preparation of the response packet for the client.
 
-**TIMEOUT State**: The configured timeout period (default 10 seconds, TIMEOUT in `src/config.h:30`) has elapsed without receiving a response from the upstream server. The system marks the server as potentially failed and considers retry or failover.
+**TIMEOUT State**: The configured timeout period (default 10 seconds, TIMEOUT in `src/config/constants.rs`) has elapsed without receiving a response from the upstream server. The system marks the server as potentially failed and considers retry or failover.
 
 **RETRY State**: After a timeout, the query is retransmitted to an alternative upstream server (if available) or the same server with updated failure tracking. The system implements a conservative retry strategy to avoid overloading failing servers.
 
@@ -83,14 +83,14 @@ State transitions are triggered by specific events within the forwarding engine:
 
 | Current State | Trigger Event | Next State | Source Function |
 |--------------|---------------|------------|-----------------|
-| IDLE | DNS query packet received | NEW | `receive_query()` in forward.c |
+| IDLE | DNS query packet received | NEW | `receive_query()` in forward.rs |
 | NEW | Cache contains valid answer | CACHED | `answer_request()` cache lookup |
-| NEW | Cache miss, upstream available | FORWARDED | `forward_query()` in forward.c |
-| FORWARDED | Response received from upstream | REPLIED | `reply_query()` in forward.c |
+| NEW | Cache miss, upstream available | FORWARDED | `forward_query()` in forward.rs |
+| FORWARDED | Response received from upstream | REPLIED | `reply_query()` in forward.rs |
 | FORWARDED | Timeout expires (10 seconds) | TIMEOUT | Timeout check in main loop |
-| TIMEOUT | Alternative server available | RETRY | Retry logic in forward.c |
+| TIMEOUT | Alternative server available | RETRY | Retry logic in forward.rs |
 | RETRY | Query forwarded to alt server | FORWARDED | `forward_query()` retry path |
-| REPLIED | Response validated and ready | IDLE | `return_reply()` in forward.c |
+| REPLIED | Response validated and ready | IDLE | `return_reply()` in forward.rs |
 | FAILED | No servers or retries exhausted | IDLE | SERVFAIL generation |
 
 ## Query Processing Sequence
@@ -100,8 +100,8 @@ The complete query processing flow involves multiple subsystems coordinating to 
 ```mermaid
 sequenceDiagram
     participant C as DNS Client
-    participant D as dnsmasq<br/>forward.c
-    participant Cache as DNS Cache<br/>cache.c
+    participant D as dnsmasq<br/>dns/forward.rs
+    participant Cache as DNS Cache<br/>dns/cache.rs
     participant U as Upstream<br/>DNS Server
     
     C->>D: DNS Query (A record)
@@ -118,7 +118,7 @@ sequenceDiagram
     else Cache Miss
         Cache-->>D: NULL (not found)
         D->>D: Select upstream server
-        D->>D: Allocate struct frec
+        D->>D: Allocate ForwardRecord
         D->>D: Generate random query ID
         Note over D: forward_query()
         D->>U: Forward DNS Query
@@ -137,7 +137,7 @@ sequenceDiagram
 
 #### 1. Query Reception (receive_query)
 
-**Source:** `src/forward.c` receive_query() function
+**Source:** `src/dns/forward.rs` receive_query() function
 
 The query reception phase handles incoming DNS packets from clients:
 
@@ -150,7 +150,7 @@ The query reception phase handles incoming DNS packets from clients:
 - Question count is non-zero
 - Packet length does not exceed buffer size
 
-**Query Name Extraction**: The DNS question name is extracted using `extract_name()` from `src/rfc1035.c`. This function handles:
+**Query Name Extraction**: The DNS question name is extracted using `extract_name()` from `src/dns/wire.rs`. This function handles:
 - DNS name compression (pointer following)
 - Label length validation (max 63 bytes per label)
 - Total name length limits (max 255 bytes)
@@ -164,11 +164,11 @@ The query reception phase handles incoming DNS packets from clients:
 
 #### 2. Cache Lookup
 
-**Source:** `src/cache.c` cache_find_by_name() function
+**Source:** `src/dns/cache.rs` cache_find_by_name() function
 
 Before forwarding to upstream servers, the system consults the local DNS cache:
 
-**Hash-Based Lookup**: The cache uses a hash table with cache_hash() computing a hash of the query name. The hash table size is configurable (default 150 entries, CACHESIZ in `src/config.h:38`).
+**Hash-Based Lookup**: The cache uses a hash table with cache_hash() computing a hash of the query name. The hash table size is configurable (default 150 entries, CACHESIZ in `src/config/constants.rs`).
 
 **Record Type Matching**: The cache lookup searches for records matching:
 - Exact query name match (case-insensitive DNS name comparison)
@@ -188,7 +188,7 @@ Before forwarding to upstream servers, the system consults the local DNS cache:
 
 #### 3. Upstream Server Selection
 
-**Source:** `src/forward.c` forward_query() function
+**Source:** `src/dns/forward.rs` forward_query() function
 
 When cache lookup fails, the system selects an appropriate upstream DNS server:
 
@@ -211,7 +211,7 @@ server=/internal.corp/10.0.0.1
 4. **Round-Robin**: Among working servers, queries are distributed for load balancing
 5. **Domain Match**: Domain-specific servers take precedence for matching queries
 
-**Server Health Tracking**: Each `struct server` maintains:
+**Server Health Tracking**: Each `ServerEntry` maintains:
 - Last successful query timestamp
 - Consecutive failure count
 - Response time moving average
@@ -219,22 +219,22 @@ server=/internal.corp/10.0.0.1
 
 #### 4. Query Forwarding
 
-**Source:** `src/forward.c` forward_query() function
+**Source:** `src/dns/forward.rs` forward_query() function
 
 The actual forwarding operation involves several critical steps:
 
-**Forward Record Allocation**: A `struct frec` (forward record) is allocated from a fixed-size pool (FTABSIZ=150). The frec tracks:
-```c
-struct frec {
-  union mysockaddr source;     /* Client source address */
-  union all_addr dest;          /* Destination for reply */
-  struct server *sentto;        /* Upstream server used */
-  unsigned short orig_id;       /* Original query ID from client */
-  unsigned short new_id;        /* Randomized ID for upstream */
-  time_t time;                  /* Timestamp for timeout */
-  unsigned int flags;           /* EDNS0, DNSSEC flags */
-  /* Additional fields... */
-};
+**Forward Record Allocation**: A `ForwardRecord` is allocated from a fixed-size pool (FTABSIZ=150). The record tracks:
+```rust
+pub struct ForwardRecord {
+    pub source: SocketAddress,     // Client source address
+    pub dest: AllAddr,             // Destination for reply
+    pub sentto: Option<ServerEntry>, // Upstream server used
+    pub orig_id: u16,              // Original query ID from client
+    pub new_id: u16,               // Randomized ID for upstream
+    pub time: Instant,             // Timestamp for timeout
+    pub flags: u32,                // EDNS0, DNSSEC flags
+    // Additional fields...
+}
 ```
 
 **Query ID Randomization**: For security, the query ID sent to upstream differs from the client's query ID:
@@ -245,7 +245,7 @@ struct frec {
 **Source Port Randomization**: Modern security best practice requires source port randomization. The system binds to a random ephemeral port for each upstream query, increasing the difficulty of blind spoofing attacks.
 
 **EDNS0 Option Processing**: If EDNS0 is enabled, the query may be modified:
-- UDP payload size advertised (default 4096 bytes, EDNS_PKTSZ in config.h)
+- UDP payload size advertised (default 1232 bytes, EDNS_PKTSZ in `src/config/constants.rs`)
 - DNSSEC OK (DO) bit set if DNSSEC validation enabled
 - Client subnet (ECS) option added if configured
 
@@ -253,7 +253,7 @@ struct frec {
 
 #### 5. Response Reception and Validation
 
-**Source:** `src/forward.c` reply_query() function
+**Source:** `src/dns/forward.rs` reply_query() function
 
 When a response arrives from an upstream server:
 
@@ -273,7 +273,7 @@ When a response arrives from an upstream server:
 - Query type must match
 - Query class must match
 
-**Answer Section Processing**: Answer records are processed by `extract_addresses()` in rfc1035.c:
+**Answer Section Processing**: Answer records are processed by `extract_addresses()` in `dns/wire.rs`:
 - Resource record format validation
 - Name decompression
 - TTL extraction
@@ -282,7 +282,7 @@ When a response arrives from an upstream server:
 
 #### 6. Cache Population
 
-**Source:** `src/cache.c` cache_insert() function
+**Source:** `src/dns/cache.rs` cache_insert() function
 
 Valid responses are cached for future queries:
 
@@ -304,7 +304,7 @@ Valid responses are cached for future queries:
 
 #### 7. Response Transmission to Client
 
-**Source:** `src/forward.c` return_reply() function
+**Source:** `src/dns/forward.rs` return_reply() function
 
 The final step returns the answer to the original client:
 
@@ -317,11 +317,11 @@ The final step returns the answer to the original client:
 
 **Transmission**: The response packet is sent via sendmsg() with appropriate source address set using platform-specific mechanisms (IP_PKTINFO on Linux, IP_SENDSRCADDR on BSD).
 
-**Forward Record Cleanup**: The struct frec is released back to the pool for reuse by calling free_frec().
+**Forward Record Cleanup**: The `ForwardRecord` is released back to the pool for reuse by calling free_frec().
 
 ## Upstream Server Selection Algorithm
 
-The upstream server selection algorithm is critical for performance, reliability, and support for split-horizon DNS scenarios. The implementation in `src/forward.c` provides sophisticated server management.
+The upstream server selection algorithm is critical for performance, reliability, and support for split-horizon DNS scenarios. The implementation in `src/dns/forward.rs` provides sophisticated server management.
 
 ### Server Configuration
 
@@ -396,7 +396,7 @@ flowchart TD
     UseAnyServer --> ForwardQuery
     UseDomainServer --> ForwardQuery
     
-    ForwardQuery --> TrackSent[Track in struct frec]
+    ForwardQuery --> TrackSent[Track in ForwardRecord]
     TrackSent --> WaitResponse[Wait for Response]
     
     WaitResponse --> CheckTimeout{Timeout<br/>Expired?}
@@ -417,7 +417,7 @@ flowchart TD
 
 ### Server Health Tracking
 
-Each upstream server maintains health metrics in `struct server`:
+Each upstream server maintains health metrics in `ServerEntry`:
 
 **Success Tracking**:
 - `queries`: Total queries sent to this server
@@ -491,52 +491,52 @@ server=192.168.1.254
 - Matches `server=/corp.example.com/10.0.0.53` (suffix match)
 - Forwarded to 10.0.0.53 instead of default servers
 
-## Query Tracking with struct frec
+## Query Tracking with ForwardRecord
 
-The forward record (frec) structure is the central data structure for tracking outstanding DNS queries. Each active query consumes one frec from a fixed-size pool.
+The `ForwardRecord` structure is the central data structure for tracking outstanding DNS queries. Each active query consumes one `ForwardRecord` from a fixed-size pool.
 
 ### Forward Record Structure
 
-**Source:** `src/dnsmasq.h` struct frec definition
+**Source:** `src/types/dns.rs` ForwardRecord definition
 
-```c
-struct frec {
-  union mysockaddr source;        /* Client source address and port */
-  union all_addr dest;             /* Destination address for reply */
-  struct server *sentto;           /* Server query was sent to */
-  struct daemon *daemon;           /* Global daemon structure reference */
-  unsigned int iface;              /* Interface index for reply */
-  unsigned short orig_id;          /* Original query ID from client */
-  unsigned short new_id;           /* New query ID for upstream */
-  int fd;                          /* Socket file descriptor */
-  time_t time;                     /* Timestamp when query forwarded */
-  unsigned int flags;              /* Query flags and state */
-  unsigned short rcode;            /* Response code */
-  struct frec *next;               /* Linked list pointer */
-  /* Additional DNSSEC-related fields when HAVE_DNSSEC enabled */
-};
+```rust
+pub struct ForwardRecord {
+    pub source: SocketAddress,        // Client source address and port
+    pub dest: AllAddr,                // Destination address for reply
+    pub sentto: Option<ServerEntry>,  // Server query was sent to
+    pub daemon: Arc<DaemonState>,     // Global daemon state reference
+    pub iface: u32,                   // Interface index for reply
+    pub orig_id: u16,                 // Original query ID from client
+    pub new_id: u16,                  // New query ID for upstream
+    pub fd: RawFd,                    // Socket file descriptor
+    pub time: Instant,                // Timestamp when query forwarded
+    pub flags: u32,                   // Query flags and state
+    pub rcode: u16,                   // Response code
+    // ForwardRecords are stored in a HashMap<u16, ForwardRecord> keyed by new_id
+    // Additional DNSSEC-related fields when "dnssec" feature enabled
+}
 ```
 
 ### Forward Record Lifecycle
 
 **Allocation** (get_new_frec function):
-1. Search frec pool for available (unused) entry
-2. If pool full, consider reusing oldest frec (query_full() called)
-3. Initialize frec fields for new query
-4. Mark frec as in-use
-5. Add to active query tracking list
+1. Search `ForwardRecord` pool for available (unused) entry
+2. If pool full, consider reusing oldest record (query_full() called)
+3. Initialize `ForwardRecord` fields for new query
+4. Mark record as in-use
+5. Add to active query tracking `HashMap`
 
 **In-Use State**: While query is outstanding:
-- frec tracks upstream server and timeout
+- `ForwardRecord` tracks upstream server and timeout
 - Query ID mapping enables response correlation
 - Client address preserved for reply routing
 - Timestamp used for timeout detection (default 10 second timeout)
 
 **Cleanup** (free_frec function):
-1. Remove from active query list
+1. Remove from active query `HashMap`
 2. Clear all fields
 3. Mark as available for reuse
-4. Return to frec pool
+4. Return to `ForwardRecord` pool
 
 ### Query ID Management
 
@@ -582,7 +582,7 @@ Client Response: ID=12345 (restored from frec->orig_id)
 
 ### Concurrency Limits
 
-**Maximum Outstanding Queries**: FTABSIZ=150 (src/config.h:17)
+**Maximum Outstanding Queries**: FTABSIZ=150 (`src/config/constants.rs`)
 
 **Rationale**: 
 - Limits memory consumption (each frec ~100 bytes)
@@ -597,14 +597,16 @@ Client Response: ID=12345 (restored from frec->orig_id)
 
 ### Timeout Management
 
-**Default Timeout**: 10 seconds (TIMEOUT in src/config.h:30)
+**Default Timeout**: 10 seconds (TIMEOUT in `src/config/constants.rs`)
 
 **Timeout Detection**: Main event loop checks timestamps:
-```c
-current_time = time(NULL);
-for each active frec:
-    if (current_time - frec->time > TIMEOUT):
-        handle_timeout(frec);
+```rust
+let now = Instant::now();
+for record in active_records.values() {
+    if now.duration_since(record.time) > Duration::from_secs(TIMEOUT) {
+        handle_timeout(record);
+    }
+}
 ```
 
 **Timeout Actions**:
@@ -625,7 +627,7 @@ dns-forward-max=5
 
 ## EDNS0 Integration
 
-EDNS0 (Extension Mechanisms for DNS) is defined in RFC 6891 and provides a framework for extending DNS protocol capabilities without breaking backward compatibility. The implementation in `src/edns0.c` handles EDNS0 pseudoheader processing.
+EDNS0 (Extension Mechanisms for DNS) is defined in RFC 6891 and provides a framework for extending DNS protocol capabilities without breaking backward compatibility. The implementation in `src/dns/edns.rs` handles EDNS0 pseudoheader processing.
 
 ### EDNS0 Pseudoheader Structure
 
@@ -634,7 +636,7 @@ EDNS0 uses a pseudo-resource record in the additional section:
 ```
 NAME:     Root (empty label, 0x00)
 TYPE:     OPT (41)
-CLASS:    UDP payload size (e.g., 4096)
+CLASS:    UDP payload size (e.g., 1232)
 TTL:      Extended RCODE and flags (32 bits)
   - Extended RCODE: bits 24-31
   - Version: bits 16-23  
@@ -645,16 +647,16 @@ RDATA:    Variable length options
 
 ### EDNS0 Option Processing
 
-**Source:** `src/edns0.c` find_pseudoheader() function
+**Source:** `src/dns/edns.rs` find_pseudoheader() function
 
 **Pseudoheader Location**: The find_pseudoheader() function scans the DNS packet additional section to locate the OPT pseudo-RR:
-```c
-unsigned char *find_pseudoheader(struct dns_header *header, 
-                                  size_t plen, 
-                                  size_t *len, 
-                                  unsigned char **p, 
-                                  int *is_sign, 
-                                  int *is_last)
+```rust
+pub fn find_pseudoheader(
+    header: &DnsHeader,
+    packet: &[u8],
+) -> Option<PseudoheaderInfo>
+// Returns parsed pseudoheader info including position, length,
+// signature presence, and whether it is the last record.
 ```
 
 **Detection Logic**:
@@ -695,19 +697,19 @@ else:
 
 EDNS0 allows clients and servers to advertise support for UDP packets larger than the original 512-byte DNS limit:
 
-**Default Payload Size**: EDNS_PKTSZ=4096 bytes (src/config.h:21)
+**Default Payload Size**: EDNS_PKTSZ=1232 bytes (`src/config/constants.rs`)
 
 **Negotiation**:
-1. Client advertises payload size in OPT CLASS field (e.g., 4096)
+1. Client advertises payload size in OPT CLASS field (e.g., 1232)
 2. dnsmasq reads client payload size
-3. dnsmasq advertises its payload size to upstream (4096)
+3. dnsmasq advertises its payload size to upstream (1232 by default)
 4. Upstream server may send responses up to advertised size
 5. dnsmasq forwards large responses to client if client supports size
 
 **Fragmentation Avoidance**: Large DNS responses can trigger IP fragmentation:
 - IPv4 fragmentation increases packet loss risk
 - Path MTU discovery may not work reliably
-- Payload size should be conservative (typical 1280-4096 bytes)
+- Default 1232 bytes chosen to avoid fragmentation on most paths (IPv6 minimum MTU minus headers)
 
 **TCP Fallback**: If UDP response exceeds payload size:
 1. Server sets TC (truncated) bit
@@ -762,16 +764,16 @@ add-subnet=24,96
 
 **Memory Efficiency**: Fixed-size buffers avoid dynamic allocation overhead:
 - Predictable memory consumption
-- No malloc/free in packet processing hot path
+- No heap allocation in packet processing hot path
 - Stack-allocated buffers where possible
 
 ## DNSSEC Integration
 
-DNSSEC (DNS Security Extensions) provides cryptographic authentication of DNS responses, protecting against cache poisoning and man-in-the-middle attacks. The forwarding engine integrates with DNSSEC validation implemented in `src/dnssec.c`.
+DNSSEC (DNS Security Extensions) provides cryptographic authentication of DNS responses, protecting against cache poisoning and man-in-the-middle attacks. The forwarding engine integrates with DNSSEC validation implemented in `src/dns/dnssec/validation.rs`.
 
 ### DNSSEC-Aware Forwarding
 
-**Conditional Compilation**: DNSSEC support requires HAVE_DNSSEC flag and Nettle cryptography library.
+**Conditional Compilation**: DNSSEC support requires the `"dnssec"` Cargo feature and the `ring` cryptography crate.
 
 **DNSSEC Mode Detection**: The forwarder operates in DNSSEC mode when:
 ```bash
@@ -797,8 +799,8 @@ trust-anchor=.,19036,8,2,49AAC11D7B6F6446...
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant F as Forwarder<br/>forward.c
-    participant V as Validator<br/>dnssec.c
+    participant F as Forwarder<br/>dns/forward.rs
+    participant V as Validator<br/>dns/dnssec/validation.rs
     participant U as Upstream Server
     
     C->>F: Query with DO=1
@@ -897,13 +899,13 @@ The AD bit indicates validated data:
 
 ### Resource Limits and DoS Prevention
 
-**DNSSEC Validation Limits** (src/config.h:25-29):
+**DNSSEC Validation Limits** (`src/config/constants.rs`):
 
-```c
-#define DNSSEC_LIMIT_WORK 40           /* Max validation queries */
-#define DNSSEC_LIMIT_SIG_FAIL 20       /* Max signature failures */
-#define DNSSEC_LIMIT_CRYPTO 200        /* Max crypto operations */
-#define DNSSEC_LIMIT_NSEC3_ITERS 150   /* Max NSEC3 iterations */
+```rust
+pub const DNSSEC_LIMIT_WORK: u32 = 40;           // Max validation queries
+pub const DNSSEC_LIMIT_SIG_FAIL: u32 = 20;       // Max signature failures
+pub const DNSSEC_LIMIT_CRYPTO: u32 = 200;        // Max crypto operations
+pub const DNSSEC_LIMIT_NSEC3_ITERS: u32 = 150;   // Max NSEC3 iterations
 ```
 
 **Rationale**: DNSSEC validation is computationally expensive and could be exploited for denial-of-service attacks:
@@ -931,7 +933,7 @@ While DNS primarily uses UDP, TCP support is essential for large responses, zone
 **UDP Characteristics** (primary protocol):
 - Connectionless, stateless
 - Single packet query and response
-- 512-byte limit (extended to 4096 with EDNS0)
+- 512-byte limit (extended to 1232 by default with EDNS0, configurable up to 4096)
 - No connection setup overhead
 - Preferred for performance
 
@@ -969,7 +971,7 @@ Full response returned via TCP
 
 ### TCP Connection Management
 
-**Source:** `src/forward.c` TCP handling functions
+**Source:** `src/dns/forward.rs` TCP handling functions
 
 **Connection Establishment**:
 1. Client connects to TCP port 53
@@ -978,12 +980,12 @@ Full response returned via TCP
 4. Child process handles all queries on this connection
 5. Connection closes after idle timeout or max queries
 
-**Child Process Limits**: MAX_PROCS=20 (src/config.h:18)
+**Child Process Limits**: MAX_PROCS=20 (`src/config/constants.rs`)
 - Maximum 20 concurrent TCP connections
 - Prevents resource exhaustion from TCP SYN floods
 - 21st connection queued or rejected
 
-**Queries Per Connection**: TCP_MAX_QUERIES=100 (src/config.h:20)
+**Queries Per Connection**: TCP_MAX_QUERIES=100 (`src/config/constants.rs`)
 - Maximum 100 queries on single TCP connection
 - Prevents long-lived connections from hogging resources
 - Connection closed after 100 queries
@@ -1057,37 +1059,31 @@ The forwarding engine must manage multiple socket file descriptors for receiving
 
 ### Socket Binding and Options
 
-**Source:** `src/network.c` socket creation functions
+**Source:** `src/net/interface.rs` and `src/net/socket.rs` socket creation functions
 
 **Listening Socket Creation**:
-```c
-// Create UDP IPv4 socket
-int fd = socket(AF_INET, SOCK_DGRAM, 0);
+```rust
+// Create UDP IPv4 socket using socket2 for extended options
+let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
 // Set socket options
-setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, ...);  // Allow address reuse
-setsockopt(fd, IPPROTO_IP, IP_PKTINFO, ...);    // Receive dest address (Linux)
-setsockopt(fd, IPPROTO_IP, IP_RECVDSTADDR, ...); // Receive dest address (BSD)
+socket.set_reuse_address(true)?;           // Allow address reuse
+// Platform-specific: IP_PKTINFO (Linux) or IP_RECVDSTADDR (BSD)
+// to receive destination address for correct reply source addressing
 
 // Bind to port 53 on all interfaces
-struct sockaddr_in addr;
-addr.sin_family = AF_INET;
-addr.sin_port = htons(53);
-addr.sin_addr.s_addr = INADDR_ANY;
-bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 53);
+socket.bind(&addr.into())?;
 ```
 
 **Upstream Socket Creation**:
-```c
+```rust
 // Create UDP socket with random source port
-int fd = socket(AF_INET, SOCK_DGRAM, 0);
+let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
 // Let OS select random ephemeral port (bind to port 0)
-struct sockaddr_in addr;
-addr.sin_family = AF_INET;
-addr.sin_port = htons(0);  // Port 0 = random ephemeral port
-addr.sin_addr.s_addr = INADDR_ANY;
-bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0); // Port 0 = random ephemeral port
+socket.bind(&addr.into())?;
 ```
 
 ### Platform-Specific Socket Options
@@ -1112,36 +1108,37 @@ bind(fd, (struct sockaddr *)&addr, sizeof(addr));
 
 ### Poll-Based I/O Multiplexing
 
-**Source:** `src/poll.c` event loop implementation
+**Source:** `src/core/event_loop.rs` mio-based event loop implementation
 
-The single-threaded event loop uses poll() to monitor multiple file descriptors:
+The single-threaded event loop uses `mio::Poll` to monitor multiple file descriptors:
 
-```c
-struct pollfd fds[MAX_FDS];
-int nfds = 0;
+```rust
+let mut poll = mio::Poll::new()?;
+let mut events = mio::Events::with_capacity(MAX_EVENTS);
 
-// Add listening sockets
-fds[nfds++] = {.fd = udp_fd, .events = POLLIN};
-fds[nfds++] = {.fd = tcp_fd, .events = POLLIN};
+// Register listening sockets
+poll.registry().register(&mut udp_source, UDP_TOKEN, Interest::READABLE)?;
+poll.registry().register(&mut tcp_source, TCP_TOKEN, Interest::READABLE)?;
 
-// Add upstream query sockets
-for each active frec:
-    fds[nfds++] = {.fd = frec->fd, .events = POLLIN};
+// Register upstream query sockets for each active ForwardRecord
+for (token, record) in active_records.iter() {
+    poll.registry().register(&mut record.source, *token, Interest::READABLE)?;
+}
 
 // Poll with timeout
-int ready = poll(fds, nfds, timeout_ms);
+poll.poll(&mut events, Some(timeout_duration))?;
 
-// Process ready descriptors
-for (int i = 0; i < nfds; i++):
-    if (fds[i].revents & POLLIN):
-        handle_socket_event(fds[i].fd);
+// Process ready events
+for event in events.iter() {
+    handle_socket_event(event.token())?;
+}
 ```
 
-**Advantages of poll()**:
-- No FD_SETSIZE limit (unlike select)
+**Advantages of mio::Poll**:
+- Abstracts epoll (Linux) / kqueue (BSD) for optimal platform performance
 - Efficient for moderate descriptor counts (<1000)
 - Portable across Unix-like systems
-- Simple API
+- Safe Rust API with no raw pointer manipulation
 
 **Event Loop Timing**:
 - Poll timeout set to next query timeout
@@ -1151,9 +1148,8 @@ for (int i = 0; i < nfds; i++):
 ### Non-Blocking I/O
 
 **Socket Non-Blocking Mode**:
-```c
-int flags = fcntl(fd, F_GETFL, 0);
-fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+```rust
+socket.set_nonblocking(true)?;
 ```
 
 **Rationale**:
@@ -1188,11 +1184,13 @@ Robust error handling and retry logic ensure reliability in the face of upstream
 
 **Timeout Monitoring**: Main event loop checks timestamps:
 
-```c
-void check_timeouts(time_t now) {
-    for each active frec:
-        if (now - frec->time > TIMEOUT):  // TIMEOUT = 10 seconds
-            handle_timeout(frec);
+```rust
+fn check_timeouts(now: Instant, active_records: &mut HashMap<u16, ForwardRecord>) {
+    for record in active_records.values_mut() {
+        if now.duration_since(record.time) > Duration::from_secs(TIMEOUT) {
+            handle_timeout(record);
+        }
+    }
 }
 ```
 
@@ -1231,10 +1229,10 @@ void check_timeouts(time_t now) {
 - Connection refused (TCP)
 
 **Failure Consequences**:
-```c
-server->failed = 1;                // Mark server as failed
-server->failure_count++;           // Increment failure counter
-server->last_failure_time = now;   // Record failure timestamp
+```rust
+server.failed = true;                    // Mark server as failed
+server.failure_count += 1;               // Increment failure counter
+server.last_failure_time = Some(now);    // Record failure timestamp
 ```
 
 **Server Recovery**:
@@ -1277,7 +1275,7 @@ DNS Header:
 
 ### Loop Detection
 
-**Source:** `src/loop.c` (if HAVE_LOOP enabled)
+**Source:** `src/dns/loop_detect.rs` (if `"loop_detect"` Cargo feature enabled)
 
 **Problem**: DNS forwarding loops can occur in complex network topologies:
 ```
@@ -1312,7 +1310,7 @@ The forwarding engine is optimized for small network deployments (100-250 client
 
 **Stack vs Heap Allocation**:
 - Fixed-size buffers allocated on stack where possible
-- Heap allocation avoided in hot paths (malloc/free overhead)
+- Heap allocation avoided in hot paths (Rust ownership model eliminates manual allocation overhead)
 - DNS packets processed using stack buffers
 
 **Cache Effectiveness**:
@@ -1646,17 +1644,17 @@ For complete understanding of dnsmasq's DNS capabilities, consult these related 
 - **[DNS_CACHING.md](DNS_CACHING.md)**: DNS cache implementation, hash table structure, LRU eviction algorithm
 - **[DNSSEC.md](DNSSEC.md)**: DNSSEC validation implementation, trust chain verification, signature validation
 - **[CONFIGURATION.md](CONFIGURATION.md)**: Complete configuration reference including DNS forwarding options
-- **[BUILDING.md](BUILDING.md)**: Compile-time options affecting DNS forwarding (HAVE_DNSSEC, EDNS_PKTSZ, FTABSIZ)
+- **[BUILDING.md](BUILDING.md)**: Cargo feature flags affecting DNS forwarding (`"dnssec"`, EDNS_PKTSZ, FTABSIZ)
 
 ## References
 
 **Source Code**:
-- `/src/forward.c` - DNS query forwarding state machine implementation
-- `/src/rfc1035.c` - DNS wire format parsing and serialization
-- `/src/network.c` - Network interface and socket management
-- `/src/edns0.c` - EDNS0 extension mechanism handling
-- `/src/config.h` - Compile-time constants and default values
-- `/src/dnsmasq.h` - Core data structures including struct frec and struct server
+- `/src/dns/forward.rs` - DNS query forwarding state machine implementation
+- `/src/dns/wire.rs` - DNS wire format parsing and serialization
+- `/src/net/interface.rs`, `/src/net/socket.rs` - Network interface and socket management
+- `/src/dns/edns.rs` - EDNS0 extension mechanism handling
+- `/src/config/constants.rs` - Compile-time constants and default values
+- `/src/types/dns.rs`, `/src/types/network.rs` - Core data structures including ForwardRecord and ServerEntry
 
 **RFCs**:
 - RFC 1035 - Domain Names: Implementation and Specification
