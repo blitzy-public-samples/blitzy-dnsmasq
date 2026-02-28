@@ -5,3 +5,6 @@
 
 /// DHCPv4 core server logic: init, packet reception, address allocation, ICMP ping.
 pub mod server;
+
+/// DHCPv4 protocol engine implementing RFC 2131 DORA cycle.
+pub mod rfc2131;
