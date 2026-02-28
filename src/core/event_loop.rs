@@ -765,6 +765,8 @@ mod tests {
         assert!(result.is_ok(), "deregister_fd should succeed: {:?}", result);
 
         // Clean up fds
+        // SAFETY: read_fd and write_fd are valid open file descriptors obtained from
+        // pipe() above. close() is safe to call on valid fds; called exactly once per fd.
         unsafe {
             libc::close(read_fd);
             libc::close(write_fd);
@@ -793,6 +795,8 @@ mod tests {
 
         // Clean up
         event_loop.deregister_fd(read_fd).ok();
+        // SAFETY: read_fd and write_fd are valid open file descriptors from pipe().
+        // close() is called exactly once per fd after deregistration.
         unsafe {
             libc::close(read_fd);
             libc::close(write_fd);
@@ -857,6 +861,8 @@ mod tests {
 
         // Write data to make pipe readable
         let data = b"test";
+        // SAFETY: write_fd is a valid open file descriptor from pipe(). The data
+        // pointer and length are valid. write() will not write beyond data.len().
         unsafe {
             libc::write(write_fd, data.as_ptr() as *const libc::c_void, data.len());
         }
@@ -877,6 +883,8 @@ mod tests {
 
         // Clean up
         event_loop.deregister_fd(read_fd).ok();
+        // SAFETY: read_fd and write_fd are valid open file descriptors from pipe().
+        // close() is called exactly once per fd after deregistration.
         unsafe {
             libc::close(read_fd);
             libc::close(write_fd);
@@ -970,6 +978,8 @@ mod tests {
                 )?;
                 // Write to pipe so poll returns immediately
                 let data = b"x";
+                // SAFETY: self.pipe_write is a valid open fd from pipe(). The data pointer
+                // and length are valid. Single-byte write is below PIPE_BUF (atomic).
                 unsafe {
                     libc::write(
                         self.pipe_write,
@@ -1001,6 +1011,8 @@ mod tests {
 
         impl Drop for ShutdownSource {
             fn drop(&mut self) {
+                // SAFETY: pipe_read and pipe_write are valid fds created via pipe() in the
+                // test setup. Drop is called exactly once, ensuring single close per fd.
                 unsafe {
                     libc::close(self.pipe_read);
                     libc::close(self.pipe_write);
@@ -1087,6 +1099,8 @@ mod tests {
     /// Helper: create a pipe and return (read_fd, write_fd).
     fn nix_pipe() -> (RawFd, RawFd) {
         let mut fds = [0i32; 2];
+        // SAFETY: fds is a stack-allocated array of 2 i32s. pipe() writes exactly
+        // two file descriptors into it. The pointer is valid for the array's lifetime.
         let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
         assert_eq!(ret, 0, "pipe() failed");
         (fds[0], fds[1])

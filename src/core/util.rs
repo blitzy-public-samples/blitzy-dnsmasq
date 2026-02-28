@@ -1252,6 +1252,8 @@ mod tests {
         assert_ne!(read_fd, write_fd);
 
         // Clean up
+        // SAFETY: read_fd and write_fd are valid open file descriptors returned by
+        // safe_pipe() above. close() is called exactly once per fd.
         unsafe {
             libc::close(read_fd);
             libc::close(write_fd);
@@ -1275,6 +1277,8 @@ mod tests {
         assert_eq!(&read_buf, data);
 
         // Clean up
+        // SAFETY: read_fd and write_fd are valid open file descriptors returned by
+        // safe_pipe() above. close() is called exactly once per fd after read/write.
         unsafe {
             libc::close(read_fd);
             libc::close(write_fd);

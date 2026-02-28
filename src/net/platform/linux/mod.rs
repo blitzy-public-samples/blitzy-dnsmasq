@@ -587,6 +587,10 @@ impl LinuxNetlink {
         // ---- RTM_NEWLINK: link/interface info (AF_LOCAL enumeration) ----
         if msg_type == RTM_NEWLINK && payload_len >= 16 && family == libc::AF_LOCAL {
             // struct ifinfomsg: family(1) + pad(1) + type(2) + index(4) + flags(4) + change(4)
+            // SAFETY: payload_ptr points to a valid netlink message payload of at least
+            // 16 bytes (checked by payload_len >= 16 above). The byte offsets 2..7
+            // correspond to the type and index fields of struct ifinfomsg, which are
+            // within the validated payload bounds.
             let hw_type = unsafe {
                 u16::from_ne_bytes([*payload_ptr.add(2), *payload_ptr.add(3)]) as u32
             };
@@ -599,6 +603,8 @@ impl LinuxNetlink {
                 ])
             };
 
+            // SAFETY: payload_ptr + 16 is within bounds (payload_len >= 16 verified above).
+            // This points to the start of the rtattr chain following the ifinfomsg header.
             let attrs_ptr = unsafe { payload_ptr.add(16) };
             let attrs_len = payload_len.saturating_sub(16);
             // SAFETY: attrs_ptr points within the validated payload buffer.
@@ -621,6 +627,9 @@ impl LinuxNetlink {
         // ---- RTM_NEWNEIGH: neighbor/ARP entry (AF_UNSPEC enumeration) ----
         if msg_type == RTM_NEWNEIGH && payload_len >= 12 {
             // struct ndmsg: family(1) + pad(1) + pad(2) + ifindex(4) + state(2) + flags(1) + type(1)
+            // SAFETY: payload_ptr points to a valid netlink message payload of at least
+            // 12 bytes (checked by payload_len >= 12). The first byte is the ndmsg family
+            // field. Offset 12 is the start of the rtattr chain, within bounds.
             let neigh_family = unsafe { *payload_ptr } as i32;
 
             let attrs_ptr = unsafe { payload_ptr.add(12) };
@@ -791,6 +800,9 @@ impl LinuxNetlink {
 
                 // Dispatch the message payload to the appropriate callback
                 if continue_enum {
+                    // SAFETY: offset + nlmsg_hdr_size <= offset + msg_len <= bytes_received
+                    // (validated above), so buf.as_ptr().add(offset + nlmsg_hdr_size) points
+                    // within the received data buffer.
                     let payload_ptr = unsafe { buf.as_ptr().add(offset + nlmsg_hdr_size) };
                     let payload_len = msg_len - nlmsg_hdr_size;
 
@@ -999,6 +1011,8 @@ impl NetworkBackend for LinuxNetlink {
             };
 
             if n < 0 {
+                // SAFETY: __errno_location() returns a valid thread-local pointer to errno.
+                // This is the standard Linux mechanism for retrieving errno after a failed syscall.
                 let errno = unsafe { *libc::__errno_location() };
                 if errno == libc::EINTR {
                     continue;
@@ -1017,6 +1031,9 @@ impl NetworkBackend for LinuxNetlink {
             let mut offset = 0usize;
 
             while offset + nlmsg_hdr_size <= bytes_received {
+                // SAFETY: offset + nlmsg_hdr_size <= bytes_received (loop guard), so
+                // buf.as_ptr().add(offset) is within the received data and we can safely
+                // cast to nlmsghdr. The kernel guarantees nlmsg_len alignment.
                 let nlh = unsafe { &*(buf.as_ptr().add(offset) as *const libc::nlmsghdr) };
 
                 let msg_len = nlh.nlmsg_len as usize;
@@ -1035,10 +1052,15 @@ impl NetworkBackend for LinuxNetlink {
 
                 // RTM_NEWNEIGH: parse neighbor entry
                 if nlh.nlmsg_type == RTM_NEWNEIGH {
+                    // SAFETY: offset + nlmsg_hdr_size is within bounds (msg_len validated
+                    // above). payload_ptr points to the ndmsg structure within the buffer.
                     let payload_ptr = unsafe { buf.as_ptr().add(offset + nlmsg_hdr_size) };
                     let payload_len = msg_len - nlmsg_hdr_size;
 
                     if payload_len >= 12 {
+                        // SAFETY: payload_ptr is valid for payload_len bytes (>= 12).
+                        // Byte 0 is the ndmsg family field. Offset 12 starts the rtattr
+                        // chain. parse_rtattr reads within attrs_len bounds.
                         let neigh_family = unsafe { *payload_ptr } as i32;
                         let attrs_ptr = unsafe { payload_ptr.add(12) };
                         let attrs_len = payload_len.saturating_sub(12);
@@ -1084,6 +1106,8 @@ impl NetworkBackend for LinuxNetlink {
 
             // Check for multi-part response
             if bytes_received > nlmsg_hdr_size {
+                // SAFETY: bytes_received > nlmsg_hdr_size ensures sufficient bytes for an
+                // nlmsghdr. buf.as_ptr() is the start of the receive buffer, valid for the cast.
                 let first_nlh = unsafe { &*(buf.as_ptr() as *const libc::nlmsghdr) };
                 if first_nlh.nlmsg_flags & libc::NLM_F_MULTI as u16 == 0 {
                     done = true;

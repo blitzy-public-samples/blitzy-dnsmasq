@@ -430,6 +430,10 @@ impl Logger {
         // --- Fallback to libc syslog if no fd is open ---
         if inner.log_fd.is_none() {
             // Fallback: use libc openlog/syslog (matches C behaviour log.c lines 719-733).
+            // SAFETY: openlog() and syslog() are standard POSIX functions. The CString
+            // tag pointer remains valid for the duration of the openlog() call. The
+            // AtomicBool ensures openlog() is called at most once. syslog() is called
+            // with a valid format string ("%s") and a null-terminated CString argument.
             unsafe {
                 static SYSLOG_OPENED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
@@ -456,10 +460,18 @@ impl Logger {
         // Timestamp (matches C: "%.15s " from ctime+4 → "Mon DD HH:MM:SS ").
         // We use chrono-free formatting via libc for fidelity with C.
         if !inner.log_stderr {
+            // SAFETY: time(NULL) is a standard POSIX call that returns the current
+            // calendar time. Passing null_mut() means no output pointer is written to.
             let now = unsafe { libc::time(std::ptr::null_mut()) };
+            // SAFETY: localtime() accepts a valid pointer to a time_t value (now is
+            // stack-allocated and valid). Returns a pointer to a static struct tm.
+            // The returned pointer is valid until the next localtime() call in this thread.
             let tm_ptr = unsafe { libc::localtime(&now) };
             if !tm_ptr.is_null() {
                 let mut buf = [0u8; 32];
+                // SAFETY: strftime() writes at most buf.len() bytes into buf. tm_ptr
+                // is non-null (checked above) and valid from the localtime() call.
+                // The format string is a null-terminated C literal.
                 let len = unsafe {
                     libc::strftime(
                         buf.as_mut_ptr() as *mut _,

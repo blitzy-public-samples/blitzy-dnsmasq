@@ -360,6 +360,7 @@ extern "C" fn signal_handler(sig: libc::c_int) {
                 libc::_exit(EC_MISC);
             }
         }
+    // SAFETY: getpid() is async-signal-safe per POSIX and always succeeds.
     } else if daemon_pid != unsafe { libc::getpid() } {
         // In helper/TCP child process: SIGALRM kills the child.
         // This is used as a timeout mechanism for TCP DNS connections

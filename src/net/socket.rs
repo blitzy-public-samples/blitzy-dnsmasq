@@ -929,6 +929,8 @@ fn fix_fd(socket: &Socket) -> Result<(), SocketError> {
         if let Ok(flags) = flags {
             let new_flags = nix::fcntl::FdFlag::from_bits_truncate(flags)
                 | nix::fcntl::FdFlag::FD_CLOEXEC;
+            // SAFETY: raw_fd is a valid open fd (same fd as borrowed above; socket is still alive).
+            // BorrowedFd does not take ownership; the socket retains ownership of the fd.
             let borrowed2 = unsafe { BorrowedFd::borrow_raw(raw_fd) };
             let _ = nix::fcntl::fcntl(
                 borrowed2,
