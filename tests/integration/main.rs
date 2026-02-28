@@ -8,7 +8,9 @@
 //!
 //! # Submodules
 //! - `wire_format` — DNS wire-format encoding/decoding roundtrip tests
+//! - `dns_forwarding` — end-to-end DNS query forwarding tests
 
 mod config_parsing;
 mod dns_cache;
+mod dns_forwarding;
 mod wire_format;
