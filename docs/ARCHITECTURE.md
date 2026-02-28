@@ -1605,6 +1605,92 @@ These core principles guide all evolution decisions. The Rust rewrite preserves 
 
 ---
 
+## C → Rust Source File Mapping
+
+The following table maps every original C source file (50 files total: 44 `.c` + 6 `.h`) to its Rust module equivalent(s). This serves as a reference for developers familiar with the C codebase navigating the Rust rewrite.
+
+### Core Runtime
+
+| C Source File | Rust Module | Notes |
+|---|---|---|
+| `src/dnsmasq.c` | `src/main.rs`, `src/core/daemon.rs`, `src/core/event_loop.rs`, `src/core/signal.rs` | Main entry, event loop, daemonization, and signal handling decomposed into separate modules |
+| `src/dnsmasq.h` | `src/lib.rs`, `src/types/*.rs` | Central header types distributed across `types/addr.rs`, `types/dns.rs`, `types/dhcp.rs`, `types/network.rs` |
+| `src/config.h` | `src/config/constants.rs`, `src/config/feature_flags.rs` | Feature flags become Cargo features; numeric constants in `constants.rs` |
+| `src/option.c` | `src/config/options.rs` | CLI/config parser; `setjmp`/`longjmp` replaced with `Result<T, ConfigError>` via `ConfigBuilder` |
+| `src/poll.c` | `src/core/event_loop.rs` | `poll()` wrapper replaced by `mio::Poll` abstraction |
+| `src/network.c` | `src/net/interface.rs`, `src/net/socket.rs` | Interface enumeration and upstream socket pool split into dedicated modules |
+| `src/log.c` | `src/core/logging.rs` | Non-blocking syslog replaced with `log`/`tracing` crate facade |
+| `src/util.c` | `src/core/util.rs`, `src/core/prng.rs` | SURF PRNG extracted to `prng.rs`; DNS name helpers in `util.rs` |
+
+### DNS Stack
+
+| C Source File | Rust Module | Notes |
+|---|---|---|
+| `src/dns-protocol.h` | `src/dns/protocol.rs` | DNS type/class/opcode constants as Rust enums and `const` values |
+| `src/forward.c` | `src/dns/forward.rs` | DNS forwarding engine: query state machine, server selection, retry |
+| `src/cache.c` | `src/dns/cache.rs` | DNS cache: intrusive hash+LRU replaced with `HashMap` + `VecDeque` |
+| `src/rfc1035.c` | `src/dns/wire.rs` | DNS wire-format: name compression, packet parsing/construction |
+| `src/dnssec.c` | `src/dns/dnssec/validation.rs` | DNSSEC trust chain validation, NSEC/NSEC3 proofs |
+| `src/crypto.c` | `src/dns/dnssec/crypto.rs` | Nettle crypto replaced with `ring` crate (RSA, ECDSA, Ed25519) |
+| `src/edns0.c` | `src/dns/edns.rs` | EDNS0 OPT record handling, ECS, MAC options, Umbrella |
+| `src/rrfilter.c` | `src/dns/rrfilter.rs` | RR filtering, compression pointer rewriting |
+| `src/auth.c` | `src/dns/auth.rs` | Authoritative DNS zone serving, SOA, AXFR |
+| `src/domain.c` | `src/dns/domain.rs` | Synthetic hostnames, split-horizon domain selection |
+| `src/domain-match.c` | `src/dns/server_match.rs` | Domain pattern matching, sorted server array, binary search |
+| `src/blockdata.c` | *(removed)* | Fixed-size block chain pool replaced by `Vec<u8>` / `bytes::Bytes` |
+| `src/loop.c` | `src/dns/loop_detect.rs` | DNS forwarding loop detection probe system |
+
+### DHCP Stack
+
+| C Source File | Rust Module | Notes |
+|---|---|---|
+| `src/dhcp-protocol.h` | `src/dhcp/protocol_v4.rs` | DHCPv4 message type constants and option codes |
+| `src/dhcp6-protocol.h` | `src/dhcp/protocol_v6.rs` | DHCPv6 message type constants and option codes |
+| `src/radv-protocol.h` | `src/dhcp/radv/protocol.rs` | Router Advertisement ICMPv6 constants |
+| `src/dhcp.c` | `src/dhcp/v4/server.rs` | DHCPv4 core: init, address allocation, ICMP conflict detection |
+| `src/dhcp6.c` | `src/dhcp/v6/server.rs` | DHCPv6 core: init, DUID management, address6 allocation |
+| `src/rfc2131.c` | `src/dhcp/v4/rfc2131.rs` | DHCPv4 protocol: full DORA cycle, PXE/UEFI, relay agent |
+| `src/rfc3315.c` | `src/dhcp/v6/rfc3315.rs` | DHCPv6 protocol: SOLICIT/ADVERTISE/REQUEST/REPLY, IA management |
+| `src/dhcp-common.c` | `src/dhcp/common.rs` | Shared DHCP utilities: tag matching, option filtering, PXE |
+| `src/lease.c` | `src/dhcp/lease.rs` | Lease persistence, DNS registration, expiration management |
+| `src/radv.c` | `src/dhcp/radv/server.rs` | IPv6 Router Advertisement construction, periodic sends |
+| `src/slaac.c` | `src/dhcp/radv/slaac.rs` | SLAAC address probing via ICMPv6 echo |
+| `src/outpacket.c` | `src/dhcp/v6/outpacket.rs` | DHCPv6 option serialization buffer builder |
+| `src/helper.c` | `src/dhcp/helper.rs` | Privilege-separated script helper process (fork/exec) |
+
+### Platform Abstraction
+
+| C Source File | Rust Module | Notes |
+|---|---|---|
+| `src/netlink.c` | `src/net/platform/linux/netlink.rs` | Linux NETLINK_ROUTE: interface/route enumeration and events |
+| `src/bpf.c` | `src/net/platform/bsd/bpf.rs` | BSD BPF raw packets, getifaddrs, PF_ROUTE monitoring |
+| `src/arp.c` | `src/net/arp.rs` | ARP/neighbor cache: MAC lookup, topology notifications |
+| `src/inotify.c` | `src/net/platform/linux/inotify.rs` | Linux inotify file-change monitoring |
+| `src/conntrack.c` | `src/net/platform/linux/conntrack.rs` | netfilter conntrack mark retrieval |
+
+### Integration
+
+| C Source File | Rust Module | Notes |
+|---|---|---|
+| `src/dbus.c` | `src/integration/dbus.rs` | D-Bus system bus interface via FFI |
+| `src/ubus.c` | `src/integration/ubus.rs` | OpenWrt UBus interface via FFI |
+| `src/tftp.c` | `src/integration/tftp.rs` | Read-only TFTP server |
+| `src/ipset.c` | `src/net/platform/linux/ipset.rs` | Linux ipset via netlink |
+| `src/nftset.c` | `src/integration/nftset.rs` | nftables set population via FFI |
+| `src/tables.c` | `src/net/platform/bsd/pf_tables.rs` | BSD PF table population |
+
+### Supporting Utilities
+
+| C Source File | Rust Module | Notes |
+|---|---|---|
+| `src/metrics.c` | `src/core/metrics.rs` | Metric naming and reset |
+| `src/metrics.h` | `src/core/metrics.rs` | Metric enum definitions (merged with implementation) |
+| `src/ip6addr.h` | `src/types/ipv6.rs` | IPv6 address helpers via `std::net::Ipv6Addr` methods |
+| `src/pattern.c` | `src/core/util.rs` | Wildcard pattern matching (merged into utility module) |
+| `src/dump.c` | `src/debug/dump.rs` | Pcap packet capture for diagnostics |
+
+---
+
 ## Conclusion
 
 Dnsmasq's architecture reflects 25 years of design evolution toward a singular goal: **providing lightweight, reliable network services for small networks and embedded systems**. The Rust rewrite preserves the proven single-process event-driven design while adding compile-time memory safety, type-safe error handling, and modern dependency management through Cargo.

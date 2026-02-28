@@ -30,7 +30,7 @@ The TFTP server enforces strict concurrency limits to prevent resource exhaustio
 **Connection Lifecycle Management** (Source: `src/integration/tftp.rs`):
 
 ```rust
-/// Connection state tracked in Vec<TftpTransfer> collection
+/// Connection state tracked in HashMap<SocketAddr, TftpTransfer> collection
 pub struct TftpTransfer {
     pub sockfd: RawFd,                  // Per-transfer UDP socket
     pub timeout: Instant,               // Transfer timeout (default 120s)
@@ -44,7 +44,7 @@ pub struct TftpTransfer {
 
 **Connection Establishment Process:**
 
-1. **Initial Request Reception** (`TftpServer::handle_request` method): Server receives RRQ (Read Request) packet on UDP port 69
+1. **Initial Request Reception** (`TftpServer::request` method): Server receives RRQ (Read Request) packet on UDP port 69
 2. **Connection Limit Check**: If active transfers >= TFTP_MAX_CONNECTIONS, reject with ERR_NOTDEF "maximum TFTP connections exceeded"
 3. **Ephemeral Socket Creation**: Allocate per-transfer socket with random ephemeral port or configured port range
 4. **Transfer State Initialization**: Create `TftpTransfer` tracking block number, window size, timeout, file descriptor
@@ -53,7 +53,7 @@ pub struct TftpTransfer {
 
 The `TftpTransfer` drop implementation releases resources when transfers complete or abort:
 - Close per-transfer socket file descriptor (via RAII `Drop` trait)
-- Remove transfer from active connection `Vec<TftpTransfer>`
+- Remove transfer from active `HashMap<SocketAddr, TftpTransfer>` collection
 - Rust ownership automatically reclaims all allocated memory
 - Log transfer completion statistics if logging enabled
 
@@ -116,7 +116,7 @@ fn check_listeners(&mut self, now: Instant) {
   2 bytes  string  1B   string  1B  string  1B
 ```
 
-**RRQ Handler** (`TftpServer::handle_request` method):
+**RRQ Handler** (`TftpServer::request` method):
 
 1. **Packet Reception**: Receive RRQ packet via `recvmsg` on listening socket (UDP port 69)
 
@@ -269,7 +269,7 @@ Client → Server: ACK block=16
 
 ### Option Negotiation Process
 
-**Parser Implementation** (`TftpServer::handle_request` method):
+**Parser Implementation** (`TftpServer::request` method):
 
 ```rust
 // Parse option name-value pairs from RRQ packet
@@ -1010,7 +1010,7 @@ aide --check
 **Primary Implementation:** `/src/integration/tftp.rs`
 
 **Key Methods:**
-- `TftpServer::handle_request`: RRQ/WRQ handler, option parsing
+- `TftpServer::request`: RRQ/WRQ handler, option parsing
 - `TftpServer::handle_data_ack`: DATA/ACK processing state machine
 - `TftpServer::check_listeners`: Main event loop, timeout management
 - `TftpTransfer::get_block`: DATA packet construction
@@ -1051,8 +1051,7 @@ aide --check
 
 ## See Also
 
-- [PXE Network Boot](PXE_BOOT.md) - Detailed PXE boot configuration
-- [DHCP Configuration](DHCP_V4.md) - DHCP options for network boot
+- [DHCP Configuration](DHCP_V4.md) - DHCP options for network boot (includes PXE boot configuration)
 - [Architecture Overview](ARCHITECTURE.md) - System design and integration
 - [Building dnsmasq](BUILDING.md) - Building with Cargo feature `"tftp"`
 

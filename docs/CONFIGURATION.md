@@ -33,7 +33,7 @@ This three-tier approach enables:
 - **Simple Text Format**: One option per line, matching long command-line options
 - **Flexible Precedence**: Command-line → config file → compile-time defaults
 - **Hot Reload**: SIGHUP signal triggers configuration reload without service interruption
-- **Extensive Options**: 350+ configuration directives supporting all features
+- **Extensive Options**: 250+ configuration directives supporting all features
 - **Modular Compilation**: Feature flags enable/disable entire subsystems at build time
 
 ---
@@ -74,22 +74,27 @@ graph TB
 **Source:** `src/config/options.rs`
 
 ```rust
-pub fn read_opts(args: &[String], compile_opts: &str) -> Result<DaemonConfig, ConfigError>
+ConfigBuilder::new()
+    .parse_cli(args)
+    .parse_file(path, hard)
+    .build() // -> Result<DaemonConfig, ConfigError>
 ```
 
-**Function:** Main configuration parsing entry point called from `main()` in `src/main.rs`
+**Pattern:** Builder pattern via `ConfigBuilder` — called from `main()` in `src/main.rs`
 
-**Parameters:**
-- `args`: Command-line argument slice
-- `compile_opts`: String containing compile-time feature flags (displayed in version output)
+**Builder Methods:**
+- `ConfigBuilder::new()`: Create builder with default configuration values
+- `.parse_cli(args: &[String])`: Parse command-line argument slice
+- `.parse_file(path: &str, hard: bool)`: Process a configuration file (hard=true errors on missing file)
+- `.build() -> Result<DaemonConfig, ConfigError>`: Validate and produce final configuration
 
 **Returns:** `Result<DaemonConfig, ConfigError>` — parsed configuration or a descriptive error
 
 **Processing Flow:**
-1. Initialize option parsing state
-2. Parse command-line options
-3. Process configuration file(s)
-4. Validate interdependent options
+1. Initialize `ConfigBuilder` with default option values
+2. Parse command-line options via `parse_cli()`
+3. Process configuration file(s) via `parse_file()`
+4. Validate interdependent options in `build()`
 5. Apply default values for unspecified options
 6. Allocate and initialize data structures
 
@@ -227,7 +232,7 @@ The example configuration file demonstrates every supported option with explanat
 
 ### Option Categories
 
-Dnsmasq supports 350+ command-line options organized by functional area:
+Dnsmasq supports 250+ command-line options organized by functional area:
 
 #### DNS Options
 
@@ -1404,6 +1409,6 @@ journalctl -u dnsmasq -n 50
 **Document Version:** 1.0  
 **Based on:** dnsmasq version 2.92  
 **Primary Sources:** `src/config/options.rs`, `src/config/constants.rs`, `src/config/feature_flags.rs`, `dnsmasq.conf.example`  
-**Total Configuration Options:** 350+ directives  
+**Total Configuration Options:** 250+ directives  
 **Compile-Time Options:** 20+ feature flags  
 **Numeric Constants:** 40+ performance and limit values

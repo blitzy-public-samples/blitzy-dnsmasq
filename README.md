@@ -100,8 +100,8 @@ cargo test
 # Run all tests with all features enabled
 cargo test --all-features
 
-# Run a specific integration test
-cargo test --test dns_forwarding
+# Run a specific integration test module
+cargo test --test integration -- dns_forwarding
 
 # Run tests with output visible
 cargo test -- --nocapture

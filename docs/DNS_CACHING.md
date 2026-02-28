@@ -96,16 +96,15 @@ graph TB
 // In the Rust implementation, the cache uses HashMap + VecDeque for LRU
 // rather than intrusive linked lists with raw pointers.
 struct DnsCache {
-    hash_table: HashMap<DnsName, Vec<CacheEntry>>,
-    lru_order: VecDeque<CacheEntryRef>,
-    hash_size: usize,
+    entries: HashMap<String, Vec<CacheEntry>>,
+    lru: VecDeque<CacheKey>,
+    max_size: usize,
 }
 ```
 
-- **`hash_table`**: `HashMap`-based storage of cache record chains (replaces raw pointer array)
-- **`hash_size`**: Current hash table size (always a power of 2)
-- **`cache_head`**: Head of LRU list — most recently used (managed by `VecDeque`)
-- **`cache_tail`**: Tail of LRU list — least recently used (managed by `VecDeque`)
+- **`entries`**: `HashMap<String, Vec<CacheEntry>>` — name-indexed storage of cache record chains (replaces raw pointer hash table array)
+- **`lru`**: `VecDeque<CacheKey>` — LRU eviction queue tracking access order (head = most recent, tail = least recent)
+- **`max_size`**: Maximum cache size in entries (default CACHESIZ = 150)
 
 ### Hash Function Implementation
 
@@ -123,37 +122,15 @@ The hash function (`DnsCache::hash()`, source: `/src/dns/cache.rs`) distributes 
 - **Separate Chaining**: Each hash bucket contains a `Vec` of records (replacing intrusive linked lists with standard `HashMap` chaining)
 - **Bucket Storage**: Records within the same bucket are managed by the `HashMap` (source: `CacheEntry` in `/src/types/dns.rs`)
 
-### Dynamic Rehashing
+### Automatic Hash Resizing
 
-The hash table is dynamically resized when the cache grows to maintain performance (source: `/src/dns/cache.rs`, `DnsCache::rehash()`):
-
-**Rehash Trigger:**
-- Initial allocation when first cache record inserted
-- Growth trigger: new_size = 64 entries initially, then doubles until `new_size >= cache_size/10`
-- Only grows, never shrinks (prevents thrashing)
-
-**Rehash Process:**
-1. Allocate new hash table array (size is power of 2)
-2. Initialize all new buckets to NULL
-3. For each record in old hash table:
-   - Remove from old bucket chain
-   - Recompute hash with new table size
-   - Insert into new bucket chain
-4. Drop old hash table (Rust ownership handles deallocation automatically)
+In the Rust implementation, `HashMap` handles all internal resizing automatically. Unlike the C implementation's manual `rehash()` function, Rust's standard `HashMap` dynamically grows its internal bucket array as entries are inserted, maintaining amortized O(1) insertion and lookup performance without any explicit resize logic in `DnsCache`.
 
 **Memory Allocation:**
 - Rust ownership model manages all cache memory automatically
-- First allocation: standard `HashMap::new()` (panics on OOM — critical for initial cache)
-- Growth: standard `HashMap` resize (logs warning on failure, continues with current size)
-
-**Source Code Reference** (rehash sizing algorithm in `/src/dns/cache.rs`):
-```rust
-// hash_size is a power of two.
-let mut new_size = 64usize;
-while new_size < size / 10 {
-    new_size <<= 1;
-}
-```
+- The `HashMap` allocates with `HashMap::with_capacity(max_size)` at cache construction time
+- Growth beyond initial capacity is handled transparently by the standard library
+- No manual rehash function is needed — Rust's `HashMap` provides this natively
 
 ---
 
@@ -224,10 +201,7 @@ flowchart TD
     
     Insert --> Hash[DnsCache::hash<br/>Add to hash bucket]
     Hash --> LinkHead[Add to LRU head]
-    LinkHead --> Rehash{Need Rehash?}
-    Rehash -->|Yes| Resize[DnsCache::rehash<br/>Resize hash table]
-    Resize --> Return2
-    Rehash -->|No| Return2([Return to Client])
+    LinkHead --> Return2([Return to Client])
     
     style Start fill:#e1f5ff
     style Return1 fill:#e1ffe1
@@ -279,7 +253,7 @@ fn is_expired(&self, now: SystemTime) -> bool {
 2. For each record:
    - Call `DnsCache::insert()` to add to cache
    - Check for allocation failures (sets `insert_error`)
-3. If successful: call `DnsCache::rehash()` if needed
+3. If successful: `HashMap` handles internal resizing automatically
 4. Clear `new_chain`
 5. Increment `METRIC_DNS_CACHE_INSERTED` metric
 
@@ -303,7 +277,7 @@ fn is_expired(&self, now: SystemTime) -> bool {
 /// In the Rust implementation, this is managed by VecDeque rather than
 /// intrusive linked list pointers.
 fn cache_link(&mut self, entry_ref: CacheEntryRef) {
-    self.lru_order.push_front(entry_ref);
+    self.lru.push_front(entry_ref);
 }
 ```
 
@@ -381,8 +355,8 @@ stateDiagram-v2
 /// In the Rust implementation, VecDeque handles unlinking automatically
 /// when an element is removed by index.
 fn cache_unlink(&mut self, entry_ref: &CacheEntryRef) {
-    if let Some(pos) = self.lru_order.iter().position(|r| r == entry_ref) {
-        self.lru_order.remove(pos);
+    if let Some(pos) = self.lru.iter().position(|r| r == entry_ref) {
+        self.lru.remove(pos);
     }
 }
 ```
@@ -761,15 +735,14 @@ pub fn make_stat(&self) -> CacheStat {
 
 **Cache Operations:**
 - **Lookup** (`DnsCache::find_by_name()`): O(1) average, O(n) worst (hash collision)
-- **Insertion** (`DnsCache::insert()`): O(1) amortized (includes rehash cost)
+- **Insertion** (`DnsCache::insert()`): O(1) amortized (HashMap handles internal resizing)
 - **Eviction** (`DnsCache::scan_free()`): O(1) with LRU tail access
 - **Expiration Check** (`CacheEntry::is_expired()`): O(1) timestamp comparison
-- **Rehash** (`DnsCache::rehash()`): O(n) where n = number of cache entries (rare operation)
 
 **Hash Table Performance:**
-- **Load Factor**: Maintained at ~10% (hash_size = cache_size * 10)
-- **Collision Rate**: Low due to good hash function and low load
-- **Rehash Frequency**: Logarithmic (doubles until target size)
+- Rust's `HashMap` maintains a load factor of ~87.5% with Robin Hood hashing
+- Collision handling and resizing are managed transparently by the standard library
+- No manual rehash logic needed — `HashMap` provides amortized O(1) insert
 
 ### Memory Consumption
 
@@ -785,7 +758,7 @@ pub fn make_stat(&self) -> CacheStat {
 
 **Memory Allocation Strategy:**
 - **Initial**: Single allocation for hash table
-- **Growth**: Geometric expansion (2x) during rehash
+- **Growth**: Handled automatically by `HashMap` internal resizing
 - **Recycling**: Rust ownership model handles deallocation automatically (no manual free lists)
 
 ### Scalability Limits
@@ -796,7 +769,7 @@ pub fn make_stat(&self) -> CacheStat {
 - **Large Networks** (>250 clients): 2000-10000 entries
 
 **Performance Degradation:**
-- Cache sizes >10000 entries may impact rehash performance
+- Cache sizes >10000 entries may increase memory consumption significantly
 - Memory consumption limits maximum practical size
 - Single-threaded architecture caps query throughput
 
@@ -937,7 +910,7 @@ addn-hosts=/etc/dnsmasq-custom-hosts
 
 **Primary Implementation:**
 - `/src/dns/cache.rs` - Core cache implementation
-  - Hash table management (`DnsCache::hash()`, `DnsCache::rehash()`)
+  - Hash table management (`DnsCache` using `HashMap<String, Vec<CacheEntry>>`)
   - LRU operations (`cache_link`, `cache_unlink`, `DnsCache::scan_free()`)
   - Lookup functions (`DnsCache::find_by_name()`, `DnsCache::find_by_addr()`)
   - Insertion functions (`DnsCache::start_insert()`, `DnsCache::insert()`, `DnsCache::end_insert()`)

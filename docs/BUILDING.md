@@ -360,8 +360,8 @@ cargo test
 # Run all tests including feature-gated ones
 cargo test --all-features
 
-# Run a specific integration test
-cargo test --test dns_forwarding
+# Run a specific integration test module
+cargo test --test integration -- dns_forwarding
 
 # Run tests with output visible
 cargo test -- --nocapture
@@ -1284,7 +1284,7 @@ flowchart TD
 
 ### Rust Module Hierarchy
 
-The source code is organized into domain-specific modules:
+The source code is organized into domain-specific modules (abbreviated — 71 `.rs` files total; see [docs/ARCHITECTURE.md](ARCHITECTURE.md) for full listing):
 
 ```
 src/
@@ -1403,8 +1403,8 @@ cargo test
 # Run all tests including feature-gated ones
 cargo test --all-features
 
-# Run a specific integration test file
-cargo test --test dns_forwarding
+# Run a specific integration test module
+cargo test --test integration -- dns_forwarding
 
 # Run tests matching a name pattern
 cargo test dns::cache

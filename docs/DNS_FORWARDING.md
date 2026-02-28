@@ -245,7 +245,7 @@ pub struct ForwardRecord {
 **Source Port Randomization**: Modern security best practice requires source port randomization. The system binds to a random ephemeral port for each upstream query, increasing the difficulty of blind spoofing attacks.
 
 **EDNS0 Option Processing**: If EDNS0 is enabled, the query may be modified:
-- UDP payload size advertised (default 4096 bytes, EDNS_PKTSZ in `src/config/constants.rs`)
+- UDP payload size advertised (default 1232 bytes, EDNS_PKTSZ in `src/config/constants.rs`)
 - DNSSEC OK (DO) bit set if DNSSEC validation enabled
 - Client subnet (ECS) option added if configured
 
@@ -636,7 +636,7 @@ EDNS0 uses a pseudo-resource record in the additional section:
 ```
 NAME:     Root (empty label, 0x00)
 TYPE:     OPT (41)
-CLASS:    UDP payload size (e.g., 4096)
+CLASS:    UDP payload size (e.g., 1232)
 TTL:      Extended RCODE and flags (32 bits)
   - Extended RCODE: bits 24-31
   - Version: bits 16-23  
@@ -697,19 +697,19 @@ else:
 
 EDNS0 allows clients and servers to advertise support for UDP packets larger than the original 512-byte DNS limit:
 
-**Default Payload Size**: EDNS_PKTSZ=4096 bytes (`src/config/constants.rs`)
+**Default Payload Size**: EDNS_PKTSZ=1232 bytes (`src/config/constants.rs`)
 
 **Negotiation**:
-1. Client advertises payload size in OPT CLASS field (e.g., 4096)
+1. Client advertises payload size in OPT CLASS field (e.g., 1232)
 2. dnsmasq reads client payload size
-3. dnsmasq advertises its payload size to upstream (4096)
+3. dnsmasq advertises its payload size to upstream (1232 by default)
 4. Upstream server may send responses up to advertised size
 5. dnsmasq forwards large responses to client if client supports size
 
 **Fragmentation Avoidance**: Large DNS responses can trigger IP fragmentation:
 - IPv4 fragmentation increases packet loss risk
 - Path MTU discovery may not work reliably
-- Payload size should be conservative (typical 1280-4096 bytes)
+- Default 1232 bytes chosen to avoid fragmentation on most paths (IPv6 minimum MTU minus headers)
 
 **TCP Fallback**: If UDP response exceeds payload size:
 1. Server sets TC (truncated) bit
@@ -933,7 +933,7 @@ While DNS primarily uses UDP, TCP support is essential for large responses, zone
 **UDP Characteristics** (primary protocol):
 - Connectionless, stateless
 - Single packet query and response
-- 512-byte limit (extended to 4096 with EDNS0)
+- 512-byte limit (extended to 1232 by default with EDNS0, configurable up to 4096)
 - No connection setup overhead
 - Preferred for performance
 

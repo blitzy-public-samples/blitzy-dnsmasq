@@ -90,16 +90,18 @@ flowchart TD
 
 ### Validation Entry Point
 
-The main entry point for DNSSEC validation is `DnssecValidator::validate_reply()` in `src/dns/dnssec/validation.rs`. This method is invoked for every DNS response when DNSSEC validation is enabled (Cargo feature `"dnssec"` and runtime option `--dnssec`).
+The main entry point for DNSSEC validation is the standalone function `dnssec_validate_reply()` in `src/dns/dnssec/validation.rs`. This function is invoked for every DNS response when DNSSEC validation is enabled (Cargo feature `"dnssec"` and runtime option `--dnssec`).
 
-**Method**: `DnssecValidator::validate_reply(&mut self, now: Instant, header: &DnsHeader, packet: &[u8], name: &str, ...) -> Result<ValidationStatus, DnssecError>`
+**Function**: `pub fn dnssec_validate_reply(header: &mut DnsHeader, plen: usize, ...) -> Result<DnssecStatus, DnssecError>`
 **Source**: `src/dns/dnssec/validation.rs` (primary validation orchestrator)
 **Purpose**: Validate all RRsets in a DNS response, verify signatures, and determine the security status of the response (SECURE, INSECURE, or BOGUS).
+
+**Supporting struct**: `DnssecValidator` manages timestamp state for clock-rollback detection (`setup_timestamp()`, `is_check_date()`).
 
 **Validation Workflow**:
 1. Check if DNSSEC is requested (DO bit set in original query)
 2. Extract all RRsets and associated RRSIGs from the response
-3. For each RRset, invoke `DnssecValidator::validate_rrset()` to verify signatures
+3. For each RRset, invoke the standalone `validate_rrset()` function to verify signatures
 4. Validate DNSKEY records against DS records in parent zones
 5. Follow the chain of trust to root zone trust anchors
 6. Handle NSEC/NSEC3 proofs for non-existent names or types
@@ -187,7 +189,7 @@ DS records in the parent zone contain a hash of the child zone's DNSKEY. This cr
 **Validation Process** in `src/dns/dnssec/validation.rs`:
 ```rust
 // Validate DNSKEY against DS record (simplified)
-// Source: src/dns/dnssec/validation.rs, DnssecValidator::validate_rrset()
+// Source: src/dns/dnssec/validation.rs, validate_rrset()
 
 // 1. Retrieve cached DS record from parent zone
 // 2. Compute digest of child zone DNSKEY using specified hash algorithm
@@ -275,7 +277,7 @@ sequenceDiagram
 
 Before signature verification, the RRset (Resource Record Set) must be converted to a canonical form exactly as it was when the signature was created. This ensures that signature verification works correctly regardless of case variations or record ordering.
 
-**Source**: `src/dns/dnssec/validation.rs`, `DnssecValidator::validate_rrset()` method (canonicalization logic integrated into validation)
+**Source**: `src/dns/dnssec/validation.rs`, `validate_rrset()` method (canonicalization logic integrated into validation)
 
 ### Canonicalization Steps
 
@@ -341,11 +343,11 @@ www.example.com.  3600  IN  A  192.0.2.2
 
 **Implementation Detail** (from `src/dns/dnssec/validation.rs`):
 
-The canonicalization process is integrated into `DnssecValidator::validate_rrset()`:
+The canonicalization process is integrated into `validate_rrset()`:
 
 ```rust
 // Simplified canonicalization logic
-// Source: src/dns/dnssec/validation.rs, DnssecValidator::validate_rrset()
+// Source: src/dns/dnssec/validation.rs, validate_rrset()
 
 // 1. Extract RRSIG fields (type covered, algorithm, original TTL, etc.)
 // 2. Build canonical RRset by sorting records
@@ -354,7 +356,7 @@ The canonicalization process is integrated into `DnssecValidator::validate_rrset
 //    - Use original TTL from RRSIG (not current TTL)
 //    - Append RDATA in canonical form
 // 4. Compute digest of concatenated canonical form using ring::digest
-// 5. Pass digest and signature to CryptoVerifier::verify() method
+// 5. Pass digest and signature to verify() method
 ```
 
 ## Signature Verification
@@ -377,9 +379,9 @@ flowchart LR
     H[DNSKEY Public Key] --> G
     D --> G
     
-    G -->|RSA| I[RSA Verify<br/>CryptoVerifier::verify_rsa]
-    G -->|ECDSA| J[ECDSA Verify<br/>CryptoVerifier::verify_ecdsa]
-    G -->|EdDSA| K[EdDSA Verify<br/>CryptoVerifier::verify_eddsa]
+    G -->|RSA| I[RSA Verify<br/>crypto::rsa_verify]
+    G -->|ECDSA| J[ECDSA Verify<br/>crypto::ecdsa_verify]
+    G -->|EdDSA| K[EdDSA Verify<br/>crypto::eddsa_verify]
     G -->|GOST| L[GOST Verify<br/>deferred — not supported by ring]
     
     I --> M{Signature Valid?}
@@ -400,56 +402,46 @@ Dnsmasq supports the following DNSSEC algorithms through the `ring` cryptography
 
 | Algorithm Number | Algorithm Name | Hash Function | Implementation |
 |-----------------|----------------|---------------|----------------|
-| 5 | RSA/SHA-1 | SHA-1 | `CryptoVerifier::verify_rsa` |
-| 7 | RSASHA1-NSEC3-SHA1 | SHA-1 | `CryptoVerifier::verify_rsa` |
-| 8 | RSA/SHA-256 | SHA-256 | `CryptoVerifier::verify_rsa` |
-| 10 | RSA/SHA-512 | SHA-512 | `CryptoVerifier::verify_rsa` |
-| 13 | ECDSA P-256/SHA-256 | SHA-256 | `CryptoVerifier::verify_ecdsa` |
-| 14 | ECDSA P-384/SHA-384 | SHA-384 | `CryptoVerifier::verify_ecdsa` |
-| 15 | Ed25519 | SHA-512 | `CryptoVerifier::verify_eddsa` |
-| 16 | Ed448 | SHAKE256 | `CryptoVerifier::verify_eddsa` |
+| 5 | RSA/SHA-1 | SHA-1 | `rsa_verify` |
+| 7 | RSASHA1-NSEC3-SHA1 | SHA-1 | `rsa_verify` |
+| 8 | RSA/SHA-256 | SHA-256 | `rsa_verify` |
+| 10 | RSA/SHA-512 | SHA-512 | `rsa_verify` |
+| 13 | ECDSA P-256/SHA-256 | SHA-256 | `ecdsa_verify` |
+| 14 | ECDSA P-384/SHA-384 | SHA-384 | `ecdsa_verify` |
+| 15 | Ed25519 | SHA-512 | `eddsa_verify` |
+| 16 | Ed448 | SHAKE256 | *Not supported — returns `UnsupportedAlgorithm` (ring limitation)* |
 | 12 | GOST R 34.10-2012 | GOST R 34.11-2012 | *Deferred — GOST not supported by `ring`* |
 
 ### Verification Implementation
 
-**Main Verification Entry Point**: `CryptoVerifier::verify(&self, algo: DnssecAlgorithm, key: &[u8], sig: &[u8], digest: &[u8]) -> Result<(), CryptoError>`
+**Main Verification Entry Point**: `pub fn verify(algo: u8, key: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, CryptoError>`
 
 **Source**: `src/dns/dnssec/crypto.rs`
 
-**Purpose**: Dispatcher method that selects the appropriate algorithm-specific verification logic using trait-based dispatch and performs signature validation.
+**Purpose**: Dispatcher function that selects the appropriate algorithm-specific verification logic via `verify_func()` and performs signature validation.
 
 **Algorithm Selection**:
 ```rust
-// Source: src/dns/dnssec/crypto.rs, CryptoVerifier::verify()
-// Uses match-based dispatch to select algorithm-specific verifier
+// Source: src/dns/dnssec/crypto.rs, verify()
+// Uses verify_func() to obtain the algorithm-specific verifier
 
-impl CryptoVerifier {
-    pub fn verify(
-        &self,
-        algo: DnssecAlgorithm,
-        key: &[u8],
-        sig: &[u8],
-        digest: &[u8],
-    ) -> Result<(), CryptoError> {
-        match algo {
-            DnssecAlgorithm::RsaSha1
-            | DnssecAlgorithm::RsaSha1Nsec3
-            | DnssecAlgorithm::RsaSha256
-            | DnssecAlgorithm::RsaSha512 => self.verify_rsa(algo, key, sig, digest),
-            DnssecAlgorithm::EcdsaP256Sha256
-            | DnssecAlgorithm::EcdsaP384Sha384 => self.verify_ecdsa(algo, key, sig, digest),
-            DnssecAlgorithm::Ed25519
-            | DnssecAlgorithm::Ed448 => self.verify_eddsa(algo, key, sig, digest),
-            DnssecAlgorithm::GostR34_10_2012 => Err(CryptoError::UnsupportedAlgorithm(algo)),
-            _ => Err(CryptoError::UnsupportedAlgorithm(algo)),
-        }
+pub fn verify(algo: u8, key: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, CryptoError> {
+    match verify_func(algo) {
+        Some(func) => func(algo, key, sig, data),
+        None => Err(CryptoError::UnsupportedAlgorithm(algo)),
     }
 }
+
+// Internal dispatch: verify_func returns the appropriate function pointer
+// Algo 5,7,8,10 (RSA variants)  → rsa_verify()
+// Algo 13,14    (ECDSA variants) → ecdsa_verify()
+// Algo 15       (Ed25519)         → eddsa_verify()
+// Algo 16       (Ed448)           → UnsupportedAlgorithm (ring limitation)
 ```
 
 ### RSA Verification
 
-**Method**: `CryptoVerifier::verify_rsa(&self, algo: DnssecAlgorithm, key: &[u8], sig: &[u8], digest: &[u8]) -> Result<(), CryptoError>`
+**Function**: `fn rsa_verify(algo: u8, key: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, CryptoError>`
 
 **Source**: `src/dns/dnssec/crypto.rs`
 
@@ -461,18 +453,18 @@ impl CryptoVerifier {
 **Implementation Details**:
 ```rust
 // Simplified RSA verification logic
-// Source: src/dns/dnssec/crypto.rs, CryptoVerifier::verify_rsa()
+// Source: src/dns/dnssec/crypto.rs, rsa_verify()
 
 // 1. Parse RSA public key from DNSKEY RDATA
 //    - Extract public exponent (e) and modulus (n)
 
-// 2. Select ring verification algorithm based on RRSIG algorithm field
+// 2. Select ring verification algorithm based on RRSIG algorithm field (u8)
 let algorithm = match algo {
-    DnssecAlgorithm::RsaSha1 | DnssecAlgorithm::RsaSha1Nsec3 =>
+    5 | 7 =>  // RSASHA1 / RSASHA1-NSEC3-SHA1
         &ring::signature::RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY,
-    DnssecAlgorithm::RsaSha256 =>
+    8 =>      // RSASHA256
         &ring::signature::RSA_PKCS1_2048_8192_SHA256,
-    DnssecAlgorithm::RsaSha512 =>
+    10 =>     // RSASHA512
         &ring::signature::RSA_PKCS1_2048_8192_SHA512,
     _ => return Err(CryptoError::UnsupportedAlgorithm(algo)),
 };
@@ -481,13 +473,13 @@ let algorithm = match algo {
 let public_key = ring::signature::UnparsedPublicKey::new(algorithm, key_bytes);
 
 // 4. Verify signature (ring handles cleanup via RAII)
-public_key.verify(digest, sig)
+public_key.verify(data, sig)
     .map_err(|_| CryptoError::SignatureVerificationFailed)
 ```
 
 ### ECDSA Verification
 
-**Method**: `CryptoVerifier::verify_ecdsa(&self, algo: DnssecAlgorithm, key: &[u8], sig: &[u8], digest: &[u8]) -> Result<(), CryptoError>`
+**Function**: `fn ecdsa_verify(algo: u8, key: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, CryptoError>`
 
 **Source**: `src/dns/dnssec/crypto.rs`
 
@@ -498,14 +490,14 @@ public_key.verify(digest, sig)
 **Implementation Details**:
 ```rust
 // Simplified ECDSA verification logic
-// Source: src/dns/dnssec/crypto.rs, CryptoVerifier::verify_ecdsa()
+// Source: src/dns/dnssec/crypto.rs, ecdsa_verify()
 
-// 1. Select ring ECDSA algorithm based on DNSSEC algorithm number
+// 1. Select ring ECDSA algorithm based on DNSSEC algorithm number (u8)
 let algorithm = match algo {
-    DnssecAlgorithm::EcdsaP256Sha256 =>
-        &ring::signature::ECDSA_P256_SHA256_FIXED,   // P-256
-    DnssecAlgorithm::EcdsaP384Sha384 =>
-        &ring::signature::ECDSA_P384_SHA384_FIXED,   // P-384
+    13 =>  // ECDSA P-256/SHA-256
+        &ring::signature::ECDSA_P256_SHA256_FIXED,
+    14 =>  // ECDSA P-384/SHA-384
+        &ring::signature::ECDSA_P384_SHA384_FIXED,
     _ => return Err(CryptoError::UnsupportedAlgorithm(algo)),
 };
 
@@ -518,45 +510,38 @@ let public_key = ring::signature::UnparsedPublicKey::new(algorithm, key_bytes);
 // 4. Parse signature (R, S components in fixed-size format)
 
 // 5. Verify signature (ring handles cleanup via RAII)
-public_key.verify(digest, sig)
+public_key.verify(data, sig)
     .map_err(|_| CryptoError::SignatureVerificationFailed)
 ```
 
 ### EdDSA Verification
 
-**Method**: `CryptoVerifier::verify_eddsa(&self, algo: DnssecAlgorithm, key: &[u8], sig: &[u8], digest: &[u8]) -> Result<(), CryptoError>`
+**Function**: `fn eddsa_verify(algo: u8, key: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, CryptoError>`
 
 **Source**: `src/dns/dnssec/crypto.rs`
 
 **Supported Algorithms**:
 - **Algorithm 15**: Ed25519 (32-byte keys, 64-byte signatures)
-- **Algorithm 16**: Ed448 (57-byte keys, 114-byte signatures) — *Note: Ed448 requires supplementary crate; `ring` natively supports Ed25519 only*
+- **Algorithm 16**: Ed448 — **not yet supported** (returns `CryptoError::UnsupportedAlgorithm`; the `ring` crate does not natively support Ed448)
 
 **Implementation Details**:
 ```rust
 // Simplified EdDSA verification logic
-// Source: src/dns/dnssec/crypto.rs, CryptoVerifier::verify_eddsa()
+// Source: src/dns/dnssec/crypto.rs, eddsa_verify()
 
-// 1. Select EdDSA variant
-let algorithm = match algo {
-    DnssecAlgorithm::Ed25519 => {
-        // Ed25519: 32-byte key, 64-byte signature
-        &ring::signature::ED25519
-    }
-    DnssecAlgorithm::Ed448 => {
-        // Ed448: 57-byte key, 114-byte signature
-        // Note: ring does not natively support Ed448; requires
-        // supplementary ed448-goldilocks crate or similar
-        return Err(CryptoError::UnsupportedAlgorithm(algo));
-    }
-    _ => return Err(CryptoError::UnsupportedAlgorithm(algo)),
-};
+// 1. Only Ed25519 (algo 15) is supported
+// Algo 16 (Ed448) returns UnsupportedAlgorithm — ring lacks Ed448 support
+if algo != 15 {
+    return Err(CryptoError::UnsupportedAlgorithm(algo));
+}
 
-// 2. Extract public key from DNSKEY RDATA
-let public_key = ring::signature::UnparsedPublicKey::new(algorithm, key);
+// 2. Ed25519: 32-byte key, 64-byte signature
+let public_key = ring::signature::UnparsedPublicKey::new(
+    &ring::signature::ED25519, key
+);
 
 // 3. Verify signature (ring handles cleanup via RAII)
-public_key.verify(digest, sig)
+public_key.verify(data, sig)
     .map_err(|_| CryptoError::SignatureVerificationFailed)
 ```
 
@@ -565,7 +550,7 @@ public_key.verify(digest, sig)
 In addition to cryptographic verification, DNSSEC requires time-based validity checks:
 
 ```rust
-// Source: src/dns/dnssec/validation.rs, DnssecValidator::validate_rrset()
+// Source: src/dns/dnssec/validation.rs, validate_rrset()
 // Check RRSIG inception and expiration times
 
 // RRSIG fields (from wire format):
@@ -974,7 +959,7 @@ When validating a DNSKEY for the root zone, dnsmasq performs the following:
 
 ```rust
 // Simplified trust anchor validation
-// Source: src/dns/dnssec/validation.rs, DnssecValidator::validate_rrset()
+// Source: src/dns/dnssec/validation.rs, validate_rrset()
 // for root zone
 
 // 1. Retrieve root zone DNSKEY from DNS response
@@ -1127,7 +1112,7 @@ impl DnssecValidator {
 
 **Enforcement**:
 ```rust
-// Source: src/dns/dnssec/validation.rs, DnssecValidator::validate_rrset()
+// Source: src/dns/dnssec/validation.rs, validate_rrset()
 
 impl DnssecValidator {
     fn validate_rrset(&mut self, /* ... */) -> Result<ValidationStatus, DnssecError> {
@@ -1166,10 +1151,10 @@ impl DnssecValidator {
 
 **Enforcement**:
 ```rust
-// Source: src/dns/dnssec/crypto.rs, CryptoVerifier::verify()
+// Source: src/dns/dnssec/crypto.rs, verify()
 
-impl CryptoVerifier {
-    pub fn verify(&mut self, algo: DnssecAlgorithm, key: &[u8], /* ... */)
+// Standalone functions in src/dns/dnssec/crypto.rs
+    pub fn verify(algo: u8, key: &[u8], sig: &[u8], data: &[u8]) -> Result<bool, CryptoError>
         -> Result<(), CryptoError>
     {
         self.crypto_ops += 1;
@@ -1542,24 +1527,23 @@ cargo build --release --features dnssec
 
 **RSA Signature Verification**:
 ```rust
-// Source: src/dns/dnssec/crypto.rs, CryptoVerifier::verify_rsa()
+// Source: src/dns/dnssec/crypto.rs, crypto::rsa_verify()
 use ring::signature;
 
-impl CryptoVerifier {
+// Standalone functions in src/dns/dnssec/crypto.rs
     fn verify_rsa(
-        &self,
-        algo: DnssecAlgorithm,
+        algo: u8,
         key_data: &[u8],
         sig: &[u8],
         message: &[u8],
     ) -> Result<(), CryptoError> {
         // Select ring RSA algorithm based on DNSSEC algorithm number
         let algorithm: &dyn signature::VerificationAlgorithm = match algo {
-            DnssecAlgorithm::RsaSha1 | DnssecAlgorithm::RsaSha1Nsec3 =>
+            5 /* RSASHA1 */ | 7 /* RSASHA1-NSEC3 */ =>
                 &signature::RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY,
-            DnssecAlgorithm::RsaSha256 =>
+            8 /* RSASHA256 */ =>
                 &signature::RSA_PKCS1_2048_8192_SHA256,
-            DnssecAlgorithm::RsaSha512 =>
+            10 /* RSASHA512 */ =>
                 &signature::RSA_PKCS1_2048_8192_SHA512,
             _ => return Err(CryptoError::UnsupportedAlgorithm(algo)),
         };
@@ -1579,22 +1563,21 @@ impl CryptoVerifier {
 
 **ECDSA Signature Verification**:
 ```rust
-// Source: src/dns/dnssec/crypto.rs, CryptoVerifier::verify_ecdsa()
+// Source: src/dns/dnssec/crypto.rs, crypto::ecdsa_verify()
 use ring::signature;
 
-impl CryptoVerifier {
+// Standalone functions in src/dns/dnssec/crypto.rs
     fn verify_ecdsa(
-        &self,
-        algo: DnssecAlgorithm,
+        algo: u8,
         key_data: &[u8],
         sig: &[u8],
         message: &[u8],
     ) -> Result<(), CryptoError> {
         // Select curve based on algorithm
         let algorithm: &dyn signature::VerificationAlgorithm = match algo {
-            DnssecAlgorithm::EcdsaP256Sha256 =>
+            13 /* ECDSA-P256 */ =>
                 &signature::ECDSA_P256_SHA256_FIXED, // P-256
-            DnssecAlgorithm::EcdsaP384Sha384 =>
+            14 /* ECDSA-P384 */ =>
                 &signature::ECDSA_P384_SHA384_FIXED, // P-384
             _ => return Err(CryptoError::UnsupportedAlgorithm(algo)),
         };
@@ -1618,19 +1601,18 @@ impl CryptoVerifier {
 
 **EdDSA Signature Verification**:
 ```rust
-// Source: src/dns/dnssec/crypto.rs, CryptoVerifier::verify_eddsa()
+// Source: src/dns/dnssec/crypto.rs, crypto::eddsa_verify()
 use ring::signature;
 
-impl CryptoVerifier {
+// Standalone functions in src/dns/dnssec/crypto.rs
     fn verify_eddsa(
-        &self,
-        algo: DnssecAlgorithm,
+        algo: u8,
         key_data: &[u8],
         sig: &[u8],
         message: &[u8],
     ) -> Result<(), CryptoError> {
         match algo {
-            DnssecAlgorithm::Ed25519 => {
+            15 /* Ed25519 */ => {
                 // Ed25519: 32-byte key, 64-byte signature
                 let public_key = signature::UnparsedPublicKey::new(
                     &signature::ED25519,
@@ -1640,7 +1622,7 @@ impl CryptoVerifier {
                     .verify(message, sig) // 64-byte signature
                     .map_err(|_| CryptoError::SignatureVerificationFailed)
             }
-            DnssecAlgorithm::Ed448 => {
+            16 /* Ed448 */ => {
                 // Ed448: 57-byte key, 114-byte signature
                 // Note: ring does not natively support Ed448.
                 // Requires supplementary crate (e.g., ed448-goldilocks).
@@ -1678,24 +1660,24 @@ impl CryptoVerifier {
 
 **Dnsmasq Error Propagation**:
 ```rust
-// Source: src/dns/dnssec/crypto.rs, CryptoVerifier::verify()
+// Source: src/dns/dnssec/crypto.rs, verify()
 
-impl CryptoVerifier {
+// Standalone functions in src/dns/dnssec/crypto.rs
     pub fn verify(
         &mut self,
-        algo: DnssecAlgorithm,
+        algo: u8 /* algorithm number */,
         key: &[u8],
         sig: &[u8],
         message: &[u8],
     ) -> Result<(), CryptoError> {
         // Dispatch to algorithm-specific verifier
         let result = match algo {
-            DnssecAlgorithm::RsaSha1 | DnssecAlgorithm::RsaSha1Nsec3
-            | DnssecAlgorithm::RsaSha256 | DnssecAlgorithm::RsaSha512 =>
+            5 /* RSASHA1 */ | 7 /* RSASHA1-NSEC3 */
+            | 8 /* RSASHA256 */ | 10 /* RSASHA512 */ =>
                 self.verify_rsa(algo, key, sig, message),
-            DnssecAlgorithm::EcdsaP256Sha256 | DnssecAlgorithm::EcdsaP384Sha384 =>
+            13 /* ECDSA-P256 */ | 14 /* ECDSA-P384 */ =>
                 self.verify_ecdsa(algo, key, sig, message),
-            DnssecAlgorithm::Ed25519 | DnssecAlgorithm::Ed448 =>
+            15 /* Ed25519 */ | 16 /* Ed448 */ =>
                 self.verify_eddsa(algo, key, sig, message),
             _ => Err(CryptoError::UnsupportedAlgorithm(algo)),
         };
