@@ -80,6 +80,16 @@ pub mod nftset;
 #[cfg(all(feature = "conntrack", target_os = "linux"))]
 pub mod conntrack;
 
+/// Linux ipset integration for DNS-based firewall rule population.
+///
+/// Provides [`IpsetController`] for dynamically populating named ipset
+/// collections with IP addresses resolved from DNS queries, enabling
+/// domain-based firewall rules via iptables/ipset.
+///
+/// Migrated from `src/ipset.c` (532 lines).
+#[cfg(all(feature = "ipset", target_os = "linux"))]
+pub mod ipset;
+
 // Re-export key types when features are enabled
 #[cfg(feature = "ubus")]
 pub use ubus::UbusController;
@@ -92,3 +102,6 @@ pub use nftset::NftsetController;
 
 #[cfg(all(feature = "conntrack", target_os = "linux"))]
 pub use conntrack::{get_incoming_mark, ConntrackError};
+
+#[cfg(all(feature = "ipset", target_os = "linux"))]
+pub use ipset::IpsetController;
