@@ -1,11 +1,80 @@
-[build]
-# Use available CPU cores for compilation
+# Cargo build configuration for dnsmasq Rust implementation
+# Mirrors build settings from the C Makefile (CFLAGS, LDFLAGS, COPTS)
+# and platform detection from src/config.h
+#
+# C Makefile reference:
+#   CFLAGS = -Wall -W -O2       → Rust: clippy.toml + Cargo.toml [profile.release]
+#   LDFLAGS = (empty default)   → Rust: per-target rustflags below
+#   PREFIX = /usr/local          → Rust: cargo install --root /usr/local
+#   BINDIR = $(PREFIX)/sbin      → Rust: cargo install places binary in bin/
+#
+# Platform detection reference (src/config.h):
+#   __linux__    → HAVE_LINUX_NETWORK  → cfg(target_os = "linux")
+#   __FreeBSD__  → HAVE_BSD_NETWORK    → cfg(target_os = "freebsd")
+#   __OpenBSD__  → HAVE_BSD_NETWORK    → cfg(target_os = "openbsd")
+#   __APPLE__    → HAVE_BSD_NETWORK    → cfg(target_os = "macos")
 
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=native"]
+# =============================================================================
+# General build settings
+# =============================================================================
+[build]
+# Incremental compilation is enabled by default for dev builds.
+# Release builds use Cargo.toml [profile.release] settings (opt-level 3, LTO)
+# which mirrors C Makefile's CFLAGS -O2 optimization.
+# Jobs auto-detected from CPU count (equivalent to make -j$(nproc)).
+
+# =============================================================================
+# Environment variables available to build scripts and source
+# =============================================================================
+[env]
+# Default version string — matches C Makefile line 72:
+#   version = -DVERSION='"`$(top)/bld/get-version $(top)`"'
+# Can be overridden at build time: DNSMASQ_VERSION=custom cargo build
+DNSMASQ_VERSION = { value = "2.92-rust", force = false }
+
+# =============================================================================
+# Target-specific configuration: Linux (glibc)
+# =============================================================================
+# Matches C config.h platform detection:
+#   #elif defined(__linux__)
+#   #define HAVE_LINUX_NETWORK
+# (config.h lines 2177-2178)
+#
+# The --as-needed linker flag mirrors the C Makefile's lean linking behavior
+# where only actually-used libraries are linked into the final binary,
+# reducing binary size and runtime library dependencies.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,--as-needed"]
+
+# =============================================================================
+# Target-specific configuration: Linux musl (Alpine Docker builds)
+# =============================================================================
+# Alpine Linux uses musl libc — requires musl-specific linker for static builds.
+# Deploy targets: Alpine 3.19.9, 3.20.8, 3.21.5, 3.22.2 (AAP Section 0.4.3)
+# The +crt-static flag produces fully static binaries suitable for minimal
+# Alpine containers without runtime library dependencies.
 
 [target.x86_64-unknown-linux-musl]
-rustflags = ["-C", "target-feature=-crt-static"]
+linker = "musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
 
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# =============================================================================
+# Target-specific configuration: cross-compilation ARM64 (glibc)
+# =============================================================================
+# Standard cross-compilation linker for ARM64 Linux with glibc.
+# Used for ARM64 server deployments (e.g., AWS Graviton, Raspberry Pi 4+).
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# =============================================================================
+# Network settings for dependency fetching
+# =============================================================================
 [net]
+# Retry network operations for CI/CD robustness (transient failures)
 retry = 3
+# Use Cargo's built-in git implementation (faster than shelling out to git CLI)
+git-fetch-with-cli = false
