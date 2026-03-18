@@ -550,7 +550,7 @@ pub fn compile_options_string() -> String {
     if !has_idn() {
         opts.push_str("no-");
     }
-    opts.push_str("i18n ");
+    opts.push_str("IDN ");
 
     if !has_dhcp() {
         opts.push_str("no-");
