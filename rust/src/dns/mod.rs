@@ -9,6 +9,7 @@
 pub mod domain;
 pub mod domain_match;
 pub mod protocol;
+pub mod rrfilter;
 
 #[cfg(feature = "dnssec")]
 pub mod blockdata;
