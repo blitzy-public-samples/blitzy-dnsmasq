@@ -51,9 +51,22 @@ pub mod metrics;
 #[cfg(all(feature = "inotify", target_os = "linux"))]
 pub mod inotify;
 
+/// pcap-format packet dumping for protocol debugging and troubleshooting.
+///
+/// Captures DNS queries/responses, DHCP transactions, Router Advertisements,
+/// and TFTP transfers to standard libpcap files readable by Wireshark/tcpdump.
+///
+/// Gated by the `dumpfile` Cargo feature (matches C `HAVE_DUMPFILE`).
+#[cfg(feature = "dumpfile")]
+pub mod dump;
+
 // Re-export key metrics types (used throughout the codebase)
 pub use metrics::{MetricType, MetricsStore, ServerStats, METRIC_MAX, METRIC_NAMES};
 
 // Re-export inotify types when the feature is active.
 #[cfg(all(feature = "inotify", target_os = "linux"))]
 pub use inotify::{dir_flags, InotifyCallbacks, InotifyWatcher};
+
+// Re-export dump types when the dumpfile feature is active.
+#[cfg(feature = "dumpfile")]
+pub use dump::{mask, PacketDumper};
