@@ -30,11 +30,14 @@
 #[cfg(target_os = "linux")]
 pub mod netlink;
 
+/// BSD BPF raw packet I/O and PF_ROUTE interface monitoring.
+/// Compiled only on FreeBSD, OpenBSD, and macOS (replaces C `HAVE_BSD_NETWORK`).
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+pub mod bpf;
+
 // NOTE: The following sub-modules are planned but created by separate agents:
 // - pub mod interface;  (from network.c — platform-independent core)
 // - pub mod arp;        (from arp.c — ARP cache management)
-// - #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
-//   pub mod bpf;        (from bpf.c — BSD BPF + routing socket)
 
 // ---------------------------------------------------------------------------
 // Conditional re-exports
@@ -48,3 +51,6 @@ pub use netlink::{IfaceCallback, NetlinkNetwork};
 
 #[cfg(target_os = "linux")]
 pub use netlink::{IFACE_DEPRECATED, IFACE_PERMANENT, IFACE_TENTATIVE};
+
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+pub use bpf::{init_bpf, route_init, route_sock, send_via_bpf, BpfNetwork};
