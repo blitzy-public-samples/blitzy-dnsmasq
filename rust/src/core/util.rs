@@ -326,6 +326,57 @@ pub fn check_dns_name(name: &str) -> bool {
     check_dns_name_internal(trimmed)
 }
 
+/// Check whether a hostname label/name is syntactically valid per
+/// RFC 952 / RFC 1123 hostname rules.
+///
+/// A legal hostname consists of labels separated by dots:
+/// - Each label is 1–63 characters.
+/// - Total length is ≤ 253 characters.
+/// - Characters must be alphanumeric (`[a-zA-Z0-9]`) or hyphens (`-`).
+/// - Labels must not begin or end with a hyphen.
+/// - The first character of the entire hostname must be alphanumeric.
+///
+/// This is used by 12+ call sites including `cache.c`, `rfc1035.c`,
+/// `option.c`, `dbus.c`, `dhcp-common.c`, `rfc2131.c`, and `lease.c`.
+///
+/// Maps to C's `legal_hostname()` (`util.c` line 447).
+pub fn legal_hostname(name: &str) -> bool {
+    if name.is_empty() || name.len() > 253 {
+        return false;
+    }
+
+    // Strip optional trailing dot
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.is_empty() {
+        return false;
+    }
+
+    // First character of the entire name must be alphanumeric
+    let first_char = name.as_bytes()[0];
+    if !first_char.is_ascii_alphanumeric() {
+        return false;
+    }
+
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        // Label must not start or end with hyphen
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        // All characters must be alphanumeric or hyphen
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Case-insensitive hostname equality test.
 ///
 /// Performs locale-independent ASCII case folding (A-Z → a-z) and compares
@@ -710,31 +761,40 @@ pub fn safe_pipe() -> DnsmasqResult<(RawFd, RawFd)> {
     Ok((read_fd.into_raw_fd(), write_fd.into_raw_fd()))
 }
 
-/// Close all file descriptors except stdin/stdout/stderr and one spare.
+/// Close all file descriptors except stdin/stdout/stderr and any spares.
 ///
 /// Iterates from `max_fd` down to 0, closing every descriptor except
-/// standard streams (0, 1, 2) and `except_fd`. Typically called after
-/// `fork()` before `exec()` to clean up inherited descriptors.
+/// standard streams (0, 1, 2) and any fd listed in `except_fds`.
+/// Typically called after `fork()` before `exec()` to clean up inherited
+/// descriptors.
 ///
 /// On Linux, attempts to use `/proc/self/fd` for efficient enumeration
-/// before falling back to the brute-force iteration.
+/// before falling back to the brute-force iteration.  The `/proc` path
+/// uses a two-pass approach (collect first, then close) to avoid closing
+/// the directory iterator's own file descriptor mid-iteration.
 ///
-/// Maps to C's `close_fds()` (`util.c` line 2480), simplified to accept
-/// a single spare file descriptor.
-pub fn close_fds(max_fd: i32, except_fd: i32) {
-    // Try efficient /proc/self/fd enumeration on Linux
+/// Maps to C's `close_fds()` (`util.c` line 2480) which accepts up to 3
+/// protected file descriptors via `(max_fd, except1, except2)`.
+pub fn close_fds(max_fd: i32, except_fds: &[i32]) {
+    // Try efficient /proc/self/fd enumeration on Linux.
+    // Two-pass approach: collect all fd numbers first, then close,
+    // so the directory iterator's own fd is not closed mid-iteration.
     #[cfg(target_os = "linux")]
     {
         if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Ok(fd) = name.parse::<i32>() {
-                        if fd <= 2 || fd == except_fd {
-                            continue;
-                        }
-                        let _ = nix::unistd::close(fd);
-                    }
-                }
+            let fds_to_close: Vec<i32> = entries
+                .flatten()
+                .filter_map(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse::<i32>().ok())
+                })
+                .filter(|&fd| fd > 2 && !except_fds.contains(&fd))
+                .collect();
+
+            for fd in fds_to_close {
+                let _ = nix::unistd::close(fd);
             }
             return;
         }
@@ -742,7 +802,7 @@ pub fn close_fds(max_fd: i32, except_fd: i32) {
 
     // Fallback: iterate through all possible descriptors
     for fd in (3..max_fd).rev() {
-        if fd == except_fd {
+        if except_fds.contains(&fd) {
             continue;
         }
         let _ = nix::unistd::close(fd);

@@ -1542,18 +1542,55 @@ pub fn dhcp_update_configs(configs: &mut [DhcpConfig], _state: &DaemonState) {
 ///
 /// Maps to C `whichdevice()` (`dhcp-common.c` line 1430).
 ///
-/// Returns `Some(device_name)` if all DHCP interfaces resolve to the same
-/// device, or `None` if there are multiple or no devices.
+/// If we are doing DHCP on exactly one interface and running on Linux, we can
+/// use `SO_BINDTODEVICE` to that device. This is needed for environments like
+/// OpenStack that run a new dnsmasq instance per VLAN interface.
+///
+/// Returns `Some(device_name)` if all DHCP-enabled interfaces resolve to the
+/// same device, or `None` if there are multiple, no interfaces, or if wildcard
+/// interface names were specified (since more interfaces may appear later).
 pub fn which_device(state: &DaemonState) -> Option<String> {
-    // In the C code, this iterates daemon->if_names and checks if
-    // there's exactly one interface. We return the domain_suffix field
-    // as a placeholder device indicator; the actual interface tracking
-    // is handled by the network module.
-    //
-    // The real implementation will check state.if_names when that field
-    // is available from the network module.
-    let _ = state;
-    None
+    // If no --interface names were specified, we cannot determine a single device.
+    if state.if_names.is_empty() {
+        return None;
+    }
+
+    // If any interface filter entry is unused or contains a wildcard ('*'),
+    // more interfaces may arrive later — cannot safely bind to a single device.
+    for if_name in &state.if_names {
+        if let Some(name) = &if_name.name {
+            if !if_name.used || name.contains('*') {
+                return None;
+            }
+        } else {
+            // Name-less entries (address-based) cannot be bound by device name
+            return None;
+        }
+    }
+
+    // Iterate the active interface records to find DHCP-enabled ones.
+    // C checks iface->dhcp4_ok || iface->dhcp6_ok via irec fields.
+    // In Rust, InterfaceRecord.flags stores per-interface capability bits.
+    // IREC_DHCP4 (bit 0x01) and IREC_DHCP6 (bit 0x02) indicate DHCP support.
+    const IREC_DHCP4: u32 = 0x01;
+    const IREC_DHCP6: u32 = 0x02;
+
+    let mut found_name: Option<&str> = None;
+    for iface in &state.interfaces {
+        if iface.flags & (IREC_DHCP4 | IREC_DHCP6) != 0 {
+            match found_name {
+                None => found_name = Some(&iface.name),
+                Some(prev) => {
+                    if prev != iface.name {
+                        // Multiple distinct devices — cannot bind to one
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    found_name.map(|s| s.to_string())
 }
 
 /// Bind DHCP sockets to a specific network device via SO_BINDTODEVICE.
@@ -1564,16 +1601,68 @@ pub fn which_device(state: &DaemonState) -> Option<String> {
 /// packet reception to the named interface. Gracefully handles EPERM for
 /// non-root operation.
 #[cfg(target_os = "linux")]
-pub fn bind_dhcp_devices(device: &str, _state: &DaemonState) -> DnsmasqResult<()> {
+pub fn bind_dhcp_devices(device: &str, state: &DaemonState) -> DnsmasqResult<()> {
+    use std::os::fd::FromRawFd;
+
     if device.is_empty() {
         return Ok(());
     }
-    // In a full integration, we would iterate state's DHCP socket fds
-    // and call bindtodevice() on each. The actual sockets are managed
-    // by the network module; this function is called during init.
+
+    // Bind DHCP socket fds to the specified device using SO_BINDTODEVICE,
+    // matching C's bind_dhcp_devices() in dhcp-common.c line 1559.
+    //
+    // Binds: dhcpfd (when DHCP enabled and not relay4),
+    //        pxefd (when PXE enabled),
+    //        dhcp6fd (when DHCPv6 enabled and not relay6).
+
+    // DHCPv4 socket — bind if active and not in relay mode
+    if state.dhcpfd >= 0 && state.relay4.is_empty() {
+        // SAFETY: dhcpfd is a valid socket fd opened by the DHCP server init.
+        // We create a temporary Socket wrapper without taking ownership (we
+        // use ManuallyDrop to prevent close on drop since state owns the fd).
+        let sock = unsafe { Socket::from_raw_fd(state.dhcpfd) };
+        let sock = std::mem::ManuallyDrop::new(sock);
+        if let Err(e) = _bindtodevice(device, &sock) {
+            tracing::warn!(
+                target: "dnsmasq::dhcp",
+                "Failed to bind DHCPv4 socket to {}: {}",
+                device, e
+            );
+        }
+    }
+
+    // PXE socket — bind if PXE enabled and fd is valid
+    if state.enable_pxe && state.pxefd >= 0 {
+        // SAFETY: pxefd is a valid socket fd opened by the PXE server init.
+        let sock = unsafe { Socket::from_raw_fd(state.pxefd) };
+        let sock = std::mem::ManuallyDrop::new(sock);
+        if let Err(e) = _bindtodevice(device, &sock) {
+            tracing::warn!(
+                target: "dnsmasq::dhcp",
+                "Failed to bind PXE socket to {}: {}",
+                device, e
+            );
+        }
+    }
+
+    // DHCPv6 socket — bind if doing DHCPv6 and not in relay mode
+    #[cfg(feature = "dhcp6")]
+    if state.doing_dhcp6 && state.dhcp6fd >= 0 && state.relay6.is_empty() {
+        // SAFETY: dhcp6fd is a valid socket fd opened by the DHCPv6 server init.
+        let sock = unsafe { Socket::from_raw_fd(state.dhcp6fd) };
+        let sock = std::mem::ManuallyDrop::new(sock);
+        if let Err(e) = _bindtodevice(device, &sock) {
+            tracing::warn!(
+                target: "dnsmasq::dhcp",
+                "Failed to bind DHCPv6 socket to {}: {}",
+                device, e
+            );
+        }
+    }
+
     info!(
         target: "dnsmasq::dhcp",
-        "DHCP, binding to device {}",
+        "DHCP sockets bound to device {}",
         device
     );
     Ok(())
@@ -1598,8 +1687,9 @@ fn _bindtodevice(device: &str, socket: &Socket) -> DnsmasqResult<()> {
     let fd = socket.as_raw_fd();
     let dev_bytes = device.as_bytes();
 
-    // Safety note: we use socket2 for safe socket operations.
-    // SO_BINDTODEVICE requires CAP_NET_RAW or root.
+    // SAFETY: setsockopt with SO_BINDTODEVICE is a valid libc call when `fd`
+    // is an open socket descriptor and `dev_bytes` points to a valid device
+    // name buffer. SO_BINDTODEVICE requires CAP_NET_RAW or root privileges.
     let result = unsafe {
         libc::setsockopt(
             fd,

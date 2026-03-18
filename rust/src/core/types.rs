@@ -40,6 +40,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use thiserror::Error;
 
 use crate::config::constants::{CACHESIZ, EDNS_PKTSZ, FTABSIZ, MAXDNAME, MAXLEASES, MAX_PROCS};
+use crate::diagnostics::metrics::METRIC_MAX;
 
 // ---------------------------------------------------------------------------
 // Error Types (replaces C errno + goto patterns)
@@ -231,11 +232,8 @@ pub enum ExitCode {
 pub const EC_INIT_OFFSET: i32 = 10;
 
 // ---------------------------------------------------------------------------
-// Number of metrics counters (__METRIC_MAX from metrics.h)
+// METRIC_MAX imported from crate::diagnostics::metrics (canonical source)
 // ---------------------------------------------------------------------------
-
-/// Total number of runtime metric counters (sentinel value from metrics.h).
-const METRIC_MAX: usize = 30;
 
 // ---------------------------------------------------------------------------
 // Option Flags  (dnsmasq.h lines 393–471)
@@ -681,6 +679,388 @@ pub struct EventDesc {
 }
 
 // ---------------------------------------------------------------------------
+// Supporting types for DaemonState fields
+// (Replaces C linked-list structs from dnsmasq.h with Rust Vec-based storage)
+// ---------------------------------------------------------------------------
+
+/// MX/SRV record entry (C: `struct mx_srv_record`).
+#[derive(Debug, Clone)]
+pub struct MxSrvRecord {
+    pub name: String,
+    pub target: String,
+    pub priority: u16,
+    pub weight: u16,
+    pub port: u16,
+    pub is_mx: bool,
+}
+
+/// NAPTR record entry (C: `struct naptr`).
+#[derive(Debug, Clone)]
+pub struct NaptrRecord {
+    pub name: String,
+    pub replace: String,
+    pub regexp: String,
+    pub services: String,
+    pub flags: String,
+    pub order: u16,
+    pub pref: u16,
+}
+
+/// TXT record entry (C: `struct txt_record`).
+#[derive(Debug, Clone)]
+pub struct TxtRecord {
+    pub name: String,
+    pub txt: Vec<u8>,
+    pub class: u16,
+}
+
+/// PTR record entry (C: `struct ptr_record`).
+#[derive(Debug, Clone)]
+pub struct PtrRecord {
+    pub name: String,
+    pub ptr: String,
+}
+
+/// Host record entry (C: `struct host_record`).
+#[derive(Debug, Clone)]
+pub struct HostRecord {
+    pub names: Vec<String>,
+    pub addr4: Option<Ipv4Addr>,
+    pub addr6: Option<Ipv6Addr>,
+    pub ttl: u32,
+}
+
+/// CNAME record entry (C: `struct cname`).
+#[derive(Debug, Clone)]
+pub struct CnameRecord {
+    pub alias: String,
+    pub target: String,
+    pub ttl: u32,
+}
+
+/// Authoritative DNS zone (C: `struct auth_zone`).
+#[cfg(feature = "auth")]
+#[derive(Debug, Clone)]
+pub struct AuthZone {
+    pub domain: String,
+    pub subnet: Vec<String>,
+    pub interface_names: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+/// Interface name mapping (C: `struct interface_name`).
+#[derive(Debug, Clone)]
+pub struct InterfaceName {
+    pub name: String,
+    pub intr: String,
+    pub family: i32,
+}
+
+/// Subnet specification for EDNS0 (C: `struct mysubnet`).
+#[derive(Debug, Clone)]
+pub struct MySubnet {
+    pub addr: std::net::IpAddr,
+    pub mask: u8,
+}
+
+/// Interface name filter entry (C: `struct iname`).
+#[derive(Debug, Clone)]
+pub struct IfName {
+    pub name: Option<String>,
+    pub addr: Option<std::net::IpAddr>,
+    pub used: bool,
+}
+
+/// Bogus address entry for address blocking (C: `struct bogus_addr`).
+#[derive(Debug, Clone)]
+pub struct BogusAddr {
+    pub addr: std::net::IpAddr,
+    pub prefix_len: u8,
+}
+
+/// Upstream DNS server entry (C: `struct server`).
+#[derive(Debug, Clone)]
+pub struct ServerEntry {
+    pub addr: SocketAddr,
+    pub source_addr: Option<SocketAddr>,
+    pub interface: Option<String>,
+    pub domain: Option<String>,
+    pub flags: u32,
+    pub queries: u32,
+    pub failed_queries: u32,
+    pub uid: u32,
+}
+
+/// Conditional domain entry (C: `struct cond_domain`).
+#[derive(Debug, Clone)]
+pub struct CondDomain {
+    pub domain: String,
+    pub prefix: Option<String>,
+    pub start: Option<std::net::IpAddr>,
+    pub end: Option<std::net::IpAddr>,
+    pub is6: bool,
+}
+
+/// ipset/nftset entry (C: `struct ipsets`).
+#[derive(Debug, Clone)]
+pub struct IpsetEntry {
+    pub domain: Vec<String>,
+    pub sets: Vec<String>,
+}
+
+/// Connmark allowlist entry (C: `struct allowlist`).
+#[derive(Debug, Clone)]
+pub struct AllowlistEntry {
+    pub mark: u32,
+    pub mask: u32,
+    pub patterns: Vec<String>,
+}
+
+/// Additional hosts file entry (C: `struct hostsfile`).
+#[derive(Debug, Clone)]
+pub struct HostsFile {
+    pub fname: String,
+    pub index: u32,
+    pub flags: u32,
+}
+
+/// Dynamic directory entry (C: `struct dyndir`).
+#[derive(Debug, Clone)]
+pub struct DynDir {
+    pub name: String,
+    pub flags: u32,
+}
+
+/// DHCP context entry (C: `struct dhcp_context`).
+#[cfg(any(feature = "dhcp", feature = "dhcp6"))]
+#[derive(Debug, Clone)]
+pub struct DhcpContextEntry {
+    pub start: std::net::IpAddr,
+    pub end: std::net::IpAddr,
+    pub netmask: Option<std::net::IpAddr>,
+    pub lease_time: u32,
+    pub flags: u32,
+    pub netid: Option<String>,
+}
+
+/// Router Advertisement interface (C: `struct ra_interface`).
+#[cfg(feature = "dhcp6")]
+#[derive(Debug, Clone)]
+pub struct RaInterface {
+    pub name: String,
+    pub interval: u32,
+    pub priority: u32,
+    pub mtu: u32,
+}
+
+/// DHCP config entry (C: `struct dhcp_config`).
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone)]
+pub struct DhcpConfigEntry {
+    pub hwaddr: Vec<u8>,
+    pub clid: Vec<u8>,
+    pub hostname: Option<String>,
+    pub addr: Option<Ipv4Addr>,
+    pub addr6: Option<Ipv6Addr>,
+    pub lease_time: u32,
+    pub flags: u32,
+    pub netid: Option<String>,
+}
+
+/// DHCP option entry (C: `struct dhcp_opt`).
+#[cfg(any(feature = "dhcp", feature = "dhcp6"))]
+#[derive(Debug, Clone)]
+pub struct DhcpOptEntry {
+    pub opt: u16,
+    pub val: Vec<u8>,
+    pub flags: u32,
+    pub netid: Option<String>,
+}
+
+/// DHCP name match entry (C: `struct dhcp_match_name`).
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone)]
+pub struct DhcpNameMatch {
+    pub name: String,
+    pub wildcard: bool,
+    pub netid: String,
+}
+
+/// DHCP vendor class entry (C: `struct dhcp_vendor`).
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone)]
+pub struct DhcpVendor {
+    pub data: Vec<u8>,
+    pub len: usize,
+    pub match_type: i32,
+    pub netid: String,
+}
+
+/// DHCP MAC match entry (C: `struct dhcp_mac`).
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone)]
+pub struct DhcpMac {
+    pub hwaddr: Vec<u8>,
+    pub hwaddr_len: usize,
+    pub hwaddr_type: u16,
+    pub netid: String,
+}
+
+/// DHCP boot configuration (C: `struct dhcp_boot`).
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone)]
+pub struct DhcpBoot {
+    pub file: Option<String>,
+    pub sname: Option<String>,
+    pub next_server: Option<Ipv4Addr>,
+    pub netid: Option<String>,
+}
+
+/// PXE service entry (C: `struct pxe_service`).
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone)]
+pub struct PxeService {
+    pub menu: String,
+    pub basename: Option<String>,
+    pub sname: Option<String>,
+    pub server: Option<Ipv4Addr>,
+    pub csa: u16,
+    pub service_type: u16,
+}
+
+/// Tag-based conditional settings (C: `struct tag_if`).
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone)]
+pub struct TagIf {
+    pub tag: String,
+    pub set: Vec<String>,
+}
+
+/// DHCP relay configuration (C: `struct dhcp_relay`).
+#[cfg(any(feature = "dhcp", feature = "dhcp6"))]
+#[derive(Debug, Clone)]
+pub struct DhcpRelay {
+    pub local: std::net::IpAddr,
+    pub server: std::net::IpAddr,
+    pub interface: Option<String>,
+}
+
+/// Delay configuration (C: `struct delay_config`).
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone)]
+pub struct DelayConfig {
+    pub delay: u32,
+    pub netid: Option<String>,
+}
+
+/// DHCP netid list entry (C: `struct dhcp_netid_list`).
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone)]
+pub struct DhcpNetIdList {
+    pub list: Vec<String>,
+}
+
+/// DNS doctor entry for address rewriting (C: `struct doctor`).
+#[derive(Debug, Clone)]
+pub struct Doctor {
+    pub in_addr: Ipv4Addr,
+    pub end: Ipv4Addr,
+    pub out: Ipv4Addr,
+    pub mask: Ipv4Addr,
+}
+
+/// Per-interface TFTP prefix (C: `struct tftp_prefix`).
+#[cfg(feature = "tftp")]
+#[derive(Debug, Clone)]
+pub struct TftpPrefix {
+    pub interface: String,
+    pub prefix: String,
+}
+
+/// DNSSEC DS trust anchor config (C: `struct ds_config`).
+#[cfg(feature = "dnssec")]
+#[derive(Debug, Clone)]
+pub struct DsConfig {
+    pub name: String,
+    pub keytag: u16,
+    pub algo: u8,
+    pub digest_type: u8,
+    pub digest: Vec<u8>,
+}
+
+/// Forwarding record entry (C: `struct frec`).
+#[derive(Debug, Clone)]
+pub struct ForwardRecord {
+    pub new_id: u16,
+    pub sentto: Option<usize>,
+    pub fd: i32,
+    pub time: i64,
+    pub flags: u32,
+}
+
+/// Server file descriptor entry (C: `struct serverfd`).
+#[derive(Debug, Clone)]
+pub struct ServerFd {
+    pub fd: i32,
+    pub source_addr: SocketAddr,
+    pub interface: Option<String>,
+    pub used: bool,
+}
+
+/// Interface record (C: `struct irec`).
+#[derive(Debug, Clone)]
+pub struct InterfaceRecord {
+    pub addr: std::net::IpAddr,
+    pub netmask: Option<std::net::IpAddr>,
+    pub name: String,
+    pub index: u32,
+    pub label: i32,
+    pub flags: u32,
+}
+
+/// Listener entry (C: `struct listener`).
+#[derive(Debug, Clone)]
+pub struct Listener {
+    pub fd: i32,
+    pub tcpfd: i32,
+    pub tftpfd: i32,
+    pub family: i32,
+    pub iface: Option<usize>,
+}
+
+/// Random socket fd (C: `struct randfd`).
+#[derive(Debug, Clone)]
+pub struct RandFd {
+    pub fd: i32,
+    pub refcount: u16,
+    pub family: i32,
+}
+
+/// Address entry (C: `struct addrlist`).
+#[derive(Debug, Clone)]
+pub struct AddrEntry {
+    pub addr: std::net::IpAddr,
+    pub prefix_len: u8,
+    pub flags: u32,
+}
+
+/// DHCP bridge mapping (C: `struct dhcp_bridge`).
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone)]
+pub struct DhcpBridge {
+    pub iface: String,
+    pub alias: Vec<String>,
+}
+
+/// Shared network mapping (C: `struct shared_network`).
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone)]
+pub struct SharedNetwork {
+    pub if_index: u32,
+    pub match_addr: std::net::IpAddr,
+}
+
+// ---------------------------------------------------------------------------
 // DaemonState  (replaces C global struct daemon, dnsmasq.h lines 1343–1526)
 // ---------------------------------------------------------------------------
 
@@ -709,6 +1089,49 @@ pub struct DaemonState {
     /// Path to an additional servers-file, if configured.
     pub servers_file: Option<String>,
 
+    /// MX/SRV record list (C: `struct mx_srv_record *mxnames`).
+    pub mxnames: Vec<MxSrvRecord>,
+
+    /// NAPTR record list (C: `struct naptr *naptr`).
+    pub naptr: Vec<NaptrRecord>,
+
+    /// TXT record list (C: `struct txt_record *txt`).
+    pub txt_records: Vec<TxtRecord>,
+
+    /// Custom RR record list (C: `struct txt_record *rr`).
+    pub rr_records: Vec<TxtRecord>,
+
+    /// PTR record list (C: `struct ptr_record *ptr`).
+    pub ptr_records: Vec<PtrRecord>,
+
+    /// RR types to cache (C: `struct rrlist *cache_rr`).
+    pub cache_rr: Vec<u16>,
+
+    /// RR types to filter (C: `struct rrlist *filter_rr`).
+    pub filter_rr: Vec<u16>,
+
+    /// Host record list (C: `struct host_record *host_records`).
+    pub host_records: Vec<HostRecord>,
+
+    /// CNAME alias list (C: `struct cname *cnames`).
+    pub cnames: Vec<CnameRecord>,
+
+    /// Authoritative DNS zones (C: `struct auth_zone *auth_zones`).
+    #[cfg(feature = "auth")]
+    pub auth_zones: Vec<AuthZone>,
+
+    /// Interface-to-name mappings (C: `struct interface_name *int_names`).
+    pub int_names: Vec<InterfaceName>,
+
+    /// MX target host (C: `char *mxtarget`).
+    pub mxtarget: Option<String>,
+
+    /// Client subnet for EDNS0 IPv4 (C: `struct mysubnet *add_subnet4`).
+    pub add_subnet4: Option<MySubnet>,
+
+    /// Client subnet for EDNS0 IPv6 (C: `struct mysubnet *add_subnet6`).
+    pub add_subnet6: Option<MySubnet>,
+
     /// Path to the DHCP lease file.
     pub lease_file: Option<String>,
 
@@ -718,8 +1141,109 @@ pub struct DaemonState {
     /// Unprivileged group name to switch to after binding ports.
     pub groupname: Option<String>,
 
+    /// Script execution user (C: `char *scriptuser`).
+    #[cfg(feature = "script")]
+    pub scriptuser: Option<String>,
+
+    /// Lua script path (C: `char *luascript`).
+    #[cfg(feature = "luascript")]
+    pub luascript: Option<String>,
+
+    /// Authoritative DNS server name (C: `char *authserver`).
+    #[cfg(feature = "auth")]
+    pub authserver: Option<String>,
+
+    /// SOA hostmaster email (C: `char *hostmaster`).
+    #[cfg(feature = "auth")]
+    pub hostmaster: Option<String>,
+
+    /// Auth interface list (C: `struct iname *authinterface`).
+    #[cfg(feature = "auth")]
+    pub authinterface: Vec<IfName>,
+
+    /// Secondary forward server list (C: `struct name_list *secondary_forward_server`).
+    pub secondary_forward_server: Vec<String>,
+
+    /// Group set flag (C: `int group_set`).
+    pub group_set: bool,
+
+    /// OS port flag (C: `int osport`).
+    pub osport: bool,
+
     /// Domain suffix appended to DHCP hostnames.
     pub domain_suffix: Option<String>,
+
+    /// Conditional domain list (C: `struct cond_domain *cond_domain`).
+    pub cond_domain: Vec<CondDomain>,
+
+    /// Synthetic domain list (C: `struct cond_domain *synth_domains`).
+    pub synth_domains: Vec<CondDomain>,
+
+    /// PID file path (C: `char *runfile`).
+    pub runfile: Option<String>,
+
+    /// Lease change command (C: `char *lease_change_command`).
+    #[cfg(feature = "script")]
+    pub lease_change_command: Option<String>,
+
+    /// Listen interface name filters (C: `struct iname *if_names`).
+    pub if_names: Vec<IfName>,
+
+    /// Listen interface address filters (C: `struct iname *if_addrs`).
+    pub if_addrs: Vec<IfName>,
+
+    /// Excluded interface list (C: `struct iname *if_except`).
+    pub if_except: Vec<IfName>,
+
+    /// DHCP-excluded interface list (C: `struct iname *dhcp_except`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_except: Vec<IfName>,
+
+    /// Auth peer list (C: `struct iname *auth_peers`).
+    #[cfg(feature = "auth")]
+    pub auth_peers: Vec<IfName>,
+
+    /// TFTP interface list (C: `struct iname *tftp_interfaces`).
+    #[cfg(feature = "tftp")]
+    pub tftp_interfaces: Vec<IfName>,
+
+    /// Bogus address list (C: `struct bogus_addr *bogus_addr`).
+    pub bogus_addr: Vec<BogusAddr>,
+
+    /// Ignore address list (C: `struct bogus_addr *ignore_addr`).
+    pub ignore_addr: Vec<BogusAddr>,
+
+    /// Upstream DNS server list (C: `struct server *servers`).
+    pub servers: Vec<ServerEntry>,
+
+    /// Local-only domain list (C: `struct server *local_domains`).
+    pub local_domains: Vec<ServerEntry>,
+
+    /// Flat server array for random/round-robin (C: `struct server **serverarray`).
+    pub serverarray: Vec<usize>,
+
+    /// Rebind domain exclusion list (C: `struct rebind_domain *no_rebind`).
+    pub no_rebind: Vec<String>,
+
+    /// Whether any server entry has a wildcard domain (C: `int server_has_wildcard`).
+    pub server_has_wildcard: bool,
+
+    /// Server array high water mark (C: `int serverarrayhwm`).
+    pub serverarrayhwm: usize,
+
+    /// ipset configuration list (C: `struct ipsets *ipsets`).
+    #[cfg(feature = "ipset")]
+    pub ipsets: Vec<IpsetEntry>,
+
+    /// nftables set configuration list (C: `struct ipsets *nftsets`).
+    #[cfg(feature = "nftset")]
+    pub nftsets: Vec<IpsetEntry>,
+
+    /// Connmark allowlist mask (C: `u32 allowlist_mask`).
+    pub allowlist_mask: u32,
+
+    /// Connmark allowlists (C: `struct allowlist *allowlists`).
+    pub allowlists: Vec<AllowlistEntry>,
 
     /// Syslog facility code (default `LOG_DAEMON`).
     pub log_fac: i32,
@@ -770,6 +1294,27 @@ pub struct DaemonState {
     /// TTL set on DHCP-derived DNS records.
     pub dhcp_ttl: u32,
 
+    /// Use DHCP-derived TTL (C: `unsigned long use_dhcp_ttl`).
+    pub use_dhcp_ttl: u32,
+
+    /// DNS client ID string (C: `char *dns_client_id`).
+    pub dns_client_id: Option<String>,
+
+    /// Umbrella org ID (C: `u32 umbrella_org`).
+    pub umbrella_org: u32,
+
+    /// Umbrella asset ID (C: `u32 umbrella_asset`).
+    pub umbrella_asset: u32,
+
+    /// Umbrella device ID (C: `u8 umbrella_device[8]`).
+    pub umbrella_device: [u8; 8],
+
+    /// Host file index counter (C: `int host_index`).
+    pub host_index: i32,
+
+    /// Additional hosts file list (C: `struct hostsfile *addn_hosts`).
+    pub addn_hosts: Vec<HostsFile>,
+
     /// Maximum EDNS0 UDP payload size (default [`EDNS_PKTSZ`] = 1232).
     pub edns_pktsz: u16,
 
@@ -779,6 +1324,238 @@ pub struct DaemonState {
     /// Maximum concurrent TCP connections (default [`MAX_PROCS`] = 20).
     pub max_procs: i32,
 
+    /// Maximum TCP connections used high water mark (C: `uint max_procs_used`).
+    pub max_procs_used: u32,
+
+    // =================================================================
+    // DHCP configuration (C lines 1389–1430)
+    // =================================================================
+    /// DHCPv4 context list (C: `struct dhcp_context *dhcp`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_contexts: Vec<DhcpContextEntry>,
+
+    /// DHCPv6 context list (C: `struct dhcp_context *dhcp6`).
+    #[cfg(feature = "dhcp6")]
+    pub dhcp6_contexts: Vec<DhcpContextEntry>,
+
+    /// Router Advertisement interface list (C: `struct ra_interface *ra_interfaces`).
+    #[cfg(feature = "dhcp6")]
+    pub ra_interfaces: Vec<RaInterface>,
+
+    /// DHCP host configuration list (C: `struct dhcp_config *dhcp_conf`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_conf: Vec<DhcpConfigEntry>,
+
+    /// DHCPv4 option list (C: `struct dhcp_opt *dhcp_opts`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_opts: Vec<DhcpOptEntry>,
+
+    /// DHCPv4 match options (C: `struct dhcp_opt *dhcp_match`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_match: Vec<DhcpOptEntry>,
+
+    /// DHCPv6 option list (C: `struct dhcp_opt *dhcp_opts6`).
+    #[cfg(feature = "dhcp6")]
+    pub dhcp_opts6: Vec<DhcpOptEntry>,
+
+    /// DHCPv6 match options (C: `struct dhcp_opt *dhcp_match6`).
+    #[cfg(feature = "dhcp6")]
+    pub dhcp_match6: Vec<DhcpOptEntry>,
+
+    /// DHCP name match list (C: `struct dhcp_match_name *dhcp_name_match`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_name_match: Vec<DhcpNameMatch>,
+
+    /// DHCP PXE vendor list (C: `struct dhcp_pxe_vendor *dhcp_pxe_vendors`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_pxe_vendors: Vec<String>,
+
+    /// DHCP vendor class list (C: `struct dhcp_vendor *dhcp_vendors`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_vendors: Vec<DhcpVendor>,
+
+    /// DHCP MAC match list (C: `struct dhcp_mac *dhcp_macs`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_macs: Vec<DhcpMac>,
+
+    /// DHCP boot configuration (C: `struct dhcp_boot *boot_config`).
+    #[cfg(feature = "dhcp")]
+    pub boot_config: Option<DhcpBoot>,
+
+    /// PXE service list (C: `struct pxe_service *pxe_services`).
+    #[cfg(feature = "dhcp")]
+    pub pxe_services: Vec<PxeService>,
+
+    /// Tag-based conditional settings (C: `struct tag_if *tag_if`).
+    #[cfg(feature = "dhcp")]
+    pub tag_if: Vec<TagIf>,
+
+    /// Override relay list (C: `struct addr_list *override_relays`).
+    #[cfg(feature = "dhcp")]
+    pub override_relays: Vec<std::net::IpAddr>,
+
+    /// DHCPv4 relay configuration (C: `struct dhcp_relay *relay4`).
+    #[cfg(feature = "dhcp")]
+    pub relay4: Vec<DhcpRelay>,
+
+    /// DHCPv6 relay configuration (C: `struct dhcp_relay *relay6`).
+    #[cfg(feature = "dhcp6")]
+    pub relay6: Vec<DhcpRelay>,
+
+    /// Delay configuration list (C: `struct delay_config *delay_conf`).
+    #[cfg(feature = "dhcp")]
+    pub delay_conf: Vec<DelayConfig>,
+
+    /// DHCP server override flag (C: `int override`).
+    #[cfg(feature = "dhcp")]
+    pub override_flag: bool,
+
+    /// PXE enable flag (C: `int enable_pxe`).
+    #[cfg(feature = "dhcp")]
+    pub enable_pxe: bool,
+
+    /// Doing Router Advertisements (C: `int doing_ra`).
+    #[cfg(feature = "dhcp6")]
+    pub doing_ra: bool,
+
+    /// Doing DHCPv6 (C: `int doing_dhcp6`).
+    #[cfg(feature = "dhcp6")]
+    pub doing_dhcp6: bool,
+
+    /// DHCP ignore netid list (C: `struct dhcp_netid_list *dhcp_ignore`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_ignore: Vec<DhcpNetIdList>,
+
+    /// DHCP ignore names netid list (C: `struct dhcp_netid_list *dhcp_ignore_names`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_ignore_names: Vec<DhcpNetIdList>,
+
+    /// DHCP generate names netid list (C: `struct dhcp_netid_list *dhcp_gen_names`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_gen_names: Vec<DhcpNetIdList>,
+
+    /// Force broadcast netid list (C: `struct dhcp_netid_list *force_broadcast`).
+    #[cfg(feature = "dhcp")]
+    pub force_broadcast: Vec<DhcpNetIdList>,
+
+    /// BOOTP dynamic netid list (C: `struct dhcp_netid_list *bootp_dynamic`).
+    #[cfg(feature = "dhcp")]
+    pub bootp_dynamic: Vec<DhcpNetIdList>,
+
+    /// DHCP hosts file list (C: `struct hostsfile *dhcp_hosts_file`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_hosts_file: Vec<HostsFile>,
+
+    /// DHCP options file list (C: `struct hostsfile *dhcp_opts_file`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_opts_file: Vec<HostsFile>,
+
+    /// Dynamic directory list (C: `struct dyndir *dynamic_dirs`).
+    pub dynamic_dirs: Vec<DynDir>,
+
+    /// Maximum DHCP leases (C: `int dhcp_max`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_max: i32,
+
+    /// Maximum concurrent TFTP transfers (C: `int tftp_max`).
+    #[cfg(feature = "tftp")]
+    pub tftp_max: i32,
+
+    /// TFTP maximum block size / MTU (C: `int tftp_mtu`).
+    #[cfg(feature = "tftp")]
+    pub tftp_mtu: i32,
+
+    /// DHCP server port (C: `int dhcp_server_port`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_server_port: u16,
+
+    /// DHCP client port (C: `int dhcp_client_port`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_client_port: u16,
+
+    /// TFTP start port (C: `int start_tftp_port`).
+    #[cfg(feature = "tftp")]
+    pub start_tftp_port: u16,
+
+    /// TFTP end port (C: `int end_tftp_port`).
+    #[cfg(feature = "tftp")]
+    pub end_tftp_port: u16,
+
+    /// Minimum lease time (C: `unsigned int min_leasetime`).
+    #[cfg(feature = "dhcp")]
+    pub min_leasetime: u32,
+
+    /// DNS doctor rewrite list (C: `struct doctor *doctors`).
+    pub doctors: Vec<Doctor>,
+
+    /// TFTP file prefix (C: `char *tftp_prefix`).
+    #[cfg(feature = "tftp")]
+    pub tftp_prefix: Option<String>,
+
+    /// Per-interface TFTP prefixes (C: `struct tftp_prefix *if_prefix`).
+    #[cfg(feature = "tftp")]
+    pub if_prefix: Vec<TftpPrefix>,
+
+    /// DUID enterprise number (C: `unsigned int duid_enterprise`).
+    #[cfg(feature = "dhcp6")]
+    pub duid_enterprise: u32,
+
+    /// DUID config data (C: `unsigned char *duid_config` + `duid_config_len`).
+    #[cfg(feature = "dhcp6")]
+    pub duid_config: Vec<u8>,
+
+    /// D-Bus service name (C: `char *dbus_name`).
+    #[cfg(feature = "dbus")]
+    pub dbus_name: Option<String>,
+
+    /// UBus service name (C: `char *ubus_name`).
+    #[cfg(feature = "ubus")]
+    pub ubus_name: Option<String>,
+
+    /// Dump file path (C: `char *dump_file`).
+    #[cfg(feature = "dumpfile")]
+    pub dump_file: Option<String>,
+
+    /// Dump mask (C: `int dump_mask`).
+    #[cfg(feature = "dumpfile")]
+    pub dump_mask: i32,
+
+    /// SOA serial number (C: `unsigned long soa_sn`).
+    #[cfg(feature = "auth")]
+    pub soa_sn: u32,
+
+    /// SOA refresh interval (C: `unsigned long soa_refresh`).
+    #[cfg(feature = "auth")]
+    pub soa_refresh: u32,
+
+    /// SOA retry interval (C: `unsigned long soa_retry`).
+    #[cfg(feature = "auth")]
+    pub soa_retry: u32,
+
+    /// SOA expiry interval (C: `unsigned long soa_expiry`).
+    #[cfg(feature = "auth")]
+    pub soa_expiry: u32,
+
+    /// Fast retry time in ms (C: `int fast_retry_time`).
+    pub fast_retry_time: i32,
+
+    /// Fast retry timeout in ms (C: `int fast_retry_timeout`).
+    pub fast_retry_timeout: i32,
+
+    /// Maximum cache expiry (C: `int cache_max_expiry`).
+    pub cache_max_expiry: i32,
+
+    // =================================================================
+    // DNSSEC configuration (C lines 1439–1445)
+    // =================================================================
+    /// DS trust anchor configs (C: `struct ds_config *ds`).
+    #[cfg(feature = "dnssec")]
+    pub ds: Vec<DsConfig>,
+
+    /// DNSSEC timestamp file path (C: `char *timestamp_file`).
+    #[cfg(feature = "dnssec")]
+    pub timestamp_file: Option<String>,
+
     // =================================================================
     // DNS runtime state  (C lines 1441–1472)
     // =================================================================
@@ -786,8 +1563,84 @@ pub struct DaemonState {
     /// Sized to `edns_pktsz` or 4096, whichever is larger.
     pub packet: Vec<u8>,
 
+    /// Packet buffer size (C: `int packet_buff_sz`).
+    pub packet_buff_sz: usize,
+
     /// Scratch buffer for DNS name assembly (max [`MAXDNAME`] bytes).
     pub namebuff: String,
+
+    /// Workspace name buffer for DNS operations (C: `char *workspacename`).
+    pub workspacename: String,
+
+    /// DNSSEC key name buffer (C: `char *keyname`).
+    #[cfg(feature = "dnssec")]
+    pub keyname: String,
+
+    /// DNSSEC CNAME chase buffer (C: `char *cname`).
+    #[cfg(feature = "dnssec")]
+    pub cname_buf: String,
+
+    /// DNSSEC RR status (TTL ceiling) array (C: `unsigned long *rr_status`).
+    #[cfg(feature = "dnssec")]
+    pub rr_status: Vec<u32>,
+
+    /// DNSSEC no-time-check flag (C: `int dnssec_no_time_check`).
+    #[cfg(feature = "dnssec")]
+    pub dnssec_no_time_check: bool,
+
+    /// DNSSEC back-to-the-future flag (C: `int back_to_the_future`).
+    #[cfg(feature = "dnssec")]
+    pub back_to_the_future: bool,
+
+    /// DNSSEC limits array (C: `int limit[LIMIT_MAX]`).
+    #[cfg(feature = "dnssec")]
+    pub dnssec_limits: Vec<i32>,
+
+    /// Forwarding request list (C: `struct frec *frec_list`).
+    /// Stored as indices into a pool for safety.
+    pub frec_list: Vec<ForwardRecord>,
+
+    /// Free frec_src count (C: `int frec_src_count`).
+    pub frec_src_count: i32,
+
+    /// Server file descriptors (C: `struct serverfd *sfds`).
+    pub sfds: Vec<ServerFd>,
+
+    /// Interface record list (C: `struct irec *interfaces`).
+    pub interfaces: Vec<InterfaceRecord>,
+
+    /// Listener list (C: `struct listener *listeners`).
+    pub listeners: Vec<Listener>,
+
+    /// Saved server pointer for resend/TFTP prefetch (C: `void *srv_save`).
+    pub srv_save: Option<usize>,
+
+    /// Saved packet length for resend (C: `size_t packet_len`).
+    pub packet_len: usize,
+
+    /// Saved fd for resend (C: `int fd_save`).
+    pub fd_save: i32,
+
+    /// TCP child pids (C: `pid_t *tcp_pids`).
+    pub tcp_pids: Vec<i32>,
+
+    /// TCP pipe fds (C: `int *tcp_pipes`).
+    pub tcp_pipes: Vec<i32>,
+
+    /// Pipe to parent fd (C: `int pipe_to_parent`).
+    pub pipe_to_parent: i32,
+
+    /// Number of random ports (C: `int numrrand`).
+    pub numrrand: i32,
+
+    /// Random socket fds (C: `struct randfd *randomsocks`).
+    pub randomsocks: Vec<RandFd>,
+
+    /// IPv6 pktinfo capability flag (C: `int v6pktinfo`).
+    pub v6pktinfo: i32,
+
+    /// All interface addresses (C: `struct addrlist *interface_addrs`).
+    pub interface_addrs: Vec<AddrEntry>,
 
     /// Monotonically increasing log line identifier.
     pub log_id: i32,
@@ -795,9 +1648,36 @@ pub struct DaemonState {
     /// Display variant of [`log_id`](Self::log_id) (may wrap).
     pub log_display_id: i32,
 
+    /// Log source address (C: `union mysockaddr *log_source_addr`).
+    pub log_source_addr: Option<MySockAddr>,
+
     // =================================================================
     // DHCP runtime state  (C lines 1474–1498)
     // =================================================================
+    /// DHCP socket fd (C: `int dhcpfd`).
+    #[cfg(feature = "dhcp")]
+    pub dhcpfd: i32,
+
+    /// Helper process fd (C: `int helperfd`).
+    #[cfg(feature = "script")]
+    pub helperfd: i32,
+
+    /// PXE socket fd (C: `int pxefd`).
+    #[cfg(feature = "dhcp")]
+    pub pxefd: i32,
+
+    /// inotify fd (C: `int inotifyfd`).
+    #[cfg(feature = "inotify")]
+    pub inotifyfd: i32,
+
+    /// Netlink fd (C: `int netlinkfd`).
+    #[cfg(target_os = "linux")]
+    pub netlinkfd: i32,
+
+    /// Kernel version (C: `int kernel_version`).
+    #[cfg(target_os = "linux")]
+    pub kernel_version: i32,
+
     /// Maximum number of concurrent DHCP leases (default [`MAXLEASES`] = 1000).
     #[cfg(feature = "dhcp")]
     pub max_dhcp_leases: i32,
@@ -806,9 +1686,79 @@ pub struct DaemonState {
     #[cfg(feature = "dhcp")]
     pub dhcp_packet: Vec<u8>,
 
+    /// DHCP scratch buffers (C: `char *dhcp_buff, *dhcp_buff2, *dhcp_buff3`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_buff: Vec<u8>,
+    #[cfg(feature = "dhcp")]
+    pub dhcp_buff2: Vec<u8>,
+    #[cfg(feature = "dhcp")]
+    pub dhcp_buff3: Vec<u8>,
+
     /// Results of ICMP ping probes before address offers.
     #[cfg(feature = "dhcp")]
     pub ping_results: Vec<PingResult>,
+
+    /// Lease file stream handle present flag (C: `FILE *lease_stream`).
+    #[cfg(feature = "dhcp")]
+    pub lease_stream_active: bool,
+
+    /// Bridge interface mappings (C: `struct dhcp_bridge *bridges`).
+    #[cfg(feature = "dhcp")]
+    pub bridges: Vec<DhcpBridge>,
+
+    /// Shared network mappings (C: `struct shared_network *shared_networks`).
+    #[cfg(feature = "dhcp")]
+    pub shared_networks: Vec<SharedNetwork>,
+
+    /// DHCPv6 DUID (C: `unsigned char *duid` + `int duid_len`).
+    #[cfg(feature = "dhcp6")]
+    pub duid: Vec<u8>,
+
+    /// DHCPv6 outgoing packet buffer (C: `struct iovec outpacket`).
+    #[cfg(feature = "dhcp6")]
+    pub outpacket: Vec<u8>,
+
+    /// DHCPv6 socket fd (C: `int dhcp6fd`).
+    #[cfg(feature = "dhcp6")]
+    pub dhcp6fd: i32,
+
+    /// ICMPv6 socket fd (C: `int icmp6fd`).
+    #[cfg(feature = "dhcp6")]
+    pub icmp6fd: i32,
+
+    // =================================================================
+    // Integration state
+    // =================================================================
+    /// D-Bus connection handle present flag (C: `void *dbus`).
+    #[cfg(feature = "dbus")]
+    pub dbus_active: bool,
+
+    /// UBus connection handle present flag (C: `void *ubus`).
+    #[cfg(feature = "ubus")]
+    pub ubus_active: bool,
+
+    // =================================================================
+    // TFTP state
+    // =================================================================
+    /// Active TFTP transfer count (C: `struct tftp_transfer *tftp_trans`).
+    #[cfg(feature = "tftp")]
+    pub tftp_transfer_count: usize,
+
+    // =================================================================
+    // Utility buffers
+    // =================================================================
+    /// Address formatting buffer (C: `char *addrbuff`).
+    pub addrbuff: String,
+
+    /// Extra logging address buffer (C: `char *addrbuff2`).
+    pub addrbuff2: Option<String>,
+
+    // =================================================================
+    // Diagnostics
+    // =================================================================
+    /// Dump file fd (C: `int dumpfd`).
+    #[cfg(feature = "dumpfile")]
+    pub dumpfd: i32,
 
     // =================================================================
     // Metrics  (C line 1433: daemon->metrics[__METRIC_MAX])
@@ -828,15 +1778,73 @@ impl DaemonState {
         let pkt_sz = std::cmp::max(EDNS_PKTSZ as usize, 4096);
 
         Self {
-            // --- Configuration defaults ---
+            // =============================================================
+            // Configuration state
+            // =============================================================
             options: OptionFlags::new(),
             resolv_files: Vec::new(),
             last_resolv: 0,
             servers_file: None,
+            mxnames: Vec::new(),
+            naptr: Vec::new(),
+            txt_records: Vec::new(),
+            rr_records: Vec::new(),
+            ptr_records: Vec::new(),
+            cache_rr: Vec::new(),
+            filter_rr: Vec::new(),
+            host_records: Vec::new(),
+            cnames: Vec::new(),
+            #[cfg(feature = "auth")]
+            auth_zones: Vec::new(),
+            int_names: Vec::new(),
+            mxtarget: None,
+            add_subnet4: None,
+            add_subnet6: None,
             lease_file: None,
             username: None,
             groupname: None,
+            #[cfg(feature = "script")]
+            scriptuser: None,
+            #[cfg(feature = "luascript")]
+            luascript: None,
+            #[cfg(feature = "auth")]
+            authserver: None,
+            #[cfg(feature = "auth")]
+            hostmaster: None,
+            #[cfg(feature = "auth")]
+            authinterface: Vec::new(),
+            secondary_forward_server: Vec::new(),
+            group_set: false,
+            osport: true, // C default: daemon->osport = 1
             domain_suffix: None,
+            cond_domain: Vec::new(),
+            synth_domains: Vec::new(),
+            runfile: None,
+            #[cfg(feature = "script")]
+            lease_change_command: None,
+            if_names: Vec::new(),
+            if_addrs: Vec::new(),
+            if_except: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_except: Vec::new(),
+            #[cfg(feature = "auth")]
+            auth_peers: Vec::new(),
+            #[cfg(feature = "tftp")]
+            tftp_interfaces: Vec::new(),
+            bogus_addr: Vec::new(),
+            ignore_addr: Vec::new(),
+            servers: Vec::new(),
+            local_domains: Vec::new(),
+            serverarray: Vec::new(),
+            no_rebind: Vec::new(),
+            server_has_wildcard: false,
+            serverarrayhwm: 0,
+            #[cfg(feature = "ipset")]
+            ipsets: Vec::new(),
+            #[cfg(feature = "nftset")]
+            nftsets: Vec::new(),
+            allowlist_mask: 0,
+            allowlists: Vec::new(),
             log_fac: -1, // LOG_DAEMON numeric value set later
             log_file: None,
             max_logs: 5, // LOG_MAX from config.h
@@ -853,25 +1861,244 @@ impl DaemonState {
             max_cache_ttl: 0,
             auth_ttl: 0,
             dhcp_ttl: 0,
+            use_dhcp_ttl: 0,
+            dns_client_id: None,
+            umbrella_org: 0,
+            umbrella_asset: 0,
+            umbrella_device: [0u8; 8],
+            host_index: 0,
+            addn_hosts: Vec::new(),
             edns_pktsz: EDNS_PKTSZ,
             randport_limit: 1,
             max_procs: MAX_PROCS as i32,
+            max_procs_used: 0,
 
-            // --- DNS state ---
+            // =============================================================
+            // DHCP configuration
+            // =============================================================
+            #[cfg(feature = "dhcp")]
+            dhcp_contexts: Vec::new(),
+            #[cfg(feature = "dhcp6")]
+            dhcp6_contexts: Vec::new(),
+            #[cfg(feature = "dhcp6")]
+            ra_interfaces: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_conf: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_opts: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_match: Vec::new(),
+            #[cfg(feature = "dhcp6")]
+            dhcp_opts6: Vec::new(),
+            #[cfg(feature = "dhcp6")]
+            dhcp_match6: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_name_match: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_pxe_vendors: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_vendors: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_macs: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            boot_config: None,
+            #[cfg(feature = "dhcp")]
+            pxe_services: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            tag_if: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            override_relays: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            relay4: Vec::new(),
+            #[cfg(feature = "dhcp6")]
+            relay6: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            delay_conf: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            override_flag: false,
+            #[cfg(feature = "dhcp")]
+            enable_pxe: false,
+            #[cfg(feature = "dhcp6")]
+            doing_ra: false,
+            #[cfg(feature = "dhcp6")]
+            doing_dhcp6: false,
+            #[cfg(feature = "dhcp")]
+            dhcp_ignore: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_ignore_names: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_gen_names: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            force_broadcast: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            bootp_dynamic: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_hosts_file: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_opts_file: Vec::new(),
+            dynamic_dirs: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_max: MAXLEASES as i32,
+            #[cfg(feature = "tftp")]
+            tftp_max: 50, // TFTP_MAX_CONNECTIONS
+            #[cfg(feature = "tftp")]
+            tftp_mtu: 0,
+            #[cfg(feature = "dhcp")]
+            dhcp_server_port: 67,
+            #[cfg(feature = "dhcp")]
+            dhcp_client_port: 68,
+            #[cfg(feature = "tftp")]
+            start_tftp_port: 0,
+            #[cfg(feature = "tftp")]
+            end_tftp_port: 0,
+            #[cfg(feature = "dhcp")]
+            min_leasetime: 120,
+            doctors: Vec::new(),
+            #[cfg(feature = "tftp")]
+            tftp_prefix: None,
+            #[cfg(feature = "tftp")]
+            if_prefix: Vec::new(),
+            #[cfg(feature = "dhcp6")]
+            duid_enterprise: 0,
+            #[cfg(feature = "dhcp6")]
+            duid_config: Vec::new(),
+            #[cfg(feature = "dbus")]
+            dbus_name: None,
+            #[cfg(feature = "ubus")]
+            ubus_name: None,
+            #[cfg(feature = "dumpfile")]
+            dump_file: None,
+            #[cfg(feature = "dumpfile")]
+            dump_mask: 0,
+            #[cfg(feature = "auth")]
+            soa_sn: 0,
+            #[cfg(feature = "auth")]
+            soa_refresh: 1200, // SOA_REFRESH default
+            #[cfg(feature = "auth")]
+            soa_retry: 180, // SOA_RETRY default
+            #[cfg(feature = "auth")]
+            soa_expiry: 1_209_600, // SOA_EXPIRY default (2 weeks)
+            fast_retry_time: 0,
+            fast_retry_timeout: 0,
+            cache_max_expiry: 0,
+
+            // =============================================================
+            // DNSSEC configuration
+            // =============================================================
+            #[cfg(feature = "dnssec")]
+            ds: Vec::new(),
+            #[cfg(feature = "dnssec")]
+            timestamp_file: None,
+
+            // =============================================================
+            // DNS runtime state
+            // =============================================================
             packet: vec![0u8; pkt_sz],
+            packet_buff_sz: pkt_sz,
             namebuff: String::with_capacity(MAXDNAME),
+            workspacename: String::with_capacity(MAXDNAME),
+            #[cfg(feature = "dnssec")]
+            keyname: String::with_capacity(MAXDNAME),
+            #[cfg(feature = "dnssec")]
+            cname_buf: String::with_capacity(MAXDNAME),
+            #[cfg(feature = "dnssec")]
+            rr_status: Vec::new(),
+            #[cfg(feature = "dnssec")]
+            dnssec_no_time_check: false,
+            #[cfg(feature = "dnssec")]
+            back_to_the_future: false,
+            #[cfg(feature = "dnssec")]
+            dnssec_limits: Vec::new(),
+            frec_list: Vec::new(),
+            frec_src_count: 0,
+            sfds: Vec::new(),
+            interfaces: Vec::new(),
+            listeners: Vec::new(),
+            srv_save: None,
+            packet_len: 0,
+            fd_save: -1,
+            tcp_pids: Vec::new(),
+            tcp_pipes: Vec::new(),
+            pipe_to_parent: -1,
+            numrrand: 0,
+            randomsocks: Vec::new(),
+            v6pktinfo: 0,
+            interface_addrs: Vec::new(),
             log_id: 0,
             log_display_id: 0,
+            log_source_addr: None,
 
-            // --- DHCP state ---
+            // =============================================================
+            // DHCP runtime state
+            // =============================================================
+            #[cfg(feature = "dhcp")]
+            dhcpfd: -1,
+            #[cfg(feature = "script")]
+            helperfd: -1,
+            #[cfg(feature = "dhcp")]
+            pxefd: -1,
+            #[cfg(feature = "inotify")]
+            inotifyfd: -1,
+            #[cfg(target_os = "linux")]
+            netlinkfd: -1,
+            #[cfg(target_os = "linux")]
+            kernel_version: 0,
             #[cfg(feature = "dhcp")]
             max_dhcp_leases: MAXLEASES as i32,
             #[cfg(feature = "dhcp")]
             dhcp_packet: Vec::with_capacity(4096),
             #[cfg(feature = "dhcp")]
+            dhcp_buff: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_buff2: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            dhcp_buff3: Vec::new(),
+            #[cfg(feature = "dhcp")]
             ping_results: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            lease_stream_active: false,
+            #[cfg(feature = "dhcp")]
+            bridges: Vec::new(),
+            #[cfg(feature = "dhcp")]
+            shared_networks: Vec::new(),
+            #[cfg(feature = "dhcp6")]
+            duid: Vec::new(),
+            #[cfg(feature = "dhcp6")]
+            outpacket: Vec::new(),
+            #[cfg(feature = "dhcp6")]
+            dhcp6fd: -1,
+            #[cfg(feature = "dhcp6")]
+            icmp6fd: -1,
 
-            // --- Metrics ---
+            // =============================================================
+            // Integration state
+            // =============================================================
+            #[cfg(feature = "dbus")]
+            dbus_active: false,
+            #[cfg(feature = "ubus")]
+            ubus_active: false,
+
+            // =============================================================
+            // TFTP state
+            // =============================================================
+            #[cfg(feature = "tftp")]
+            tftp_transfer_count: 0,
+
+            // =============================================================
+            // Utility buffers
+            // =============================================================
+            addrbuff: String::with_capacity(64),
+            addrbuff2: None,
+
+            // =============================================================
+            // Diagnostics
+            // =============================================================
+            #[cfg(feature = "dumpfile")]
+            dumpfd: -1,
+
+            // =============================================================
+            // Metrics
+            // =============================================================
             metrics: vec![0u32; METRIC_MAX],
         }
     }

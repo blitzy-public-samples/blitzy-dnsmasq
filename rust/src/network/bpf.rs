@@ -139,8 +139,39 @@ const IFACE_PERMANENT: u32 = 4;
 // `libc::rt_msghdr` is only available on macOS; FreeBSD/OpenBSD need local
 // definitions. We define the struct ourselves for cross-BSD portability.
 
-/// BSD routing message header (mirrors C `struct rt_msghdr`).
+/// BSD routing metrics (mirrors C `struct rt_metrics` from `<net/route.h>`).
+/// Included in [`rt_msghdr_local`] so that `size_of::<rt_msghdr_local>()`
+/// correctly accounts for the metrics and socket addresses are parsed from
+/// the correct offset (immediately following the full header).
+///
+/// FreeBSD defines 14 `u_long` fields in `rt_metrics`. The exact field names
+/// vary between BSD variants, but the total size is consistent at
+/// `14 * sizeof(c_ulong)` across FreeBSD, NetBSD, and macOS.
+#[repr(C)]
+#[allow(non_camel_case_types, dead_code)]
+struct rt_metrics_local {
+    rmx_locks: libc::c_ulong,
+    rmx_mtu: libc::c_ulong,
+    rmx_hopcount: libc::c_ulong,
+    rmx_expire: libc::c_ulong,
+    rmx_recvpipe: libc::c_ulong,
+    rmx_sendpipe: libc::c_ulong,
+    rmx_ssthresh: libc::c_ulong,
+    rmx_rtt: libc::c_ulong,
+    rmx_rttvar: libc::c_ulong,
+    rmx_pksent: libc::c_ulong,
+    rmx_weight: libc::c_ulong,
+    rmx_nhidx: libc::c_ulong,
+    rmx_filler: [libc::c_ulong; 2],
+}
+
+/// BSD routing message header (mirrors C `struct rt_msghdr` from `<net/route.h>`).
 /// Used to parse sysctl ARP table responses in [`arp_enumerate_bsd()`].
+///
+/// The full struct — including [`rt_metrics_local`] — must be defined so that
+/// `size_of::<rt_msghdr_local>()` matches the kernel's `sizeof(struct rt_msghdr)`.
+/// Socket addresses follow immediately after the header in the sysctl buffer,
+/// so an undersized struct would cause address parsing at the wrong offset.
 #[repr(C)]
 #[allow(non_camel_case_types, dead_code)]
 struct rt_msghdr_local {
@@ -148,6 +179,7 @@ struct rt_msghdr_local {
     rtm_version: libc::c_uchar,
     rtm_type: libc::c_uchar,
     rtm_index: libc::c_ushort,
+    _rtm_spare1: libc::c_ushort,
     rtm_flags: libc::c_int,
     rtm_addrs: libc::c_int,
     rtm_pid: libc::pid_t,
@@ -155,7 +187,7 @@ struct rt_msghdr_local {
     rtm_errno: libc::c_int,
     rtm_fmask: libc::c_int,
     _rtm_inits: libc::c_ulong,
-    // rt_metrics follows but we don't need it
+    _rtm_rmx: rt_metrics_local,
 }
 
 // ---------------------------------------------------------------------------
@@ -866,8 +898,10 @@ fn get_ipv6_addr_info(iface_name: &str, addr: &Ipv6Addr) -> (u32, u32, u32) {
             }
         }
 
-        // Close temporary socket.
-        libc::close(raw_fd);
+        // The temporary socket (`fd`, an OwnedFd) is closed automatically
+        // when it drops at the end of this function via its Drop impl.
+        // No manual libc::close() needed — doing so would cause a double-close
+        // since OwnedFd also closes the fd on drop.
     }
 
     (flags, preferred, valid)

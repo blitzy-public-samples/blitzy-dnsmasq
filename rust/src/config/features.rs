@@ -536,6 +536,12 @@ pub fn compile_options_string() -> String {
     // GNU-getopt (always available in Rust via clap)
     opts.push_str("GNU-getopt ");
 
+    // Broken-RTC flag: Rust implementation does not assume a broken RTC,
+    // but we include the token in the output for completeness. In C this is
+    // controlled by the HAVE_BROKEN_RTC preprocessor macro. Since Rust uses
+    // the system clock normally, we do not emit "no-RTC".
+    // If a future build-time flag is added, gate this accordingly.
+
     // Feature flags — format matches C compile_opts exactly
     if !has_dbus() {
         opts.push_str("no-");
@@ -547,10 +553,19 @@ pub fn compile_options_string() -> String {
     }
     opts.push_str("UBus ");
 
-    if !has_idn() {
-        opts.push_str("no-");
+    // i18n (internationalization/locale support): In C, controlled by
+    // LOCALEDIR being defined. Rust does not use gettext/LOCALEDIR, so
+    // we emit "no-i18n" to accurately reflect no locale translation support.
+    opts.push_str("no-i18n ");
+
+    // IDN: C distinguishes HAVE_LIBIDN2 (emits "IDN2") from HAVE_IDN
+    // (emits "IDN"). Rust uses the `idna` crate which implements IDNA 2008
+    // (equivalent to libidn2), so we emit "IDN2" when the feature is enabled.
+    if has_idn() {
+        opts.push_str("IDN2 ");
+    } else {
+        opts.push_str("no-IDN ");
     }
-    opts.push_str("IDN ");
 
     if !has_dhcp() {
         opts.push_str("no-");
@@ -602,6 +617,12 @@ pub fn compile_options_string() -> String {
         opts.push_str("no-");
     }
     opts.push_str("DNSSEC ");
+
+    // NO_ID: In C, controlled by the NO_ID preprocessor macro which
+    // disables CHAOS TXT identity responses at compile time. In Rust,
+    // identity support is always compiled in (controlled at runtime via
+    // the --no-ident flag / OPT_NO_IDENT), so we never emit "no-ID".
+    // This matches the default C build where NO_ID is not defined.
 
     if !has_loop_detect() {
         opts.push_str("no-");

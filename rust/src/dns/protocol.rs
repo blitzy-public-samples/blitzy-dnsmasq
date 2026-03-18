@@ -111,34 +111,63 @@ pub const HB4_RCODE: u8 = 0x0f;
 // ===========================================================================
 
 /// DNS response codes (RCODE) per RFC 1035 Section 4.1.1.
+///
+/// The [`Unknown`](Self::Unknown) variant preserves raw RCODE values
+/// that fall outside the standard 0-5 range, matching C dnsmasq's
+/// behavior of passing raw RCODE values through without remapping.
+/// This prevents incorrect error handling (e.g., treating RCODE=9
+/// NOTAUTH as success).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
 pub enum ResponseCode {
     /// No error condition.
-    NoError = 0,
+    NoError,
     /// Format error — server unable to interpret the query.
-    FormErr = 1,
+    FormErr,
     /// Server failure — unable to process due to internal error.
-    ServFail = 2,
+    ServFail,
     /// Non-Existent Domain — the queried domain name does not exist.
-    NxDomain = 3,
+    NxDomain,
     /// Not Implemented — server does not support the requested operation.
-    NotImp = 4,
+    NotImp,
     /// Query Refused — server refuses to perform the operation.
-    Refused = 5,
+    Refused,
+    /// Unknown/reserved RCODE — preserves the original wire value.
+    ///
+    /// RCODEs 6-15 are either reserved or defined by later RFCs
+    /// (e.g., 9 = NOTAUTH, 10 = NOTZONE).  C dnsmasq passes these
+    /// through as raw values; this variant does the same.
+    Unknown(u8),
 }
 
 impl ResponseCode {
-    /// Convert a raw `u8` to a [`ResponseCode`], returning `None` for unknown codes.
-    pub fn from_u8(v: u8) -> Option<Self> {
+    /// Convert a raw `u8` to a [`ResponseCode`].
+    ///
+    /// Known codes (0-5) are mapped to their named variants.
+    /// Unrecognised codes are preserved as [`ResponseCode::Unknown(u8)`],
+    /// matching C dnsmasq's behavior of passing raw values through
+    /// without corruption.
+    pub fn from_u8(v: u8) -> Self {
         match v {
-            0 => Some(Self::NoError),
-            1 => Some(Self::FormErr),
-            2 => Some(Self::ServFail),
-            3 => Some(Self::NxDomain),
-            4 => Some(Self::NotImp),
-            5 => Some(Self::Refused),
-            _ => None,
+            0 => Self::NoError,
+            1 => Self::FormErr,
+            2 => Self::ServFail,
+            3 => Self::NxDomain,
+            4 => Self::NotImp,
+            5 => Self::Refused,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Convert to the raw `u8` wire-format value.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::NoError => 0,
+            Self::FormErr => 1,
+            Self::ServFail => 2,
+            Self::NxDomain => 3,
+            Self::NotImp => 4,
+            Self::Refused => 5,
+            Self::Unknown(v) => v,
         }
     }
 }
@@ -152,6 +181,7 @@ impl fmt::Display for ResponseCode {
             Self::NxDomain => write!(f, "NXDOMAIN"),
             Self::NotImp => write!(f, "NOTIMP"),
             Self::Refused => write!(f, "REFUSED"),
+            Self::Unknown(v) => write!(f, "RCODE({})", v),
         }
     }
 }
@@ -210,131 +240,182 @@ impl fmt::Display for DnsClass {
 /// DNS resource record types per RFC 1035 and subsequent RFCs.
 ///
 /// Covers all types referenced by dnsmasq including obsolete types
-/// retained for protocol completeness.
+/// retained for protocol completeness.  The [`Unknown`](Self::Unknown)
+/// variant preserves raw type codes for types not explicitly handled,
+/// matching C dnsmasq's behavior of passing unrecognized type values
+/// through the DNS pipeline without remapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u16)]
 pub enum RRType {
     /// IPv4 host address (RFC 1035).
-    A = 1,
+    A,
     /// Authoritative name server (RFC 1035).
-    NS = 2,
+    NS,
     /// Mail destination — obsolete, use MX (RFC 1035).
-    MD = 3,
+    MD,
     /// Mail forwarder — obsolete, use MX (RFC 1035).
-    MF = 4,
+    MF,
     /// Canonical name alias (RFC 1035).
-    CNAME = 5,
+    CNAME,
     /// Start of zone authority (RFC 1035).
-    SOA = 6,
+    SOA,
     /// Mailbox domain name — experimental (RFC 1035).
-    MB = 7,
+    MB,
     /// Mail group member — experimental (RFC 1035).
-    MG = 8,
+    MG,
     /// Mail rename domain — experimental (RFC 1035).
-    MR = 9,
+    MR,
     /// Domain name pointer for reverse DNS (RFC 1035).
-    PTR = 12,
+    PTR,
     /// Mailbox info — experimental (RFC 1035).
-    MINFO = 14,
+    MINFO,
     /// Mail exchange (RFC 1035).
-    MX = 15,
+    MX,
     /// Text strings (RFC 1035).
-    TXT = 16,
+    TXT,
     /// Responsible person (RFC 1183).
-    RP = 17,
+    RP,
     /// AFS database location (RFC 1183).
-    AFSDB = 18,
+    AFSDB,
     /// Route through (RFC 1183).
-    RT = 21,
+    RT,
     /// Security signature — obsolete DNSSEC (RFC 2535).
-    SIG = 24,
+    SIG,
     /// X.400 mail mapping (RFC 2163).
-    PX = 26,
+    PX,
     /// IPv6 host address (RFC 3596).
-    AAAA = 28,
+    AAAA,
     /// Next domain — obsolete DNSSEC (RFC 2535).
-    NXT = 30,
+    NXT,
     /// Service locator (RFC 2782).
-    SRV = 33,
+    SRV,
     /// Naming authority pointer (RFC 2915).
-    NAPTR = 35,
+    NAPTR,
     /// Key exchange delegation (RFC 2230).
-    KX = 36,
+    KX,
     /// Delegation name (RFC 6672).
-    DNAME = 39,
+    DNAME,
     /// EDNS0 pseudo-RR (RFC 6891).
-    OPT = 41,
+    OPT,
     /// Delegation signer — DNSSEC (RFC 4034).
-    DS = 43,
+    DS,
     /// DNSSEC signature (RFC 4034).
-    RRSIG = 46,
+    RRSIG,
     /// DNSSEC authenticated denial of existence (RFC 4034).
-    NSEC = 47,
+    NSEC,
     /// DNSSEC public key (RFC 4034).
-    DNSKEY = 48,
+    DNSKEY,
     /// Hashed authenticated denial — DNSSEC (RFC 5155).
-    NSEC3 = 50,
+    NSEC3,
     /// Transaction key (RFC 2930).
-    TKEY = 249,
+    TKEY,
     /// Transaction signature (RFC 8945).
-    TSIG = 250,
+    TSIG,
     /// Incremental zone transfer (RFC 1995) — actually AXFR below.
-    AXFR = 252,
+    AXFR,
     /// Mailbox-related RRs (RFC 1035).
-    MAILB = 253,
+    MAILB,
     /// Wildcard match — all record types (RFC 1035).
-    ANY = 255,
+    ANY,
     /// Certification Authority Authorization (RFC 8659).
-    CAA = 257,
+    CAA,
+    /// Unknown/unrecognized RR type — preserves the original wire value.
+    ///
+    /// C dnsmasq passes raw type values through without remapping; this
+    /// variant ensures no information is lost for private-use, experimental,
+    /// or future RR types (e.g., 65280 private-use range).
+    Unknown(u16),
 }
 
 impl RRType {
-    /// Convert a raw `u16` to a known [`RRType`], returning `None` for unrecognised codes.
-    pub fn from_u16(v: u16) -> Option<Self> {
+    /// Convert a raw `u16` wire-format value to an [`RRType`].
+    ///
+    /// Known type codes are mapped to their named variants.
+    /// Unrecognised codes are preserved as [`RRType::Unknown(u16)`],
+    /// matching C dnsmasq's behavior of passing raw values through
+    /// the DNS pipeline without corruption.
+    pub fn from_u16(v: u16) -> Self {
         match v {
-            1 => Some(Self::A),
-            2 => Some(Self::NS),
-            3 => Some(Self::MD),
-            4 => Some(Self::MF),
-            5 => Some(Self::CNAME),
-            6 => Some(Self::SOA),
-            7 => Some(Self::MB),
-            8 => Some(Self::MG),
-            9 => Some(Self::MR),
-            12 => Some(Self::PTR),
-            14 => Some(Self::MINFO),
-            15 => Some(Self::MX),
-            16 => Some(Self::TXT),
-            17 => Some(Self::RP),
-            18 => Some(Self::AFSDB),
-            21 => Some(Self::RT),
-            24 => Some(Self::SIG),
-            26 => Some(Self::PX),
-            28 => Some(Self::AAAA),
-            30 => Some(Self::NXT),
-            33 => Some(Self::SRV),
-            35 => Some(Self::NAPTR),
-            36 => Some(Self::KX),
-            39 => Some(Self::DNAME),
-            41 => Some(Self::OPT),
-            43 => Some(Self::DS),
-            46 => Some(Self::RRSIG),
-            47 => Some(Self::NSEC),
-            48 => Some(Self::DNSKEY),
-            50 => Some(Self::NSEC3),
-            249 => Some(Self::TKEY),
-            250 => Some(Self::TSIG),
-            252 => Some(Self::AXFR),
-            253 => Some(Self::MAILB),
-            255 => Some(Self::ANY),
-            257 => Some(Self::CAA),
-            _ => None,
+            1 => Self::A,
+            2 => Self::NS,
+            3 => Self::MD,
+            4 => Self::MF,
+            5 => Self::CNAME,
+            6 => Self::SOA,
+            7 => Self::MB,
+            8 => Self::MG,
+            9 => Self::MR,
+            12 => Self::PTR,
+            14 => Self::MINFO,
+            15 => Self::MX,
+            16 => Self::TXT,
+            17 => Self::RP,
+            18 => Self::AFSDB,
+            21 => Self::RT,
+            24 => Self::SIG,
+            26 => Self::PX,
+            28 => Self::AAAA,
+            30 => Self::NXT,
+            33 => Self::SRV,
+            35 => Self::NAPTR,
+            36 => Self::KX,
+            39 => Self::DNAME,
+            41 => Self::OPT,
+            43 => Self::DS,
+            46 => Self::RRSIG,
+            47 => Self::NSEC,
+            48 => Self::DNSKEY,
+            50 => Self::NSEC3,
+            249 => Self::TKEY,
+            250 => Self::TSIG,
+            252 => Self::AXFR,
+            253 => Self::MAILB,
+            255 => Self::ANY,
+            257 => Self::CAA,
+            other => Self::Unknown(other),
         }
     }
 
     /// Convert to the raw `u16` wire-format value.
     pub fn to_u16(self) -> u16 {
-        self as u16
+        match self {
+            Self::A => 1,
+            Self::NS => 2,
+            Self::MD => 3,
+            Self::MF => 4,
+            Self::CNAME => 5,
+            Self::SOA => 6,
+            Self::MB => 7,
+            Self::MG => 8,
+            Self::MR => 9,
+            Self::PTR => 12,
+            Self::MINFO => 14,
+            Self::MX => 15,
+            Self::TXT => 16,
+            Self::RP => 17,
+            Self::AFSDB => 18,
+            Self::RT => 21,
+            Self::SIG => 24,
+            Self::PX => 26,
+            Self::AAAA => 28,
+            Self::NXT => 30,
+            Self::SRV => 33,
+            Self::NAPTR => 35,
+            Self::KX => 36,
+            Self::DNAME => 39,
+            Self::OPT => 41,
+            Self::DS => 43,
+            Self::RRSIG => 46,
+            Self::NSEC => 47,
+            Self::DNSKEY => 48,
+            Self::NSEC3 => 50,
+            Self::TKEY => 249,
+            Self::TSIG => 250,
+            Self::AXFR => 252,
+            Self::MAILB => 253,
+            Self::ANY => 255,
+            Self::CAA => 257,
+            Self::Unknown(v) => v,
+        }
     }
 }
 
@@ -509,7 +590,7 @@ impl DnsHeaderFlags {
         if self.cd {
             hb4 |= HB4_CD;
         }
-        hb4 |= (self.rcode as u8) & HB4_RCODE;
+        hb4 |= self.rcode.to_u8() & HB4_RCODE;
 
         (hb3, hb4)
     }
@@ -517,7 +598,7 @@ impl DnsHeaderFlags {
     /// Decode flags from the two raw bytes (hb3, hb4) from wire format.
     fn from_bytes(hb3: u8, hb4: u8) -> Self {
         let rcode_val = hb4 & HB4_RCODE;
-        let rcode = ResponseCode::from_u8(rcode_val).unwrap_or(ResponseCode::NoError);
+        let rcode = ResponseCode::from_u8(rcode_val);
         Self {
             qr: (hb3 & HB3_QR) != 0,
             opcode: (hb3 & HB3_OPCODE) >> 3,
@@ -692,7 +773,7 @@ impl DnsName {
     /// (before following any compression pointers).
     ///
     /// Replaces C `extract_name()` from rfc1035.c.
-    pub fn from_wire(_buf: &[u8], offset: usize, packet: &[u8]) -> DnsmasqResult<(Self, usize)> {
+    pub fn from_wire(offset: usize, packet: &[u8]) -> DnsmasqResult<(Self, usize)> {
         let mut labels = Vec::new();
         let mut pos = offset;
         let mut hops = 0usize;
@@ -935,7 +1016,7 @@ impl DnsPacket {
         // Parse questions.
         let mut questions = Vec::with_capacity(header.qdcount as usize);
         for _ in 0..header.qdcount {
-            let (name, consumed) = DnsName::from_wire(data, offset, data)?;
+            let (name, consumed) = DnsName::from_wire(offset, data)?;
             offset += consumed;
             if offset + 4 > data.len() {
                 return Err(DnsmasqError::DnsProtocol(
@@ -946,7 +1027,7 @@ impl DnsPacket {
             let qclass_raw = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
             offset += 4;
 
-            let qtype = RRType::from_u16(qtype_raw).unwrap_or(RRType::ANY);
+            let qtype = RRType::from_u16(qtype_raw);
             let qclass = DnsClass::from_u16(qclass_raw).unwrap_or(DnsClass::IN);
 
             questions.push(DnsQuestion {
@@ -961,7 +1042,7 @@ impl DnsPacket {
             |data: &[u8], off: &mut usize, count: u16| -> DnsmasqResult<Vec<DnsResourceRecord>> {
                 let mut records = Vec::with_capacity(count as usize);
                 for _ in 0..count {
-                    let (name, consumed) = DnsName::from_wire(data, *off, data)?;
+                    let (name, consumed) = DnsName::from_wire(*off, data)?;
                     *off += consumed;
 
                     // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) = 10 bytes
@@ -989,7 +1070,7 @@ impl DnsPacket {
                     let rdata = Bytes::copy_from_slice(&data[*off..*off + rdlength]);
                     *off += rdlength;
 
-                    let rr_type = RRType::from_u16(rr_type_raw).unwrap_or(RRType::ANY);
+                    let rr_type = RRType::from_u16(rr_type_raw);
                     let class = DnsClass::from_u16(class_raw).unwrap_or(DnsClass::IN);
 
                     records.push(DnsResourceRecord {
@@ -1238,19 +1319,23 @@ mod tests {
 
     #[test]
     fn test_response_code_roundtrip() {
-        for code in [
-            ResponseCode::NoError,
-            ResponseCode::FormErr,
-            ResponseCode::ServFail,
-            ResponseCode::NxDomain,
-            ResponseCode::NotImp,
-            ResponseCode::Refused,
+        for (expected_val, code) in [
+            (0u8, ResponseCode::NoError),
+            (1, ResponseCode::FormErr),
+            (2, ResponseCode::ServFail),
+            (3, ResponseCode::NxDomain),
+            (4, ResponseCode::NotImp),
+            (5, ResponseCode::Refused),
         ] {
-            let v = code as u8;
-            assert_eq!(ResponseCode::from_u8(v), Some(code));
+            assert_eq!(ResponseCode::from_u8(expected_val), code);
+            assert_eq!(code.to_u8(), expected_val);
         }
-        assert_eq!(ResponseCode::from_u8(6), None);
-        assert_eq!(ResponseCode::from_u8(255), None);
+        // Unknown codes are preserved, not remapped to NoError
+        assert_eq!(ResponseCode::from_u8(6), ResponseCode::Unknown(6));
+        assert_eq!(ResponseCode::from_u8(9), ResponseCode::Unknown(9));
+        assert_eq!(ResponseCode::from_u8(255), ResponseCode::Unknown(255));
+        // Unknown variant preserves raw value through roundtrip
+        assert_eq!(ResponseCode::Unknown(9).to_u8(), 9);
     }
 
     #[test]
@@ -1266,14 +1351,18 @@ mod tests {
 
     #[test]
     fn test_rr_type_roundtrip() {
-        assert_eq!(RRType::from_u16(1), Some(RRType::A));
-        assert_eq!(RRType::from_u16(28), Some(RRType::AAAA));
-        assert_eq!(RRType::from_u16(41), Some(RRType::OPT));
-        assert_eq!(RRType::from_u16(257), Some(RRType::CAA));
-        assert_eq!(RRType::from_u16(0), None);
-        assert_eq!(RRType::from_u16(9999), None);
+        assert_eq!(RRType::from_u16(1), RRType::A);
+        assert_eq!(RRType::from_u16(28), RRType::AAAA);
+        assert_eq!(RRType::from_u16(41), RRType::OPT);
+        assert_eq!(RRType::from_u16(257), RRType::CAA);
+        // Unknown codes are preserved, not remapped to ANY
+        assert_eq!(RRType::from_u16(0), RRType::Unknown(0));
+        assert_eq!(RRType::from_u16(9999), RRType::Unknown(9999));
+        assert_eq!(RRType::from_u16(65280), RRType::Unknown(65280));
         assert_eq!(RRType::A.to_u16(), 1);
         assert_eq!(RRType::AAAA.to_u16(), 28);
+        // Unknown variant preserves raw value through roundtrip
+        assert_eq!(RRType::Unknown(65280).to_u16(), 65280);
     }
 
     #[test]
@@ -1346,7 +1435,7 @@ mod tests {
         let wire: Vec<u8> = vec![
             7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
         ];
-        let (name, consumed) = DnsName::from_wire(&wire, 0, &wire).unwrap();
+        let (name, consumed) = DnsName::from_wire(0, &wire).unwrap();
         assert_eq!(name.to_string(), "example.com.");
         assert_eq!(consumed, 13);
         assert_eq!(name.label_count(), 2);
@@ -1363,7 +1452,7 @@ mod tests {
         // At offset 25, a compression pointer to offset 12
         pkt.extend_from_slice(&[0xC0, 12]);
 
-        let (name, consumed) = DnsName::from_wire(&pkt, 25, &pkt).unwrap();
+        let (name, consumed) = DnsName::from_wire(25, &pkt).unwrap();
         assert_eq!(name.to_string(), "example.com.");
         assert_eq!(consumed, 2); // pointer is 2 bytes
     }
@@ -1372,7 +1461,7 @@ mod tests {
     fn test_dns_name_compression_loop_detected() {
         // Create a packet with a self-referencing compression pointer
         let pkt = vec![0xC0, 0x00]; // points back to itself
-        let result = DnsName::from_wire(&pkt, 0, &pkt);
+        let result = DnsName::from_wire(0, &pkt);
         assert!(result.is_err());
     }
 
@@ -1546,7 +1635,7 @@ mod tests {
         assert_eq!(hb4 & HB4_RA, HB4_RA);
         assert_eq!(hb4 & HB4_AD, HB4_AD);
         assert_eq!(hb4 & HB4_CD, HB4_CD);
-        assert_eq!(hb4 & HB4_RCODE, ResponseCode::Refused as u8);
+        assert_eq!(hb4 & HB4_RCODE, ResponseCode::Refused.to_u8());
 
         let decoded = DnsHeaderFlags::from_bytes(hb3, hb4);
         assert_eq!(decoded, flags);
@@ -1635,7 +1724,7 @@ mod tests {
     #[test]
     fn test_dns_name_from_wire_root() {
         let wire = [0u8]; // root label
-        let (name, consumed) = DnsName::from_wire(&wire, 0, &wire).unwrap();
+        let (name, consumed) = DnsName::from_wire(0, &wire).unwrap();
         assert!(name.is_root());
         assert_eq!(consumed, 1);
     }
@@ -1703,7 +1792,7 @@ mod tests {
         let name = DnsName::from_str_unchecked("mail.example.com");
         let mut buf = BytesMut::new();
         name.to_wire(&mut buf);
-        let (parsed, _consumed) = DnsName::from_wire(&buf, 0, &buf).unwrap();
+        let (parsed, _consumed) = DnsName::from_wire(0, &buf).unwrap();
         assert_eq!(name, parsed);
     }
 
@@ -1713,7 +1802,7 @@ mod tests {
         let mut wire = vec![64u8]; // label length 64 (exceeds MAXLABEL=63)
         wire.extend(vec![b'a'; 64]);
         wire.push(0);
-        let result = DnsName::from_wire(&wire, 0, &wire);
+        let result = DnsName::from_wire(0, &wire);
         assert!(result.is_err());
     }
 
@@ -1721,7 +1810,7 @@ mod tests {
     fn test_dns_name_label_beyond_packet() {
         // label says 10 bytes but packet only has 5 after length byte
         let wire = vec![10, b'a', b'b', b'c', b'd', b'e'];
-        let result = DnsName::from_wire(&wire, 0, &wire);
+        let result = DnsName::from_wire(0, &wire);
         assert!(result.is_err());
     }
 
@@ -1768,12 +1857,7 @@ mod tests {
         ];
         for t in &types {
             let val = t.to_u16();
-            assert_eq!(
-                RRType::from_u16(val),
-                Some(*t),
-                "RRType {:?} failed roundtrip",
-                t
-            );
+            assert_eq!(RRType::from_u16(val), *t, "RRType {:?} failed roundtrip", t);
         }
     }
 

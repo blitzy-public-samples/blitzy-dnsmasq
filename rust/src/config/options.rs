@@ -276,6 +276,48 @@ pub struct ScriptConfig {
     pub scriptuser: Option<String>,
 }
 
+/// PXE boot menu prompt configuration (from `--pxe-prompt`).
+///
+/// Maps to C's `pxe_service` prompt entry in option.c.
+#[derive(Debug, Clone)]
+pub struct PxePromptConfig {
+    /// Prompt text displayed to PXE clients.
+    pub prompt: String,
+    /// Timeout in seconds (0 = no timeout, boot first entry).
+    pub timeout: Option<u32>,
+    /// Optional tag filter.
+    pub tag: Option<String>,
+}
+
+/// PXE boot service configuration (from `--pxe-service`).
+///
+/// Maps to C's `struct pxe_service` in dnsmasq.h.
+#[derive(Debug, Clone)]
+pub struct PxeServiceConfig {
+    /// Service type: "x86PC", "IA32_EFI", "x86-64_EFI", etc.
+    pub service_type: String,
+    /// Menu entry description shown to PXE clients.
+    pub description: String,
+    /// Boot filename or server address.
+    pub server: Option<String>,
+    /// Optional tag filter.
+    pub tag: Option<String>,
+}
+
+/// Address alias configuration (from `--alias`).
+///
+/// Maps DNS results from one IP range to another, matching C's
+/// `struct addr_alias` from dnsmasq.h.
+#[derive(Debug, Clone)]
+pub struct AliasConfig {
+    /// Source address to match.
+    pub from: Ipv4Addr,
+    /// Replacement address.
+    pub to: Ipv4Addr,
+    /// Optional netmask for range-based aliasing.
+    pub mask: Option<Ipv4Addr>,
+}
+
 /// ipset configuration (from `--ipset`).
 #[derive(Debug, Clone)]
 pub struct IpsetConfig {
@@ -516,6 +558,10 @@ pub struct DhcpConfig {
     pub quiet_ra: bool,
     pub ra_params: Vec<RaParamConfig>,
     pub leasequery: Option<LeasequeryConfig>,
+    /// Allow DHCP clients to do their own DDNS updates (C OPT_FQDN_UPDATE).
+    pub client_update: bool,
+    /// Enable dynamic BOOTP address allocation (C OPT_BOOTP_DYNAMIC).
+    pub bootp_dynamic: bool,
 }
 
 impl Default for DhcpConfig {
@@ -570,6 +616,8 @@ impl Default for DhcpConfig {
             quiet_ra: false,
             ra_params: Vec::new(),
             leasequery: None,
+            client_update: false,
+            bootp_dynamic: false,
         }
     }
 }
@@ -633,6 +681,24 @@ pub struct DnsmasqConfig {
     pub fast_dns_retry: Option<u32>,
     pub localise_queries: bool,
     pub no_ident: bool,
+    /// Enable proxy DNSSEC mode — pass through DNSSEC records from upstream
+    /// without local validation.  Equivalent to C OPT_DNSSEC_PROXY.
+    pub proxy_dnssec: bool,
+    /// Add client MAC address to DNS queries forwarded upstream (C OPT_ADD_MAC).
+    pub add_mac: bool,
+    /// Strip MAC address from DNS queries before forwarding (C OPT_STRIP_MAC).
+    pub strip_mac: bool,
+    /// Add EDNS0 client subnet option to DNS queries (C OPT_CLIENT_SUBNET).
+    /// Optional prefix length; `Some(None)` = enabled with default, `Some(Some(n))` = specific prefix.
+    pub add_subnet: Option<Option<u32>>,
+    /// Strip EDNS0 client subnet from DNS queries (C OPT_STRIP_ECS).
+    pub strip_subnet: bool,
+    /// CPE-ID string to add to DNS queries (C daemon->cpe_id).
+    pub add_cpe_id: Option<String>,
+    /// Address aliases for DNS rewrites (C daemon->addr_alias).
+    pub aliases: Vec<AliasConfig>,
+    /// Script to run for additional configuration (C daemon->conf_script).
+    pub conf_script: Option<String>,
 
     // ── Network Settings ──
     pub listen_addresses: Vec<IpAddr>,
@@ -669,6 +735,13 @@ pub struct DnsmasqConfig {
     pub interface_names: Vec<InterfaceNameConfig>,
     pub synth_domains: Vec<SynthDomainConfig>,
     pub domain_matches: Vec<DomainMatchConfig>,
+    /// Filter useless Windows DNS queries for SOA/SRV on local domain
+    /// (C OPT_FILTER in src/option.c).
+    pub filterwin2k: bool,
+    /// PXE boot service prompts (C daemon->pxe_services in src/option.c).
+    pub pxe_prompts: Vec<PxePromptConfig>,
+    /// PXE boot service entries (C daemon->pxe_services in src/option.c).
+    pub pxe_services: Vec<PxeServiceConfig>,
 
     // ── DHCP Settings (feature-gated) ──
     #[cfg(feature = "dhcp")]
@@ -784,6 +857,14 @@ impl Default for DnsmasqConfig {
             fast_dns_retry: None,
             localise_queries: false,
             no_ident: false,
+            proxy_dnssec: false,
+            add_mac: false,
+            strip_mac: false,
+            add_subnet: None,
+            strip_subnet: false,
+            add_cpe_id: None,
+            aliases: Vec::new(),
+            conf_script: None,
             listen_addresses: Vec::new(),
             interfaces: Vec::new(),
             except_interfaces: Vec::new(),
@@ -816,6 +897,9 @@ impl Default for DnsmasqConfig {
             interface_names: Vec::new(),
             synth_domains: Vec::new(),
             domain_matches: Vec::new(),
+            filterwin2k: false,
+            pxe_prompts: Vec::new(),
+            pxe_services: Vec::new(),
             #[cfg(feature = "dhcp")]
             dhcp: None,
             #[cfg(feature = "tftp")]
@@ -981,14 +1065,12 @@ fn parse_dhcp_option_value(s: &str) -> Vec<u8> {
 }
 
 /// Check if a filename matches a glob filter like `*.conf`.
+/// Check whether a filename matches a glob filter pattern.
+///
+/// Delegates to [`crate::core::pattern::glob_match`] for full glob support
+/// rather than duplicating matching logic.
 fn matches_glob_filter(filename: &str, filter: &str) -> bool {
-    if let Some(suffix) = filter.strip_prefix('*') {
-        filename.ends_with(suffix)
-    } else if let Some(prefix) = filter.strip_suffix('*') {
-        filename.starts_with(prefix)
-    } else {
-        filename == filter
-    }
+    crate::core::pattern::glob_match(filename, filter)
 }
 
 // ============================================================================
@@ -1496,10 +1578,10 @@ impl DnsmasqConfig {
             "no-round-robin" => {
                 self.no_round_robin = true;
             }
-            "0x20-no-encode" => {
+            "no-0x20-encode" => {
                 self.no_0x20_encode = true;
             }
-            "0x20-encode" => {
+            "do-0x20-encode" => {
                 self.do_0x20_encode = true;
             }
             "cache-rr" => {
@@ -1556,7 +1638,8 @@ impl DnsmasqConfig {
             }
             "proxy-dnssec" => {
                 // Enable proxy DNSSEC mode — pass through DNSSEC records
-                // This is a boolean flag in C dnsmasq
+                // from upstream without local validation (C OPT_DNSSEC_PROXY).
+                self.proxy_dnssec = true;
             }
 
             // ================================================================
@@ -2109,7 +2192,9 @@ impl DnsmasqConfig {
             }
             "dhcp-client-update" => {
                 #[cfg(feature = "dhcp")]
-                { /* client update flag — handled at runtime */ }
+                {
+                    self.ensure_dhcp().client_update = true;
+                }
             }
             "dhcp-ignore-clid" => {
                 #[cfg(feature = "dhcp")]
@@ -2187,9 +2272,11 @@ impl DnsmasqConfig {
                 }
             }
             "bootp-dynamic" => {
-                // Enable dynamic BOOTP allocation
+                // Enable dynamic BOOTP address allocation (C OPT_BOOTP_DYNAMIC).
                 #[cfg(feature = "dhcp")]
-                { /* flag stored at runtime */ }
+                {
+                    self.ensure_dhcp().bootp_dynamic = true;
+                }
             }
             "dhcp-hostsfile" => {
                 #[cfg(feature = "dhcp")]
@@ -2642,6 +2729,14 @@ impl DnsmasqConfig {
                     self.ensure_dnssec().timestamp = Some(v.to_string());
                 }
             }
+            "dnssec-limits" => {
+                // DNSSEC validation limits (C option.c LOPT_LIMIT).
+                #[cfg(feature = "dnssec")]
+                {
+                    let v = require_value(key, value)?;
+                    self.ensure_dnssec().limits = Some(v.to_string());
+                }
+            }
 
             // ================================================================
             // Auth DNS Directives (feature-gated)
@@ -2747,7 +2842,7 @@ impl DnsmasqConfig {
                         "dhcp-luascript requires the 'luascript' feature to be enabled".to_string(),
                     ));
                 }
-                #[cfg(feature = "script")]
+                #[cfg(feature = "luascript")]
                 {
                     let v = require_value(key, value)?;
                     if let Some(ref mut sc) = self.script {
@@ -2876,12 +2971,15 @@ impl DnsmasqConfig {
                 }
             }
             "conf-script" => {
-                // Config from script output — treated as advisory in Rust
-                if let Some(v) = value {
-                    // Execute the script and parse its output (not implemented for safety)
-                    // Just log a warning — scripts are a security risk
-                    let _ = v;
-                }
+                // Config from script output (C daemon->conf_script in option.c).
+                // The script is executed and its stdout is parsed as additional
+                // configuration directives.  Store the path for runtime execution.
+                let v = require_value(key, value)?;
+                tracing::warn!(
+                    script = %v,
+                    "conf-script directive accepted; script will be executed at runtime for additional configuration"
+                );
+                self.conf_script = Some(v.to_string());
             }
             "pid-file" => {
                 if let Some(v) = value {
@@ -2986,23 +3084,82 @@ impl DnsmasqConfig {
             }
 
             // ================================================================
-            // MAC/Subnet/CPE additions (runtime flags)
+            // MAC/Subnet/CPE additions (C OPT_ADD_MAC, OPT_STRIP_MAC, etc.)
             // ================================================================
-            "add-mac" => { /* add MAC address to DNS queries — runtime flag */ }
-            "strip-mac" => { /* strip MAC address from DNS queries — runtime flag */ }
-            "add-subnet" => { /* add client subnet to DNS queries (EDNS0) — runtime flag */ }
-            "strip-subnet" => { /* strip client subnet from DNS queries — runtime flag */ }
-            "add-cpe-id" => { /* add CPE-ID to DNS queries — runtime flag */ }
+            "add-mac" => {
+                // Add client MAC address to DNS queries forwarded upstream
+                // (C OPT_ADD_MAC in src/option.c).
+                self.add_mac = true;
+            }
+            "strip-mac" => {
+                // Strip MAC address option from DNS queries before forwarding
+                // (C OPT_STRIP_MAC in src/option.c).
+                self.strip_mac = true;
+            }
+            "add-subnet" => {
+                // Add EDNS0 client subnet option to DNS queries
+                // (C OPT_CLIENT_SUBNET in src/option.c).
+                // Optional value specifies the prefix length.
+                if let Some(v) = value {
+                    if v.is_empty() {
+                        self.add_subnet = Some(None);
+                    } else {
+                        let prefix = parse_u32("add-subnet", v)?;
+                        self.add_subnet = Some(Some(prefix));
+                    }
+                } else {
+                    self.add_subnet = Some(None);
+                }
+            }
+            "strip-subnet" => {
+                // Strip EDNS0 client subnet from DNS queries before forwarding
+                // (C OPT_STRIP_ECS in src/option.c).
+                self.strip_subnet = true;
+            }
+            "add-cpe-id" => {
+                // Add CPE-ID to DNS queries forwarded upstream
+                // (C daemon->cpe_id in src/option.c).
+                let v = require_value(key, value)?;
+                self.add_cpe_id = Some(v.to_string());
+            }
 
             // ================================================================
-            // Alias directive
+            // Alias directive (C struct addr_alias)
             // ================================================================
             "alias" => {
-                // alias=old-ip,new-ip[,mask] — IP address translation for DHCP replies
-                // This is a runtime transformation, stored for later use
-                if let Some(_v) = value {
-                    // Parsed and stored at runtime by the DHCP module
+                // alias=old-ip,new-ip[,mask] — IP address translation for
+                // DNS answers matching old-ip (C's addr_alias chain).
+                let v = require_value(key, value)?;
+                let parts = split_on(v, ',');
+                if parts.len() < 2 {
+                    return Err(DnsmasqError::Config(
+                        "alias requires at least old-ip,new-ip".to_string(),
+                    ));
                 }
+                let from: Ipv4Addr = parts[0].trim().parse().map_err(|_| {
+                    DnsmasqError::Config(format!(
+                        "invalid source address in alias: {}",
+                        parts[0].trim()
+                    ))
+                })?;
+                let to: Ipv4Addr = parts[1].trim().parse().map_err(|_| {
+                    DnsmasqError::Config(format!(
+                        "invalid target address in alias: {}",
+                        parts[1].trim()
+                    ))
+                })?;
+                let mask = if parts.len() > 2 {
+                    let m: Ipv4Addr = parts[2].trim().parse().map_err(|_| {
+                        DnsmasqError::Config(format!(
+                            "invalid netmask in alias: {}",
+                            parts[2].trim()
+                        ))
+                    })?;
+                    Some(m)
+                } else {
+                    None
+                };
+                self.aliases.push(AliasConfig { from, to, mask });
             }
 
             // ================================================================
@@ -3020,6 +3177,107 @@ impl DnsmasqConfig {
                     domain: canonicalise(&parts[0]),
                     server: parts[1].to_string(),
                 });
+            }
+
+            // ================================================================
+            // Missing C directives — backward compatibility (F15)
+            // ================================================================
+            "filterwin2k" | "filterSRV" => {
+                // Filter useless Windows-originated DNS queries (SOA, SRV)
+                // for wpad, isatap, etc.  (C OPT_FILTER in src/option.c).
+                self.filterwin2k = true;
+            }
+            "pxe-prompt" => {
+                // PXE boot prompt: pxe-prompt=[tag:]<prompt>[,<timeout>]
+                // (C option.c LOPT_PXE_PROMT).
+                #[cfg(feature = "dhcp")]
+                {
+                    let v = require_value(key, value)?;
+                    let parts = split_on(v, ',');
+                    let (prompt_str, tag) =
+                        if parts[0].starts_with("tag:") || parts[0].starts_with("net:") {
+                            let tag_str = parts[0]
+                                .trim_start_matches("tag:")
+                                .trim_start_matches("net:");
+                            if parts.len() < 2 {
+                                return Err(DnsmasqError::Config(
+                                    "pxe-prompt: missing prompt text after tag".to_string(),
+                                ));
+                            }
+                            (parts[1].as_str(), Some(tag_str.to_string()))
+                        } else {
+                            (parts[0].as_str(), None)
+                        };
+                    let timeout = if tag.is_some() {
+                        parts.get(2).and_then(|s| s.parse::<u32>().ok())
+                    } else {
+                        parts.get(1).and_then(|s| s.parse::<u32>().ok())
+                    };
+                    self.pxe_prompts.push(PxePromptConfig {
+                        prompt: prompt_str.to_string(),
+                        timeout,
+                        tag,
+                    });
+                }
+            }
+            "pxe-service" => {
+                // PXE boot service: pxe-service=[tag:]<type>,<description>[,<filename>|<bootservicetype>][,<server>]
+                // (C option.c LOPT_PXE_SERV).
+                #[cfg(feature = "dhcp")]
+                {
+                    let v = require_value(key, value)?;
+                    let parts = split_on(v, ',');
+                    let (stype, desc, server, tag) = if !parts.is_empty()
+                        && (parts[0].starts_with("tag:") || parts[0].starts_with("net:"))
+                    {
+                        let tag_str = parts[0]
+                            .trim_start_matches("tag:")
+                            .trim_start_matches("net:");
+                        if parts.len() < 3 {
+                            return Err(DnsmasqError::Config(
+                                "pxe-service: requires type,description after tag".to_string(),
+                            ));
+                        }
+                        (
+                            parts[1].as_str(),
+                            parts[2].as_str(),
+                            parts.get(3).map(|s| s.to_string()),
+                            Some(tag_str.to_string()),
+                        )
+                    } else {
+                        if parts.len() < 2 {
+                            return Err(DnsmasqError::Config(
+                                "pxe-service: requires type,description".to_string(),
+                            ));
+                        }
+                        (
+                            parts[0].as_str(),
+                            parts[1].as_str(),
+                            parts.get(2).map(|s| s.to_string()),
+                            None,
+                        )
+                    };
+                    self.pxe_services.push(PxeServiceConfig {
+                        service_type: stype.to_string(),
+                        description: desc.to_string(),
+                        server,
+                        tag,
+                    });
+                }
+            }
+            "domain-suffix" => {
+                // Alias for "domain" in C dnsmasq.
+                // Reuse the same handler by recursing.
+                return self.process_directive("domain", value);
+            }
+            "dhcp-ignore" => {
+                // Ignore DHCP requests matching a tag (C LOPT_DHCP_INOTIFY).
+                // dhcp-ignore=tag:<tag>  — ignore requests with this tag.
+                #[cfg(feature = "dhcp")]
+                {
+                    let v = require_value(key, value)?;
+                    self.ensure_dhcp().ignore_names.push(v.to_string());
+                }
             }
 
             // ================================================================

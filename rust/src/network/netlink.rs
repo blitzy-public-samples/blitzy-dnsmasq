@@ -3,6 +3,11 @@
 //
 // This file is part of dnsmasq, a lightweight DNS/DHCP/TFTP server.
 // Ported from C (src/netlink.c) to Rust as part of the memory-safety migration.
+//
+// Platform gate: This module is Linux-only. It is gated by
+// `#[cfg(target_os = "linux")]` on the module declaration in `network/mod.rs`,
+// preventing compilation on non-Linux platforms. Netlink is a Linux kernel
+// interface with no equivalent on BSD or macOS.
 
 //! Linux netlink socket interface for real-time kernel network monitoring.
 //!
@@ -889,28 +894,38 @@ impl NetlinkNetwork {
         let ifa = unsafe { &*(msg_data.as_ptr().wrapping_add(ifa_offset) as *const IfAddrMsg) };
 
         let mut addrp: Option<Ipv6Addr> = None;
+        let mut have_local = false;
         let mut preferred: u32 = 0;
         let mut valid: u32 = 0;
 
-        // Parse rtattr chain
+        // Parse rtattr chain.
+        // IFA_LOCAL takes precedence over IFA_ADDRESS for point-to-point
+        // interfaces. C's netlink.c checks IFA_LOCAL first and only uses
+        // IFA_ADDRESS as fallback. Since attribute order in the kernel
+        // message is not guaranteed, we track whether IFA_LOCAL was seen
+        // and skip IFA_ADDRESS when it was.
         let attr_offset = ifa_offset + nlmsg_align(ifa_size);
         if attr_offset <= msg_data.len() {
             let attr_buf = &msg_data[attr_offset..];
             for (rta_type, rta_data) in RtAttrIter::new(attr_buf) {
                 match rta_type {
                     IFA_LOCAL => {
-                        // IFA_LOCAL takes precedence (for point-to-point interfaces)
+                        // IFA_LOCAL: the local (source) address. On point-to-point
+                        // interfaces this is the correct address to use. Always
+                        // takes precedence over IFA_ADDRESS regardless of order.
                         if rta_data.len() >= 16 {
                             let mut octets = [0u8; 16];
                             octets.copy_from_slice(&rta_data[..16]);
                             addrp = Some(Ipv6Addr::from(octets));
+                            have_local = true;
                         }
                     }
                     IFA_ADDRESS => {
-                        // IFA_ADDRESS used only if no IFA_LOCAL seen yet.
-                        // Both set addrp; last one in chain wins (matches C behavior
-                        // where IFA_LOCAL typically comes after IFA_ADDRESS).
-                        if rta_data.len() >= 16 {
+                        // IFA_ADDRESS: the peer/broadcast address on point-to-point
+                        // interfaces, or the interface address on broadcast links.
+                        // Only used as fallback when no IFA_LOCAL has been seen,
+                        // matching C's netlink.c behavior.
+                        if !have_local && rta_data.len() >= 16 {
                             let mut octets = [0u8; 16];
                             octets.copy_from_slice(&rta_data[..16]);
                             addrp = Some(Ipv6Addr::from(octets));

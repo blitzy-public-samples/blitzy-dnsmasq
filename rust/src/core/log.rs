@@ -793,3 +793,276 @@ pub fn log_debug_message(message: &str) {
         message
     );
 }
+
+// ---------------------------------------------------------------------------
+// Native Syslog Integration
+// ---------------------------------------------------------------------------
+
+/// Open a connection to the system syslog daemon via `libc::openlog`.
+///
+/// This provides native syslog(3) integration ensuring messages route correctly
+/// through rsyslog/syslog-ng when running in daemon mode. C's `log.c` used a
+/// direct UDP/Unix domain socket connection to `/dev/log`; this function uses
+/// the POSIX syslog API for broader compatibility.
+///
+/// # Arguments
+///
+/// * `ident` — Program name string for syslog identification (typically "dnsmasq").
+/// * `facility` — Syslog facility code from [`LogFacility`].
+///
+/// # Safety
+///
+/// Uses `libc::openlog` which requires the ident string pointer to remain valid
+/// for the lifetime of the syslog connection. The static string "dnsmasq\0"
+/// satisfies this requirement.
+pub fn open_system_syslog(facility: &LogFacility) {
+    let facility_code = facility.as_syslog_code();
+    // SAFETY: "dnsmasq\0" is a static string literal with null terminator.
+    // libc::openlog requires the ident pointer to remain valid until closelog(),
+    // which is satisfied by a static byte string. LOG_PID | LOG_NDELAY matches
+    // C dnsmasq's syslog configuration.
+    unsafe {
+        libc::openlog(
+            c"dnsmasq".as_ptr(),
+            libc::LOG_PID | libc::LOG_NDELAY,
+            facility_code,
+        );
+    }
+}
+
+/// Write a single message to the system syslog daemon via `libc::syslog`.
+///
+/// Priority levels map tracing levels to syslog priorities:
+/// - ERROR → `LOG_ERR`
+/// - WARN  → `LOG_WARNING`
+/// - INFO  → `LOG_INFO`
+/// - DEBUG/TRACE → `LOG_DEBUG`
+pub fn write_system_syslog(priority: i32, message: &str) {
+    let c_msg = std::ffi::CString::new(message).unwrap_or_default();
+    // SAFETY: libc::syslog is a standard POSIX function. The CString ensures
+    // null termination. The format string "%s" prevents format string attacks.
+    unsafe {
+        libc::syslog(priority, c"%s".as_ptr(), c_msg.as_ptr());
+    }
+}
+
+/// Close the system syslog connection via `libc::closelog`.
+///
+/// Called during daemon shutdown to release syslog resources.
+pub fn close_system_syslog() {
+    // SAFETY: libc::closelog is a standard POSIX function with no preconditions.
+    unsafe {
+        libc::closelog();
+    }
+}
+
+/// Map a tracing [`Level`] to a syslog priority value.
+///
+/// Follows the standard syslog priority mapping:
+/// - `ERROR` → `LOG_ERR` (3)
+/// - `WARN`  → `LOG_WARNING` (4)
+/// - `INFO`  → `LOG_INFO` (6)
+/// - `DEBUG` → `LOG_DEBUG` (7)
+/// - `TRACE` → `LOG_DEBUG` (7)
+pub fn tracing_level_to_syslog_priority(level: Level) -> i32 {
+    if level == Level::ERROR {
+        libc::LOG_ERR
+    } else if level == Level::WARN {
+        libc::LOG_WARNING
+    } else if level == Level::INFO {
+        libc::LOG_INFO
+    } else {
+        libc::LOG_DEBUG
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- LogFacility -------------------------------------------------------
+
+    #[test]
+    fn log_facility_default_is_daemon() {
+        assert_eq!(LogFacility::default(), LogFacility::Daemon);
+    }
+
+    #[test]
+    fn log_facility_syslog_codes() {
+        assert_eq!(LogFacility::Daemon.as_syslog_code(), 24); // 3 << 3
+        assert_eq!(LogFacility::Local0.as_syslog_code(), 128); // 16 << 3
+        assert_eq!(LogFacility::User.as_syslog_code(), 8); // 1 << 3
+        assert_eq!(LogFacility::Mail.as_syslog_code(), 16); // 2 << 3
+        assert_eq!(LogFacility::Custom(42).as_syslog_code(), 42);
+    }
+
+    #[test]
+    fn log_facility_round_trip() {
+        let cases = [
+            (SYSLOG_FACILITY_DAEMON, LogFacility::Daemon),
+            (SYSLOG_FACILITY_LOCAL0, LogFacility::Local0),
+            (SYSLOG_FACILITY_USER, LogFacility::User),
+            (SYSLOG_FACILITY_MAIL, LogFacility::Mail),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(LogFacility::from_syslog_code(code), expected);
+            assert_eq!(expected.as_syslog_code(), code);
+        }
+    }
+
+    #[test]
+    fn log_facility_unknown_code_becomes_custom() {
+        let fac = LogFacility::from_syslog_code(999);
+        assert_eq!(fac, LogFacility::Custom(999));
+        assert_eq!(fac.as_syslog_code(), 999);
+    }
+
+    #[test]
+    fn log_facility_display() {
+        assert_eq!(format!("{}", LogFacility::Daemon), "daemon");
+        assert_eq!(format!("{}", LogFacility::Local0), "local0");
+        assert_eq!(format!("{}", LogFacility::User), "user");
+        assert_eq!(format!("{}", LogFacility::Mail), "mail");
+        assert_eq!(format!("{}", LogFacility::Custom(42)), "custom(42)");
+    }
+
+    // -- LogConfig ---------------------------------------------------------
+
+    #[test]
+    fn log_config_default() {
+        let config = LogConfig::default();
+        assert_eq!(config.facility, LogFacility::Daemon);
+        assert!(config.log_file.is_none());
+        assert!(!config.debug);
+        assert!(!config.json_output);
+        assert_eq!(config.max_level, Level::INFO);
+        assert!(!config.extra_logging);
+        assert!(!config.log_queries);
+        assert!(config.log_dhcp); // C default: DHCP logging on
+    }
+
+    // -- EnvFilter ---------------------------------------------------------
+
+    #[test]
+    fn env_filter_default_level() {
+        let config = LogConfig::default();
+        let filter = build_env_filter(&config);
+        // The default filter should contain "info" as the base level
+        let filter_str = format!("{}", filter);
+        assert!(
+            filter_str.contains("info"),
+            "Default filter should contain 'info', got: {}",
+            filter_str
+        );
+    }
+
+    #[test]
+    fn env_filter_with_query_logging() {
+        let config = LogConfig {
+            log_queries: true,
+            ..LogConfig::default()
+        };
+        let filter = build_env_filter(&config);
+        let filter_str = format!("{}", filter);
+        assert!(
+            filter_str.contains("dnsmasq::dns=debug"),
+            "Filter should contain dns debug directive, got: {}",
+            filter_str
+        );
+    }
+
+    #[test]
+    fn env_filter_with_dhcp_logging() {
+        let config = LogConfig {
+            log_dhcp: true,
+            ..LogConfig::default()
+        };
+        let filter = build_env_filter(&config);
+        let filter_str = format!("{}", filter);
+        assert!(
+            filter_str.contains("dnsmasq::dhcp=debug"),
+            "Filter should contain dhcp debug directive, got: {}",
+            filter_str
+        );
+    }
+
+    // -- Level mapping -----------------------------------------------------
+
+    #[test]
+    fn level_to_directive_str_mapping() {
+        assert_eq!(level_to_directive_str(Level::ERROR), "error");
+        assert_eq!(level_to_directive_str(Level::WARN), "warn");
+        assert_eq!(level_to_directive_str(Level::INFO), "info");
+        assert_eq!(level_to_directive_str(Level::DEBUG), "debug");
+        assert_eq!(level_to_directive_str(Level::TRACE), "trace");
+    }
+
+    // -- Syslog priority mapping -------------------------------------------
+
+    #[test]
+    fn syslog_priority_mapping() {
+        assert_eq!(
+            tracing_level_to_syslog_priority(Level::ERROR),
+            libc::LOG_ERR
+        );
+        assert_eq!(
+            tracing_level_to_syslog_priority(Level::WARN),
+            libc::LOG_WARNING
+        );
+        assert_eq!(
+            tracing_level_to_syslog_priority(Level::INFO),
+            libc::LOG_INFO
+        );
+        assert_eq!(
+            tracing_level_to_syslog_priority(Level::DEBUG),
+            libc::LOG_DEBUG
+        );
+        assert_eq!(
+            tracing_level_to_syslog_priority(Level::TRACE),
+            libc::LOG_DEBUG
+        );
+    }
+
+    // -- FileWriter --------------------------------------------------------
+
+    #[test]
+    fn file_writer_open_and_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.log");
+        let writer = FileWriter::open(path.to_str().unwrap()).unwrap();
+        // Flush should succeed on a valid file
+        writer.flush_file();
+    }
+
+    #[test]
+    fn file_writer_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.log");
+        let writer = FileWriter::open(path.to_str().unwrap()).unwrap();
+
+        // Write something
+        {
+            let mut handle = writer.state.lock().unwrap();
+            handle.file.write_all(b"hello").unwrap();
+        }
+
+        // Reopen should succeed
+        writer.reopen().unwrap();
+
+        // Write more after reopen
+        {
+            let mut handle = writer.state.lock().unwrap();
+            handle.file.write_all(b"world").unwrap();
+        }
+    }
+
+    #[test]
+    fn file_writer_open_nonexistent_dir_fails() {
+        let result = FileWriter::open("/nonexistent/dir/test.log");
+        assert!(result.is_err());
+    }
+}

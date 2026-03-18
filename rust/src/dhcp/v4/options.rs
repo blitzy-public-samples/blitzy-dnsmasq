@@ -449,6 +449,18 @@ pub fn in_list(list: &[u8], opt: u8) -> bool {
 /// `sname`/`file` overload fallback present in the C version — the buffer
 /// simply expands.
 ///
+/// ## Deviation from C / RFC 2131 §4.1
+///
+/// C's `free_space()` includes `sname`/`file` field overload fallback per
+/// RFC 2131 §4.1: when the 312-byte options area is full, it can spill
+/// options into the `sname` (64 bytes) and `file` (128 bytes) fields of the
+/// DHCP message, setting the Option Overload option (code 52) to indicate
+/// which fields contain options. The Rust version omits this overload
+/// mechanism because `Vec<u8>` growth eliminates the fixed-size constraint.
+/// The final packet serializer is responsible for enforcing the 576-byte
+/// minimum DHCP message size and performing sname/file overload if the
+/// options exceed the available space in the wire-format packet.
+///
 /// Returns `None` when the options area is malformed (no `OPTION_END` found).
 ///
 /// Replaces C `free_space(mess, end, opt, len)` (rfc2131.c line 3120).

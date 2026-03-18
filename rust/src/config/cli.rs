@@ -1392,33 +1392,46 @@ impl CliArgs {
             }
         }
 
-        // Validate conflicting options: no-resolv + resolv-file
+        // Warn about no-resolv + resolv-file combination.
+        // C dnsmasq silently accepts this (resolv-file simply has no effect
+        // when no-resolv is set). We match C's permissive behavior and log
+        // a warning instead of rejecting the combination to maintain
+        // drop-in replacement compatibility.
         if self.no_resolv && !self.resolv_file.is_empty() {
-            return Err(DnsmasqError::Config(
-                "conflicting options: --no-resolv and --resolv-file cannot be used together"
-                    .to_string(),
-            ));
+            tracing::warn!(
+                "--no-resolv and --resolv-file both specified; \
+                 --resolv-file will have no effect"
+            );
         }
 
         // Validate conflicting options: no-daemon + keep-in-foreground
         // (Not actually conflicting in C, but warn: both keep in foreground)
 
-        // Validate neg-ttl if set
+        // Warn about large neg-ttl values.
+        // Note: C dnsmasq does not enforce an upper bound on neg-ttl;
+        // we issue a warning rather than an error to maintain backward
+        // compatibility as a drop-in replacement.
         if let Some(neg_ttl) = self.neg_ttl {
             if neg_ttl > 86400 {
-                return Err(DnsmasqError::Config(format!(
-                    "neg-ttl ({neg_ttl}) exceeds maximum of 86400 seconds (1 day)"
-                )));
+                tracing::warn!(
+                    neg_ttl,
+                    "neg-ttl ({neg_ttl}) exceeds 86400 seconds (1 day); \
+                     this may cause stale negative cache entries"
+                );
             }
         }
 
-        // Validate min-cache-ttl vs TTL floor limit (3600s)
+        // Warn about unusually large min-cache-ttl values.
+        // C dnsmasq does not enforce an upper bound; we match that behavior
+        // and only warn when the value exceeds the recommended floor limit.
         if let Some(min_cttl) = self.min_cache_ttl {
             if min_cttl > crate::config::constants::TTL_FLOOR_LIMIT {
-                return Err(DnsmasqError::Config(format!(
-                    "min-cache-ttl ({min_cttl}) exceeds maximum allowed value of {} seconds",
+                tracing::warn!(
+                    min_cache_ttl = min_cttl,
+                    limit = crate::config::constants::TTL_FLOOR_LIMIT,
+                    "min-cache-ttl ({min_cttl}) exceeds recommended maximum of {} seconds",
                     crate::config::constants::TTL_FLOOR_LIMIT
-                )));
+                );
             }
         }
 
@@ -1593,6 +1606,9 @@ mod tests {
 
     #[test]
     fn test_validate_no_resolv_with_resolv_file() {
+        // C dnsmasq silently accepts --no-resolv + --resolv-file (resolv-file
+        // simply has no effect). Our Rust version matches this permissive
+        // behavior — validate() succeeds with a warning instead of an error.
         let args = CliArgs::try_parse_from([
             "dnsmasq",
             "--no-resolv",
@@ -1601,9 +1617,10 @@ mod tests {
         ])
         .unwrap();
         let result = args.validate();
-        assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("conflicting"));
+        assert!(
+            result.is_ok(),
+            "validate() should accept --no-resolv + --resolv-file (matching C behavior)"
+        );
     }
 
     #[test]
@@ -1679,11 +1696,15 @@ mod tests {
 
     #[test]
     fn test_validate_min_cache_ttl_limit() {
+        // C dnsmasq does not enforce upper bounds on min-cache-ttl.
+        // Our Rust version matches this permissive behavior — validate()
+        // succeeds with a warning instead of an error for backward compat.
         let args = CliArgs::try_parse_from(["dnsmasq", "--min-cache-ttl", "7200"]).unwrap();
         let result = args.validate();
-        assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("min-cache-ttl"));
+        assert!(
+            result.is_ok(),
+            "validate() should accept large min-cache-ttl values (matching C behavior)"
+        );
     }
 
     #[test]
