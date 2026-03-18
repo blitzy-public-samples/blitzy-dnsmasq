@@ -15,6 +15,9 @@ pub mod rrfilter;
 #[cfg(feature = "dnssec")]
 pub mod blockdata;
 
+#[cfg(feature = "dnssec")]
+pub mod crypto;
+
 #[cfg(feature = "loop-detect")]
 pub mod loop_detect;
 
