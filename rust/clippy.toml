@@ -1,6 +1,170 @@
+# clippy.toml — Clippy Lint Configuration for dnsmasq Rust Migration
+#
+# This configuration file controls Rust's Clippy linter settings for the dnsmasq
+# C-to-Rust migration project. Settings are tuned to balance strict code quality
+# enforcement with the practical realities of migrating a 92,894-line C codebase
+# (50 source files) to idiomatic Rust.
+#
+# Key design decisions:
+# - MSRV pinned to 1.91.0 to match rust-toolchain.toml and Cargo.toml
+# - Elevated complexity thresholds accommodate protocol state machines and
+#   configuration parsers inherited from C (option.c: 350+ directives,
+#   rfc2131.c/rfc3315.c: DHCP state machines, forward.c: DNS forwarding)
+# - Domain-specific identifiers whitelisted for documentation lints
+# - Memory-safety lints remain at their strictest defaults (no overrides here)
+#
+# Lint levels (deny/warn/allow) are configured in Rust source code via attributes:
+#   #![deny(unsafe_code)]          — enforced in core logic modules
+#   #![deny(clippy::unwrap_used)]  — prevent panics in production code
+#   #[allow(unsafe_code)]          — permitted only in FFI modules with SAFETY comments
+#
+# Usage:
+#   cargo clippy --all-features -- -D warnings
+#   cargo clippy --all-features -- -W clippy::pedantic
+#
+# Settings must not conflict with rustfmt.toml (formatting) or Cargo.toml (edition/msrv).
+# Reference: https://doc.rust-lang.org/clippy/lint_configuration.html
+
+# ---------------------------------------------------------------------------
+# Minimum Supported Rust Version
+# ---------------------------------------------------------------------------
+# Pinned to Rust 1.91.0 stable, matching:
+#   - rust-toolchain.toml:  channel = "1.91.0"
+#   - Cargo.toml:           rust-version = "1.91.0"
+#
+# Clippy uses this value to gate lint suggestions that require language features
+# from newer Rust versions, ensuring every suggestion is actionable on the
+# project's pinned toolchain without requiring an upgrade.
 msrv = "1.91.0"
+
+# ---------------------------------------------------------------------------
+# Cognitive Complexity Threshold  (clippy::cognitive_complexity)
+# ---------------------------------------------------------------------------
+# Default: 25. Raised to 50 for this project.
+#
+# Rationale: The dnsmasq C-to-Rust migration includes several inherently complex
+# functions from the original C source that cannot be decomposed without altering
+# externally observable behavior (violating the functional preservation rule):
+#
+#   - Configuration parser (from option.c, 8,128 lines): 350+ directives handled
+#     in deeply nested match arms — the parser must remain a single logical unit
+#     to preserve directive-ordering semantics identical to the C implementation.
+#
+#   - DHCPv4 state machine (from rfc2131.c, 5,209 lines): DISCOVER → OFFER →
+#     REQUEST → ACK protocol flow with complex branching per RFC 2131.
+#
+#   - DHCPv6 state machine (from rfc3315.c, 4,216 lines): SOLICIT → ADVERTISE →
+#     REQUEST → REPLY protocol flow with prefix delegation branching per RFC 3315.
+#
+#   - DNS packet parser (from rfc1035.c, 3,622 lines): wire format decoding with
+#     name compression pointer following, requiring deep nesting for correctness.
+#
+#   - DNS forwarding engine (from forward.c, 6,068 lines): upstream server
+#     selection, retry logic, and timeout handling with many conditional paths.
+#
+# This threshold prevents false positives on correctly-migrated protocol logic
+# while still flagging genuinely over-complex newly written code.
 cognitive-complexity-threshold = 50
+
+# ---------------------------------------------------------------------------
+# Too Many Arguments Threshold  (clippy::too_many_arguments)
+# ---------------------------------------------------------------------------
+# Default: 7. Raised to 10 for this project.
+#
+# Rationale: Network protocol functions frequently require many parameters that
+# are semantically distinct and cannot be meaningfully grouped without losing
+# clarity. Examples from the C source being migrated:
+#
+#   - DNS forwarding: query context, upstream server, packet buffer, flags,
+#     source address, destination address, and timeout parameters.
+#
+#   - DHCP lease allocation: client MAC, requested IP, hostname, lease duration,
+#     DHCP options, interface context, and client identifier.
+#
+#   - Socket binding (from network.c, 6,331 lines): address, port, interface
+#     name, protocol family, socket type, and socket option flags.
+#
+# Functions exceeding this threshold should consider a parameter struct (builder
+# pattern), but are not automatically flagged as violations during migration.
 too-many-arguments-threshold = 10
+
+# ---------------------------------------------------------------------------
+# Type Complexity Threshold  (clippy::type_complexity)
+# ---------------------------------------------------------------------------
+# Default: 250. Raised to 300 for this project.
+#
+# Rationale: The async I/O migration from the C poll()-based event loop (poll.c)
+# to tokio async/await introduces complex generic type signatures, particularly:
+#
+#   - Boxed futures with lifetime parameters:
+#     Pin<Box<dyn Future<Output = Result<T, E>> + Send>>
+#
+#   - Nested Result types from layered error handling:
+#     Result<Option<Vec<DnsRecord>>, DnsmasqError>
+#
+#   - Callback types for lease-change notifications and script execution helper
+#     (from helper.c): trait objects with Send + Sync bounds.
+#
+#   - Shared state wrappers: Arc<RwLock<DaemonState>> replacing the C global
+#     struct daemon, threaded through async function parameters.
+#
+# This threshold accommodates Rust's verbose type signatures for async network
+# daemon code without suppressing warnings on genuinely over-complicated types.
 type-complexity-threshold = 300
+
+# ---------------------------------------------------------------------------
+# Documentation Valid Identifiers  (clippy::doc_markdown)
+# ---------------------------------------------------------------------------
+# Domain-specific identifiers that may appear in documentation comments without
+# backtick-quoting. Clippy's doc_markdown lint flags CamelCase and UPPER_CASE
+# words in doc comments as potential unlinked Rust items. The identifiers below
+# are technical terms from the DNS, DHCP, and network protocol domains that are
+# not Rust types and should not trigger the lint.
+#
+# Categories:
+#   Project:           dnsmasq
+#   Protocol versions: DHCPv4, DHCPv6, IPv4, IPv6
+#   Security:          DNSSEC
+#   DNS extensions:    EDNS0
+#   Network boot:      PXE, TFTP
+#   IPv6 autoconfig:   SLAAC
+#   Packet capture:    BPF
+#   Router adverts:    ICMPv6
+#   Unix signals:      SIGHUP (config reload), SIGUSR1 (cache dump),
+#                      SIGUSR2 (server statistics)
+#   Integrations:      NetworkManager, OpenWrt, UBus
+#   IEEE 754:          NaN (used in timing/metrics calculations)
+doc-valid-idents = [
+    "dnsmasq",
+    "DHCPv4",
+    "DHCPv6",
+    "DNSSEC",
+    "EDNS0",
+    "PXE",
+    "TFTP",
+    "SLAAC",
+    "BPF",
+    "ICMPv6",
+    "SIGHUP",
+    "SIGUSR1",
+    "SIGUSR2",
+    "NetworkManager",
+    "OpenWrt",
+    "UBus",
+    "NaN",
+    "IPv4",
+    "IPv6",
+]
+
+# ---------------------------------------------------------------------------
+# Single Character Binding Names Threshold  (clippy::many_single_char_names)
+# ---------------------------------------------------------------------------
+# Default: 4. Raised to 5 for this project.
+#
+# Rationale: Network protocol code commonly uses single-character variable names
+# for loop iterators and short-lived temporaries. DNS packet parsing and DHCP
+# option encoding functions use conventional single-letter names derived from
+# protocol RFCs (e.g., 'p' for pointer, 'n' for name length, 'c' for class,
+# 't' for type, 'q' for query). A threshold of 5 accommodates these patterns
+# while still flagging excessive use of opaque single-character names.
 single-char-binding-names-threshold = 5
-doc-valid-idents = ["dnsmasq", "DHCPv4", "DHCPv6", "DNSSEC", "EDNS0", "PXE", "TFTP", "SLAAC", "BPF", "ICMPv6", "SIGHUP", "SIGUSR1", "SIGUSR2", "NetworkManager", "OpenWrt", "UBus", "NaN", "IPv4", "IPv6"]
