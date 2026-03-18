@@ -52,6 +52,18 @@
 #[cfg(feature = "ubus")]
 pub mod ubus;
 
+/// BSD PF table integration for DNS-based firewall rule population.
+///
+/// Provides `PfTableController` for creating PF tables and adding/removing
+/// IP addresses via ioctl on `/dev/pf`. Platform-gated to FreeBSD/OpenBSD/NetBSD.
+///
+/// Migrated from `src/tables.c` (386 lines).
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+pub mod tables;
+
 // Re-export key types when features are enabled
 #[cfg(feature = "ubus")]
 pub use ubus::UbusController;
+
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+pub use tables::PfTableController;

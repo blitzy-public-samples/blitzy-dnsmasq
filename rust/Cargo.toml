@@ -74,7 +74,7 @@ luascript = ["script", "dep:mlua"]
 tokio = { version = "1.48.0", features = ["full"] }
 
 # Safe POSIX bindings — replaces raw C system calls (privilege drop, raw sockets, signals)
-nix = { version = "0.30.1", features = ["net", "socket", "signal", "user", "fs", "poll"] }
+nix = { version = "0.30.1", features = ["net", "socket", "signal", "user", "fs", "poll", "ioctl"] }
 
 # Advanced socket configuration — replaces C setsockopt() calls (network.c)
 socket2 = { version = "0.6.0", features = ["all"] }
