@@ -6,6 +6,7 @@
 //! This module provides DNS wire format handling, packet parsing/construction,
 //! protocol constants, and supporting functionality for the dnsmasq daemon.
 
+pub mod domain;
 pub mod protocol;
 
 #[cfg(feature = "dnssec")]
