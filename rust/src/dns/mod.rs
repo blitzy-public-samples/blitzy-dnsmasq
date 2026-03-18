@@ -6,6 +6,7 @@
 //! This module provides DNS wire format handling, packet parsing/construction,
 //! protocol constants, and supporting functionality for the dnsmasq daemon.
 
+pub mod cache;
 pub mod domain;
 pub mod domain_match;
 pub mod protocol;
