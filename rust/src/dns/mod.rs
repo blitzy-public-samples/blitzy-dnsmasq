@@ -8,6 +8,9 @@
 
 pub mod protocol;
 
+#[cfg(feature = "dnssec")]
+pub mod blockdata;
+
 // Re-export core protocol types for convenient access
 pub use protocol::{
     // Byte helpers
