@@ -1,8 +1,61 @@
+# rustfmt.toml — Code Formatting Configuration for dnsmasq Rust Migration
+#
+# Configures rustfmt for consistent code formatting across all 80+ Rust source
+# files in the dnsmasq C-to-Rust migration. These settings ensure uniform
+# formatting for complex protocol implementations (DNS/DHCP state machines),
+# network packet construction, and configuration parsing code.
+#
+# All options below are stable and compatible with Rust 1.91.0 stable toolchain.
+# Run formatting with: cargo fmt
+# Check formatting with: cargo fmt -- --check
+
+# Rust edition used for parsing syntax — matches Cargo.toml edition setting.
 edition = "2021"
+
+# Maximum line width (default: 100). Wider than the traditional 80-column limit
+# to accommodate complex protocol structures, nested match arms in DNS/DHCP
+# state machines, and long type signatures common in network daemon code.
 max_width = 100
+
+# Number of spaces per indentation level (default: 4). Standard Rust convention.
 tab_spaces = 4
+
+# Use shorthand field initialization syntax: `Foo { bar }` instead of
+# `Foo { bar: bar }`. Reduces verbosity in struct construction throughout
+# the codebase, especially in packet builders and configuration types.
 use_field_init_shorthand = true
+
+# Use the `?` try operator shorthand instead of `try!()` macro.
+# Idiomatic Rust error handling for the Result<T, DnsmasqError> propagation
+# pattern used across all modules.
 use_try_shorthand = true
+
+# Enforce Unix-style LF line endings across all platforms. Ensures consistent
+# line endings in the repository regardless of contributor OS.
 newline_style = "Unix"
+
+# Sort `use` import statements alphabetically within each group.
+# Ensures deterministic import ordering across all modules.
 reorder_imports = true
+
+# Sort `mod` declarations alphabetically. Ensures deterministic module ordering
+# in mod.rs files throughout the module hierarchy (config/, core/, dns/, dhcp/,
+# network/, integration/, services/, diagnostics/).
 reorder_modules = true
+
+# --------------------------------------------------------------------------
+# Nightly-only options (documented for reference — uncomment when using
+# nightly rustfmt or if these options are stabilized in a future release):
+#
+# Group imports by module to reduce the number of `use` statements:
+#   imports_granularity = "Module"
+#
+# Separate imports into three groups: std library, external crates, then
+# crate-internal imports, with blank lines between groups:
+#   group_imports = "StdExternalCrate"
+#
+# To enable these, add `unstable_features = true` and use nightly rustfmt.
+# Tracking issues:
+#   imports_granularity: https://github.com/rust-lang/rustfmt/issues/4991
+#   group_imports: https://github.com/rust-lang/rustfmt/issues/5083
+# --------------------------------------------------------------------------
