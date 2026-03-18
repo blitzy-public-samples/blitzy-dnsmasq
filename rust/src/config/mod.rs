@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // Configuration module root — declares sub-modules for the config subsystem.
-// Full implementation will be provided by the config/mod.rs agent.
+// Maps to C `src/config.h` and `src/option.c`, providing compile-time constants,
+// feature flag detection, configuration file parsing, and CLI argument processing.
 
 pub mod constants;
+pub mod features;

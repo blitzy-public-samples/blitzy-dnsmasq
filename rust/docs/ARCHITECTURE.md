@@ -649,11 +649,11 @@ fn main() {
 
     match target_os.as_str() {
         "linux" => {
-            println!("cargo:rustc-cfg=have_linux_network");
+            println!("cargo:rustc-cfg=linux_network");
             println!("cargo:rustc-cfg=have_inotify");
         }
         "freebsd" | "openbsd" | "netbsd" | "macos" => {
-            println!("cargo:rustc-cfg=have_bsd_network");
+            println!("cargo:rustc-cfg=bsd_network");
         }
         _ => {}
     }
