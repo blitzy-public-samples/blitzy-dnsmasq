@@ -25,3 +25,6 @@ pub mod v4;
 pub mod v6;
 
 pub mod ip6addr;
+
+#[cfg(feature = "dhcp6")]
+pub mod slaac;
