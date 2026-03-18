@@ -61,9 +61,21 @@ pub mod ubus;
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
 pub mod tables;
 
+/// nftables set integration for DNS-based firewall rule population.
+///
+/// Provides [`NftsetController`] for adding/removing IP addresses in nftables
+/// sets, enabling domain-based firewall policies on modern Linux systems.
+///
+/// Migrated from `src/nftset.c` (392 lines).
+#[cfg(feature = "nftset")]
+pub mod nftset;
+
 // Re-export key types when features are enabled
 #[cfg(feature = "ubus")]
 pub use ubus::UbusController;
 
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
 pub use tables::PfTableController;
+
+#[cfg(feature = "nftset")]
+pub use nftset::NftsetController;
