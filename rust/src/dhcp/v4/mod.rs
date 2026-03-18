@@ -13,14 +13,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! # DHCP Module
+//! # DHCPv4 Module
 //!
-//! Root module for DHCPv4 and DHCPv6 server functionality, lease management,
-//! Router Advertisement, SLAAC, and shared DHCP utilities.
+//! Sub-module root for DHCPv4 server functionality including protocol
+//! handling, option encode/decode, and server core.
 
-pub mod v4;
-
-#[cfg(feature = "dhcp6")]
-pub mod v6;
-
-pub mod ip6addr;
+pub mod options;
