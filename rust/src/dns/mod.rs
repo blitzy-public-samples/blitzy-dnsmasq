@@ -18,6 +18,9 @@ pub mod blockdata;
 #[cfg(feature = "dnssec")]
 pub mod crypto;
 
+#[cfg(feature = "dnssec")]
+pub mod dnssec;
+
 #[cfg(feature = "auth")]
 pub mod auth;
 
