@@ -1,0 +1,6 @@
+msrv = "1.91.0"
+cognitive-complexity-threshold = 50
+too-many-arguments-threshold = 10
+type-complexity-threshold = 300
+single-char-binding-names-threshold = 5
+doc-valid-idents = ["dnsmasq", "DHCPv4", "DHCPv6", "DNSSEC", "EDNS0", "PXE", "TFTP", "SLAAC", "BPF", "ICMPv6", "SIGHUP", "SIGUSR1", "SIGUSR2", "NetworkManager", "OpenWrt", "UBus", "NaN", "IPv4", "IPv6"]

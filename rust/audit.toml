@@ -1,0 +1,17 @@
+[advisories]
+# No advisories ignored by default — enforce zero-vulnerability target
+ignore = []
+# Warn on unmaintained dependencies
+informational_warnings = ["unmaintained"]
+
+[output]
+# Deny unmaintained crates in CI
+deny = ["unmaintained"]
+# Default terminal output format
+format = "terminal"
+
+[yanked]
+# Check for yanked crate versions
+enabled = true
+# Update advisory database before scanning
+update_index = true

@@ -1,0 +1,157 @@
+[package]
+name = "dnsmasq"
+version = "2.92.0"
+edition = "2021"
+rust-version = "1.91.0"
+authors = ["dnsmasq contributors"]
+description = "Memory-safe Rust implementation of dnsmasq - DNS forwarder, DHCP server, and network boot daemon"
+license = "GPL-2.0-or-later"
+repository = "https://thekelleys.org.uk/dnsmasq/doc.html"
+readme = "docs/README.md"
+build = "build.rs"
+
+[[bin]]
+name = "dnsmasq"
+path = "src/main.rs"
+
+[lib]
+name = "dnsmasq"
+path = "src/lib.rs"
+
+[features]
+default = ["dhcp", "dhcp6", "tftp", "script", "auth", "ipset", "loop-detect", "dumpfile", "inotify"]
+
+# DHCPv4 server — maps C HAVE_DHCP (config.h ~line 937)
+dhcp = []
+
+# DHCPv6 server — maps C HAVE_DHCP6 (config.h ~line 989), implies dhcp
+dhcp6 = ["dhcp"]
+
+# TFTP/PXE boot server — maps C HAVE_TFTP (config.h ~line 895)
+tftp = []
+
+# Script execution on lease events — maps C HAVE_SCRIPT (config.h ~line 1046)
+script = []
+
+# Authoritative DNS — maps C HAVE_AUTH (config.h ~line 1459)
+auth = []
+
+# Linux ipset integration — maps C HAVE_IPSET (config.h ~line 1352)
+ipset = []
+
+# DNS forwarding loop detection — maps C HAVE_LOOP (config.h ~line 774)
+loop-detect = []
+
+# Packet dump for debugging — maps C HAVE_DUMPFILE
+dumpfile = []
+
+# File change monitoring (Linux inotify) — maps C HAVE_INOTIFY (auto-detected)
+inotify = []
+
+# DNSSEC validation — maps C HAVE_DNSSEC (requires nettle crate)
+dnssec = ["dep:nettle"]
+
+# D-Bus control interface — maps C HAVE_DBUS (requires dbus crate)
+dbus = ["dep:dbus"]
+
+# OpenWrt UBus interface — maps C HAVE_UBUS
+ubus = []
+
+# Internationalized domain names — maps C HAVE_IDN / HAVE_LIBIDN2
+idn = ["dep:idna"]
+
+# Linux conntrack marks — maps C HAVE_CONNTRACK
+conntrack = []
+
+# nftables set integration — maps C HAVE_NFTSET (requires nftables crate)
+nftset = ["dep:nftables"]
+
+# Lua scripting — maps C HAVE_LUASCRIPT (requires script + mlua)
+luascript = ["script", "dep:mlua"]
+
+[dependencies]
+# Async runtime — replaces C poll()-based event loop (poll.c, dnsmasq.c main loop)
+tokio = { version = "1.48.0", features = ["full"] }
+
+# Safe POSIX bindings — replaces raw C system calls (privilege drop, raw sockets, signals)
+nix = { version = "0.30.1", features = ["net", "socket", "signal", "user", "fs", "poll"] }
+
+# Advanced socket configuration — replaces C setsockopt() calls (network.c)
+socket2 = { version = "0.6.0", features = ["all"] }
+
+# Raw FFI bindings — for platform-specific unsafe FFI blocks
+libc = "0.2"
+
+# CLI argument parsing — replaces C getopt_long in option.c
+clap = { version = "4.5.60", features = ["derive", "env"] }
+
+# Serialization — config parsing, lease file, JSON structured logging
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Structured logging — replaces C syslog integration (log.c)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Efficient byte buffers — DNS/DHCP packet construction/parsing
+bytes = "1"
+
+# Error type derivation — replaces C errno patterns
+thiserror = "2"
+
+# Top-level error handling — binary entry point
+anyhow = "1"
+
+# Conditional compilation helper — platform-specific code branching
+cfg-if = "1"
+
+# D-Bus integration — cfg(feature = "dbus"), replaces libdbus-1
+dbus = { version = "0.9", optional = true }
+
+# DNSSEC crypto — cfg(feature = "dnssec"), replaces libnettle/hogweed
+nettle = { version = "7", optional = true }
+
+# nftables sets — cfg(feature = "nftset"), replaces libnftables
+nftables = { version = "0.4", optional = true }
+
+# Lua scripting — cfg(feature = "luascript"), replaces liblua
+mlua = { version = "0.10", optional = true, features = ["lua54"] }
+
+# IDN support — cfg(feature = "idn"), replaces libidn2
+idna = { version = "1.0", optional = true }
+
+[dev-dependencies]
+# Property-based testing — DNS/DHCP protocol correctness
+proptest = "1.9.0"
+
+# Mock testing — external interaction isolation
+mockall = "0.13.1"
+
+# Async test utilities
+tokio-test = "0.4"
+
+# CLI integration testing
+assert_cmd = "2"
+
+# Temporary files for test isolation
+tempfile = "3"
+
+# Boolean-valued predicate functions for CLI integration testing assertions
+predicates = "3"
+
+# Statistical benchmarking framework for dns_cache_bench benchmark
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[[bench]]
+name = "dns_cache_bench"
+harness = false
