@@ -12,6 +12,9 @@ pub mod protocol;
 #[cfg(feature = "dnssec")]
 pub mod blockdata;
 
+#[cfg(feature = "loop-detect")]
+pub mod loop_detect;
+
 // Re-export core protocol types for convenient access
 pub use protocol::{
     // Byte helpers
