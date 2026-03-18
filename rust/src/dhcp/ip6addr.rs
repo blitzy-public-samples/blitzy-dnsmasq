@@ -199,7 +199,11 @@ mod tests {
     #[test]
     fn test_ula_fdff_upper_bound() {
         // fdff:ffff::1 is the upper range of ULA
-        assert!(is_ula(&"fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse::<Ipv6Addr>().unwrap()));
+        assert!(is_ula(
+            &"fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
+                .parse::<Ipv6Addr>()
+                .unwrap()
+        ));
     }
 
     #[test]
@@ -336,9 +340,7 @@ mod tests {
     fn test_ll_zero_not_with_interface_id() {
         // fe80::211:22ff:fe33:4455 has an interface ID — NOT zero
         assert!(!is_link_local_zero(
-            &"fe80::211:22ff:fe33:4455"
-                .parse::<Ipv6Addr>()
-                .unwrap()
+            &"fe80::211:22ff:fe33:4455".parse::<Ipv6Addr>().unwrap()
         ));
     }
 

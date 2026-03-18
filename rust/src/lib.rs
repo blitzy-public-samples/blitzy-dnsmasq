@@ -2,3 +2,6 @@
 
 pub mod config;
 pub mod core;
+
+#[cfg(feature = "dhcp")]
+pub mod dhcp;
