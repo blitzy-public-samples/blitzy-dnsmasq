@@ -18,6 +18,9 @@ pub mod blockdata;
 #[cfg(feature = "dnssec")]
 pub mod crypto;
 
+#[cfg(feature = "auth")]
+pub mod auth;
+
 #[cfg(feature = "loop-detect")]
 pub mod loop_detect;
 
