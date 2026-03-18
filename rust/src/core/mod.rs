@@ -3,5 +3,6 @@
 
 pub mod log;
 pub mod pattern;
+pub mod poll;
 pub mod types;
 pub mod util;
