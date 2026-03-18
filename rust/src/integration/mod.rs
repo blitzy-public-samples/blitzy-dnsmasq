@@ -70,6 +70,16 @@ pub mod tables;
 #[cfg(feature = "nftset")]
 pub mod nftset;
 
+/// Linux netfilter conntrack mark retrieval for DNS policy routing.
+///
+/// Provides [`get_incoming_mark`] for querying the Linux kernel's conntrack
+/// table to retrieve connection marks associated with incoming DNS queries,
+/// enabling VPN split-horizon and per-connection DNS policies.
+///
+/// Migrated from `src/conntrack.c` (324 lines).
+#[cfg(all(feature = "conntrack", target_os = "linux"))]
+pub mod conntrack;
+
 // Re-export key types when features are enabled
 #[cfg(feature = "ubus")]
 pub use ubus::UbusController;
@@ -79,3 +89,6 @@ pub use tables::PfTableController;
 
 #[cfg(feature = "nftset")]
 pub use nftset::NftsetController;
+
+#[cfg(all(feature = "conntrack", target_os = "linux"))]
+pub use conntrack::{get_incoming_mark, ConntrackError};
