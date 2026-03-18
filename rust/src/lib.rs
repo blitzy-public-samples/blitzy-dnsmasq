@@ -8,3 +8,5 @@ pub mod network;
 
 #[cfg(feature = "dhcp")]
 pub mod dhcp;
+
+pub mod integration;
