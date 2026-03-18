@@ -35,8 +35,11 @@ pub mod netlink;
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
 pub mod bpf;
 
-// NOTE: The following sub-modules are planned but created by separate agents:
-// - pub mod interface;  (from network.c — platform-independent core)
+/// Core network interface management: enumeration, socket binding, listeners.
+/// Migrated from `network.c` — the platform-independent network management core.
+pub mod interface;
+
+// NOTE: The following sub-module is planned but created by a separate agent:
 // - pub mod arp;        (from arp.c — ARP cache management)
 
 // ---------------------------------------------------------------------------
