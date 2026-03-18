@@ -18,6 +18,7 @@
 //! Root module for DHCPv4 and DHCPv6 server functionality, lease management,
 //! Router Advertisement, SLAAC, and shared DHCP utilities.
 
+pub mod common;
 pub mod v4;
 
 #[cfg(feature = "dhcp6")]
