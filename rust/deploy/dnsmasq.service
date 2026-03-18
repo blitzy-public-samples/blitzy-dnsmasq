@@ -1,0 +1,38 @@
+[Unit]
+Description=dnsmasq - A lightweight DHCP and caching DNS server
+Documentation=man:dnsmasq(8)
+After=network-online.target
+Wants=nss-lookup.target
+Before=nss-lookup.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/dnsmasq --test
+ExecStart=/usr/local/sbin/dnsmasq -k
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Privilege separation: dnsmasq starts as root, binds ports 53/67/69,
+# then drops to unprivileged user (default: nobody).
+# See src/dnsmasq.c lines 93-100 for privilege separation lifecycle.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE
+
+# Security hardening
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=no
+
+# Signal handling: SIGHUP=reload, SIGUSR1=cache dump, SIGUSR2=stats
+# See src/dnsmasq.c lines 278-291 for signal handler registration.
+KillSignal=SIGTERM
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=64
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
