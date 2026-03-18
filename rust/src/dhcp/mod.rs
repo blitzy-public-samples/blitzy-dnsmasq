@@ -28,3 +28,6 @@ pub mod ip6addr;
 
 #[cfg(feature = "dhcp6")]
 pub mod slaac;
+
+#[cfg(feature = "dhcp6")]
+pub mod radv;
