@@ -82,6 +82,13 @@ pub enum DnsmasqError {
     #[error("Lease error: {0}")]
     Lease(String),
 
+    /// Miscellaneous error not fitting other categories.
+    ///
+    /// Maps to C's `EC_MISC` exit code.  Used for symlink resolution failures,
+    /// inotify setup errors, and other non-categorised failures.
+    #[error("Miscellaneous error: {0}")]
+    Misc(String),
+
     /// Unrecoverable error that requires immediate process exit.
     #[error("Fatal error (exit code {code}): {message}")]
     Fatal {

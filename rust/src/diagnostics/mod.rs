@@ -41,5 +41,19 @@
 /// unconditionally available).
 pub mod metrics;
 
+/// Async inotify-based file monitoring for configuration change detection.
+///
+/// Monitors resolv.conf, dynamic DHCP host directories, and DHCP option
+/// directories for changes.  Linux-only — on other platforms, dnsmasq falls
+/// back to polling.
+///
+/// Gated by both the `inotify` Cargo feature and `target_os = "linux"`.
+#[cfg(all(feature = "inotify", target_os = "linux"))]
+pub mod inotify;
+
 // Re-export key metrics types (used throughout the codebase)
 pub use metrics::{MetricType, MetricsStore, ServerStats, METRIC_MAX, METRIC_NAMES};
+
+// Re-export inotify types when the feature is active.
+#[cfg(all(feature = "inotify", target_os = "linux"))]
+pub use inotify::{dir_flags, InotifyCallbacks, InotifyWatcher};
