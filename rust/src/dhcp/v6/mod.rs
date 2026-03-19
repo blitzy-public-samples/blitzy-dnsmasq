@@ -19,3 +19,4 @@
 //! construction functionality. Gated by `#[cfg(feature = "dhcp6")]`.
 
 pub mod outpacket;
+pub mod server;
