@@ -19,4 +19,5 @@
 //! handling, option encode/decode, and server core.
 
 pub mod options;
+pub mod protocol;
 pub mod server;
