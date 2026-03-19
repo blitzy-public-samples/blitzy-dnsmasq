@@ -2,7 +2,6 @@
 // The crate-level #![deny(unsafe_code)] is overridden here because this module
 // requires direct system call interactions that cannot be expressed in safe Rust.
 #![allow(unsafe_code)]
-
 // dnsmasq is Copyright (c) 2000-2025 Simon Kelley
 //
 // SPDX-License-Identifier: GPL-2.0-or-later

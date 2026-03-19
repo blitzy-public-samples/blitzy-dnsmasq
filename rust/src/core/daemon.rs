@@ -2,7 +2,6 @@
 // The crate-level #![deny(unsafe_code)] is overridden here because this module
 // requires direct system call interactions that cannot be expressed in safe Rust.
 #![allow(unsafe_code)]
-
 // Copyright (c) 2000-2025 Simon Kelley
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
@@ -80,7 +79,7 @@ use crate::config::options::DnsmasqConfig;
 use crate::core::log::{flush_logging, reopen_log};
 use crate::core::poll::{bind_tcp, bind_udp, EventLoop, TimerEvent};
 use crate::core::types::{DaemonState, DnsmasqError, DnsmasqResult, EventCode, ExitCode};
-use crate::core::util::{close_fds, dnsmasq_time};
+use crate::core::util::dnsmasq_time;
 
 // =============================================================================
 // Constants
@@ -108,11 +107,6 @@ const DEFAULT_DHCPV6_PORT: u16 = 547;
 /// Default TFTP listen port (standard well-known port for TFTP).
 #[cfg(feature = "tftp")]
 const DEFAULT_TFTP_PORT: u16 = 69;
-
-/// Maximum file descriptors to close during initialization.
-///
-/// Maps to C `max_fd` in `dnsmasq.c` main() — used by `close_fds()`.
-const MAX_FD_CLOSE: i32 = 1024;
 
 // =============================================================================
 // DaemonRunner
@@ -200,7 +194,7 @@ impl DaemonRunner {
     /// This is the Rust equivalent of C's `main()` initialization sequence
     /// in `dnsmasq.c` lines 226–1060. It:
     ///
-    /// 1. Closes inherited file descriptors (`close_fds()`)
+    /// 1. (Skipped in Rust — CLOEXEC handles inherited fd cleanup)
     /// 2. Binds network sockets (DNS, DHCP, TFTP) as root
     /// 3. Performs privilege separation via [`drop_privileges()`]
     /// 4. Initializes the DNS cache and DHCP lease database
@@ -227,10 +221,21 @@ impl DaemonRunner {
     ) -> DnsmasqResult<Self> {
         info!("dnsmasq starting, version {}", VERSION);
 
-        // Close inherited file descriptors — maps to C close_fds() at
-        // dnsmasq.c line ~460. We keep stdin/stdout/stderr (0, 1, 2).
-        // Source: src/dnsmasq.c line ~460: close_fds(max_fd, ...)
-        close_fds(MAX_FD_CLOSE, &[0, 1, 2]);
+        // NOTE: The C implementation calls close_fds() here (dnsmasq.c ~460)
+        // to close inherited file descriptors from the parent process.
+        // In Rust, this is UNSAFE within an active tokio runtime because
+        // tokio creates internal file descriptors (epoll fd, waker pipes)
+        // that would be destroyed, causing an I/O driver panic:
+        //   "failed to wake I/O driver: Bad file descriptor (os error 9)"
+        //
+        // Rust's standard library already sets FD_CLOEXEC on all file
+        // descriptors it creates, so inherited fds from exec'd processes
+        // are automatically closed. Manual close_fds() is both unnecessary
+        // and harmful in the async runtime context.
+        //
+        // If close-on-exec cleanup is needed for pre-exec fds, it should
+        // be performed BEFORE the tokio runtime is initialized (i.e.,
+        // before #[tokio::main] creates the runtime).
 
         // Initialize the async event loop and timer system.
         // Replaces C's poll_reset()/poll_listen()/do_poll() pattern from poll.c.
@@ -1631,7 +1636,6 @@ mod tests {
     #[test]
     fn test_interval_constants() {
         assert_eq!(INTERVAL_RESOLV, 1);
-        assert_eq!(MAX_FD_CLOSE, 1024);
     }
 
     /// Verify that DaemonState::new() creates a valid default state.

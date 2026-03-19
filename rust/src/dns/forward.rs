@@ -66,7 +66,9 @@ use crate::dns::protocol::{
     DnsPacketBuilder, RRType, ResponseCode, HB3_QR, HB3_RD, HB3_TC, HB4_AD, HB4_CD, HB4_RA,
     HB4_RCODE, MAXDNAME, NAMESERVER_PORT, RRFIXEDSZ,
 };
-use crate::dns::rrfilter::{check_rrs, rrfilter, RRFilterMode};
+use crate::dns::rrfilter::check_rrs;
+#[cfg(feature = "dnssec")]
+use crate::dns::rrfilter::{rrfilter, RRFilterMode};
 
 #[cfg(feature = "dnssec")]
 use crate::dns::blockdata::BlockData;
@@ -1927,6 +1929,9 @@ pub async fn reply_query(
     // Save values from record before mutable borrow.
     let query_name = record.query_name.clone();
     let query_type = record.query_type;
+    // query_class is used by DNSSEC validation when that feature is enabled;
+    // suppress the unused-variable warning for non-DNSSEC builds.
+    #[allow(unused_variables)]
     let query_class = record.query_class;
     let query_id = record.query_id;
     let source = record.source;
@@ -3090,6 +3095,9 @@ pub async fn tcp_request(
             }
         };
 
+        // query_class is used by DNSSEC validation when that feature is enabled;
+        // suppress the unused-variable warning for non-DNSSEC builds.
+        #[allow(unused_variables)]
         let (query_name, query_type, query_class) = if let Some(q) = dns_pkt.questions.first() {
             (q.name.to_string(), q.qtype, q.qclass)
         } else {

@@ -70,7 +70,7 @@ use dnsmasq::core::log;
 use dnsmasq::core::types::DaemonState;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
@@ -113,10 +113,61 @@ async fn main() -> Result<()> {
     // All short options from OPTSTRING and long-only options from LOPT_*
     // constants are supported for 100% CLI backward compatibility.
     //
-    // clap handles --help and --version automatically, printing usage
-    // information and exiting with code 0 (matching C behavior).
+    // NOTE: Custom --help (-w) and --version (-v) flags are defined in
+    // cli.rs with clap's built-in help/version disabled (disable_help_flag
+    // = true, disable_version_flag = true) because dnsmasq uses -w for
+    // help and -v for version (not the standard -h/-V). We check these
+    // flags explicitly below before proceeding to daemon initialization.
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     let cli_args = CliArgs::parse();
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Phase 1a: Handle early-exit flags (--help, --version, --test)
+    // These must be checked before logging or daemon initialization.
+    // Matching C dnsmasq behavior: these flags print output and exit(0).
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    // --help / -w: Print usage text and exit with code 0.
+    // Replaces C's display of usage[] array from option.c lines 543-742.
+    if cli_args.help_flag {
+        CliArgs::command()
+            .print_help()
+            .context("Failed to print help")?;
+        println!(); // Ensure trailing newline after help output
+        return Ok(());
+    }
+
+    // --version / -v: Print version and copyright information, then exit.
+    // Replaces C's "dnsmasq version" output from dnsmasq.c startup banner.
+    if cli_args.version_flag {
+        println!(
+            "dnsmasq version {} — {}",
+            dnsmasq::VERSION,
+            dnsmasq::COPYRIGHT
+        );
+        return Ok(());
+    }
+
+    // --test: Validate configuration syntax without starting the daemon.
+    // Replaces C's one_file() + die() config validation path.
+    // Parse the configuration file(s), report errors, and exit with code
+    // 0 on success or non-zero on failure — without binding any sockets.
+    if cli_args.test {
+        // Initialize minimal logging for config error output.
+        let log_config = build_log_config(&cli_args);
+        log::init_logging(&log_config).context("Failed to initialize logging subsystem")?;
+
+        match DnsmasqConfig::load(&cli_args) {
+            Ok(_) => {
+                println!("dnsmasq: syntax check OK.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("dnsmasq: syntax check FAILED: {}", e);
+                return Err(e.into());
+            }
+        }
+    }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // Phase 2: Initialize logging subsystem

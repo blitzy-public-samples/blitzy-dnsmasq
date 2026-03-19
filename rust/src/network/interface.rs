@@ -2,7 +2,6 @@
 // The crate-level #![deny(unsafe_code)] is overridden here because this module
 // requires direct system call interactions that cannot be expressed in safe Rust.
 #![allow(unsafe_code)]
-
 // Copyright (C) 2000-2025 Simon Kelley and contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
@@ -355,17 +354,22 @@ pub fn iface_check(
         }
     }
 
-    // Check --auth-server interface
-    for auth_ifn in &state.authinterface {
-        if let Some(ref auth_name) = auth_ifn.name {
-            if glob_match(auth_name, name) {
-                is_auth = true;
-            }
-        }
-        if let Some(check_addr) = addr {
-            if let Some(ref auth_addr) = auth_ifn.addr {
-                if auth_addr == check_addr {
+    // Check --auth-server interface (only when auth feature is enabled).
+    // The authinterface field on DaemonState is gated by #[cfg(feature = "auth")]
+    // in core/types.rs, so this access must also be feature-gated.
+    #[cfg(feature = "auth")]
+    {
+        for auth_ifn in &state.authinterface {
+            if let Some(ref auth_name) = auth_ifn.name {
+                if glob_match(auth_name, name) {
                     is_auth = true;
+                }
+            }
+            if let Some(check_addr) = addr {
+                if let Some(ref auth_addr) = auth_ifn.addr {
+                    if auth_addr == check_addr {
+                        is_auth = true;
+                    }
                 }
             }
         }
