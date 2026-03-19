@@ -1749,9 +1749,17 @@ impl DnsCache {
     pub fn cache_find_non_terminal(&mut self, name: &DnsName) -> bool {
         let target_key = make_cache_key(name);
 
-        // Direct match: the name itself has entries.
+        // Helper: returns true if entry is a positive (non-NXDOMAIN) live entry.
+        // NXDOMAIN negative cache entries do not prove the name exists as a
+        // non-terminal node in the DNS tree, so they must be excluded from
+        // the non-terminal check (e.g., for authoritative NXDOMAIN vs NODATA).
+        let is_positive_live = |e: &CacheEntry| {
+            !e.is_expired() && !e.flags.nxdomain && !matches!(e.data, CacheData::NxDomain)
+        };
+
+        // Direct match: the name itself has positive entries.
         if let Some(entries) = self.entries.get(&target_key) {
-            if entries.iter().any(|e| !e.is_expired()) {
+            if entries.iter().any(&is_positive_live) {
                 return true;
             }
         }
@@ -1764,7 +1772,7 @@ impl DnsCache {
         for key in self.entries.keys() {
             if key.ends_with(&dot_target) || key == target_str {
                 if let Some(entries) = self.entries.get(key) {
-                    if entries.iter().any(|e| !e.is_expired()) {
+                    if entries.iter().any(&is_positive_live) {
                         return true;
                     }
                 }

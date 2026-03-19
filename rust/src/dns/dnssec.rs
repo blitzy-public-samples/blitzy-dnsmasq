@@ -62,7 +62,7 @@ use crate::config::constants::{
     DNSSEC_LIMIT_CRYPTO, DNSSEC_LIMIT_NSEC3_ITERS, DNSSEC_LIMIT_SIG_FAIL, DNSSEC_LIMIT_WORK,
 };
 use crate::core::types::{DnsmasqError, DnsmasqResult};
-use crate::core::util::{hostname_cmp, hostname_eq};
+use crate::core::util::hostname_eq;
 use crate::dns::blockdata::BlockData;
 use crate::dns::cache::{CacheData, CacheEntry, CacheFlags, DnsCache};
 use crate::dns::crypto::{CryptoVerifier, DigestAlgorithm, DnssecAlgorithm, Nsec3HashAlgorithm};
@@ -472,6 +472,71 @@ fn count_labels(name: &str) -> usize {
         return 0;
     }
     trimmed.split('.').count()
+}
+
+// ===========================================================================
+// RFC 4034 §6.3 canonical DNS name ordering
+// ===========================================================================
+
+/// Compare two domain names in canonical DNS name order per RFC 4034 §6.3.
+///
+/// The canonical ordering compares names label-by-label, starting from
+/// the **rightmost (most significant)** label and working left.  Within
+/// each label the comparison is case-insensitive (ASCII lowercase).
+/// Shorter names (fewer labels) sort before longer names when the
+/// shorter name is a suffix of the longer one.
+///
+/// This is the ordering required for NSEC and NSEC3 denial-of-existence
+/// proofs.  It differs from simple byte comparison because the label
+/// structure matters (e.g., `a.example.com` vs `b.example.com` compares
+/// `com`, then `example`, then `a` vs `b`).
+///
+/// Source: RFC 4034 §6.1 — Canonical DNS Name Order.
+fn canonical_dns_name_cmp(a: &str, b: &str) -> Ordering {
+    let a_trimmed = a.trim_end_matches('.');
+    let b_trimmed = b.trim_end_matches('.');
+
+    // Split into labels and reverse so we compare rightmost first.
+    let a_labels: Vec<&str> = if a_trimmed.is_empty() {
+        Vec::new()
+    } else {
+        a_trimmed.split('.').collect()
+    };
+    let b_labels: Vec<&str> = if b_trimmed.is_empty() {
+        Vec::new()
+    } else {
+        b_trimmed.split('.').collect()
+    };
+
+    // Compare label-by-label from rightmost (most significant) to leftmost.
+    let a_len = a_labels.len();
+    let b_len = b_labels.len();
+    let min_len = a_len.min(b_len);
+
+    for i in 0..min_len {
+        let a_label = a_labels[a_len - 1 - i].as_bytes();
+        let b_label = b_labels[b_len - 1 - i].as_bytes();
+
+        // Compare this label pair byte-by-byte (case-insensitive).
+        let label_len = a_label.len().min(b_label.len());
+        for j in 0..label_len {
+            let c1 = a_label[j].to_ascii_lowercase();
+            let c2 = b_label[j].to_ascii_lowercase();
+            match c1.cmp(&c2) {
+                Ordering::Equal => continue,
+                other => return other,
+            }
+        }
+
+        // If label bytes compared equal, shorter label sorts first.
+        match a_label.len().cmp(&b_label.len()) {
+            Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+
+    // All compared labels are equal — fewer labels sorts first.
+    a_len.cmp(&b_len)
 }
 
 // ===========================================================================
@@ -1171,7 +1236,11 @@ impl DnssecValidator {
                         algorithm: key_algorithm,
                         key_data,
                     },
-                    expires: std::time::Instant::now() + Duration::from_secs(dnskey_rr.ttl as u64),
+                    // Cap TTL to RFC-recommended maximum of 7 days (604800 seconds) to prevent
+                    // malicious responses with extremely large TTLs from causing overflow or
+                    // indefinite cache retention.
+                    expires: std::time::Instant::now()
+                        + Duration::from_secs((dnskey_rr.ttl as u64).min(604_800)),
                     last_access: std::time::Instant::now(),
                     flags: CacheFlags {
                         from_upstream: true,
@@ -1259,10 +1328,13 @@ impl DnssecValidator {
             ]);
             let key_tag = u16::from_be_bytes([rrsig.rdata[16], rrsig.rdata[17]]);
 
-            // Extract signer's name from RRSIG RDATA (after fixed 18 bytes)
+            // Extract signer's name from RRSIG RDATA (after fixed 18 bytes).
+            // We preserve the consumed byte count so we can correctly locate
+            // the signature data that follows the signer name in the RDATA.
+            // Source: RFC 4034 §3.1 — RRSIG RDATA format.
             let signer_data = &rrsig.rdata[18..];
-            let signer_name = match DnsName::from_wire(0, signer_data) {
-                Ok((name, _consumed)) => name,
+            let (signer_name, signer_name_consumed) = match DnsName::from_wire(0, signer_data) {
+                Ok((name, consumed)) => (name, consumed),
                 Err(_) => continue,
             };
 
@@ -1355,14 +1427,30 @@ impl DnssecValidator {
                     sorted_records.sort_by(|a, b| a.rdata.cmp(&b.rdata));
 
                     for rr in &sorted_records {
-                        // Owner name in wire format (lowercase, with wildcard expansion)
+                        // Owner name in wire format (lowercase, with wildcard expansion).
+                        // RFC 4035 §5.3.4: if RRSIG label count < actual owner name
+                        // label count, the response was synthesised from a wildcard.
+                        // Reconstruct the wildcard source by taking the rightmost
+                        // `labels` labels of the actual owner name and prepending `*`.
                         let name_labels = count_labels(&rr.name.to_string());
                         if (labels as usize) < name_labels {
-                            // Wildcard expansion: use *.signer_name
+                            // Wildcard expansion per RFC 4035 §5.3.4:
+                            // Take the rightmost `labels` labels of the owner
+                            // name and prepend the wildcard label `*`.
+                            let owner_str = rr.name.to_string();
+                            let owner_str = owner_str.trim_end_matches('.');
+                            let all_labels: Vec<&str> = owner_str.split('.').collect();
+                            let keep = labels as usize;
+                            // Reconstruct from the rightmost `keep` labels.
+                            let suffix = if keep > 0 && keep <= all_labels.len() {
+                                all_labels[all_labels.len() - keep..].join(".")
+                            } else {
+                                owner_str.to_string()
+                            };
+                            let wildcard = format!("*.{}", suffix);
+                            let wc_name = DnsName::from_str_unchecked(&wildcard);
                             let mut owner_wire = BytesMut::new();
-                            owner_wire.put_u8(1); // label length for "*"
-                            owner_wire.put_u8(b'*');
-                            signer_name.to_wire(&mut owner_wire);
+                            wc_name.to_wire(&mut owner_wire);
                             verify_data.extend_from_slice(&owner_wire);
                         } else {
                             let mut owner_wire = BytesMut::new();
@@ -1380,9 +1468,12 @@ impl DnssecValidator {
                         verify_data.extend_from_slice(&rr.rdata);
                     }
 
-                    // Extract the actual signature from the RRSIG
-                    let signer_wire_len = signer_wire.len();
-                    let sig_offset = 18 + signer_wire_len;
+                    // Extract the actual signature from the RRSIG.
+                    // Use the consumed byte count from the original wire-format
+                    // parse (not signer_wire.len()) because the original RDATA
+                    // may use name compression pointers that differ in length
+                    // from the re-encoded canonical form.
+                    let sig_offset = 18 + signer_name_consumed;
                     if sig_offset >= rrsig.rdata.len() {
                         continue;
                     }
@@ -1392,7 +1483,8 @@ impl DnssecValidator {
                     // verify(algo, key_data: &BlockData, sig_data: &BlockData, digest: &[u8])
                     let key_block = BlockData::new(key_data);
                     let sig_block = BlockData::new(signature);
-                    match CryptoVerifier::verify(algo, &key_block, &sig_block, &verify_data) {
+                    match CryptoVerifier::verify(algo, &key_block, &sig_block, verify_data.as_ref())
+                    {
                         Ok(true) => {
                             debug!(
                                 name = %rrset.name,
@@ -1667,33 +1759,58 @@ impl DnssecValidator {
     ) -> DnsmasqResult<DnssecStatus> {
         let trimmed = name.trim_end_matches('.');
 
-        // Check trust anchors first (most common: root trust anchor)
+        // Identify the deepest trust anchor that is an ancestor of (or equal
+        // to) the queried name.  A trust anchor at the root covers everything.
+        // RFC 4035 §5.1: validation starts from a configured trust anchor and
+        // walks DOWN through delegation points, verifying DS records at each.
+        let mut anchor_name: Option<String> = None;
+
         for ta in &self.trust_anchors {
             let ta_name = ta.domain.to_string();
             let ta_trimmed = ta_name.trim_end_matches('.');
 
-            if hostname_eq(trimmed, ta_trimmed) || ta_trimmed == "." || ta_trimmed.is_empty() {
-                // This name is at or below a trust anchor
-                return Ok(DnssecStatus::Secure);
-            }
+            let covers = hostname_eq(trimmed, ta_trimmed)
+                || ta_trimmed == "."
+                || ta_trimmed.is_empty()
+                || trimmed.ends_with(&format!(".{}", ta_trimmed));
 
-            // Check if name is a subdomain of the trust anchor
-            if trimmed.ends_with(&format!(".{}", ta_trimmed))
-                || (ta_trimmed == "." || ta_trimmed.is_empty())
-            {
-                return Ok(DnssecStatus::Secure);
+            if covers {
+                // Keep the deepest (longest) matching trust anchor.
+                if anchor_name
+                    .as_ref()
+                    .is_none_or(|prev| ta_trimmed.len() > prev.len())
+                {
+                    anchor_name = Some(ta_trimmed.to_string());
+                }
             }
         }
 
-        // Walk up the DNS tree looking for DS records
+        // If the queried name IS the trust anchor itself, it is secure by
+        // definition — no intermediate delegations exist.
+        if let Some(ref anchor) = anchor_name {
+            if hostname_eq(trimmed, anchor) || anchor == "." || anchor.is_empty() {
+                // Trust anchor matches exactly (or root anchor) — secure.
+                // For the root anchor we still need to check child delegations
+                // unless the queried name IS the root.
+                if hostname_eq(trimmed, anchor) && !anchor.is_empty() && anchor != "." {
+                    return Ok(DnssecStatus::Secure);
+                }
+            }
+        }
+
+        // Walk UP from the queried name toward the trust anchor, checking for
+        // cached DS records at each delegation point.  If we encounter a
+        // delegation with NO DS record, the chain is broken and the zone
+        // is insecure.  If we find DS records all the way up to the trust
+        // anchor, the zone is secure.
         let mut current = trimmed.to_string();
         loop {
             let dns_name = DnsName::from_str_unchecked(&current);
 
-            // Check for cached DS records
+            // Check for cached DS records at this delegation point.
             let ds_entries = cache.cache_find_by_name(&dns_name, Some(RRType::DS));
             if !ds_entries.is_empty() {
-                // Check if any DS has a supported algorithm and digest
+                // Verify at least one DS has a supported algorithm and digest.
                 let mut has_supported = false;
                 for entry in &ds_entries {
                     if let CacheData::Ds {
@@ -1712,21 +1829,37 @@ impl DnssecValidator {
                 }
 
                 if has_supported {
+                    // DS is validated at this delegation — if we are at or
+                    // above the trust anchor level, the chain is complete.
+                    if let Some(ref anchor) = anchor_name {
+                        if hostname_eq(&current, anchor) || anchor == "." || anchor.is_empty() {
+                            return Ok(DnssecStatus::Secure);
+                        }
+                    }
+                    // DS exists but we haven't reached the trust anchor yet;
+                    // continue walking up.
+                }
+            } else {
+                // No DS at this delegation.  Check for explicit proof of
+                // insecure delegation (negative cache entry or non-terminal).
+                if cache.cache_find_non_terminal(&dns_name) {
+                    // Records exist for this name but no DS — insecure
+                    // delegation per RFC 4035.
+                    return Ok(DnssecStatus::Insecure);
+                }
+            }
+
+            // Check if this level matches the trust anchor (reached the
+            // anchor without finding a broken chain → secure).
+            if let Some(ref anchor) = anchor_name {
+                if hostname_eq(&current, anchor)
+                    || ((anchor == "." || anchor.is_empty()) && current.is_empty())
+                {
                     return Ok(DnssecStatus::Secure);
                 }
             }
 
-            // Check if this zone has a negative DS cache entry (insecure delegation)
-            if cache.cache_find_non_terminal(&dns_name) {
-                // There are records for this name, check if DS is explicitly absent
-                let ds_check = cache.cache_find_by_name(&dns_name, Some(RRType::DS));
-                if ds_check.is_empty() {
-                    // No DS at all — might need to fetch
-                    // Continue walking up
-                }
-            }
-
-            // Move to parent domain
+            // Move to parent domain.
             if let Some(dot_pos) = current.find('.') {
                 current = current[dot_pos + 1..].to_string();
             } else {
@@ -1734,6 +1867,12 @@ impl DnssecValidator {
             }
 
             if current.is_empty() {
+                // At root — check if root trust anchor covers us.
+                if let Some(ref anchor) = anchor_name {
+                    if anchor == "." || anchor.is_empty() {
+                        return Ok(DnssecStatus::Secure);
+                    }
+                }
                 break;
             }
 
@@ -1743,8 +1882,14 @@ impl DnssecValidator {
             }
         }
 
-        // No trust anchor found — the zone is either insecure or we need DS records
-        Ok(DnssecStatus::NeedDs)
+        // No trust anchor found or delegation chain is incomplete.
+        if anchor_name.is_some() {
+            // Trust anchor exists but DS records are missing — need to fetch.
+            Ok(DnssecStatus::NeedDs)
+        } else {
+            // No trust anchor covers this name at all.
+            Ok(DnssecStatus::NeedDs)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1809,33 +1954,113 @@ impl DnssecValidator {
             }
 
             // Case 2: Name falls between owner and next (canonical ordering)
-            let cmp_owner = hostname_cmp(&qname_lower, &owner_lower);
-            let cmp_next = hostname_cmp(&qname_lower, &next_lower);
+            // Uses RFC 4034 §6.3 label-by-label canonical ordering (right-to-left)
+            // instead of simple byte comparison, as required for NSEC proofs.
+            let cmp_owner = canonical_dns_name_cmp(&qname_lower, &owner_lower);
+            let cmp_next = canonical_dns_name_cmp(&qname_lower, &next_lower);
 
-            // Normal ordering: owner < qname < next
-            if cmp_owner == Ordering::Greater && cmp_next == Ordering::Less {
+            let name_covered =
+                // Normal ordering: owner < qname < next
+                (cmp_owner == Ordering::Greater && cmp_next == Ordering::Less)
+                || {
+                    // Wrap-around case: owner > next (last NSEC in zone)
+                    let owner_next_cmp = canonical_dns_name_cmp(&owner_lower, &next_lower);
+                    (owner_next_cmp == Ordering::Greater || owner_next_cmp == Ordering::Equal)
+                        && (cmp_owner == Ordering::Greater || cmp_next == Ordering::Less)
+                };
+
+            if name_covered {
                 debug!(
                     qname = qname,
                     owner = owner_lower,
                     next = next_lower,
-                    "NSEC proves non-existence (between)"
+                    "NSEC proves name non-existence"
                 );
-                return Ok(DnssecStatus::Secure);
-            }
 
-            // Wrap-around case: owner > next (last NSEC in zone)
-            let owner_next_cmp = hostname_cmp(&owner_lower, &next_lower);
-            if owner_next_cmp == Ordering::Greater || owner_next_cmp == Ordering::Equal {
-                // qname is after owner OR before next
-                if cmp_owner == Ordering::Greater || cmp_next == Ordering::Less {
+                // RFC 4035 §5.4 step 3: additionally prove that no wildcard at
+                // the closest encloser could have matched the queried name.
+                // The closest encloser is the longest ancestor of qname that
+                // actually exists in the zone.  We derive it by stripping
+                // the leftmost label from qname.
+                let closest_encloser = if let Some(dot_pos) = qname_lower.find('.') {
+                    &qname_lower[dot_pos + 1..]
+                } else {
+                    &qname_lower
+                };
+                let wildcard_name = format!("*.{}", closest_encloser);
+                let wc_lower = wildcard_name.to_ascii_lowercase();
+
+                // Check whether another NSEC in the authority section covers
+                // the wildcard name, proving it doesn't exist either.
+                let mut wildcard_proven = false;
+                for wc_nsec in nsec_records {
+                    let wc_owner = wc_nsec
+                        .name
+                        .to_string()
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase()
+                        .to_string();
+
+                    // If the wildcard name is the NSEC owner, the wildcard exists.
+                    // Check the type bitmap — if the queried type is absent, it is
+                    // a NODATA wildcard answer (still non-existent for this type).
+                    if hostname_eq(&wc_lower, &wc_owner) {
+                        let (_, wc_consumed) = match DnsName::from_wire(0, &wc_nsec.rdata) {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+                        let wc_bitmap = &wc_nsec.rdata[wc_consumed..];
+                        if !check_type_bitmap(wc_bitmap, qtype) {
+                            wildcard_proven = true;
+                            break;
+                        }
+                        continue;
+                    }
+
+                    // Check if the wildcard name falls between this NSEC's owner
+                    // and next name (same canonical ordering logic).
+                    let (wc_next, wc_consumed) = match DnsName::from_wire(0, &wc_nsec.rdata) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    let _ = &wc_nsec.rdata[wc_consumed..]; // bitmap (unused here)
+                    let wc_next_lower = wc_next
+                        .to_string()
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase();
+
+                    let wc_cmp_owner = canonical_dns_name_cmp(&wc_lower, &wc_owner);
+                    let wc_cmp_next = canonical_dns_name_cmp(&wc_lower, &wc_next_lower);
+
+                    let wc_covered =
+                        (wc_cmp_owner == Ordering::Greater && wc_cmp_next == Ordering::Less) || {
+                            let own_next = canonical_dns_name_cmp(&wc_owner, &wc_next_lower);
+                            (own_next == Ordering::Greater || own_next == Ordering::Equal)
+                                && (wc_cmp_owner == Ordering::Greater
+                                    || wc_cmp_next == Ordering::Less)
+                        };
+                    if wc_covered {
+                        wildcard_proven = true;
+                        break;
+                    }
+                }
+
+                if wildcard_proven {
                     debug!(
                         qname = qname,
-                        owner = owner_lower,
-                        next = next_lower,
-                        "NSEC proves non-existence (wrap-around)"
+                        wildcard = wc_lower,
+                        "NSEC proves both name and wildcard non-existence"
                     );
                     return Ok(DnssecStatus::Secure);
                 }
+
+                // Wildcard proof not found — the name doesn't exist but a
+                // wildcard might, so we can't definitively prove NXDOMAIN.
+                debug!(
+                    qname = qname,
+                    wildcard = wc_lower,
+                    "NSEC covers name but wildcard non-existence not proven"
+                );
             }
         }
 

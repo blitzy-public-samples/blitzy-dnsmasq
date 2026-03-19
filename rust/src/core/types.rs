@@ -707,11 +707,19 @@ pub struct NaptrRecord {
 }
 
 /// TXT record entry (C: `struct txt_record`).
+///
+/// Also used for custom RR records (via `--dns-rr`).  When representing a
+/// TXT record `class` holds the DNS class (typically IN = 1) and `rr_type`
+/// is 0.  When representing a custom RR record `rr_type` holds the DNS RR
+/// type value (e.g. 1 = A, 28 = AAAA) and `class` remains IN.
 #[derive(Debug, Clone)]
 pub struct TxtRecord {
     pub name: String,
     pub txt: Vec<u8>,
     pub class: u16,
+    /// DNS resource record type — used by custom RR records (`--dns-rr`).
+    /// For regular TXT records this is 0 (unused).
+    pub rr_type: u16,
 }
 
 /// PTR record entry (C: `struct ptr_record`).
@@ -851,6 +859,11 @@ pub struct RaInterface {
     pub interval: u32,
     pub priority: u32,
     pub mtu: u32,
+    /// Router lifetime override in seconds (0 = use 3×interval).
+    pub lifetime: u32,
+    /// Interface name from which to read MTU via sysctl.
+    /// Empty string means use the RA target interface itself.
+    pub mtu_name: String,
 }
 
 /// DHCP config entry (C: `struct dhcp_config`).
@@ -1726,6 +1739,14 @@ pub struct DaemonState {
     #[cfg(feature = "dhcp6")]
     pub icmp6fd: i32,
 
+    /// SLAAC lease information for ICMPv6 echo reply confirmation.
+    /// Populated by the lease module from `DhcpLease` entries; consumed by
+    /// `radv::icmp6_packet()` → `slaac::slaac_ping_reply()`.
+    /// Replaces C pattern where `slaac_ping_reply()` iterated the global
+    /// `leases` linked list.
+    #[cfg(feature = "dhcp6")]
+    pub slaac_leases: Vec<crate::dhcp::slaac::SlaacLeaseInfo>,
+
     // =================================================================
     // Integration state
     // =================================================================
@@ -2069,6 +2090,8 @@ impl DaemonState {
             dhcp6fd: -1,
             #[cfg(feature = "dhcp6")]
             icmp6fd: -1,
+            #[cfg(feature = "dhcp6")]
+            slaac_leases: Vec::new(),
 
             // =============================================================
             // Integration state

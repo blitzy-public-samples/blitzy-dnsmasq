@@ -1415,7 +1415,7 @@ fn handle_axfr(
     // Custom RR records.
     for rr in &state.rr_records {
         if hostname_eq(&rr.name, &zone.domain) || is_subdomain(&rr.name, &zone.domain) {
-            let rr_type = RRType::from_u16(rr.class);
+            let rr_type = RRType::from_u16(rr.rr_type);
             let name = DnsName::from_str_unchecked(&rr.name);
             transfer_records.push((name, rr_type, ttl, rr.txt.clone()));
         }

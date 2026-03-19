@@ -50,7 +50,7 @@ use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::config::constants::{MAXDNAME, SERVERS_LOGGED, SMALL_PORT_RANGE, TCP_BACKLOG, TIMEOUT};
 use crate::core::pattern::glob_match;
@@ -58,7 +58,7 @@ use crate::core::types::{
     opt, DaemonState, DnsmasqError, DnsmasqResult, InterfaceRecord, Listener, MySockAddr,
     OptionFlags, ServerEntry, ServerFd,
 };
-use crate::core::util::{close_fds, format_addr, hostname_eq, sockaddr_eq, SurfRng};
+use crate::core::util::{format_addr, hostname_eq, sockaddr_eq, SurfRng};
 
 #[cfg(target_os = "linux")]
 use crate::network::netlink::{NetlinkNetwork, IFACE_DEPRECATED, IFACE_TENTATIVE};
@@ -89,7 +89,7 @@ pub const SERV_FOR_NODOTS: u32 = 1 << 6;
 pub const SERV_NO_ADDR: u32 = 1 << 2;
 
 /// Server has an associated domain — derived from non-empty domain field.
-pub const SERV_HAS_DOMAIN: u32 = 0;
+pub const SERV_HAS_DOMAIN: u32 = 1 << 16;
 
 /// Server loaded from D-Bus.
 pub const SERV_FROM_DBUS: u32 = 1 << 8;
@@ -104,7 +104,7 @@ pub const SERV_COUNTED: u32 = 1 << 5;
 pub const SERV_USE_RESOLV: u32 = 1 << 0;
 
 /// Do not rebind-check replies from this server.
-pub const SERV_NO_REBIND: u32 = 0;
+pub const SERV_NO_REBIND: u32 = 1 << 17;
 
 /// Server loaded from a secondary configuration file.
 pub const SERV_FROM_FILE: u32 = 1 << 12;
@@ -591,11 +591,13 @@ fn release_listener(listener_idx: usize, state: &mut DaemonState) -> bool {
         }
     }
     if l.tcpfd >= 0 {
+        // SAFETY: Closing a valid TCP listener fd owned by this listener entry.
         unsafe {
             libc::close(l.tcpfd);
         }
     }
     if l.tftpfd >= 0 {
+        // SAFETY: Closing a valid TFTP listener fd owned by this listener entry.
         unsafe {
             libc::close(l.tftpfd);
         }
@@ -1427,6 +1429,10 @@ pub fn local_bind(
                 let port = state.min_port + (rng.rand16() % port_range);
                 bind_addr.set_port(port);
                 let sock_addr = SockAddr::from(bind_addr);
+                // SAFETY: `fd` is a valid socket descriptor returned by a prior
+                // `libc::socket` call.  `sock_addr` is a stack-allocated
+                // `SockAddr` whose pointer and length are valid for the
+                // duration of the `bind` call.
                 let ret = unsafe {
                     libc::bind(
                         fd,
@@ -1456,6 +1462,9 @@ pub fn local_bind(
     let is_wildcard = bind_addr.ip().is_unspecified();
     if !is_wildcard || bind_addr.port() != 0 {
         let sock_addr = SockAddr::from(bind_addr);
+        // SAFETY: `fd` is a valid socket descriptor and `sock_addr` is a
+        // stack-allocated `SockAddr` with a valid pointer and length for
+        // the duration of the `bind` syscall.
         let ret = unsafe {
             libc::bind(
                 fd,
@@ -1581,6 +1590,8 @@ fn allocate_sfd(
 
     // Bind
     if let Err(e) = local_bind(fd, addr, intname, 0, false, state) {
+        // SAFETY: Closing `fd` which was created by `libc::socket` above
+        // and is still owned by this function (not yet stored in state).
         unsafe {
             libc::close(fd);
         }
@@ -1589,6 +1600,9 @@ fn allocate_sfd(
 
     // Set non-blocking
     if let Err(e) = fix_fd(fd) {
+        // SAFETY: Closing `fd` which was created by `libc::socket` above
+        // and is still owned by this function (bind succeeded but fix_fd
+        // failed, so we must release the fd).
         unsafe {
             libc::close(fd);
         }
@@ -1739,25 +1753,24 @@ pub fn check_servers(_no_loop_check: bool, state: &mut DaemonState) -> DnsmasqRe
         }
     }
 
-    // Garbage collect unused sfds
-    // Garbage collect unused sfds — close their file descriptors using close_fds
-    // utility which safely closes a set of fds while preserving specified exceptions
+    // Garbage collect unused sfds — close ONLY the specific stale server
+    // file descriptors.  We must NOT use close_fds() here because that
+    // utility closes ALL fds in a range except a keep list, which would
+    // destroy listener, DHCP, log, and other daemon fds that are not in the
+    // server fd keep list.  Instead, close each stale fd individually.
     let sfds_to_close: Vec<i32> = state
         .sfds
         .iter()
         .filter(|sfd| !sfd.used)
         .map(|sfd| sfd.fd)
         .collect();
-    if !sfds_to_close.is_empty() {
-        // Use close_fds utility to batch-close garbage collected server fds
-        let keep_fds: Vec<i32> = state
-            .sfds
-            .iter()
-            .filter(|sfd| sfd.used)
-            .map(|sfd| sfd.fd)
-            .collect();
-        let max_fd = sfds_to_close.iter().copied().max().unwrap_or(0);
-        close_fds(max_fd + 1, &keep_fds);
+    for stale_fd in &sfds_to_close {
+        // SAFETY: We are closing file descriptors that belong to server
+        // socket entries marked as unused during the check_servers sweep.
+        // These fds are owned by the daemon and are no longer referenced
+        // by any active server entry after the retain below.
+        let _ = nix::unistd::close(*stale_fd);
+        trace!(fd = stale_fd, "closed stale server fd");
     }
     state.sfds.retain(|sfd| sfd.used);
 

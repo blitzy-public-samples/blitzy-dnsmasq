@@ -172,8 +172,9 @@ pub struct ServerMatchFlags {
     pub mark: bool,
     /// Server originated from resolv.conf.
     pub from_resolv: bool,
-    /// Server originated from DHCP.
-    pub from_dhcp: bool,
+    /// Server originated from D-Bus (e.g., NetworkManager).
+    /// Maps to C `SERV_FROM_DBUS` flag.
+    pub from_dbus: bool,
     /// Server has been detected as causing a forwarding loop.
     pub loop_detected: bool,
 }
@@ -199,7 +200,7 @@ impl ServerMatchFlags {
             all_zeros: (raw & SERV_ALL_ZEROS) != 0,
             mark: (raw & SERV_MARK) != 0,
             from_resolv: (raw & SERV_FROM_RESOLV) != 0,
-            from_dhcp: (raw & SERV_FROM_DBUS) != 0,
+            from_dbus: (raw & SERV_FROM_DBUS) != 0,
             loop_detected: (raw & SERV_LOOP) != 0,
         }
     }
@@ -225,7 +226,7 @@ impl ServerMatchFlags {
         if self.for_nodots {
             f |= SERV_FOR_NODOTS;
         }
-        if self.from_dhcp {
+        if self.from_dbus {
             f |= SERV_FROM_DBUS;
         }
         if self.mark {

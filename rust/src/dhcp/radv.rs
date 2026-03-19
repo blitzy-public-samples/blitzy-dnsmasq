@@ -631,7 +631,13 @@ pub fn icmp6_packet(state: &mut DaemonState) -> DnsmasqResult<()> {
             if sz < std::mem::size_of::<PingPacket>() {
                 return Ok(());
             }
-            slaac_ping_reply(&src_addr, &buf[..sz], &if_name, &mut [], &state.options);
+            slaac_ping_reply(
+                &src_addr,
+                &buf[..sz],
+                &if_name,
+                &mut state.slaac_leases,
+                &state.options,
+            );
         }
         _ => {
             debug!(target: "dnsmasq::dhcp",
@@ -754,7 +760,7 @@ fn send_ra_on_interface(
         header_bytes[1] = 0; // code
         header_bytes[2] = 0; // checksum (kernel-computed)
         header_bytes[3] = 0;
-        header_bytes[4] = 64; // hop limit (default 64)
+        header_bytes[4] = read_hop_limit(iface); // hop limit from kernel, fallback 64
         header_bytes[5] = flags;
         // Router lifetime (network byte order).
         let lt = parm.adv_lifetime.min(0xFFFF) as u16;
@@ -1438,9 +1444,9 @@ fn find_iface_param(iface: &str, state: &DaemonState) -> Option<RaInterface> {
             return Some(RaInterface {
                 name: ra_iface.name.clone(),
                 interval: ra_iface.interval,
-                lifetime: 0, // types.rs RaInterface doesn't have lifetime field
+                lifetime: ra_iface.lifetime,
                 prio: ra_iface.priority as u8,
-                mtu_name: String::new(), // types.rs RaInterface doesn't have mtu_name
+                mtu_name: ra_iface.mtu_name.clone(),
             });
         }
     }
@@ -1603,6 +1609,24 @@ fn read_interface_mtu(iface: &str) -> Option<u32> {
         Err(_) => {
             debug!(target: "dnsmasq::dhcp", "RA: cannot read MTU from {}", path);
             None
+        }
+    }
+}
+
+/// Read the hop limit for an interface from the kernel sysctl.
+///
+/// The C code reads `/proc/sys/net/ipv6/conf/{iface}/hop_limit` and uses the
+/// result as the Cur Hop Limit field in Router Advertisements.  Falls back to
+/// the default value of 64 if the sysctl file cannot be read.
+///
+/// Source: C `radv.c` — hop_limit set from `/proc/sys/net/ipv6/conf/`.
+fn read_hop_limit(iface: &str) -> u8 {
+    let path = format!("/proc/sys/net/ipv6/conf/{}/hop_limit", iface);
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => contents.trim().parse::<u8>().unwrap_or(64),
+        Err(_) => {
+            debug!(target: "dnsmasq::dhcp", "RA: cannot read hop_limit from {}, using default 64", path);
+            64
         }
     }
 }
