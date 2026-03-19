@@ -96,13 +96,16 @@ pub struct MigrateArgs {
     pub verbose: bool,
 
     /// Check feature-gated directives against the current compilation.
-    /// Warns if the config uses directives requiring features that are
-    /// not compiled into the current binary (e.g., DNSSEC, D-Bus).
-    #[arg(long = "check-features", default_value_t = true)]
+    /// When supplied, warns if the config uses directives requiring
+    /// features that are not compiled into the current binary (e.g.,
+    /// DNSSEC, D-Bus). Disabled by default; pass `--check-features`
+    /// to enable.
+    #[arg(long = "check-features")]
     pub check_features: bool,
 
     /// Treat warnings as errors (strict validation mode).
-    /// When enabled, any warning also causes a non-zero exit code.
+    /// When supplied, any warning also causes a non-zero exit code.
+    /// Disabled by default; pass `--strict` to enable.
     #[arg(long = "strict")]
     pub strict: bool,
 
@@ -215,13 +218,19 @@ fn main() -> ExitCode {
             }
         }
         Err(e) => {
-            // Fatal error — could not even open or read the config file
+            // Fatal error — could not even open or read the config file.
+            // In JSON mode, the fatal error report is written to stdout (not
+            // stderr) so that a single-stream JSON consumer can process both
+            // success and failure results without merging two streams. The
+            // "error" field distinguishes fatal errors from validation results.
+            // In human-readable mode, fatal errors go to stderr as expected.
             if args.json_output {
                 let error_report = serde_json::json!({
                     "success": false,
-                    "fatal_error": format!("{:#}", e),
+                    "error": format!("{:#}", e),
+                    "fatal": true,
                 });
-                eprintln!(
+                println!(
                     "{}",
                     serde_json::to_string_pretty(&error_report).unwrap_or_default()
                 );

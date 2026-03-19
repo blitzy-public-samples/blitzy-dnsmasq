@@ -66,6 +66,18 @@
 // =============================================================================
 // Crate-Level Lint Configuration
 // =============================================================================
+//
+// NOTE ON CLIPPY SUPPRESSIONS:
+// This crate has ~50 crate-level `#[allow(clippy::...)]` directives below.
+// Each suppression is documented with its rationale (casting for wire-format
+// protocol code, FFI pointer operations, style choices mirroring C patterns,
+// struct shapes dictated by the protocol, etc.).  These are crate-wide rather
+// than per-module because the same patterns recur across most modules in this
+// protocol-heavy networking daemon.  As the port stabilises, individual
+// suppressions should be periodically reviewed: remove any that no longer
+// trigger, and migrate remaining ones to per-module `#[allow(...)]` where
+// they apply to only a subset of modules.
+// =============================================================================
 
 // No unsafe code in core logic per AAP Section 0.7.1.  FFI exceptions in
 // platform-specific modules (e.g., network/netlink.rs, network/bpf.rs) use
@@ -367,12 +379,14 @@ pub use crate::config::constants;
 // Version and Copyright Constants
 // =============================================================================
 
-/// dnsmasq version string matching C implementation's `VERSION` macro.
+/// dnsmasq version string identifying the Rust port of v2.92.
 ///
-/// Defined in C as: `#define VERSION "2.92"` (set at build time in Makefile).
-/// This constant ensures the Rust binary reports the same version as the C
-/// original for monitoring and compatibility purposes.
-pub const VERSION: &str = "2.92";
+/// The `"-rust"` suffix distinguishes this binary from the original C
+/// implementation (`VERSION "2.92"` in the Makefile) so that operators,
+/// monitoring systems, and log parsers can identify which implementation
+/// is running. The base version matches the C release for compatibility,
+/// while the suffix signals the Rust memory-safe rewrite.
+pub const VERSION: &str = "2.92-rust";
 
 /// Copyright notice matching C source header.
 ///

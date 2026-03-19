@@ -464,6 +464,13 @@ fn build_log_config(cli_args: &CliArgs) -> log::LogConfig {
 
     log::LogConfig {
         facility,
+        // log_file is intentionally None during early CLI-based logging setup.
+        // File-based logging (via `--log-facility=/path/to/file` or
+        // `log-facility=/path/to/file` in dnsmasq.conf) is parsed from the
+        // full configuration in DnsmasqConfig::load() (Phase 3) and applied
+        // when DaemonRunner::new() reconfigures the logging subsystem with
+        // the complete configuration. This early LogConfig is only used for
+        // logging during CLI parsing and config loading itself.
         log_file: None,
         debug,
         json_output: false,
@@ -476,27 +483,61 @@ fn build_log_config(cli_args: &CliArgs) -> log::LogConfig {
 
 /// Parse a syslog facility name or number from the `--log-facility` directive.
 ///
-/// Supports both named facilities (matching C's facility lookup in log.c)
-/// and numeric codes for advanced configurations.
+/// Supports the full POSIX syslog facility set (matching C's `facilitynames[]`
+/// array from `option.c` lines 164-184): `kern`, `user`, `mail`, `daemon`,
+/// `auth`, `syslog`, `lpr`, `news`, `uucp`, `cron`, and `local0` through
+/// `local7`. Numeric facility codes are also accepted for advanced
+/// configurations.
+///
+/// If the value starts with `/` it is treated as a log file path by the
+/// config parser (handled upstream in `DnsmasqConfig::load()`), not here.
 ///
 /// # Examples
 ///
 /// - `"daemon"` → `LogFacility::Daemon`
 /// - `"local0"` → `LogFacility::Local0`
-/// - `"user"` → `LogFacility::User`
+/// - `"local3"` → `LogFacility::Custom(19 << 3)` (LOG_LOCAL3)
+/// - `"kern"` → `LogFacility::Custom(0)` (LOG_KERN)
+/// - `"auth"` → `LogFacility::Custom(4 << 3)` (LOG_AUTH)
+/// - `"cron"` → `LogFacility::Custom(9 << 3)` (LOG_CRON)
 /// - `"16"` → `LogFacility::Custom(16 * 8)` (numeric facility code)
 fn parse_log_facility(name: &str) -> log::LogFacility {
+    // Syslog facility codes from <syslog.h> — each is the facility number
+    // shifted left by 3 (i.e., multiplied by 8) per RFC 3164 PRI encoding.
+    //
+    // This list matches C dnsmasq's facilitynames[] array in option.c
+    // (lines 164-184) which maps all standard POSIX facility names.
     match name.to_ascii_lowercase().as_str() {
-        "daemon" => log::LogFacility::Daemon,
-        "local0" => log::LogFacility::Local0,
-        "user" => log::LogFacility::User,
-        "mail" => log::LogFacility::Mail,
+        // Facilities with dedicated LogFacility enum variants:
+        "daemon" => log::LogFacility::Daemon, // LOG_DAEMON = 3 << 3 = 24
+        "local0" => log::LogFacility::Local0, // LOG_LOCAL0 = 16 << 3 = 128
+        "user" => log::LogFacility::User,     // LOG_USER = 1 << 3 = 8
+        "mail" => log::LogFacility::Mail,     // LOG_MAIL = 2 << 3 = 16
+
+        // Additional POSIX syslog facilities (C option.c lines 165-183).
+        // Mapped via Custom(code) with pre-computed syslog facility codes.
+        "kern" => log::LogFacility::Custom(0), // LOG_KERN = 0 << 3 = 0
+        "auth" => log::LogFacility::Custom(4 << 3), // LOG_AUTH = 4 << 3 = 32
+        "syslog" => log::LogFacility::Custom(5 << 3), // LOG_SYSLOG = 5 << 3 = 40
+        "lpr" => log::LogFacility::Custom(6 << 3), // LOG_LPR = 6 << 3 = 48
+        "news" => log::LogFacility::Custom(7 << 3), // LOG_NEWS = 7 << 3 = 56
+        "uucp" => log::LogFacility::Custom(8 << 3), // LOG_UUCP = 8 << 3 = 64
+        "cron" => log::LogFacility::Custom(9 << 3), // LOG_CRON = 9 << 3 = 72
+        "local1" => log::LogFacility::Custom(17 << 3), // LOG_LOCAL1 = 17 << 3 = 136
+        "local2" => log::LogFacility::Custom(18 << 3), // LOG_LOCAL2 = 18 << 3 = 144
+        "local3" => log::LogFacility::Custom(19 << 3), // LOG_LOCAL3 = 19 << 3 = 152
+        "local4" => log::LogFacility::Custom(20 << 3), // LOG_LOCAL4 = 20 << 3 = 160
+        "local5" => log::LogFacility::Custom(21 << 3), // LOG_LOCAL5 = 21 << 3 = 168
+        "local6" => log::LogFacility::Custom(22 << 3), // LOG_LOCAL6 = 22 << 3 = 176
+        "local7" => log::LogFacility::Custom(23 << 3), // LOG_LOCAL7 = 23 << 3 = 184
+
         // Numeric facility: parse and convert to syslog code (facility * 8).
         other => {
             if let Ok(code) = other.parse::<i32>() {
                 log::LogFacility::from_syslog_code(code)
             } else {
-                // Unrecognized facility name: fall back to daemon (matching C behavior).
+                // Unrecognized facility name: fall back to daemon (matching C behavior
+                // which returns "bad log facility" error but we gracefully degrade).
                 log::LogFacility::Daemon
             }
         }
