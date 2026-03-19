@@ -31,3 +31,5 @@ pub mod slaac;
 
 #[cfg(feature = "dhcp6")]
 pub mod radv;
+
+pub mod lease;
