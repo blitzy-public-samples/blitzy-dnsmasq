@@ -59,15 +59,15 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
+use libc::AF_INET;
 use tracing::{debug, error, info, warn};
 
-use crate::config::constants::{
-    ARPHRD_ETHER, DEFLEASE, DEFLEASE6, LEASEFILE, LEASE_RETRY, MAXLEASES,
-};
+use crate::config::constants::{ARPHRD_ETHER, LEASEFILE, LEASE_RETRY, MAXLEASES};
 use crate::core::types::{opt, DaemonState, DnsmasqError, DnsmasqResult, OptionFlags};
+#[cfg(not(feature = "broken-rtc"))]
+use crate::core::util::dnsmasq_time;
 use crate::core::util::{
-    canonicalise, dnsmasq_time, format_mac, hostname_eq, is_same_net, is_same_net6, parse_hex,
-    SurfRng,
+    canonicalise, format_mac, hostname_eq, is_same_net, is_same_net6, parse_hex, SurfRng,
 };
 use crate::dhcp::common::{
     find_config, get_domain6, DhcpConfig, DhcpContext, NetId, CONFIG_NAME, CONTEXT_PROXY,
@@ -1149,31 +1149,60 @@ pub fn lease6_reset(db: &mut [DhcpLease]) {
 ///
 /// When `now` is non-zero, it is used as the base time. Otherwise falls back
 /// to `dnsmasq_time()` for the current wall-clock time.
-pub fn lease_set_expires(lease: &mut DhcpLease, len: u32, now: i64) {
-    // Apply default lease time if zero is passed (use protocol-appropriate default).
-    let effective_len = if len == 0 {
-        if lease.is_v6() {
-            DEFLEASE6
-        } else {
-            DEFLEASE
-        }
-    } else {
-        len
-    };
+pub fn lease_set_expires(
+    lease: &mut DhcpLease,
+    len: u32,
+    #[cfg_attr(feature = "broken-rtc", allow(unused))] now: i64,
+) {
+    // C semantics: len=0 means no change to the expiry time.
+    // Only non-zero lengths are applied. This matches C's lease_set_expires()
+    // where len=0 is a no-op for expiry (only flags are updated).
+    if len == 0 {
+        // No change to expiry — but still mark as changed for DNS dirty tracking.
+        lease.flags.aux_changed = true;
+        lease.raw_flags |= LEASE_AUX_CHANGED | LEASE_EXP_CHANGED;
+        // C always sets dns_dirty when lease_set_expires is called.
+        // The dns_dirty flag must be set by the caller on the LeaseDatabase.
+        debug!(lease = %lease, expires = lease.expires, duration = 0u32, "set lease expiry (no change, len=0)");
+        return;
+    }
 
-    if effective_len == 0xFFFFFFFF {
+    if len == 0xFFFFFFFF {
         lease.expires = 0;
     } else {
-        // Use the provided `now` as the base time, matching C behavior.
-        // Falls back to dnsmasq_time() only when called without a meaningful
-        // time parameter (0).
-        let base_time = if now != 0 { now } else { dnsmasq_time() };
-        let new_expires = base_time.saturating_add(effective_len as i64);
-        lease.expires = if new_expires <= 0 { 0 } else { new_expires };
+        // HAVE_BROKEN_RTC: On systems without a wall-clock (embedded routers,
+        // etc.), store the lease duration directly rather than computing an
+        // absolute expiry timestamp.  This matches C's compile-time
+        // `HAVE_BROKEN_RTC` guard in `lease_set_expires()`.
+        #[cfg(feature = "broken-rtc")]
+        {
+            lease.expires = len as i64;
+        }
+        #[cfg(not(feature = "broken-rtc"))]
+        {
+            // Use the provided `now` as the base time, matching C behavior.
+            // Falls back to dnsmasq_time() only when called without a meaningful
+            // time parameter (0).
+            let base_time = if now != 0 { now } else { dnsmasq_time() };
+            let new_expires = base_time.saturating_add(len as i64);
+            lease.expires = if new_expires <= 0 { 0 } else { new_expires };
+        }
     }
     lease.flags.aux_changed = true;
     lease.raw_flags |= LEASE_AUX_CHANGED | LEASE_EXP_CHANGED;
-    debug!(lease = %lease, expires = lease.expires, duration = effective_len, "set lease expiry");
+    debug!(lease = %lease, expires = lease.expires, duration = len, "set lease expiry");
+}
+
+/// Set the expiration time on a lease within a database context.
+///
+/// Wraps [`lease_set_expires`] and additionally marks the database's
+/// `dns_dirty` flag, matching C behavior where DNS is always re-evaluated
+/// when lease expiry changes.
+pub fn lease_set_expires_db(db: &mut LeaseDatabase, lease_idx: usize, len: u32, now: i64) {
+    if let Some(lease) = db.leases.get_mut(lease_idx) {
+        lease_set_expires(lease, len, now);
+        db.dns_dirty = true;
+    }
 }
 
 /// Set the IAID (Identity Association Identifier) for a DHCPv6 lease.
@@ -1565,7 +1594,7 @@ pub fn lease_find_interfaces(db: &mut LeaseDatabase, state: &mut DaemonState) {
 
     for (iface_addr, iface_mask, iface_name, iface_idx) in &interfaces {
         // Validate this interface is configured for DHCP service using iface_check().
-        let (allowed, _auth) = iface_check(libc::AF_INET, Some(iface_addr), iface_name, state);
+        let (allowed, _auth) = iface_check(AF_INET, Some(iface_addr), iface_name, state);
         if !allowed {
             continue;
         }
@@ -1864,11 +1893,16 @@ pub fn lease_update_slaac(db: &mut LeaseDatabase, now: i64, contexts: &[DhcpCont
 }
 
 /// Build SlaacLeaseInfo list from current leases for slaac module calls.
+///
+/// Includes all DHCPv6 leases with valid hardware addresses (hwaddr_len > 0),
+/// not just those that already have SLAAC addresses. This allows initial SLAAC
+/// address creation for newly allocated v6 leases, matching C behavior where
+/// `slaac_add_addrs()` iterates all v6 leases regardless of existing SLAAC state.
 #[cfg(feature = "dhcp6")]
 fn build_slaac_lease_infos(leases: &[DhcpLease]) -> Vec<SlaacLeaseInfo> {
     leases
         .iter()
-        .filter(|l| l.is_v6() && !l.slaac_addresses.is_empty())
+        .filter(|l| l.is_v6() && l.hwaddr_len > 0)
         .map(|l| SlaacLeaseInfo {
             hwaddr: l.hwaddr[..l.hwaddr_len.min(l.hwaddr.len())].to_vec(),
             hwaddr_type: l.hwaddr_type as u16,
@@ -1883,11 +1917,14 @@ fn build_slaac_lease_infos(leases: &[DhcpLease]) -> Vec<SlaacLeaseInfo> {
 }
 
 /// Copy updated SLAAC state back to leases from slaac module results.
+///
+/// Must iterate with the same filter as `build_slaac_lease_infos` (all v6
+/// leases with valid hardware addresses) to maintain 1:1 index correspondence.
 #[cfg(feature = "dhcp6")]
 fn apply_slaac_updates(leases: &mut [DhcpLease], infos: &[SlaacLeaseInfo]) {
     let mut info_idx = 0;
     for lease in leases.iter_mut() {
-        if lease.is_v6() && !lease.slaac_addresses.is_empty() {
+        if lease.is_v6() && lease.hwaddr_len > 0 {
             if info_idx < infos.len() {
                 lease.slaac_addresses = infos[info_idx].slaac_addresses.clone();
             }
@@ -2094,6 +2131,11 @@ mod tests {
     fn test_lease_set_expires_normal() {
         let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
         lease_set_expires(&mut lease, 3600, 1700000000);
+        // With broken-rtc feature enabled, expiry stores the raw duration.
+        // Without broken-rtc, expiry stores now + len (absolute timestamp).
+        #[cfg(feature = "broken-rtc")]
+        assert_eq!(lease.expires, 3600);
+        #[cfg(not(feature = "broken-rtc"))]
         assert_eq!(lease.expires, 1700003600);
     }
 

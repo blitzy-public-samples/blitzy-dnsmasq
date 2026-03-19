@@ -744,6 +744,11 @@ impl EdnsHandler {
     /// * `Ok(new_len)` — Updated packet length.
     ///
     /// Maps to C `add_source_addr()` (edns0.c lines 993-1024).
+    /// Add EDNS0 Client Subnet option (legacy interface without cacheable tracking).
+    ///
+    /// Delegates to `add_source_addr_with_cacheable` but discards the cacheability
+    /// result. Retained for backward compatibility with call sites that don't
+    /// need cacheable tracking.
     pub fn add_source_addr(
         packet: &mut BytesMut,
         packet_len: usize,
@@ -751,60 +756,154 @@ impl EdnsHandler {
         source: &MySockAddr,
         state: &DaemonState,
     ) -> DnsmasqResult<usize> {
-        if !state.options.is_set(opt::CLIENT_SUBNET) {
-            return Ok(packet_len);
-        }
+        let cacheable = true;
+        let (len, _) = Self::add_source_addr_with_cacheable(
+            packet, packet_len, limit, source, &cacheable, state,
+        )?;
+        Ok(len)
+    }
 
-        let source_addr = source.to_socket_addr();
-        let ip = source_addr.ip();
+    /// Add or strip EDNS0 Client Subnet (ECS) option per RFC 7871 with
+    /// cacheable flag tracking.
+    ///
+    /// Implements the full three-mode C behavior (edns0.c add_source_addr):
+    ///
+    /// - **Mode 1** (`CLIENT_SUBNET` set): Add client subnet option with source
+    ///   address. If `STRIP_ECS` also set, replace existing ECS (replace=1).
+    /// - **Mode 2** (`STRIP_ECS` only): Remove existing ECS option from packet
+    ///   (replace=2 in C).
+    /// - **Mode 3** (neither flag set): Passive detection — if client sent an
+    ///   ECS option, mark response as non-cacheable via `check_source()`.
+    ///
+    /// # Returns
+    /// * `Ok((new_len, cacheable))` — Updated packet length and whether the
+    ///   response remains cacheable after this operation.
+    fn add_source_addr_with_cacheable(
+        packet: &mut BytesMut,
+        packet_len: usize,
+        limit: usize,
+        source: &MySockAddr,
+        upstream_cacheable: &bool,
+        state: &DaemonState,
+    ) -> DnsmasqResult<(usize, bool)> {
+        let mut cacheable = true;
 
-        // Determine if we should strip existing ECS (passive mode detection)
-        if state.options.is_set(opt::STRIP_ECS) {
-            // Check if the client already sent an ECS option
-            if let Some((edns_data, _, _, _)) =
-                Self::find_pseudoheader(&packet[..packet_len], packet_len)?
-            {
-                let has_ecs = edns_data
-                    .options
-                    .iter()
-                    .any(|o| o.code == edns0::OPTION_CLIENT_SUBNET);
+        if state.options.is_set(opt::CLIENT_SUBNET) {
+            // Mode 1: CLIENT_SUBNET is set — add ECS option.
+            let replace = if state.options.is_set(opt::STRIP_ECS) {
+                // CLIENT_SUBNET + STRIP_ECS: replace existing ECS (C: replace=1).
+                ReplaceMode::ReplaceOrAdd
+            } else {
+                // CLIENT_SUBNET only: add without replacing (C: replace=0).
+                ReplaceMode::NoReplace
+            };
+
+            let source_addr = source.to_socket_addr();
+            let ip = source_addr.ip();
+
+            // calc_subnet_opt determines cacheability based on whether a
+            // fixed configured address is used (cacheable) or the variable
+            // client address (not cacheable).
+            let (subnet, addr_cacheable) = Self::calc_subnet_opt_with_cacheable(&ip, state);
+            if !addr_cacheable {
+                cacheable = false;
+            }
+
+            let opt_data = subnet.to_bytes();
+
+            debug!(
+                family = subnet.family,
+                source_mask = subnet.source_netmask,
+                "EDNS0: adding ECS option"
+            );
+
+            let new_len = Self::add_pseudoheader(
+                packet,
+                packet_len,
+                limit,
+                edns0::OPTION_CLIENT_SUBNET,
+                &opt_data,
+                false,
+                replace,
+                state.edns_pktsz,
+            )?;
+            Ok((new_len, cacheable))
+        } else if state.options.is_set(opt::STRIP_ECS) {
+            // Mode 2: STRIP_ECS only — remove existing ECS option (C: replace=2).
+            debug!("EDNS0: stripping existing ECS from client query");
+            let new_len = Self::add_pseudoheader(
+                packet,
+                packet_len,
+                limit,
+                edns0::OPTION_CLIENT_SUBNET,
+                &[],
+                false,
+                ReplaceMode::ReplaceOnly,
+                state.edns_pktsz,
+            )?;
+            Ok((new_len, cacheable))
+        } else {
+            // Mode 3: Neither flag set — passive detection.
+            // If we still think the data is cacheable, and we're not
+            // messing with EDNS client subnet ourselves, see if the client
+            // sent a client subnet. If so, mark the data as uncacheable.
+            // (C: edns0.c lines 1007-1012)
+            if *upstream_cacheable {
+                let has_ecs = if let Some((edns_data, _, _, _)) =
+                    Self::find_pseudoheader(&packet[..packet_len], packet_len)?
+                {
+                    edns_data
+                        .options
+                        .iter()
+                        .any(|o| o.code == edns0::OPTION_CLIENT_SUBNET)
+                } else {
+                    false
+                };
+
                 if has_ecs {
-                    // Passively detected: client already sent ECS. Strip it.
-                    debug!("EDNS0: stripping existing ECS from client query");
-                    return Self::add_pseudoheader(
-                        packet,
-                        packet_len,
-                        limit,
-                        edns0::OPTION_CLIENT_SUBNET,
-                        &[],
-                        false,
-                        ReplaceMode::ReplaceOnly,
-                        state.edns_pktsz,
-                    );
+                    // Client sent ECS — check_source will determine if the
+                    // response is client-specific and thus non-cacheable.
+                    let check_result =
+                        Self::check_source(&packet[..packet_len], packet_len, None, source, state)
+                            .unwrap_or(false);
+                    if !check_result {
+                        cacheable = false;
+                    }
                 }
             }
+            Ok((packet_len, cacheable))
         }
+    }
 
-        // Calculate the subnet option
-        let subnet = Self::calc_subnet_opt(&ip, state);
-        let opt_data = subnet.to_bytes();
-
-        debug!(
-            family = subnet.family,
-            source_mask = subnet.source_netmask,
-            "EDNS0: adding ECS option"
-        );
-
-        Self::add_pseudoheader(
-            packet,
-            packet_len,
-            limit,
-            edns0::OPTION_CLIENT_SUBNET,
-            &opt_data,
-            false,
-            ReplaceMode::NoReplace,
-            state.edns_pktsz,
-        )
+    /// Calculate subnet option data with cacheability flag.
+    ///
+    /// Maps to C `calc_subnet_opt()` (edns0.c lines 878-930) which sets
+    /// `*cacheablep` based on whether a fixed configured address is used
+    /// (cacheable=1) or the variable client address (cacheable=0).
+    fn calc_subnet_opt_with_cacheable(
+        source_ip: &IpAddr,
+        state: &DaemonState,
+    ) -> (SubnetOpt, bool) {
+        let subnet = Self::calc_subnet_opt(source_ip, state);
+        // Determine cacheability: if subnet mask is 0 (no address supplied)
+        // or if a configured fixed address was used, the response is cacheable.
+        // If the variable client address is used, it's not cacheable.
+        // C: cacheable=1 when addr_used is set (fixed config) or mask==0.
+        // C: cacheable=0 when using the actual client source address.
+        let cacheable = if subnet.source_netmask == 0 {
+            // No address ever supplied — cacheable (C line 924).
+            true
+        } else {
+            // Check if a fixed address is configured: the presence of
+            // add_subnet4/add_subnet6 with addr_used indicates a constant
+            // address, making responses cacheable. Without it, the variable
+            // client source address is used → non-cacheable.
+            match source_ip {
+                IpAddr::V4(_) => state.add_subnet4.as_ref().is_none_or(|s| s.addr_used),
+                IpAddr::V6(_) => state.add_subnet6.as_ref().is_none_or(|s| s.addr_used),
+            }
+        };
+        (subnet, cacheable)
     }
 
     // -----------------------------------------------------------------------
@@ -1147,6 +1246,17 @@ impl EdnsHandler {
     /// * `Ok(new_len)` — Final packet length after all options are added.
     ///
     /// Maps to C `add_edns0_config()` (edns0.c lines 1322-1340).
+    /// Add all configured EDNS0 options to a DNS query packet.
+    ///
+    /// This is the single entry point for adding all EDNS0 options during query
+    /// forwarding. Returns the new packet length and a `cacheable` flag indicating
+    /// whether the response can be cached (false when client-specific data like
+    /// MAC or variable ECS was added).
+    ///
+    /// Maps to C `add_edns0_config()` (edns0.c lines 1322–1339).
+    ///
+    /// # Returns
+    /// * `Ok((new_len, cacheable))` — Updated packet length and cacheability flag.
     pub fn add_edns0_config(
         packet: &mut BytesMut,
         packet_len: usize,
@@ -1156,10 +1266,17 @@ impl EdnsHandler {
         arp_cache: &mut ArpCache,
         arp_enumerator: &dyn crate::network::arp::ArpEnumerator,
         state: &DaemonState,
-    ) -> DnsmasqResult<usize> {
+    ) -> DnsmasqResult<(usize, bool)> {
         let mut len = packet_len;
+        // Start cacheable: response is assumed cacheable unless we add
+        // client-specific data (MAC, variable ECS address).
+        // Maps to C: `*cacheable = 1;` (edns0.c line 1325).
+        let mut cacheable = true;
 
-        // 1. Add raw MAC address option
+        // 1. Add raw MAC address option — sets cacheable=false when MAC added.
+        // C: `plen = add_mac(..., cacheable);` where add_mac sets *cacheablep=0
+        // when a MAC option is successfully added (edns0.c line 770).
+        let old_len = len;
         len = Self::add_mac(
             packet,
             len,
@@ -1170,8 +1287,13 @@ impl EdnsHandler {
             arp_enumerator,
             state,
         )?;
+        if len != old_len {
+            cacheable = false;
+        }
 
-        // 2. Add DNS client identification (base64/hex MAC)
+        // 2. Add DNS client identification (base64/hex MAC) — also sets
+        //    cacheable=false when client MAC is embedded (edns0.c line 688).
+        let old_len = len;
         len = Self::add_dns_client(
             packet,
             len,
@@ -1182,8 +1304,12 @@ impl EdnsHandler {
             arp_enumerator,
             state,
         )?;
+        if len != old_len {
+            cacheable = false;
+        }
 
-        // 3. Add NOMCPEID option (dns_client_id string)
+        // 3. Add NOMCPEID option (dns_client_id string) — uses a constant
+        //    configured value, so does not affect cacheability.
         if let Some(ref client_id) = state.dns_client_id {
             let id_bytes = client_id.as_bytes();
             debug!(
@@ -1205,10 +1331,16 @@ impl EdnsHandler {
         // 4. Add Cisco Umbrella option
         len = Self::add_umbrella_opt(packet, len, limit, source, state)?;
 
-        // 5. Add EDNS Client Subnet option
-        len = Self::add_source_addr(packet, len, limit, source, state)?;
+        // 5. Add EDNS Client Subnet option — may set cacheable=false
+        //    when using variable client address (not a configured fixed subnet).
+        let (new_len, ecs_cacheable) =
+            Self::add_source_addr_with_cacheable(packet, len, limit, source, &cacheable, state)?;
+        len = new_len;
+        if !ecs_cacheable {
+            cacheable = false;
+        }
 
-        Ok(len)
+        Ok((len, cacheable))
     }
 
     // -----------------------------------------------------------------------

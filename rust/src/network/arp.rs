@@ -159,6 +159,18 @@ pub trait ArpEnumerator {
     fn enumerate_arp(&self, callback: &mut dyn FnMut(IpAddr, &[u8])) -> DnsmasqResult<()>;
 }
 
+/// No-op ARP enumerator that always reports zero entries.
+///
+/// Used as a placeholder when the ARP cache is not available or not relevant
+/// (e.g., for queries where MAC-based EDNS0 options are not needed).
+pub struct NullArpEnumerator;
+
+impl ArpEnumerator for NullArpEnumerator {
+    fn enumerate_arp(&self, _callback: &mut dyn FnMut(IpAddr, &[u8])) -> DnsmasqResult<()> {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ArpCache Struct
 // ---------------------------------------------------------------------------

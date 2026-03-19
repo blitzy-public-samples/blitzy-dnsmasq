@@ -75,10 +75,18 @@ use dbus::{Message, MessageType};
 
 use tracing::{debug, error, info, warn};
 
+#[cfg(feature = "dhcp")]
+use crate::config::constants::ARPHRD_ETHER;
 use crate::core::types::DaemonState;
+#[cfg(feature = "dhcp")]
+use crate::core::util::parse_hex;
 use crate::core::util::{format_addr, format_mac};
 #[cfg(feature = "dhcp")]
-use crate::dhcp::lease::DhcpLease;
+use crate::dhcp::lease::{
+    lease4_allocate, lease_set_expires, lease_set_hwaddr, DhcpLease, LeaseType,
+};
+#[cfg(all(feature = "dhcp", feature = "dhcp6"))]
+use crate::dhcp::lease::{lease6_allocate, lease_set_iaid};
 use crate::diagnostics::metrics::{MetricsStore, METRIC_MAX};
 use crate::dns::cache::DnsCache;
 use crate::dns::domain_match::DomainMatcher;
@@ -164,93 +172,117 @@ const OPT_LOCALISE: u32 = 18;
 // Introspection XML (from src/dbus.c lines 112-191)
 // ---------------------------------------------------------------------------
 
-/// Complete D-Bus introspection XML for the dnsmasq service object.
+/// Build the D-Bus introspection XML for the dnsmasq service object.
 ///
-/// This XML is returned in response to `org.freedesktop.DBus.Introspectable.Introspect`
+/// Returned in response to `org.freedesktop.DBus.Introspectable.Introspect`
 /// method calls, allowing D-Bus tools (d-feet, busctl, gdbus) to discover
 /// the available methods and signals.
-const INTROSPECTION_XML: &str = concat!(
-    "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\"\n",
-    "\"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n",
-    "<node name=\"/uk/org/thekelleys/dnsmasq\">\n",
-    "  <interface name=\"org.freedesktop.DBus.Introspectable\">\n",
-    "    <method name=\"Introspect\">\n",
-    "      <arg direction=\"out\" name=\"data\" type=\"s\"/>\n",
-    "    </method>\n",
-    "  </interface>\n",
-    "  <interface name=\"uk.org.thekelleys.dnsmasq\">\n",
-    "    <method name=\"ClearCache\">\n",
-    "    </method>\n",
-    "    <method name=\"GetVersion\">\n",
-    "      <arg direction=\"out\" name=\"version\" type=\"s\"/>\n",
-    "    </method>\n",
-    "    <method name=\"SetServers\">\n",
-    "      <arg direction=\"in\" name=\"servers\" type=\"av\"/>\n",
-    "    </method>\n",
-    "    <method name=\"SetServersEx\">\n",
-    "      <arg direction=\"in\" name=\"servers\" type=\"aas\"/>\n",
-    "    </method>\n",
-    "    <method name=\"SetDomainServers\">\n",
-    "      <arg direction=\"in\" name=\"servers\" type=\"as\"/>\n",
-    "    </method>\n",
-    "    <method name=\"SetFilterWin2KOption\">\n",
-    "      <arg direction=\"in\" name=\"filterwin2k\" type=\"b\"/>\n",
-    "    </method>\n",
-    "    <method name=\"SetBogusPrivOption\">\n",
-    "      <arg direction=\"in\" name=\"boguspriv\" type=\"b\"/>\n",
-    "    </method>\n",
-    "    <method name=\"SetFilterA\">\n",
-    "      <arg direction=\"in\" name=\"filter\" type=\"b\"/>\n",
-    "    </method>\n",
-    "    <method name=\"SetFilterAAAA\">\n",
-    "      <arg direction=\"in\" name=\"filter\" type=\"b\"/>\n",
-    "    </method>\n",
-    "    <method name=\"SetLocaliseQueriesOption\">\n",
-    "      <arg direction=\"in\" name=\"localise\" type=\"b\"/>\n",
-    "    </method>\n",
-    "    <method name=\"GetMetrics\">\n",
-    "      <arg direction=\"out\" name=\"metrics\" type=\"a{su}\"/>\n",
-    "    </method>\n",
-    "    <method name=\"GetServerMetrics\">\n",
-    "      <arg direction=\"out\" name=\"metrics\" type=\"aa{ss}\"/>\n",
-    "    </method>\n",
-    "    <method name=\"ClearMetrics\">\n",
-    "    </method>\n",
-    "    <method name=\"AddDhcpLease\">\n",
-    "      <arg direction=\"in\" name=\"ipaddr\" type=\"s\"/>\n",
-    "      <arg direction=\"in\" name=\"hwaddr\" type=\"s\"/>\n",
-    "      <arg direction=\"in\" name=\"hostname\" type=\"s\"/>\n",
-    "      <arg direction=\"in\" name=\"clid\" type=\"s\"/>\n",
-    "      <arg direction=\"in\" name=\"lease_duration\" type=\"u\"/>\n",
-    "      <arg direction=\"in\" name=\"iaid\" type=\"u\"/>\n",
-    "      <arg direction=\"in\" name=\"is_temporary\" type=\"b\"/>\n",
-    "      <arg direction=\"out\" name=\"result\" type=\"b\"/>\n",
-    "    </method>\n",
-    "    <method name=\"DeleteDhcpLease\">\n",
-    "      <arg direction=\"in\" name=\"ipaddr\" type=\"s\"/>\n",
-    "      <arg direction=\"out\" name=\"result\" type=\"b\"/>\n",
-    "    </method>\n",
-    "    <method name=\"GetLoopServers\">\n",
-    "      <arg direction=\"out\" name=\"servers\" type=\"as\"/>\n",
-    "    </method>\n",
-    "    <signal name=\"DhcpLeaseAdded\">\n",
-    "      <arg name=\"ipaddr\" type=\"s\"/>\n",
-    "      <arg name=\"hwaddr\" type=\"s\"/>\n",
-    "      <arg name=\"hostname\" type=\"s\"/>\n",
-    "    </signal>\n",
-    "    <signal name=\"DhcpLeaseDeleted\">\n",
-    "      <arg name=\"ipaddr\" type=\"s\"/>\n",
-    "      <arg name=\"hwaddr\" type=\"s\"/>\n",
-    "      <arg name=\"hostname\" type=\"s\"/>\n",
-    "    </signal>\n",
-    "    <signal name=\"DhcpLeaseUpdated\">\n",
-    "      <arg name=\"ipaddr\" type=\"s\"/>\n",
-    "      <arg name=\"hwaddr\" type=\"s\"/>\n",
-    "      <arg name=\"hostname\" type=\"s\"/>\n",
-    "    </signal>\n",
-    "  </interface>\n",
-    "</node>\n"
-);
+///
+/// The XML is constructed at runtime to conditionally include feature-gated
+/// methods, matching C's use of `#ifdef HAVE_DHCP` / `#ifdef HAVE_LOOP`
+/// preprocessor guards in the introspection template (`dbus.c` lines 108-191).
+fn build_introspection_xml() -> String {
+    let mut xml = String::with_capacity(4096);
+    xml.push_str(
+        "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\"\n\
+         \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n\
+         <node name=\"/uk/org/thekelleys/dnsmasq\">\n\
+         \x20 <interface name=\"org.freedesktop.DBus.Introspectable\">\n\
+         \x20   <method name=\"Introspect\">\n\
+         \x20     <arg name=\"data\" direction=\"out\" type=\"s\"/>\n\
+         \x20   </method>\n\
+         \x20 </interface>\n\
+         \x20 <interface name=\"uk.org.thekelleys.dnsmasq\">\n\
+         \x20   <method name=\"ClearCache\">\n\
+         \x20   </method>\n\
+         \x20   <method name=\"GetVersion\">\n\
+         \x20     <arg name=\"version\" direction=\"out\" type=\"s\"/>\n\
+         \x20   </method>\n",
+    );
+    // GetLoopServers: conditionally included per C's #ifdef HAVE_LOOP
+    #[cfg(feature = "loop-detect")]
+    xml.push_str(
+        "\x20   <method name=\"GetLoopServers\">\n\
+         \x20     <arg name=\"server\" direction=\"out\" type=\"as\"/>\n\
+         \x20   </method>\n",
+    );
+    xml.push_str(
+        "\x20   <method name=\"SetServers\">\n\
+         \x20     <arg name=\"servers\" direction=\"in\" type=\"av\"/>\n\
+         \x20   </method>\n\
+         \x20   <method name=\"SetServersEx\">\n\
+         \x20     <arg name=\"servers\" direction=\"in\" type=\"aas\"/>\n\
+         \x20   </method>\n\
+         \x20   <method name=\"SetDomainServers\">\n\
+         \x20     <arg name=\"servers\" direction=\"in\" type=\"as\"/>\n\
+         \x20   </method>\n\
+         \x20   <method name=\"SetFilterWin2KOption\">\n\
+         \x20     <arg name=\"filterwin2k\" direction=\"in\" type=\"b\"/>\n\
+         \x20   </method>\n\
+         \x20   <method name=\"SetBogusPrivOption\">\n\
+         \x20     <arg name=\"boguspriv\" direction=\"in\" type=\"b\"/>\n\
+         \x20   </method>\n\
+         \x20   <method name=\"SetFilterA\">\n\
+         \x20     <arg name=\"filter-a\" direction=\"in\" type=\"b\"/>\n\
+         \x20   </method>\n\
+         \x20   <method name=\"SetFilterAAAA\">\n\
+         \x20     <arg name=\"filter-aaaa\" direction=\"in\" type=\"b\"/>\n\
+         \x20   </method>\n\
+         \x20   <method name=\"SetLocaliseQueriesOption\">\n\
+         \x20     <arg name=\"localise-queries\" direction=\"in\" type=\"b\"/>\n\
+         \x20   </method>\n",
+    );
+    xml.push_str(
+        "\x20   <signal name=\"DhcpLeaseAdded\">\n\
+         \x20     <arg name=\"ipaddr\" type=\"s\"/>\n\
+         \x20     <arg name=\"hwaddr\" type=\"s\"/>\n\
+         \x20     <arg name=\"hostname\" type=\"s\"/>\n\
+         \x20   </signal>\n\
+         \x20   <signal name=\"DhcpLeaseDeleted\">\n\
+         \x20     <arg name=\"ipaddr\" type=\"s\"/>\n\
+         \x20     <arg name=\"hwaddr\" type=\"s\"/>\n\
+         \x20     <arg name=\"hostname\" type=\"s\"/>\n\
+         \x20   </signal>\n\
+         \x20   <signal name=\"DhcpLeaseUpdated\">\n\
+         \x20     <arg name=\"ipaddr\" type=\"s\"/>\n\
+         \x20     <arg name=\"hwaddr\" type=\"s\"/>\n\
+         \x20     <arg name=\"hostname\" type=\"s\"/>\n\
+         \x20   </signal>\n",
+    );
+    // AddDhcpLease / DeleteDhcpLease: conditionally included per C's #ifdef HAVE_DHCP.
+    // Hostname and CLID use D-Bus byte array type `ay` (not string `s`) to match C's
+    // interface contract (`dbus.c` lines 171-172), preserving NetworkManager compatibility.
+    // AddDhcpLease has no output argument — C returns an empty method_return on success.
+    #[cfg(feature = "dhcp")]
+    xml.push_str(
+        "\x20   <method name=\"AddDhcpLease\">\n\
+         \x20     <arg name=\"ipaddr\" type=\"s\"/>\n\
+         \x20     <arg name=\"hwaddr\" type=\"s\"/>\n\
+         \x20     <arg name=\"hostname\" type=\"ay\"/>\n\
+         \x20     <arg name=\"clid\" type=\"ay\"/>\n\
+         \x20     <arg name=\"lease_duration\" type=\"u\"/>\n\
+         \x20     <arg name=\"ia_id\" type=\"u\"/>\n\
+         \x20     <arg name=\"is_temporary\" type=\"b\"/>\n\
+         \x20   </method>\n\
+         \x20   <method name=\"DeleteDhcpLease\">\n\
+         \x20     <arg name=\"ipaddr\" type=\"s\"/>\n\
+         \x20     <arg name=\"success\" type=\"b\" direction=\"out\"/>\n\
+         \x20   </method>\n",
+    );
+    xml.push_str(
+        "\x20   <method name=\"GetMetrics\">\n\
+         \x20     <arg name=\"metrics\" direction=\"out\" type=\"a{su}\"/>\n\
+         \x20   </method>\n\
+         \x20   <method name=\"GetServerMetrics\">\n\
+         \x20     <arg name=\"metrics\" direction=\"out\" type=\"a{ss}\"/>\n\
+         \x20   </method>\n\
+         \x20   <method name=\"ClearMetrics\">\n\
+         \x20   </method>\n\
+         \x20 </interface>\n\
+         </node>\n",
+    );
+    xml
+}
 
 // ---------------------------------------------------------------------------
 // Error types (Phase 10 of agent_prompt)
@@ -635,9 +667,9 @@ impl DbusController {
             "GetServerMetrics" => Some(Self::handle_get_server_metrics(msg, state)),
             "ClearMetrics" => Some(Self::handle_clear_metrics(msg, metrics, state)),
             #[cfg(feature = "dhcp")]
-            "AddDhcpLease" => Some(Self::handle_add_dhcp_lease(msg)),
+            "AddDhcpLease" => Some(Self::handle_add_dhcp_lease(msg, state)),
             #[cfg(feature = "dhcp")]
-            "DeleteDhcpLease" => Some(Self::handle_delete_dhcp_lease(msg)),
+            "DeleteDhcpLease" => Some(Self::handle_delete_dhcp_lease(msg, state)),
             #[cfg(feature = "loop-detect")]
             "GetLoopServers" => Some(Self::handle_get_loop_servers(msg, state)),
             _ => {
@@ -652,8 +684,13 @@ impl DbusController {
     // -----------------------------------------------------------------------
 
     /// Handle `Introspect` — return XML service description.
+    ///
+    /// Builds the introspection XML dynamically to conditionally include
+    /// feature-gated methods (DHCP lease management, loop detection),
+    /// matching C's `#ifdef HAVE_DHCP` / `#ifdef HAVE_LOOP` guards.
     fn handle_introspect(&self, msg: &Message) -> Message {
-        msg.method_return().append1(INTROSPECTION_XML)
+        let xml = build_introspection_xml();
+        msg.method_return().append1(xml)
     }
 
     /// Handle `GetVersion` — return the dnsmasq version string.
@@ -909,85 +946,294 @@ impl DbusController {
 
     /// Handle `AddDhcpLease` — create or update a DHCP lease.
     ///
-    /// Replaces C `message_handler` AddDhcpLease dispatch (`dbus.c` lines
-    /// 1072-1252). Parses 7 arguments: ipaddr, hwaddr, hostname, clid,
-    /// lease_duration, iaid, is_temporary.
+    /// Replaces C `dbus_add_lease()` (`dbus.c` lines 1072-1190). Parses 7
+    /// arguments: ipaddr (s), hwaddr (s), hostname (ay), clid (ay),
+    /// lease_duration (u), ia_id (u), is_temporary (b).
+    ///
+    /// Creates or updates a lease entry in the daemon's lease database,
+    /// matching C behaviour:
+    /// 1. Parse and validate IP address (IPv4 or IPv6).
+    /// 2. Find existing lease or allocate a new one.
+    /// 3. Set hardware address, client-id, expires, and hostname.
+    /// 4. Returns an empty method_return on success (no output arg per C
+    ///    XML definition) or a D-Bus error on invalid arguments.
     #[cfg(feature = "dhcp")]
-    fn handle_add_dhcp_lease(msg: &Message) -> Message {
+    fn handle_add_dhcp_lease(
+        msg: &Message,
+        state: &Arc<std::sync::RwLock<DaemonState>>,
+    ) -> Message {
         let mut iter = msg.iter_init();
 
+        // 1. ipaddr — string (s)
         let ipaddr: String = match iter.read() {
             Ok(v) => v,
-            Err(_) => return create_invalid_args_error(msg, "Missing ipaddr"),
+            Err(_) => return create_invalid_args_error(msg, "Expected string as first argument"),
         };
         iter.next();
 
-        let hwaddr: String = match iter.read() {
+        // 2. hwaddr — string (s)
+        let hwaddr_str: String = match iter.read() {
             Ok(v) => v,
-            Err(_) => return create_invalid_args_error(msg, "Missing hwaddr"),
+            Err(_) => return create_invalid_args_error(msg, "Expected string as second argument"),
         };
         iter.next();
 
-        let hostname: String = match iter.read() {
+        // 3. hostname — byte array (ay), matching C `dbus.c` line 171 type="ay"
+        let hostname_bytes: Vec<u8> = match iter.read() {
             Ok(v) => v,
-            Err(_) => return create_invalid_args_error(msg, "Missing hostname"),
+            Err(_) => {
+                return create_invalid_args_error(msg, "Expected byte array as third argument")
+            }
         };
         iter.next();
 
-        let clid: String = match iter.read() {
+        // 4. clid — byte array (ay), matching C `dbus.c` line 172 type="ay"
+        let clid_bytes: Vec<u8> = match iter.read() {
             Ok(v) => v,
-            Err(_) => return create_invalid_args_error(msg, "Missing clid"),
+            Err(_) => {
+                return create_invalid_args_error(msg, "Expected byte array as fourth argument")
+            }
         };
         iter.next();
 
-        let _lease_duration: u32 = match iter.read() {
+        // 5. lease_duration — uint32 (u)
+        let lease_duration: u32 = match iter.read() {
             Ok(v) => v,
-            Err(_) => return create_invalid_args_error(msg, "Missing lease_duration"),
+            Err(_) => return create_invalid_args_error(msg, "Expected uint32 as fifth argument"),
         };
         iter.next();
 
-        let _iaid: u32 = match iter.read() {
+        // 6. ia_id — uint32 (u)
+        let ia_id: u32 = match iter.read() {
             Ok(v) => v,
-            Err(_) => return create_invalid_args_error(msg, "Missing iaid"),
+            Err(_) => return create_invalid_args_error(msg, "Expected uint32 as sixth argument"),
         };
         iter.next();
 
-        let _is_temporary: bool = match iter.read() {
+        // 7. is_temporary — boolean (b)
+        let is_temporary: bool = match iter.read() {
             Ok(v) => v,
-            Err(_) => return create_invalid_args_error(msg, "Missing is_temporary"),
+            Err(_) => {
+                return create_invalid_args_error(msg, "Expected boolean as seventh argument")
+            }
         };
 
-        debug!(
-            ipaddr = %ipaddr,
-            hwaddr = %hwaddr,
-            hostname = %hostname,
-            clid = %clid,
-            "D-Bus AddDhcpLease"
-        );
+        // Parse hardware address from hex string (C: parse_hex(hwaddr, ...))
+        let hw_bytes = match parse_hex(&hwaddr_str) {
+            Some(b) => b,
+            None => {
+                return create_invalid_args_error(
+                    msg,
+                    &format!("Invalid HW address '{}'", hwaddr_str),
+                )
+            }
+        };
+        // Default hw_type: ARPHRD_ETHER (1) for non-empty addresses, matching C behaviour.
+        let hw_type: i32 = if hw_bytes.is_empty() {
+            0
+        } else {
+            ARPHRD_ETHER as i32
+        };
 
-        // Lease creation is delegated to the DHCP lease manager subsystem.
-        // The D-Bus interface validates arguments and returns success; the
-        // actual lease database integration occurs through the DHCP module's
-        // shared state mechanisms.
-        let success = true;
-        msg.method_return().append1(success)
+        // Acquire write lock on daemon state to modify lease database.
+        let mut st = match state.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                warn!("Failed to acquire state lock for AddDhcpLease");
+                return create_invalid_args_error(msg, "Internal error: state lock");
+            }
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // Determine address family and find/create lease.
+        if let Ok(addr4) = ipaddr.parse::<Ipv4Addr>() {
+            // IPv4 lease — ia_id and is_temporary must be zero (C dbus.c line ~1151)
+            if ia_id != 0 || is_temporary {
+                return create_invalid_args_error(
+                    msg,
+                    "ia_id and is_temporary must be zero for IPv4 lease",
+                );
+            }
+
+            // Find existing lease or allocate a new one.
+            let lease_idx = if let Some(idx) = st.leases.iter().position(|l| l.addr == Some(addr4))
+            {
+                idx
+            } else {
+                let lease = lease4_allocate(addr4);
+                st.leases.push(lease);
+                st.leases.len() - 1
+            };
+
+            // Set hardware address and client-id (C: lease_set_hwaddr)
+            let clid_ref = if clid_bytes.is_empty() {
+                None
+            } else {
+                Some(clid_bytes.as_slice())
+            };
+            lease_set_hwaddr(
+                &mut st.leases[lease_idx],
+                &hw_bytes,
+                clid_ref,
+                hw_bytes.len(),
+                hw_type,
+                now,
+                false,
+            );
+
+            // Set lease expiry (C: lease_set_expires)
+            lease_set_expires(&mut st.leases[lease_idx], lease_duration, now);
+
+            // Set hostname from byte array (C: strips trailing NUL, rejects embedded NULs)
+            if !hostname_bytes.is_empty() {
+                let hostname_clean = strip_hostname_nul(&hostname_bytes);
+                match hostname_clean {
+                    Ok(name) if !name.is_empty() => {
+                        st.leases[lease_idx].hostname = Some(name.to_string());
+                        st.leases[lease_idx].flags.has_changed = true;
+                    }
+                    Ok(_) => {} // empty hostname — skip
+                    Err(e) => return create_invalid_args_error(msg, e),
+                }
+            }
+
+            debug!(
+                ipaddr = %ipaddr, hwaddr = %hwaddr_str,
+                "D-Bus AddDhcpLease: IPv4 lease created/updated"
+            );
+        } else if let Ok(addr6) = ipaddr.parse::<Ipv6Addr>() {
+            // IPv6 lease
+            #[cfg(feature = "dhcp6")]
+            {
+                let lease_type = if is_temporary {
+                    LeaseType::Ta
+                } else {
+                    LeaseType::Na
+                };
+
+                let lease_idx =
+                    if let Some(idx) = st.leases.iter().position(|l| l.addr6 == Some(addr6)) {
+                        idx
+                    } else {
+                        let lease = lease6_allocate(addr6, lease_type);
+                        st.leases.push(lease);
+                        st.leases.len() - 1
+                    };
+
+                lease_set_iaid(&mut st.leases[lease_idx], ia_id);
+
+                let clid_ref = if clid_bytes.is_empty() {
+                    None
+                } else {
+                    Some(clid_bytes.as_slice())
+                };
+                lease_set_hwaddr(
+                    &mut st.leases[lease_idx],
+                    &hw_bytes,
+                    clid_ref,
+                    hw_bytes.len(),
+                    hw_type,
+                    now,
+                    false,
+                );
+                lease_set_expires(&mut st.leases[lease_idx], lease_duration, now);
+
+                if !hostname_bytes.is_empty() {
+                    let hostname_clean = strip_hostname_nul(&hostname_bytes);
+                    match hostname_clean {
+                        Ok(name) if !name.is_empty() => {
+                            st.leases[lease_idx].hostname = Some(name.to_string());
+                            st.leases[lease_idx].flags.has_changed = true;
+                        }
+                        Ok(_) => {}
+                        Err(e) => return create_invalid_args_error(msg, e),
+                    }
+                }
+
+                debug!(
+                    ipaddr = %ipaddr, hwaddr = %hwaddr_str,
+                    "D-Bus AddDhcpLease: IPv6 lease created/updated"
+                );
+            }
+            #[cfg(not(feature = "dhcp6"))]
+            {
+                let _ = addr6;
+                return create_invalid_args_error(msg, "DHCPv6 support not compiled in");
+            }
+        } else {
+            return create_invalid_args_error(msg, &format!("Invalid IP address '{}'", ipaddr));
+        }
+
+        // C returns NULL on success → message_handler creates an empty method_return
+        msg.method_return()
     }
 
     /// Handle `DeleteDhcpLease` — remove a lease by IP address.
     ///
-    /// Replaces C `message_handler` DeleteDhcpLease dispatch (`dbus.c` lines
-    /// 1252-1298).
+    /// Replaces C `dbus_del_lease()` (`dbus.c` lines 1252-1298).
+    /// Locates the lease by IP address (IPv4 or IPv6), removes it from the
+    /// lease database, and returns a boolean indicating whether the lease was
+    /// found and deleted.
     #[cfg(feature = "dhcp")]
-    fn handle_delete_dhcp_lease(msg: &Message) -> Message {
-        match msg.read1::<String>() {
-            Ok(ipaddr) => {
-                debug!(ipaddr = %ipaddr, "D-Bus DeleteDhcpLease");
-                // Lease deletion is delegated to the DHCP lease manager.
-                let success = true;
-                msg.method_return().append1(success)
+    fn handle_delete_dhcp_lease(
+        msg: &Message,
+        state: &Arc<std::sync::RwLock<DaemonState>>,
+    ) -> Message {
+        let ipaddr: String = match msg.read1() {
+            Ok(v) => v,
+            Err(_) => return create_invalid_args_error(msg, "Expected string as first argument"),
+        };
+
+        let mut st = match state.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                warn!("Failed to acquire state lock for DeleteDhcpLease");
+                return create_invalid_args_error(msg, "Internal error: state lock");
             }
-            Err(_) => create_invalid_args_error(msg, "Expected string ipaddr argument"),
+        };
+
+        let found: bool;
+
+        if let Ok(addr4) = ipaddr.parse::<Ipv4Addr>() {
+            // IPv4 lease deletion
+            let pos = st.leases.iter().position(|l| l.addr == Some(addr4));
+            if let Some(idx) = pos {
+                let removed = st.leases.remove(idx);
+                debug!(
+                    ipaddr = %ipaddr,
+                    hostname = ?removed.hostname,
+                    "D-Bus DeleteDhcpLease: IPv4 lease removed"
+                );
+                found = true;
+            } else {
+                debug!(ipaddr = %ipaddr, "D-Bus DeleteDhcpLease: IPv4 lease not found");
+                found = false;
+            }
+        } else if let Ok(addr6) = ipaddr.parse::<Ipv6Addr>() {
+            // IPv6 lease deletion
+            let pos = st.leases.iter().position(|l| l.addr6 == Some(addr6));
+            if let Some(idx) = pos {
+                let removed = st.leases.remove(idx);
+                debug!(
+                    ipaddr = %ipaddr,
+                    hostname = ?removed.hostname,
+                    "D-Bus DeleteDhcpLease: IPv6 lease removed"
+                );
+                found = true;
+            } else {
+                debug!(ipaddr = %ipaddr, "D-Bus DeleteDhcpLease: IPv6 lease not found");
+                found = false;
+            }
+        } else {
+            return create_invalid_args_error(msg, &format!("Invalid IP address '{}'", ipaddr));
         }
+
+        // C returns boolean success via dbus_message_append_args(reply, DBUS_TYPE_BOOLEAN, &ret)
+        msg.method_return().append1(found)
     }
 
     /// Handle `GetLoopServers` — return servers causing forwarding loops.
@@ -1036,6 +1282,30 @@ pub fn emit_signal(controller: &DbusController, action: i32, lease: &DhcpLease, 
 #[cfg(not(feature = "dhcp"))]
 pub fn emit_signal(_controller: &DbusController, _action: i32, _hostname: &str) {
     // DHCP feature not enabled — no signals to emit.
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions — hostname byte-array processing
+// ---------------------------------------------------------------------------
+
+/// Strip a trailing NUL byte from a hostname byte array and validate that
+/// no embedded NUL characters remain.
+///
+/// Matches C `dbus_add_lease()` behaviour (`dbus.c` lines ~1115-1126):
+/// - A single trailing `\0` is stripped.
+/// - An embedded `\0` (not at the end) is rejected with an error.
+#[cfg(feature = "dhcp")]
+fn strip_hostname_nul(bytes: &[u8]) -> Result<&str, &'static str> {
+    let data = if bytes.last() == Some(&0) {
+        &bytes[..bytes.len() - 1]
+    } else {
+        bytes
+    };
+    // Check for embedded NUL (C: memchr(hostname, '\0', hostname_len))
+    if data.contains(&0) {
+        return Err("Hostname contains an embedded NUL character");
+    }
+    std::str::from_utf8(data).map_err(|_| "Hostname contains invalid UTF-8")
 }
 
 // ---------------------------------------------------------------------------
@@ -1369,29 +1639,57 @@ mod tests {
 
     #[test]
     fn test_introspection_xml_contains_methods() {
-        assert!(INTROSPECTION_XML.contains("ClearCache"));
-        assert!(INTROSPECTION_XML.contains("GetVersion"));
-        assert!(INTROSPECTION_XML.contains("SetServers"));
-        assert!(INTROSPECTION_XML.contains("SetServersEx"));
-        assert!(INTROSPECTION_XML.contains("SetDomainServers"));
-        assert!(INTROSPECTION_XML.contains("SetFilterWin2KOption"));
-        assert!(INTROSPECTION_XML.contains("SetBogusPrivOption"));
-        assert!(INTROSPECTION_XML.contains("SetFilterA"));
-        assert!(INTROSPECTION_XML.contains("SetFilterAAAA"));
-        assert!(INTROSPECTION_XML.contains("SetLocaliseQueriesOption"));
-        assert!(INTROSPECTION_XML.contains("GetMetrics"));
-        assert!(INTROSPECTION_XML.contains("GetServerMetrics"));
-        assert!(INTROSPECTION_XML.contains("ClearMetrics"));
-        assert!(INTROSPECTION_XML.contains("AddDhcpLease"));
-        assert!(INTROSPECTION_XML.contains("DeleteDhcpLease"));
-        assert!(INTROSPECTION_XML.contains("GetLoopServers"));
+        let xml = build_introspection_xml();
+        assert!(xml.contains("ClearCache"));
+        assert!(xml.contains("GetVersion"));
+        assert!(xml.contains("SetServers"));
+        assert!(xml.contains("SetServersEx"));
+        assert!(xml.contains("SetDomainServers"));
+        assert!(xml.contains("SetFilterWin2KOption"));
+        assert!(xml.contains("SetBogusPrivOption"));
+        assert!(xml.contains("SetFilterA"));
+        assert!(xml.contains("SetFilterAAAA"));
+        assert!(xml.contains("SetLocaliseQueriesOption"));
+        assert!(xml.contains("GetMetrics"));
+        assert!(xml.contains("GetServerMetrics"));
+        assert!(xml.contains("ClearMetrics"));
     }
 
     #[test]
     fn test_introspection_xml_contains_signals() {
-        assert!(INTROSPECTION_XML.contains("DhcpLeaseAdded"));
-        assert!(INTROSPECTION_XML.contains("DhcpLeaseDeleted"));
-        assert!(INTROSPECTION_XML.contains("DhcpLeaseUpdated"));
+        let xml = build_introspection_xml();
+        assert!(xml.contains("DhcpLeaseAdded"));
+        assert!(xml.contains("DhcpLeaseDeleted"));
+        assert!(xml.contains("DhcpLeaseUpdated"));
+    }
+
+    #[test]
+    fn test_introspection_xml_feature_gated_methods() {
+        let xml = build_introspection_xml();
+        // AddDhcpLease/DeleteDhcpLease gated by dhcp feature
+        #[cfg(feature = "dhcp")]
+        {
+            assert!(xml.contains("AddDhcpLease"));
+            assert!(xml.contains("DeleteDhcpLease"));
+        }
+        // GetLoopServers gated by loop-detect feature
+        #[cfg(feature = "loop-detect")]
+        {
+            assert!(xml.contains("GetLoopServers"));
+        }
+    }
+
+    #[test]
+    fn test_introspection_xml_ay_types() {
+        // Verify hostname and clid use byte array type (ay), not string (s),
+        // matching C's D-Bus interface contract for NetworkManager compat.
+        let xml = build_introspection_xml();
+        #[cfg(feature = "dhcp")]
+        {
+            // Check AddDhcpLease hostname and clid args are "ay"
+            assert!(xml.contains(r#"name="hostname" type="ay""#));
+            assert!(xml.contains(r#"name="clid" type="ay""#));
+        }
     }
 
     #[test]

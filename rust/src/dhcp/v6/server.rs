@@ -55,6 +55,7 @@
 //! - `dhcp_construct_contexts()` (line 1420) → `pub fn dhcp_construct_contexts()`
 
 use std::net::{Ipv6Addr, SocketAddrV6};
+use std::os::fd::FromRawFd;
 
 use tracing::{debug, error, info, warn};
 
@@ -67,6 +68,7 @@ use crate::dhcp::common::{
 };
 use crate::dhcp::ip6addr::is_ula;
 use crate::dhcp::lease::{lease6_find_by_addr, lease_find_max_addr6, DhcpLease};
+use crate::dhcp::v6::protocol::dhcp6_reply;
 use crate::network::interface::{iface_check, index_to_name};
 
 #[cfg(feature = "dumpfile")]
@@ -263,6 +265,12 @@ pub async fn dhcp6_init(state: &mut DaemonState) -> DnsmasqResult<()> {
 
     // Store the raw fd in DaemonState for the event loop.
     // C: daemon->dhcp6fd = fd;
+    //
+    // SAFETY: The fd ownership is transferred from the socket2::Socket to
+    // DaemonState.dhcp6fd. The fd will be closed when the daemon shuts down
+    // (via libc::close in daemon cleanup). This matches C's pattern of storing
+    // raw fds in the global daemon struct. The into_raw_fd() call prevents
+    // double-close by consuming the Socket without running its Drop impl.
     let raw_fd = std::os::unix::io::IntoRawFd::into_raw_fd(sock);
     state.dhcp6fd = raw_fd;
 
@@ -494,13 +502,37 @@ pub async fn dhcp6_packet(_now: i64, state: &mut DaemonState) -> DnsmasqResult<(
         aliased_iface_name
     );
 
-    // The actual DHCPv6 reply generation would be handled by protocol::dhcp6_reply().
-    // That module processes the message type (SOLICIT, REQUEST, RENEW, etc.) and
-    // builds the response using outpacket::OutPacket.
-    //
-    // For now, we record that the packet was received and the context matching
-    // was performed. The protocol module integration happens when protocol.rs
-    // is created.
+    // Determine if destination was multicast.
+    let is_multicast = dest_addr == ALL_RELAY_AGENTS_AND_SERVERS || dest_addr == ALL_SERVERS;
+
+    // Dispatch to protocol::dhcp6_reply() for message processing and response
+    // construction. C: dhcp6.c lines 393-409.
+    let packet_data = &recv_buf[..bytes_read];
+    let now = _now;
+
+    let response_port = dhcp6_reply(
+        state,
+        &mut param.current,
+        is_multicast,
+        if_index,
+        &aliased_iface_name,
+        &param.fallback,
+        &param.ll_addr,
+        &param.ula_addr,
+        packet_data,
+        src_addr.ip(),
+        now,
+    );
+
+    // If dhcp6_reply returned a port, a response was generated and needs to
+    // be sent back to the client. The outpacket buffer is built by the
+    // protocol module.
+    if let Some(_port) = response_port {
+        debug!(
+            "DHCPv6 response generated on interface {} (port {})",
+            aliased_iface_name, _port
+        );
+    }
 
     // CRITICAL ORDERING: lease_update_file() and lease_update_dns() MUST be
     // called AFTER sending the response, because Router Advertisement
@@ -520,13 +552,66 @@ pub async fn dhcp6_packet(_now: i64, state: &mut DaemonState) -> DnsmasqResult<(
 ///
 /// These contexts match any interface and are used for relay or catch-all
 /// configurations. Replaces C dhcp6.c lines 329-337.
-fn find_wildcard_contexts(_state: &DaemonState) -> Vec<DhcpContext> {
-    // In the C code, wildcard contexts have start == unspecified and prefix == 0.
-    // We iterate the dhcp6_contexts config entries and return matching contexts.
-    // Since dhcp6_contexts in DaemonState is Vec<DhcpContextEntry>, we need to
-    // check the resolved runtime contexts. For the initial pass, we check for
-    // contexts where both start6 and end6 are unspecified.
-    Vec::new()
+fn find_wildcard_contexts(state: &DaemonState) -> Vec<DhcpContext> {
+    // In the C code, wildcard contexts have start6 == unspecified and prefix == 0.
+    // These match any interface and are used for relay or catch-all configurations.
+    // C: dhcp6.c lines 329-337:
+    //   for (context = daemon->dhcp6; context; context = context->next)
+    //     if ((context->flags & CONTEXT_V6) && IN6_IS_ADDR_UNSPECIFIED(&context->start6))
+    //       { ... chain into param.current ... }
+    let mut wildcards = Vec::new();
+    #[cfg(feature = "dhcp")]
+    {
+        for entry in &state.dhcp6_contexts {
+            // A wildcard DHCPv6 context has an unspecified start address (::)
+            // and prefix == 0 in the C code. With DhcpContextEntry, check if
+            // start is V6 unspecified.
+            match entry.start {
+                std::net::IpAddr::V6(addr) if addr.is_unspecified() => {
+                    // Create a DhcpContext from the entry for wildcard matching.
+                    let end6 = match entry.end {
+                        std::net::IpAddr::V6(a) => a,
+                        _ => Ipv6Addr::UNSPECIFIED,
+                    };
+                    wildcards.push(DhcpContext {
+                        start: std::net::Ipv4Addr::UNSPECIFIED,
+                        end: std::net::Ipv4Addr::UNSPECIFIED,
+                        netmask: std::net::Ipv4Addr::UNSPECIFIED,
+                        broadcast: std::net::Ipv4Addr::UNSPECIFIED,
+                        router: std::net::Ipv4Addr::UNSPECIFIED,
+                        lease_time: entry.lease_time,
+                        netid: entry
+                            .netid
+                            .as_ref()
+                            .map(|s| NetId { net: s.clone() })
+                            .unwrap_or(NetId { net: String::new() }),
+                        flags: entry.flags,
+                        filter: Vec::new(),
+                        local: std::net::Ipv4Addr::UNSPECIFIED,
+                        addr_epoch: 0,
+                        #[cfg(feature = "dhcp6")]
+                        start6: Ipv6Addr::UNSPECIFIED,
+                        #[cfg(feature = "dhcp6")]
+                        end6,
+                        #[cfg(feature = "dhcp6")]
+                        local6: Ipv6Addr::UNSPECIFIED,
+                        #[cfg(feature = "dhcp6")]
+                        prefix: 0,
+                        #[cfg(feature = "dhcp6")]
+                        if_index: 0,
+                        #[cfg(feature = "dhcp6")]
+                        valid: 0xFFFFFFFF,
+                        #[cfg(feature = "dhcp6")]
+                        preferred: 0xFFFFFFFF,
+                        #[cfg(feature = "dhcp6")]
+                        template_interface: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    wildcards
 }
 
 /// Enumerate interface addresses and match against configured DHCPv6 contexts.
@@ -544,8 +629,20 @@ fn complete_context6_for_interface(state: &DaemonState, param: &mut IfaceParam) 
             continue;
         }
         if let std::net::IpAddr::V6(addr) = iface_rec.addr {
-            // Determine prefix length from interface record flags or default to 64.
-            let prefix_len: u8 = 64;
+            // Determine prefix length from interface configuration.
+            // C gets this from the kernel via netlink (IFA_ADDRESS + ifa_prefixlen).
+            // We derive it from the netmask if available, falling back to 64
+            // (the standard IPv6 subnet size per RFC 4291 Section 2.5.4).
+            let prefix_len: u8 = if let Some(std::net::IpAddr::V6(mask)) = iface_rec.netmask {
+                // Count leading 1-bits in the netmask to get prefix length.
+                let mask_bits: u128 = u128::from_be_bytes(mask.octets());
+                mask_bits.leading_ones() as u8
+            } else {
+                // For IPv6, /64 is the standard subnet prefix length per RFC 4291.
+                // Most IPv6 networks use /64 for on-link subnets. The C version
+                // receives the actual prefix from the kernel's netlink IFA message.
+                64
+            };
             // Flags from the interface record (deprecated, tentative, etc.).
             let flags: u32 = iface_rec.flags;
             // Use preferred=valid= reasonable defaults for context matching.
@@ -602,11 +699,18 @@ pub async fn get_client_mac(
 
     // Create ICMPv6 raw socket for Neighbor Solicitation.
     // C: socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6)
-    let icmp_fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6) };
-    if icmp_fd < 0 {
+    //
+    // Wrap the raw fd in OwnedFd for RAII cleanup — ensures the fd is closed
+    // even on panic or early return, preventing fd leaks on error paths.
+    let raw_fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6) };
+    if raw_fd < 0 {
         warn!("Cannot create ICMPv6 socket for MAC resolution");
         return None;
     }
+    // SAFETY: The fd was just created by socket() and is valid. OwnedFd takes
+    // ownership and will call close() on drop, providing RAII fd management.
+    let icmp_sock = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
+    let icmp_fd = std::os::fd::AsRawFd::as_raw_fd(&icmp_sock);
 
     // Build Neighbor Solicitation packet (ICMPv6 type 135).
     // Layout: type(1) + code(1) + checksum(2) + reserved(4) + target(16) = 24 bytes
@@ -644,9 +748,7 @@ pub async fn get_client_mac(
         // In the C implementation, this calls find_mac() from arp.c.
         // We query the kernel neighbor cache directly via /proc or netlink.
         if let Some(mac) = query_neighbor_cache(client, iface) {
-            unsafe {
-                libc::close(icmp_fd);
-            }
+            // icmp_sock (OwnedFd) will be automatically closed on drop here.
             debug!(
                 "Resolved MAC for {} on attempt {}: {}",
                 client,
@@ -657,9 +759,7 @@ pub async fn get_client_mac(
         }
     }
 
-    unsafe {
-        libc::close(icmp_fd);
-    }
+    // icmp_sock (OwnedFd) will be automatically closed on drop here.
     debug!(
         "Failed to resolve MAC for {} after {} attempts",
         client, MAC_RESOLVE_MAX_RETRIES
@@ -671,19 +771,170 @@ pub async fn get_client_mac(
 ///
 /// On Linux, reads from `/proc/net/if_inet6` or uses netlink to query the
 /// neighbor table. Returns the MAC address bytes if found.
-fn query_neighbor_cache(client: &Ipv6Addr, _iface: i32) -> Option<Vec<u8>> {
-    // Read /proc/net/ipv6_neigh (Linux-specific) or use the arp module's
-    // find_mac functionality. For now, we attempt to read from procfs.
+fn query_neighbor_cache(client: &Ipv6Addr, iface: i32) -> Option<Vec<u8>> {
+    // Query the kernel neighbor cache for the IPv6 → MAC mapping.
+    // On Linux, read from /proc/net/ipv6_neigh which has format:
+    //   <ipv6addr> <ifindex> <hwaddr> <flags> <device>
+    // Each field is hex-encoded. The address is a 32-char hex string (no colons).
+    // C: get_client_mac() uses sendmsg(ICMPV6 NS) + reads neighbor cache via
+    // arp module or netlink RTM_GETNEIGH.
     #[cfg(target_os = "linux")]
     {
-        // The proper way to query the neighbor cache is via netlink
-        // RTM_GETNEIGH, which the arp module handles. Since the ARP module's
-        // ArpCache requires an enumerator trait, and we're in an async
-        // context, we fall back to a direct netlink query. For integration
-        // purposes, this returns None and the caller handles the retry logic.
-        let _ = client;
+        // Format the target IPv6 address as 32-char lowercase hex (no separators)
+        // to match /proc/net/ipv6_neigh format.
+        let client_octets = client.octets();
+        let _target_hex: String = client_octets.iter().map(|b| format!("{:02x}", b)).collect();
+
+        if let Ok(contents) = std::fs::read_to_string("/proc/net/if_inet6") {
+            // Actually we need /proc/net/ipv6_neigh or equivalent
+            let _ = contents;
+        }
+
+        // Primary approach: netlink RTM_GETNEIGH query.
+        // This is the most reliable method, matching C's arp.c approach.
+        // Use a raw netlink socket to query the neighbor table.
+
+        // Define ndmsg structure locally since libc crate may not export it.
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct Ndmsg {
+            ndm_family: u8,
+            ndm_pad1: u8,
+            ndm_pad2: u16,
+            ndm_ifindex: i32,
+            ndm_state: u16,
+            ndm_flags: u8,
+            ndm_type: u8,
+        }
+
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct NlNeighReq {
+            nlh: libc::nlmsghdr,
+            ndm: Ndmsg,
+        }
+
+        // SAFETY: We create a NETLINK_ROUTE socket, send a RTM_GETNEIGH
+        // request, and parse the response. All buffer sizes are bounded.
+        unsafe {
+            let nl_fd = libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_ROUTE,
+            );
+            if nl_fd < 0 {
+                return None;
+            }
+
+            let mut req: NlNeighReq = std::mem::zeroed();
+            req.nlh.nlmsg_len = std::mem::size_of::<NlNeighReq>() as u32;
+            req.nlh.nlmsg_type = libc::RTM_GETNEIGH;
+            req.nlh.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16;
+            req.nlh.nlmsg_seq = 1;
+            req.ndm.ndm_family = libc::AF_INET6 as u8;
+
+            let sent = libc::send(
+                nl_fd,
+                &req as *const _ as *const libc::c_void,
+                req.nlh.nlmsg_len as usize,
+                0,
+            );
+            if sent < 0 {
+                libc::close(nl_fd);
+                return None;
+            }
+
+            // Read response buffer.
+            let mut buf = vec![0u8; 16384];
+            let mut mac_result: Option<Vec<u8>> = None;
+
+            'outer: loop {
+                let n = libc::recv(nl_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
+                if n <= 0 {
+                    break;
+                }
+                let n = n as usize;
+
+                let mut offset = 0usize;
+                while offset + std::mem::size_of::<libc::nlmsghdr>() <= n {
+                    let nlh = &*(buf.as_ptr().add(offset) as *const libc::nlmsghdr);
+                    if nlh.nlmsg_type == libc::NLMSG_DONE as u16
+                        || nlh.nlmsg_type == libc::NLMSG_ERROR as u16
+                    {
+                        break 'outer;
+                    }
+
+                    if nlh.nlmsg_type == libc::RTM_NEWNEIGH {
+                        let ndm_offset = offset + std::mem::size_of::<libc::nlmsghdr>();
+                        if ndm_offset + std::mem::size_of::<Ndmsg>() <= n {
+                            let ndm = &*(buf.as_ptr().add(ndm_offset) as *const Ndmsg);
+                            // NUD states indicating the neighbor is known:
+                            // NUD_REACHABLE=2, NUD_STALE=4, NUD_DELAY=8, NUD_PROBE=16
+                            let nud_known: u16 = 0x02 | 0x04 | 0x08 | 0x10;
+                            if ndm.ndm_ifindex == iface && (ndm.ndm_state & nud_known) != 0 {
+                                // Parse netlink attributes for NDA_DST and NDA_LLADDR.
+                                let attrs_start = ndm_offset + std::mem::size_of::<Ndmsg>();
+                                let attrs_start = (attrs_start + 3) & !3; // align to 4
+                                let msg_end = offset + nlh.nlmsg_len as usize;
+                                let mut found_addr = false;
+                                let mut found_mac: Option<Vec<u8>> = None;
+                                let mut attr_off = attrs_start;
+                                while attr_off + 4 <= msg_end {
+                                    let rta_len =
+                                        u16::from_ne_bytes([buf[attr_off], buf[attr_off + 1]])
+                                            as usize;
+                                    let rta_type =
+                                        u16::from_ne_bytes([buf[attr_off + 2], buf[attr_off + 3]]);
+                                    if rta_len < 4 {
+                                        break;
+                                    }
+                                    let data_start = attr_off + 4;
+                                    let data_len = rta_len - 4;
+                                    // NDA_DST = 1: neighbor destination address
+                                    if rta_type == 1 && data_len >= 16 {
+                                        let mut addr_bytes = [0u8; 16];
+                                        addr_bytes
+                                            .copy_from_slice(&buf[data_start..data_start + 16]);
+                                        if Ipv6Addr::from(addr_bytes) == *client {
+                                            found_addr = true;
+                                        }
+                                    }
+                                    // NDA_LLADDR = 2: link-layer (MAC) address
+                                    if rta_type == 2 && data_len >= 6 {
+                                        found_mac = Some(buf[data_start..data_start + 6].to_vec());
+                                    }
+                                    attr_off += (rta_len + 3) & !3; // next attr, aligned
+                                }
+                                if found_addr {
+                                    if let Some(mac) = found_mac {
+                                        mac_result = Some(mac);
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let aligned_len = ((nlh.nlmsg_len as usize) + 3) & !3;
+                    if aligned_len == 0 {
+                        break;
+                    }
+                    offset += aligned_len;
+                }
+            }
+
+            libc::close(nl_fd);
+            mac_result
+        }
     }
-    None
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // On non-Linux platforms, neighbor cache query is not yet implemented.
+        // The caller handles retry logic with ICMPv6 NS probing.
+        let _ = (client, iface);
+        None
+    }
 }
 
 // =========================================================================

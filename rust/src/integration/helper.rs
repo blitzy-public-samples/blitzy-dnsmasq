@@ -68,7 +68,7 @@ use crate::config::constants::{ARPHRD_ETHER, CHGRP, CHUSER};
 use crate::core::types::{AllAddr, DaemonState, DnsmasqError, MySockAddr};
 
 #[cfg(feature = "dhcp")]
-use crate::dhcp::lease::DhcpLease;
+use crate::dhcp::lease::{DhcpLease, LeaseType};
 
 // ---------------------------------------------------------------------------
 // Constants (from C helper.c and dnsmasq.h)
@@ -452,12 +452,11 @@ impl ScriptHelper {
         if lease.flags.aux_changed {
             flags |= LEASE_AUX_CHANGED;
         }
-        // Determine v6 lease type via Display impl (avoids importing LeaseType).
-        let lt_str = format!("{}", lease.lease_type);
-        if lt_str == "na" {
-            flags |= LEASE_NA;
-        } else if lt_str == "ta" {
-            flags |= LEASE_TA;
+        // Determine v6 lease type via direct enum variant matching.
+        match lease.lease_type {
+            LeaseType::Na => flags |= LEASE_NA,
+            LeaseType::Ta => flags |= LEASE_TA,
+            _ => {} // Pd and V4 do not set additional flags here
         }
 
         let resolved_hostname = hostname
@@ -769,11 +768,25 @@ impl ScriptHelper {
                 cmd.env("PATH", path);
             }
 
-            // Drop privileges before exec — SAFETY: setgid/setuid are
+            // Drop privileges before exec — SAFETY: setgroups/setgid/setuid are
             // async-signal-safe and the closure runs in the forked child
             // between fork and exec, matching C helper.c lines 202-260.
+            // C calls setgroups(0, NULL) before setgid() to clear supplementary
+            // groups, preventing privilege escalation through group memberships.
             unsafe {
                 cmd.pre_exec(move || {
+                    // Clear supplementary groups before changing GID.
+                    // C: setgroups(0, NULL) — helper.c line 225.
+                    // This prevents the child from retaining any supplementary
+                    // group memberships from the parent process.
+                    if gid.is_some() {
+                        nix::unistd::setgroups(&[]).map_err(|e| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                format!("setgroups(0) failed: {}", e),
+                            )
+                        })?;
+                    }
                     if let Some(gid_val) = gid {
                         nix::unistd::setgid(gid_val).map_err(|e| {
                             std::io::Error::new(
@@ -794,8 +807,14 @@ impl ScriptHelper {
                 });
             }
 
-            match cmd.output().await {
-                Ok(output) => {
+            // Wrap script execution with a timeout to prevent hanging scripts
+            // from blocking the async task indefinitely. C uses HELPER_TIMEOUT
+            // (typically 120 seconds). We use 120 seconds as the default.
+            const HELPER_TIMEOUT_SECS: u64 = 120;
+            let timeout_duration = std::time::Duration::from_secs(HELPER_TIMEOUT_SECS);
+
+            match tokio::time::timeout(timeout_duration, cmd.output()).await {
+                Ok(Ok(output)) => {
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         warn!(
@@ -813,7 +832,7 @@ impl ScriptHelper {
                         );
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!(
                         script = %script_path,
                         action = action_str,
@@ -823,6 +842,20 @@ impl ScriptHelper {
                     return Err(DnsmasqError::Misc(format!(
                         "script execution failed: {}",
                         e
+                    )));
+                }
+                Err(_elapsed) => {
+                    // Timeout expired — script was killed or is still hanging.
+                    // Log and continue processing other events.
+                    error!(
+                        script = %script_path,
+                        action = action_str,
+                        timeout_secs = HELPER_TIMEOUT_SECS,
+                        "script execution timed out"
+                    );
+                    return Err(DnsmasqError::Misc(format!(
+                        "script execution timed out after {} seconds",
+                        HELPER_TIMEOUT_SECS
                     )));
                 }
             }

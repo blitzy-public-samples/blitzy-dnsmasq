@@ -63,6 +63,10 @@ idn = ["dep:idna"]
 # Linux conntrack marks — maps C HAVE_CONNTRACK
 conntrack = []
 
+# Broken RTC support — maps C HAVE_BROKEN_RTC (for systems without wall-clock time)
+# When enabled, lease expiry is stored as duration remaining rather than absolute timestamp
+broken-rtc = []
+
 # nftables set integration — maps C HAVE_NFTSET (requires nftables crate)
 nftset = ["dep:nftables"]
 

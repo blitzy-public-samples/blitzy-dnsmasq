@@ -1059,21 +1059,21 @@ fn process_solicit(
 
     let mut any_ia = false;
 
-    // Iterate through IA_NA and IA_TA options
+    // Iterate through IA_NA, IA_TA, and IA_PD options (C processes all three per RFC 3315/3633)
     let mut ia_pos = 0;
     while let Some((ia_code, ia_data, next_pos)) = opt6_next(opts, ia_pos) {
         ia_pos = next_pos;
 
         let ia_type = match IaType::from_option_code(ia_code) {
-            Some(t) if t == IaType::Na || t == IaType::Ta => t,
-            _ => continue,
+            Some(t) => t,
+            None => continue,
         };
 
         state.ia_type = ia_type;
         any_ia = true;
 
-        // Extract IAID from IA option
-        if ia_type == IaType::Na && ia_data.len() >= 4 {
+        // Extract IAID from IA option (IA_NA and IA_PD have IAID at offset 0)
+        if (ia_type == IaType::Na || ia_type == IaType::Pd) && ia_data.len() >= 4 {
             state.iaid = opt6_uint(ia_data, 0, 4);
         }
 
@@ -1082,79 +1082,164 @@ fn process_solicit(
         let mut min_time: u32 = 0xFFFFFFFF;
         let mut found_address = false;
 
-        // Try to find address from config first
-        if let Some(ref cfg) = config {
-            if cfg.flags & CONFIG_ADDR6 != 0 {
+        if ia_type == IaType::Pd {
+            // IA_PD: Prefix Delegation processing (C: rfc3315.c IA_PD handling)
+            // IA_PD sub-options start after IAID(4)+T1(4)+T2(4) = 12 bytes
+            let pd_opts = if ia_data.len() > 12 {
+                &ia_data[12..]
+            } else {
+                &[]
+            };
+            let mut pd_pos = 0;
+            while let Some((sub_code, sub_data, sub_next)) = opt6_next(pd_opts, pd_pos) {
+                pd_pos = sub_next;
+                // IAPREFIX sub-option: preferred(4) + valid(4) + prefix_len(1) + prefix(16) = 25 bytes
+                if sub_code != super::OPTION6_IAPREFIX || sub_data.len() < 25 {
+                    continue;
+                }
+                let req_prefix_len = sub_data[8];
+                let mut prefix_bytes = [0u8; 16];
+                prefix_bytes.copy_from_slice(&sub_data[9..25]);
+                let req_prefix = Ipv6Addr::from(prefix_bytes);
+
+                // Try to find a matching prefix delegation context
+                if let Some(ctx) = contexts.iter().find(|c| {
+                    c.flags & CONTEXT_USED == 0
+                        && c.prefix as u8 <= req_prefix_len
+                        && is_same_net6(req_prefix, c.start6, c.prefix as u8)
+                }) {
+                    let lease_time = config
+                        .as_ref()
+                        .filter(|c| c.flags & CONFIG_TIME != 0)
+                        .map(|c| c.lease_time)
+                        .unwrap_or(ctx.lease_time);
+                    add_prefix(
+                        state,
+                        contexts,
+                        lease_time,
+                        &mut min_time,
+                        &req_prefix,
+                        req_prefix_len,
+                        now,
+                        outpacket,
+                        daemon,
+                    );
+                    mark_context_used(contexts, &req_prefix);
+                    found_address = true;
+                    get_context_tag(state, contexts, &req_prefix);
+                }
+            }
+
+            // If no prefix from client request, try to allocate a new one
+            if !found_address && rapid_commit {
                 #[cfg(feature = "dhcp6")]
-                for &addr6 in &cfg.addr6 {
-                    if config_valid(cfg, contexts, &addr6, state, now)
-                        && (server::address6_available(contexts, &addr6, &state.tags, true)
-                            .is_some()
-                            || rapid_commit)
-                    {
+                for ctx in contexts.iter() {
+                    if ctx.flags & CONTEXT_USED == 0 && ctx.prefix > 0 {
+                        let prefix_addr = ctx.start6;
+                        let prefix_len = ctx.prefix as u8;
+                        let lease_time = config
+                            .as_ref()
+                            .filter(|c| c.flags & CONFIG_TIME != 0)
+                            .map(|c| c.lease_time)
+                            .unwrap_or(ctx.lease_time);
+                        add_prefix(
+                            state,
+                            contexts,
+                            lease_time,
+                            &mut min_time,
+                            &prefix_addr,
+                            prefix_len,
+                            now,
+                            outpacket,
+                            daemon,
+                        );
+                        found_address = true;
+                        break;
+                    }
+                }
+            }
+        } else {
+            // IA_NA / IA_TA: Address processing (original logic)
+            // Try to find address from config first
+            if let Some(ref cfg) = config {
+                if cfg.flags & CONFIG_ADDR6 != 0 {
+                    #[cfg(feature = "dhcp6")]
+                    for &addr6 in &cfg.addr6 {
+                        if config_valid(cfg, contexts, &addr6, state, now, &daemon.leases)
+                            && (server::address6_available(contexts, &addr6, &state.tags, true)
+                                .is_some()
+                                || rapid_commit)
+                        {
+                            add_address(
+                                state,
+                                contexts,
+                                cfg.lease_time,
+                                &mut min_time,
+                                &addr6,
+                                now,
+                                outpacket,
+                                daemon,
+                            );
+                            mark_context_used(contexts, &addr6);
+                            found_address = true;
+                            get_context_tag(state, contexts, &addr6);
+                        }
+                    }
+                }
+            }
+
+            // If no static address from config, try dynamic allocation
+            if !found_address {
+                #[cfg(feature = "dhcp6")]
+                {
+                    let clid = state.clid.as_deref().unwrap_or(&[]);
+                    let is_temp = ia_type == IaType::Ta;
+                    let lease_db = &daemon.leases;
+                    let full_configs = daemon_config_entries_to_configs(&daemon.dhcp_conf);
+
+                    if let Some((ctx_idx, addr)) = server::address6_allocate(
+                        contexts,
+                        clid,
+                        is_temp,
+                        state.iaid,
+                        0,
+                        &state.tags,
+                        true,
+                        &full_configs,
+                        daemon,
+                        lease_db,
+                    ) {
+                        let lease_time = contexts
+                            .get(ctx_idx)
+                            .map(|c| c.lease_time)
+                            .unwrap_or(DEFLEASE6);
                         add_address(
                             state,
                             contexts,
-                            cfg.lease_time,
+                            lease_time,
                             &mut min_time,
-                            &addr6,
+                            &addr,
                             now,
                             outpacket,
+                            daemon,
                         );
-                        mark_context_used(contexts, &addr6);
+                        mark_context_used(contexts, &addr);
                         found_address = true;
-                        get_context_tag(state, contexts, &addr6);
+                        get_context_tag(state, contexts, &addr);
                     }
                 }
             }
         }
 
-        // If no static address from config, try dynamic allocation
         if !found_address {
-            #[cfg(feature = "dhcp6")]
-            {
-                let clid = state.clid.as_deref().unwrap_or(&[]);
-                let is_temp = ia_type == IaType::Ta;
-                let lease_db: Vec<DhcpLease> = Vec::new();
-                let full_configs = daemon_config_entries_to_configs(&daemon.dhcp_conf);
-
-                if let Some((ctx_idx, addr)) = server::address6_allocate(
-                    contexts,
-                    clid,
-                    is_temp,
-                    state.iaid,
-                    0,
-                    &state.tags,
-                    true,
-                    &full_configs,
-                    daemon,
-                    &lease_db,
-                ) {
-                    let lease_time = contexts
-                        .get(ctx_idx)
-                        .map(|c| c.lease_time)
-                        .unwrap_or(DEFLEASE6);
-                    add_address(
-                        state,
-                        contexts,
-                        lease_time,
-                        &mut min_time,
-                        &addr,
-                        now,
-                        outpacket,
-                    );
-                    mark_context_used(contexts, &addr);
-                    found_address = true;
-                    get_context_tag(state, contexts, &addr);
-                }
-            }
-        }
-
-        if !found_address {
-            // No address available — add status code
+            // No address/prefix available — add status code
             let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
             outpacket.put_opt6_short(super::DHCP6_NO_ADDRS_AVAIL);
-            outpacket.put_opt6_string("no addresses available");
+            outpacket.put_opt6_string(if ia_type == IaType::Pd {
+                "no prefixes available"
+            } else {
+                "no addresses available"
+            });
             outpacket.end_opt6(s);
         }
 
@@ -1195,20 +1280,20 @@ fn process_request(
     state.lease_allocate = true;
     let mut any_ia = false;
 
-    // Iterate through IA options in the request
+    // Iterate through IA_NA, IA_TA, and IA_PD options in the request
     let mut ia_pos = 0;
     while let Some((ia_code, ia_data, next_pos)) = opt6_next(opts, ia_pos) {
         ia_pos = next_pos;
 
         let ia_type = match IaType::from_option_code(ia_code) {
-            Some(t) if t == IaType::Na || t == IaType::Ta => t,
-            _ => continue,
+            Some(t) => t,
+            None => continue,
         };
 
         state.ia_type = ia_type;
         any_ia = true;
 
-        if ia_type == IaType::Na && ia_data.len() >= 4 {
+        if (ia_type == IaType::Na || ia_type == IaType::Pd) && ia_data.len() >= 4 {
             state.iaid = opt6_uint(ia_data, 0, 4);
         }
 
@@ -1216,80 +1301,143 @@ fn process_request(
         let mut min_time: u32 = 0xFFFFFFFF;
         let mut found = false;
 
-        // Iterate through IAADDR sub-options in the IA
-        let ia_opts = if ia_type == IaType::Na && ia_data.len() > 12 {
-            &ia_data[12..]
-        } else if ia_type == IaType::Ta && ia_data.len() > 4 {
-            &ia_data[4..]
-        } else {
-            &[]
-        };
+        if ia_type == IaType::Pd {
+            // IA_PD REQUEST: validate and commit requested prefixes
+            let pd_opts = if ia_data.len() > 12 {
+                &ia_data[12..]
+            } else {
+                &[]
+            };
+            let mut pd_pos = 0;
+            while let Some((sub_code, sub_data, sub_next)) = opt6_next(pd_opts, pd_pos) {
+                pd_pos = sub_next;
+                if sub_code != super::OPTION6_IAPREFIX || sub_data.len() < 25 {
+                    continue;
+                }
+                let req_prefix_len = sub_data[8];
+                let mut prefix_bytes = [0u8; 16];
+                prefix_bytes.copy_from_slice(&sub_data[9..25]);
+                let req_prefix = Ipv6Addr::from(prefix_bytes);
 
-        let mut ia_opt_pos = 0;
-        while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
-            ia_opt_pos = sub_next;
-
-            if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
-                continue;
-            }
-
-            // Extract requested IPv6 address from IAADDR (first 16 bytes)
-            let mut addr_bytes = [0u8; 16];
-            addr_bytes.copy_from_slice(&sub_data[0..16]);
-            let req_addr = Ipv6Addr::from(addr_bytes);
-
-            // Validate address against contexts
-            if server::address6_valid(contexts, &req_addr, &state.tags, true).is_some() {
-                // Address is valid for our context — check if available
-                if check_address(state, contexts, &req_addr) {
-                    let lease_time = config
-                        .as_ref()
-                        .filter(|c| c.flags & CONFIG_TIME != 0)
-                        .map(|c| c.lease_time)
-                        .unwrap_or_else(|| {
-                            contexts
-                                .iter()
-                                .find(|c| is_same_net6(req_addr, c.start6, c.prefix as u8))
-                                .map(|c| c.lease_time)
-                                .unwrap_or(DEFLEASE6)
-                        });
-
-                    add_address(
-                        state,
-                        contexts,
-                        lease_time,
-                        &mut min_time,
-                        &req_addr,
-                        now,
-                        outpacket,
-                    );
-                    mark_context_used(contexts, &req_addr);
-                    get_context_tag(state, contexts, &req_addr);
-                    found = true;
-
-                    // Update lease
-                    update_leases(state, contexts, &req_addr, lease_time, now, daemon);
+                if server::address6_valid(contexts, &req_prefix, &state.tags, true).is_some() {
+                    if check_address(state, contexts, &req_prefix, &daemon.leases) {
+                        let lease_time = config
+                            .as_ref()
+                            .filter(|c| c.flags & CONFIG_TIME != 0)
+                            .map(|c| c.lease_time)
+                            .unwrap_or_else(|| {
+                                contexts
+                                    .iter()
+                                    .find(|c| is_same_net6(req_prefix, c.start6, c.prefix as u8))
+                                    .map(|c| c.lease_time)
+                                    .unwrap_or(DEFLEASE6)
+                            });
+                        add_prefix(
+                            state,
+                            contexts,
+                            lease_time,
+                            &mut min_time,
+                            &req_prefix,
+                            req_prefix_len,
+                            now,
+                            outpacket,
+                            daemon,
+                        );
+                        mark_context_used(contexts, &req_prefix);
+                        get_context_tag(state, contexts, &req_prefix);
+                        found = true;
+                        update_leases(state, contexts, &req_prefix, lease_time, now, daemon);
+                    } else {
+                        let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+                        outpacket.put_opt6_short(super::DHCP6_NO_ADDRS_AVAIL);
+                        outpacket.put_opt6_string("prefix unavailable");
+                        outpacket.end_opt6(s);
+                    }
                 } else {
-                    // Address already in use by another client
                     let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
-                    outpacket.put_opt6_short(super::DHCP6_NO_ADDRS_AVAIL);
-                    outpacket.put_opt6_string("address unavailable");
+                    outpacket.put_opt6_short(super::DHCP6_NOT_ON_LINK);
+                    outpacket.put_opt6_string("not on link");
                     outpacket.end_opt6(s);
                 }
+            }
+        } else {
+            // IA_NA / IA_TA: Iterate through IAADDR sub-options in the IA
+            let ia_opts = if ia_type == IaType::Na && ia_data.len() > 12 {
+                &ia_data[12..]
+            } else if ia_type == IaType::Ta && ia_data.len() > 4 {
+                &ia_data[4..]
             } else {
-                // Address not on link
-                let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
-                outpacket.put_opt6_short(super::DHCP6_NOT_ON_LINK);
-                outpacket.put_opt6_string("not on link");
-                outpacket.end_opt6(s);
+                &[]
+            };
+
+            let mut ia_opt_pos = 0;
+            while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
+                ia_opt_pos = sub_next;
+
+                if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
+                    continue;
+                }
+
+                // Extract requested IPv6 address from IAADDR (first 16 bytes)
+                let mut addr_bytes = [0u8; 16];
+                addr_bytes.copy_from_slice(&sub_data[0..16]);
+                let req_addr = Ipv6Addr::from(addr_bytes);
+
+                // Validate address against contexts
+                if server::address6_valid(contexts, &req_addr, &state.tags, true).is_some() {
+                    // Address is valid for our context — check if available
+                    if check_address(state, contexts, &req_addr, &daemon.leases) {
+                        let lease_time = config
+                            .as_ref()
+                            .filter(|c| c.flags & CONFIG_TIME != 0)
+                            .map(|c| c.lease_time)
+                            .unwrap_or_else(|| {
+                                contexts
+                                    .iter()
+                                    .find(|c| is_same_net6(req_addr, c.start6, c.prefix as u8))
+                                    .map(|c| c.lease_time)
+                                    .unwrap_or(DEFLEASE6)
+                            });
+
+                        add_address(
+                            state,
+                            contexts,
+                            lease_time,
+                            &mut min_time,
+                            &req_addr,
+                            now,
+                            outpacket,
+                            daemon,
+                        );
+                        mark_context_used(contexts, &req_addr);
+                        get_context_tag(state, contexts, &req_addr);
+                        found = true;
+
+                        // Update lease
+                        update_leases(state, contexts, &req_addr, lease_time, now, daemon);
+                    } else {
+                        let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+                        outpacket.put_opt6_short(super::DHCP6_NO_ADDRS_AVAIL);
+                        outpacket.put_opt6_string("address unavailable");
+                        outpacket.end_opt6(s);
+                    }
+                } else {
+                    let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+                    outpacket.put_opt6_short(super::DHCP6_NOT_ON_LINK);
+                    outpacket.put_opt6_string("not on link");
+                    outpacket.end_opt6(s);
+                }
             }
         }
 
-        if !found && ia_opt_pos == 0 {
-            // Empty IA — no IAADDR sub-options
+        if !found {
             let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
             outpacket.put_opt6_short(super::DHCP6_NO_ADDRS_AVAIL);
-            outpacket.put_opt6_string("no addresses available");
+            outpacket.put_opt6_string(if ia_type == IaType::Pd {
+                "no prefixes available"
+            } else {
+                "no addresses available"
+            });
             outpacket.end_opt6(s);
         }
 
@@ -1323,95 +1471,154 @@ fn process_renew_rebind(
 ) -> DnsmasqResult<bool> {
     state.lease_allocate = true;
 
-    // Iterate through IA options
+    // Iterate through IA_NA, IA_TA, and IA_PD options
     let mut ia_pos = 0;
     while let Some((ia_code, ia_data, next_pos)) = opt6_next(opts, ia_pos) {
         ia_pos = next_pos;
 
         let ia_type = match IaType::from_option_code(ia_code) {
-            Some(t) if t == IaType::Na || t == IaType::Ta => t,
-            _ => continue,
+            Some(t) => t,
+            None => continue,
         };
 
         state.ia_type = ia_type;
 
-        if ia_type == IaType::Na && ia_data.len() >= 4 {
+        if (ia_type == IaType::Na || ia_type == IaType::Pd) && ia_data.len() >= 4 {
             state.iaid = opt6_uint(ia_data, 0, 4);
         }
 
         let (ia_container, t1_counter) = build_ia(state, outpacket);
         let mut min_time: u32 = 0xFFFFFFFF;
 
-        // Iterate IAADDR sub-options
-        let ia_opts = if ia_type == IaType::Na && ia_data.len() > 12 {
-            &ia_data[12..]
-        } else if ia_type == IaType::Ta && ia_data.len() > 4 {
-            &ia_data[4..]
-        } else {
-            &[]
-        };
+        if ia_type == IaType::Pd {
+            // IA_PD: iterate IAPREFIX sub-options
+            let pd_opts = if ia_data.len() > 12 {
+                &ia_data[12..]
+            } else {
+                &[]
+            };
+            let mut pd_pos = 0;
+            while let Some((sub_code, sub_data, sub_next)) = opt6_next(pd_opts, pd_pos) {
+                pd_pos = sub_next;
+                if sub_code != super::OPTION6_IAPREFIX || sub_data.len() < 25 {
+                    continue;
+                }
+                let req_prefix_len = sub_data[8];
+                let mut prefix_bytes = [0u8; 16];
+                prefix_bytes.copy_from_slice(&sub_data[9..25]);
+                let req_prefix = Ipv6Addr::from(prefix_bytes);
 
-        let mut ia_opt_pos = 0;
-        while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
-            ia_opt_pos = sub_next;
+                let existing_lease = lease6_find_by_addr(
+                    &daemon.leases,
+                    &req_prefix,
+                    req_prefix_len as i32,
+                    &req_prefix,
+                );
 
-            if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
-                continue;
-            }
-
-            let mut addr_bytes = [0u8; 16];
-            addr_bytes.copy_from_slice(&sub_data[0..16]);
-            let req_addr = Ipv6Addr::from(addr_bytes);
-
-            // Look up existing lease (clone clid to avoid borrow conflict)
-            let existing_lease = lease6_find_by_addr(
-                &[], // The lease DB would be passed in production
-                &req_addr,
-                128,
-                &req_addr,
-            );
-
-            if existing_lease.is_some() || !is_renew {
-                // For REBIND without existing lease, create new one if address valid
-                if server::address6_valid(contexts, &req_addr, &state.tags, true).is_some() {
-                    let lease_time = config
-                        .as_ref()
-                        .filter(|c| c.flags & CONFIG_TIME != 0)
-                        .map(|c| c.lease_time)
-                        .unwrap_or_else(|| {
-                            contexts
-                                .iter()
-                                .find(|c| is_same_net6(req_addr, c.start6, c.prefix as u8))
-                                .map(|c| c.lease_time)
-                                .unwrap_or(DEFLEASE6)
-                        });
-
-                    add_address(
-                        state,
-                        contexts,
-                        lease_time,
-                        &mut min_time,
-                        &req_addr,
-                        now,
-                        outpacket,
-                    );
-                    mark_context_used(contexts, &req_addr);
-                    get_context_tag(state, contexts, &req_addr);
-
-                    update_leases(state, contexts, &req_addr, lease_time, now, daemon);
+                if existing_lease.is_some() || !is_renew {
+                    if server::address6_valid(contexts, &req_prefix, &state.tags, true).is_some() {
+                        let lease_time = config
+                            .as_ref()
+                            .filter(|c| c.flags & CONFIG_TIME != 0)
+                            .map(|c| c.lease_time)
+                            .unwrap_or_else(|| {
+                                contexts
+                                    .iter()
+                                    .find(|c| is_same_net6(req_prefix, c.start6, c.prefix as u8))
+                                    .map(|c| c.lease_time)
+                                    .unwrap_or(DEFLEASE6)
+                            });
+                        add_prefix(
+                            state,
+                            contexts,
+                            lease_time,
+                            &mut min_time,
+                            &req_prefix,
+                            req_prefix_len,
+                            now,
+                            outpacket,
+                            daemon,
+                        );
+                        mark_context_used(contexts, &req_prefix);
+                        get_context_tag(state, contexts, &req_prefix);
+                        update_leases(state, contexts, &req_prefix, lease_time, now, daemon);
+                    } else {
+                        let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+                        outpacket.put_opt6_short(super::DHCP6_NOT_ON_LINK);
+                        outpacket.put_opt6_string("not on link");
+                        outpacket.end_opt6(s);
+                    }
                 } else {
-                    // Address no longer valid for this link
                     let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
-                    outpacket.put_opt6_short(super::DHCP6_NOT_ON_LINK);
-                    outpacket.put_opt6_string("not on link");
+                    outpacket.put_opt6_short(super::DHCP6_NO_BINDING);
+                    outpacket.put_opt6_string("no binding");
                     outpacket.end_opt6(s);
                 }
+            }
+        } else {
+            // IA_NA / IA_TA: iterate IAADDR sub-options
+            let ia_opts = if ia_type == IaType::Na && ia_data.len() > 12 {
+                &ia_data[12..]
+            } else if ia_type == IaType::Ta && ia_data.len() > 4 {
+                &ia_data[4..]
             } else {
-                // RENEW: no existing lease — NoBinding
-                let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
-                outpacket.put_opt6_short(super::DHCP6_NO_BINDING);
-                outpacket.put_opt6_string("no binding");
-                outpacket.end_opt6(s);
+                &[]
+            };
+
+            let mut ia_opt_pos = 0;
+            while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
+                ia_opt_pos = sub_next;
+
+                if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
+                    continue;
+                }
+
+                let mut addr_bytes = [0u8; 16];
+                addr_bytes.copy_from_slice(&sub_data[0..16]);
+                let req_addr = Ipv6Addr::from(addr_bytes);
+
+                // Look up existing lease from the daemon's canonical lease database
+                let existing_lease = lease6_find_by_addr(&daemon.leases, &req_addr, 128, &req_addr);
+
+                if existing_lease.is_some() || !is_renew {
+                    if server::address6_valid(contexts, &req_addr, &state.tags, true).is_some() {
+                        let lease_time = config
+                            .as_ref()
+                            .filter(|c| c.flags & CONFIG_TIME != 0)
+                            .map(|c| c.lease_time)
+                            .unwrap_or_else(|| {
+                                contexts
+                                    .iter()
+                                    .find(|c| is_same_net6(req_addr, c.start6, c.prefix as u8))
+                                    .map(|c| c.lease_time)
+                                    .unwrap_or(DEFLEASE6)
+                            });
+
+                        add_address(
+                            state,
+                            contexts,
+                            lease_time,
+                            &mut min_time,
+                            &req_addr,
+                            now,
+                            outpacket,
+                            daemon,
+                        );
+                        mark_context_used(contexts, &req_addr);
+                        get_context_tag(state, contexts, &req_addr);
+                        update_leases(state, contexts, &req_addr, lease_time, now, daemon);
+                    } else {
+                        let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+                        outpacket.put_opt6_short(super::DHCP6_NOT_ON_LINK);
+                        outpacket.put_opt6_string("not on link");
+                        outpacket.end_opt6(s);
+                    }
+                } else {
+                    let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+                    outpacket.put_opt6_short(super::DHCP6_NO_BINDING);
+                    outpacket.put_opt6_string("no binding");
+                    outpacket.end_opt6(s);
+                }
             }
         }
 
@@ -1440,41 +1647,67 @@ fn process_confirm(
     let mut found_addr = false;
     let mut all_valid = true;
 
-    // Iterate through IA options looking for IAADDR
+    // Iterate through IA_NA, IA_TA, and IA_PD options looking for addresses/prefixes
     let mut ia_pos = 0;
     while let Some((ia_code, ia_data, next_pos)) = opt6_next(opts, ia_pos) {
         ia_pos = next_pos;
 
-        if ia_code != super::OPTION6_IA_NA && ia_code != super::OPTION6_IA_TA {
+        let ia_type = IaType::from_option_code(ia_code);
+        if ia_type.is_none() {
             continue;
         }
+        let ia_type = ia_type.unwrap();
 
-        let ia_opts = if ia_code == super::OPTION6_IA_NA && ia_data.len() > 12 {
-            &ia_data[12..]
-        } else if ia_code == super::OPTION6_IA_TA && ia_data.len() > 4 {
-            &ia_data[4..]
-        } else {
-            continue;
-        };
-
-        let mut ia_opt_pos = 0;
-        while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
-            ia_opt_pos = sub_next;
-
-            if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
+        if ia_type == IaType::Pd {
+            // IA_PD: validate IAPREFIX sub-options
+            let pd_opts = if ia_data.len() > 12 {
+                &ia_data[12..]
+            } else {
                 continue;
+            };
+            let mut pd_pos = 0;
+            while let Some((sub_code, sub_data, sub_next)) = opt6_next(pd_opts, pd_pos) {
+                pd_pos = sub_next;
+                if sub_code != super::OPTION6_IAPREFIX || sub_data.len() < 25 {
+                    continue;
+                }
+                let mut prefix_bytes = [0u8; 16];
+                prefix_bytes.copy_from_slice(&sub_data[9..25]);
+                let prefix_addr = Ipv6Addr::from(prefix_bytes);
+                found_addr = true;
+                if server::address6_valid(contexts, &prefix_addr, &state.tags, true).is_none() {
+                    all_valid = false;
+                    break;
+                }
             }
+        } else {
+            // IA_NA / IA_TA: validate IAADDR sub-options
+            let ia_opts = if ia_type == IaType::Na && ia_data.len() > 12 {
+                &ia_data[12..]
+            } else if ia_type == IaType::Ta && ia_data.len() > 4 {
+                &ia_data[4..]
+            } else {
+                continue;
+            };
 
-            let mut addr_bytes = [0u8; 16];
-            addr_bytes.copy_from_slice(&sub_data[0..16]);
-            let addr = Ipv6Addr::from(addr_bytes);
+            let mut ia_opt_pos = 0;
+            while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
+                ia_opt_pos = sub_next;
 
-            found_addr = true;
+                if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
+                    continue;
+                }
 
-            // Check if address is valid in any context
-            if server::address6_valid(contexts, &addr, &state.tags, true).is_none() {
-                all_valid = false;
-                break;
+                let mut addr_bytes = [0u8; 16];
+                addr_bytes.copy_from_slice(&sub_data[0..16]);
+                let addr = Ipv6Addr::from(addr_bytes);
+
+                found_addr = true;
+
+                if server::address6_valid(contexts, &addr, &state.tags, true).is_none() {
+                    all_valid = false;
+                    break;
+                }
             }
         }
 
@@ -1514,8 +1747,11 @@ fn process_confirm(
 }
 
 /// Process DHCPv6 RELEASE message (C: rfc3315.c lines 1815-1878).
+///
+/// Finds leases matching the client's IA addresses/prefixes, verifies the CLID
+/// matches, and removes the lease from the canonical lease database.
 fn process_release(
-    _daemon: &mut DaemonState,
+    daemon: &mut DaemonState,
     contexts: &[DhcpContext],
     state: &mut Dhcp6RequestState,
     opts: &[u8],
@@ -1526,55 +1762,54 @@ fn process_release(
     while let Some((ia_code, ia_data, next_pos)) = opt6_next(opts, ia_pos) {
         ia_pos = next_pos;
 
-        if ia_code != super::OPTION6_IA_NA && ia_code != super::OPTION6_IA_TA {
-            continue;
-        }
-
-        let ia_opts = if ia_code == super::OPTION6_IA_NA && ia_data.len() > 12 {
-            &ia_data[12..]
-        } else if ia_code == super::OPTION6_IA_TA && ia_data.len() > 4 {
-            &ia_data[4..]
-        } else {
-            continue;
+        let ia_type = match IaType::from_option_code(ia_code) {
+            Some(t) => t,
+            None => continue,
         };
 
-        let mut ia_opt_pos = 0;
-        while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
-            ia_opt_pos = sub_next;
-
-            if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
-                continue;
-            }
-
-            let mut addr_bytes = [0u8; 16];
-            addr_bytes.copy_from_slice(&sub_data[0..16]);
-            let addr = Ipv6Addr::from(addr_bytes);
-
-            // Find and delete the lease
-            let existing = lease6_find_by_addr(&[], &addr, 128, &addr);
-            if let Some(lease) = existing {
-                // Verify CLID matches
-                let clid_match = match (&state.clid, &lease.clid) {
-                    (Some(req_clid), Some(lease_clid)) => req_clid == lease_clid,
-                    _ => false,
-                };
-
-                if clid_match {
-                    log6_packet(state, "RELEASE", Some(&addr), None);
-                    // In production, lease_prune would remove the lease
-                } else {
-                    // NoBinding — CLID mismatch
-                    let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
-                    outpacket.put_opt6_short(super::DHCP6_NO_BINDING);
-                    outpacket.put_opt6_string("no binding");
-                    outpacket.end_opt6(s);
-                }
+        if ia_type == IaType::Pd {
+            // IA_PD: iterate IAPREFIX sub-options
+            let pd_opts = if ia_data.len() > 12 {
+                &ia_data[12..]
             } else {
-                // No lease found for this address
-                let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
-                outpacket.put_opt6_short(super::DHCP6_NO_BINDING);
-                outpacket.put_opt6_string("no binding");
-                outpacket.end_opt6(s);
+                continue;
+            };
+            let mut pd_pos = 0;
+            while let Some((sub_code, sub_data, sub_next)) = opt6_next(pd_opts, pd_pos) {
+                pd_pos = sub_next;
+                if sub_code != super::OPTION6_IAPREFIX || sub_data.len() < 25 {
+                    continue;
+                }
+                let prefix_len = sub_data[8];
+                let mut prefix_bytes = [0u8; 16];
+                prefix_bytes.copy_from_slice(&sub_data[9..25]);
+                let prefix_addr = Ipv6Addr::from(prefix_bytes);
+
+                release_lease_by_addr(daemon, state, &prefix_addr, prefix_len as i32, outpacket);
+            }
+        } else {
+            // IA_NA / IA_TA: iterate IAADDR sub-options
+            let ia_opts = if ia_type == IaType::Na && ia_data.len() > 12 {
+                &ia_data[12..]
+            } else if ia_type == IaType::Ta && ia_data.len() > 4 {
+                &ia_data[4..]
+            } else {
+                continue;
+            };
+
+            let mut ia_opt_pos = 0;
+            while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
+                ia_opt_pos = sub_next;
+
+                if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
+                    continue;
+                }
+
+                let mut addr_bytes = [0u8; 16];
+                addr_bytes.copy_from_slice(&sub_data[0..16]);
+                let addr = Ipv6Addr::from(addr_bytes);
+
+                release_lease_by_addr(daemon, state, &addr, 128, outpacket);
             }
         }
     }
@@ -1590,9 +1825,56 @@ fn process_release(
     Ok(true)
 }
 
+/// Helper: find a lease by address in the daemon's lease database, verify the
+/// CLID matches, and remove the lease. Emits NoBinding status on mismatch.
+fn release_lease_by_addr(
+    daemon: &mut DaemonState,
+    state: &Dhcp6RequestState,
+    addr: &Ipv6Addr,
+    prefix: i32,
+    outpacket: &mut OutPacket,
+) {
+    // Find the lease index in the canonical database.
+    // Cast prefix (i32) to u8 for comparison with DhcpLease.prefix_len (u8).
+    let prefix_u8 = prefix as u8;
+    let lease_idx = daemon.leases.iter().position(|l| {
+        if let Some(ref a6) = l.addr6 {
+            a6 == addr && l.prefix_len == prefix_u8
+        } else {
+            false
+        }
+    });
+
+    if let Some(idx) = lease_idx {
+        // Verify CLID matches before deleting
+        let clid_match = match (&state.clid, &daemon.leases[idx].clid) {
+            (Some(req_clid), Some(lease_clid)) => req_clid == lease_clid,
+            _ => false,
+        };
+
+        if clid_match {
+            log6_packet(state, "RELEASE", Some(addr), None);
+            // Actually remove the lease from the canonical database
+            daemon.leases.remove(idx);
+        } else {
+            let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+            outpacket.put_opt6_short(super::DHCP6_NO_BINDING);
+            outpacket.put_opt6_string("no binding");
+            outpacket.end_opt6(s);
+        }
+    } else {
+        let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+        outpacket.put_opt6_short(super::DHCP6_NO_BINDING);
+        outpacket.put_opt6_string("no binding");
+        outpacket.end_opt6(s);
+    }
+}
+
 /// Process DHCPv6 DECLINE message (C: rfc3315.c lines 1880-1960).
 ///
-/// Marks declined addresses as unavailable for a backoff period.
+/// Marks declined addresses/prefixes as unavailable for a backoff period
+/// by incrementing the addr_epoch on matching contexts, which invalidates
+/// cached allocations.
 fn process_decline(
     _daemon: &mut DaemonState,
     contexts: &mut [DhcpContext],
@@ -1605,38 +1887,64 @@ fn process_decline(
     while let Some((ia_code, ia_data, next_pos)) = opt6_next(opts, ia_pos) {
         ia_pos = next_pos;
 
-        if ia_code != super::OPTION6_IA_NA && ia_code != super::OPTION6_IA_TA {
-            continue;
-        }
-
-        let ia_opts = if ia_code == super::OPTION6_IA_NA && ia_data.len() > 12 {
-            &ia_data[12..]
-        } else if ia_code == super::OPTION6_IA_TA && ia_data.len() > 4 {
-            &ia_data[4..]
-        } else {
-            continue;
+        let ia_type = match IaType::from_option_code(ia_code) {
+            Some(t) => t,
+            None => continue,
         };
 
-        let mut ia_opt_pos = 0;
-        while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
-            ia_opt_pos = sub_next;
-
-            if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
+        if ia_type == IaType::Pd {
+            // IA_PD: iterate IAPREFIX sub-options
+            let pd_opts = if ia_data.len() > 12 {
+                &ia_data[12..]
+            } else {
                 continue;
+            };
+            let mut pd_pos = 0;
+            while let Some((sub_code, sub_data, sub_next)) = opt6_next(pd_opts, pd_pos) {
+                pd_pos = sub_next;
+                if sub_code != super::OPTION6_IAPREFIX || sub_data.len() < 25 {
+                    continue;
+                }
+                let mut prefix_bytes = [0u8; 16];
+                prefix_bytes.copy_from_slice(&sub_data[9..25]);
+                let prefix_addr = Ipv6Addr::from(prefix_bytes);
+                log6_packet(state, "DECLINE", Some(&prefix_addr), None);
+                for ctx in contexts.iter_mut() {
+                    #[cfg(feature = "dhcp6")]
+                    if is_same_net6(prefix_addr, ctx.start6, ctx.prefix as u8) {
+                        ctx.addr_epoch = ctx.addr_epoch.wrapping_add(1);
+                    }
+                }
             }
+        } else {
+            // IA_NA / IA_TA: iterate IAADDR sub-options
+            let ia_opts = if ia_type == IaType::Na && ia_data.len() > 12 {
+                &ia_data[12..]
+            } else if ia_type == IaType::Ta && ia_data.len() > 4 {
+                &ia_data[4..]
+            } else {
+                continue;
+            };
 
-            let mut addr_bytes = [0u8; 16];
-            addr_bytes.copy_from_slice(&sub_data[0..16]);
-            let addr = Ipv6Addr::from(addr_bytes);
+            let mut ia_opt_pos = 0;
+            while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
+                ia_opt_pos = sub_next;
 
-            log6_packet(state, "DECLINE", Some(&addr), None);
+                if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
+                    continue;
+                }
 
-            // Increment addr_epoch on matching contexts to invalidate
-            // cached allocations. C: context->addr_epoch++
-            for ctx in contexts.iter_mut() {
-                #[cfg(feature = "dhcp6")]
-                if is_same_net6(addr, ctx.start6, ctx.prefix as u8) {
-                    ctx.addr_epoch = ctx.addr_epoch.wrapping_add(1);
+                let mut addr_bytes = [0u8; 16];
+                addr_bytes.copy_from_slice(&sub_data[0..16]);
+                let addr = Ipv6Addr::from(addr_bytes);
+
+                log6_packet(state, "DECLINE", Some(&addr), None);
+
+                for ctx in contexts.iter_mut() {
+                    #[cfg(feature = "dhcp6")]
+                    if is_same_net6(addr, ctx.start6, ctx.prefix as u8) {
+                        ctx.addr_epoch = ctx.addr_epoch.wrapping_add(1);
+                    }
                 }
             }
         }
@@ -1779,6 +2087,7 @@ fn add_address(
     addr: &Ipv6Addr,
     _now: i64,
     outpacket: &mut OutPacket,
+    daemon: &DaemonState,
 ) {
     // Find matching context for this address
     let ctx = contexts.iter().find(|c| {
@@ -1826,6 +2135,76 @@ fn add_address(
         "REPLY",
         Some(addr),
         Some(&format!("lease {}", valid_lifetime)),
+        daemon,
+    );
+}
+
+/// Construct an IAPREFIX sub-option in the outgoing DHCPv6 response.
+///
+/// Mirrors `add_address()` but writes an IAPREFIX (option 26) with
+/// preferred(4) + valid(4) + prefix_len(1) + prefix(16) = 25 bytes
+/// of payload, as required by RFC 3633 §10.
+fn add_prefix(
+    state: &Dhcp6RequestState,
+    contexts: &[DhcpContext],
+    lease_time: u32,
+    min_time: &mut u32,
+    prefix_addr: &Ipv6Addr,
+    prefix_len: u8,
+    _now: i64,
+    outpacket: &mut OutPacket,
+    daemon: &DaemonState,
+) {
+    // Find matching context for this prefix
+    let ctx = contexts.iter().find(|c| {
+        #[cfg(feature = "dhcp6")]
+        {
+            is_same_net6(*prefix_addr, c.start6, c.prefix as u8)
+        }
+        #[cfg(not(feature = "dhcp6"))]
+        {
+            let _ = c;
+            false
+        }
+    });
+
+    let (valid_lifetime, preferred_lifetime) = if let Some(c) = ctx {
+        calculate_times(c, min_time, lease_time)
+    } else {
+        let effective = if lease_time == 0 {
+            DEFLEASE6
+        } else {
+            lease_time
+        };
+        if effective < *min_time {
+            *min_time = effective;
+        }
+        (effective, effective)
+    };
+
+    // Write IAPREFIX sub-option (option 26)
+    let iaprefix = outpacket.new_opt6(super::OPTION6_IAPREFIX);
+
+    // Preferred lifetime (4 bytes)
+    outpacket.put_opt6_long(preferred_lifetime);
+
+    // Valid lifetime (4 bytes)
+    outpacket.put_opt6_long(valid_lifetime);
+
+    // Prefix length (1 byte)
+    outpacket.put_opt6_char(prefix_len);
+
+    // IPv6 prefix (16 bytes)
+    outpacket.put_opt6(&prefix_addr.octets());
+
+    outpacket.end_opt6(iaprefix);
+
+    log6_quiet(
+        state,
+        "REPLY",
+        Some(prefix_addr),
+        Some(&format!("prefix /{} lease {}", prefix_len, valid_lifetime)),
+        daemon,
     );
 }
 
@@ -1895,72 +2274,92 @@ fn calculate_times(context: &DhcpContext, min_time: &mut u32, lease_time: u32) -
 // Address Management Helpers
 // ---------------------------------------------------------------------------
 
-/// Update or create a DHCPv6 lease in the database.
+/// Update or create a DHCPv6 lease in the canonical daemon lease database.
 ///
 /// Replaces C `update_leases()` (rfc3315.c line 3346).
+///
+/// Searches `daemon.leases` for an existing lease matching the address/prefix.
+/// If found, updates it in place. If not found and `lease_allocate` is set,
+/// creates a new lease and appends it to the database.
 fn update_leases(
     state: &Dhcp6RequestState,
     _contexts: &[DhcpContext],
     addr: &Ipv6Addr,
     lease_time: u32,
     now: i64,
-    _daemon: &mut DaemonState,
+    daemon: &mut DaemonState,
 ) {
     let lease_type = state.ia_type.to_lease_type();
+    let prefix_len = if state.ia_type == IaType::Pd { 64 } else { 128 };
 
-    // Try to find existing lease
-    let existing = lease6_find_by_addr(&[], addr, 128, addr);
-
-    let mut lease = if let Some(existing_lease) = existing {
-        existing_lease.clone()
-    } else if state.lease_allocate {
-        // Allocate new lease
-        lease6_allocate(*addr, lease_type)
-    } else {
-        return;
-    };
-
-    // Set lease properties
-    lease_set_expires(&mut lease, lease_time, now);
-    lease_set_iaid(&mut lease, state.iaid);
-
-    // Set hardware address
-    let clid = state.clid.as_deref();
-    lease_set_hwaddr(
-        &mut lease,
-        &state.mac,
-        clid,
-        state.mac.len(),
-        state.mac_type as i32,
-        now,
-        false,
-    );
-
-    // Set interface
-    lease_set_interface(&mut lease, &state.iface_name, now);
-
-    // Set hostname if available
-    if let Some(ref hostname) = state.hostname {
-        // Note: In production, this would call lease_set_hostname on the LeaseDatabase
-        debug!(
-            addr = %addr,
-            hostname = %hostname,
-            auth = state.hostname_auth,
-            "setting DHCPv6 lease hostname"
-        );
-    }
-
-    // Add extra data for lease-change script notification
-    #[cfg(feature = "script")]
-    {
-        // Vendor class data
-        lease_add_extradata(&mut lease, &[], 0);
-        // Hostname
-        if let Some(ref hn) = state.hostname {
-            lease_add_extradata(&mut lease, hn.as_bytes(), 0);
+    // Try to find existing lease index in the canonical lease database
+    let existing_idx = daemon.leases.iter().position(|l| {
+        if let Some(ref a6) = l.addr6 {
+            a6 == addr && l.prefix_len == prefix_len
         } else {
-            lease_add_extradata(&mut lease, &[], 0);
+            false
         }
+    });
+
+    if let Some(idx) = existing_idx {
+        // Update existing lease in place
+        let lease = &mut daemon.leases[idx];
+        lease_set_expires(lease, lease_time, now);
+        lease_set_iaid(lease, state.iaid);
+        let clid = state.clid.as_deref();
+        lease_set_hwaddr(
+            lease,
+            &state.mac,
+            clid,
+            state.mac.len(),
+            state.mac_type as i32,
+            now,
+            false,
+        );
+        lease_set_interface(lease, &state.iface_name, now);
+        if let Some(ref hostname) = state.hostname {
+            lease.hostname = Some(hostname.clone());
+        }
+        #[cfg(feature = "script")]
+        {
+            lease_add_extradata(lease, &[], 0);
+            if let Some(ref hn) = state.hostname {
+                lease_add_extradata(lease, hn.as_bytes(), 0);
+            } else {
+                lease_add_extradata(lease, &[], 0);
+            }
+        }
+    } else if state.lease_allocate {
+        // Allocate new lease and persist to the canonical database
+        let mut lease = lease6_allocate(*addr, lease_type);
+        lease.prefix_len = prefix_len;
+        lease_set_expires(&mut lease, lease_time, now);
+        lease_set_iaid(&mut lease, state.iaid);
+        let clid = state.clid.as_deref();
+        lease_set_hwaddr(
+            &mut lease,
+            &state.mac,
+            clid,
+            state.mac.len(),
+            state.mac_type as i32,
+            now,
+            false,
+        );
+        lease_set_interface(&mut lease, &state.iface_name, now);
+        if let Some(ref hostname) = state.hostname {
+            lease.hostname = Some(hostname.clone());
+        }
+        #[cfg(feature = "script")]
+        {
+            lease_add_extradata(&mut lease, &[], 0);
+            if let Some(ref hn) = state.hostname {
+                lease_add_extradata(&mut lease, hn.as_bytes(), 0);
+            } else {
+                lease_add_extradata(&mut lease, &[], 0);
+            }
+        }
+        // Persist to the canonical lease store
+        daemon.leases.push(lease);
     }
 }
 
@@ -2000,9 +2399,14 @@ fn mark_config_used(contexts: &mut [DhcpContext], addr: &Ipv6Addr) {
 /// Returns true if:
 /// - No existing lease exists for this address, OR
 /// - The existing lease belongs to the same client (same CLID + IAID)
-fn check_address(state: &Dhcp6RequestState, _contexts: &[DhcpContext], addr: &Ipv6Addr) -> bool {
-    // Look up existing lease for this address
-    let existing = lease6_find_by_addr(&[], addr, 128, addr);
+fn check_address(
+    state: &Dhcp6RequestState,
+    _contexts: &[DhcpContext],
+    addr: &Ipv6Addr,
+    lease_db: &[DhcpLease],
+) -> bool {
+    // Look up existing lease for this address in the canonical lease database
+    let existing = lease6_find_by_addr(lease_db, addr, 128, addr);
 
     match existing {
         None => true, // No lease — address is available
@@ -2060,6 +2464,7 @@ fn config_valid(
     addr: &Ipv6Addr,
     state: &Dhcp6RequestState,
     now: i64,
+    lease_db: &[DhcpLease],
 ) -> bool {
     if config.flags & CONFIG_ADDR6 == 0 {
         return false;
@@ -2080,7 +2485,7 @@ fn config_valid(
             for ctx in contexts {
                 if is_same_net6(cfg_addr, ctx.start6, ctx.prefix as u8) {
                     // Check the address is actually available
-                    if check_address(state, contexts, &cfg_addr) {
+                    if check_address(state, contexts, &cfg_addr, lease_db) {
                         return true;
                     }
                 }
@@ -2527,22 +2932,50 @@ fn log6_packet(
 /// Conditional logging: only log if OPT_LOG_OPTS is set or OPT_QUIET_DHCP6 is not set.
 ///
 /// Replaces C `log6_quiet()` (rfc3315.c line 3575).
+///
+/// C behavior: `log6_quiet()` checks `option_bool(OPT_LOG_OPTS)` and
+/// `!option_bool(OPT_QUIET_DHCP6)`. If neither is set, the message is
+/// suppressed entirely.
 fn log6_quiet(
     state: &Dhcp6RequestState,
     msg_type: &str,
     addr: Option<&Ipv6Addr>,
     extra: Option<&str>,
+    daemon: &DaemonState,
 ) {
-    // In production, would check daemon.options.is_set(opt::LOG_OPTS) ||
-    // !daemon.options.is_set(opt::QUIET_DHCP6). Since we don't have
-    // DaemonState here, always log at debug level.
-    debug!(
-        xid = state.xid,
-        msg = msg_type,
-        addr = ?addr,
-        extra = ?extra,
-        "DHCPv6 quiet log"
-    );
+    // Check daemon option flags — suppress logging when quiet mode is enabled
+    // and LOG_OPTS is not explicitly set. Uses OptionFlags::is_set() method.
+    let log_opts = daemon.options.is_set(opt::LOG_OPTS);
+    let quiet_dhcp6 = daemon.options.is_set(opt::QUIET_DHCP6);
+
+    if !log_opts && quiet_dhcp6 {
+        return; // Quiet mode — suppress this log message
+    }
+
+    // Emit the log at info level (matching C's my_syslog(MS_DHCP | LOG_INFO, ...))
+    match (addr, extra) {
+        (Some(a), Some(e)) => {
+            info!(
+                xid = state.xid,
+                "DHCPv6 {} {} {} {}", msg_type, state.iface_name, a, e
+            );
+        }
+        (Some(a), None) => {
+            info!(
+                xid = state.xid,
+                "DHCPv6 {} {} {}", msg_type, state.iface_name, a
+            );
+        }
+        (None, Some(e)) => {
+            info!(
+                xid = state.xid,
+                "DHCPv6 {} {} {}", msg_type, state.iface_name, e
+            );
+        }
+        (None, None) => {
+            info!(xid = state.xid, "DHCPv6 {} {}", msg_type, state.iface_name);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

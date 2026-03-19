@@ -419,10 +419,9 @@ pub async fn dhcp_init(state: &mut DaemonState) -> DnsmasqResult<()> {
     }
 
     // Load /etc/ethers file for MAC-to-hostname static reservations.
-    // Note: dhcp_read_ethers works with Vec<DhcpConfig>, which is the common
-    // module's richer type.  DaemonState stores the simpler DhcpConfigEntry
-    // variant.  We load into a local vec here; the ethers configs are consumed
-    // by the protocol layer which converts as needed.
+    // The ethers entries are converted to DhcpConfigEntry and stored in
+    // DaemonState.dhcp_conf for use by the protocol layer during address
+    // allocation and static assignment.
     let ethers_path = ETHERSFILE;
     let mut ethers_configs: Vec<DhcpConfig> = Vec::new();
     if let Err(e) = dhcp_read_ethers(ethers_path, &mut ethers_configs) {
@@ -433,6 +432,26 @@ pub async fn dhcp_init(state: &mut DaemonState) -> DnsmasqResult<()> {
             path = ethers_path,
             "Loaded ethers file entries"
         );
+        // Convert common::DhcpConfig to core::types::DhcpConfigEntry and
+        // persist in DaemonState for the protocol layer.
+        for ec in &ethers_configs {
+            let hwaddr_bytes: Vec<u8> = ec
+                .hwaddr
+                .iter()
+                .flat_map(|h| h.hwaddr.iter().copied())
+                .collect();
+            let entry = crate::core::types::DhcpConfigEntry {
+                hwaddr: hwaddr_bytes,
+                clid: ec.clid.clone().unwrap_or_default(),
+                hostname: ec.hostname.clone(),
+                addr: ec.addr,
+                addr6: None,
+                lease_time: ec.lease_time,
+                flags: ec.flags,
+                netid: ec.netid.first().map(|n| n.net.clone()),
+            };
+            state.dhcp_conf.push(entry);
+        }
     }
 
     Ok(())
@@ -536,11 +555,20 @@ pub async fn dhcp_packet(now: i64, pxe_fd: bool, state: &mut DaemonState) -> Dns
     let msg_name = dhcp_msg_name(msg_type);
     let giaddr = extract_ipv4(&state.dhcp_packet, GIADDR_OFFSET);
 
-    // Determine receiving interface (from ancillary data / IP_PKTINFO).
-    // In the full integration, the interface index comes from recvmsg
-    // control messages. Here we use 0 as default until the main event
-    // loop supplies the actual index.
-    let if_index: u32 = 0;
+    // Determine receiving interface index. C uses IP_PKTINFO ancillary data
+    // from recvmsg() to get the exact interface index. Here we look up the
+    // interface matching the DHCP socket's bound address in the interface
+    // record table.
+    let if_index: u32 = if let std::net::IpAddr::V4(v4) = src_addr.ip() {
+        state
+            .interfaces
+            .iter()
+            .find(|iface| iface.addr == std::net::IpAddr::V4(v4))
+            .map(|iface| iface.index)
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let iface_name = index_to_name(if_index).unwrap_or_else(|| "unknown".into());
     let resolved_iface = resolve_bridge_alias(&iface_name, state);
 
@@ -1162,10 +1190,8 @@ fn icmp_checksum(data: &[u8]) -> u16 {
 /// nix's [`SockaddrIn`] validates the destination address construction.
 /// [`MsgFlags`] constants define receive behavior (non-blocking poll).
 async fn send_icmp_probe(addr: Ipv4Addr, packet: &[u8], identifier: u16) -> bool {
-    // Create raw ICMP socket using IPPROTO_ICMP and IPPROTO_UDP protocol
-    // constants from libc for protocol identification.
+    // Create raw ICMP socket using IPPROTO_ICMP protocol constant from libc.
     let icmp_proto = libc::IPPROTO_ICMP;
-    let _udp_proto = libc::IPPROTO_UDP; // Referenced for protocol constant verification.
     let sock = match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(icmp_proto))) {
         Ok(s) => s,
         Err(e) => {
@@ -1596,6 +1622,10 @@ pub fn relay_reply4(packet: &[u8], iface_name: &str, state: &DaemonState) -> Opt
         "Processing relay reply"
     );
 
+    // The actual network send is performed by the caller (the main event
+    // loop dispatch in daemon.rs) after this function validates and prepares
+    // the relay reply. This mirrors C's architecture where relay_reply4()
+    // processes the packet and the caller handles sendto().
     Some(packet.len() as i32)
 }
 

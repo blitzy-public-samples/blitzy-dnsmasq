@@ -403,8 +403,11 @@ pub mod opt {
     pub const AUTH_LOG: u32 = 76;
     /// Enable DHCP leasequery (RFC 4388).
     pub const LEASEQUERY: u32 = 77;
+    /// Systems without a wall-clock RTC store lease lengths instead of
+    /// expiry timestamps. Replaces C's `HAVE_BROKEN_RTC` compile-time flag.
+    pub const BROKEN_RTC: u32 = 78;
     /// Sentinel — total number of option flags.
-    pub const LAST: u32 = 78;
+    pub const LAST: u32 = 79;
 }
 
 /// Number of `u32` words needed to store all option bits.
@@ -769,6 +772,10 @@ pub struct InterfaceName {
 pub struct MySubnet {
     pub addr: std::net::IpAddr,
     pub mask: u8,
+    /// Whether a fixed address was explicitly configured (C: `addr_used`).
+    /// When true, the configured address is used instead of the variable
+    /// client source address, making ECS responses cacheable.
+    pub addr_used: bool,
 }
 
 /// Interface name filter entry (C: `struct iname`).
@@ -950,12 +957,26 @@ pub struct TagIf {
 }
 
 /// DHCP relay configuration (C: `struct dhcp_relay`).
+///
+/// Supports two relay modes:
+/// - Normal mode (`split_mode = false`): relay forwards to a single upstream server.
+/// - Split mode (`split_mode = true`): relay forwards to multiple upstream servers
+///   (each matching relay config entry gets a copy of the packet).
 #[cfg(any(feature = "dhcp", feature = "dhcp6"))]
 #[derive(Debug, Clone)]
 pub struct DhcpRelay {
     pub local: std::net::IpAddr,
     pub server: std::net::IpAddr,
     pub interface: Option<String>,
+    /// Network mask for subnet-based relay matching.
+    pub mask: Option<Ipv4Addr>,
+    /// Interface index — working storage for the interface on which requests arrived.
+    pub iface_index: i32,
+    /// Port of the upstream relay server (default: 67 for DHCPv4).
+    pub port: u16,
+    /// Split mode: when true, the relay forwards to ALL matching relay configs
+    /// (C: `RELAY_SPLIT`). When false, only the first match is used.
+    pub split_mode: bool,
 }
 
 /// Delay configuration (C: `struct delay_config`).
@@ -1331,6 +1352,10 @@ pub struct DaemonState {
     /// Maximum EDNS0 UDP payload size (default [`EDNS_PKTSZ`] = 1232).
     pub edns_pktsz: u16,
 
+    /// Interface MTU value for DHCP Option 26 (C: `int mtu`).
+    /// When non-zero, included in DHCP responses as the interface MTU option.
+    pub mtu: u32,
+
     /// Random port allocation limit.
     pub randport_limit: i32,
 
@@ -1695,6 +1720,13 @@ pub struct DaemonState {
     #[cfg(feature = "dhcp")]
     pub max_dhcp_leases: i32,
 
+    /// Active DHCP lease database (both v4 and v6 leases).
+    /// Replaces C's global `leases` linked list that was accessed by all
+    /// lease-related functions. This Vec is the canonical lease store;
+    /// `lease6_find_by_addr()`, `lease_find_by_addr()`, etc. search it.
+    #[cfg(feature = "dhcp")]
+    pub leases: Vec<crate::dhcp::lease::DhcpLease>,
+
     /// DHCP packet buffer (sized for a full DHCP message).
     #[cfg(feature = "dhcp")]
     pub dhcp_packet: Vec<u8>,
@@ -1890,6 +1922,7 @@ impl DaemonState {
             host_index: 0,
             addn_hosts: Vec::new(),
             edns_pktsz: EDNS_PKTSZ,
+            mtu: 0,
             randport_limit: 1,
             max_procs: MAX_PROCS as i32,
             max_procs_used: 0,
@@ -2066,6 +2099,8 @@ impl DaemonState {
             kernel_version: 0,
             #[cfg(feature = "dhcp")]
             max_dhcp_leases: MAXLEASES as i32,
+            #[cfg(feature = "dhcp")]
+            leases: Vec::new(),
             #[cfg(feature = "dhcp")]
             dhcp_packet: Vec::with_capacity(4096),
             #[cfg(feature = "dhcp")]

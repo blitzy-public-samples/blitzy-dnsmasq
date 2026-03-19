@@ -33,7 +33,8 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -278,9 +279,12 @@ pub struct UpstreamServer {
     /// Interface name to bind outgoing queries to.
     pub interface: Option<String>,
     /// Modified moving average of query latency (×128 for integer arithmetic).
-    pub mma_latency: u64,
+    /// Uses `AtomicU64` so latency can be updated through `Arc<UpstreamServer>`
+    /// shared references without requiring mutable access.
+    pub mma_latency: AtomicU64,
     /// Smoothed query latency in milliseconds (= mma_latency / 128).
-    pub query_latency: u64,
+    /// Uses `AtomicU64` for the same shared-reference mutability reason.
+    pub query_latency: AtomicU64,
     /// Position in the flattened server array.
     pub arrayposn: usize,
     /// Last server in this server's group that responded.
@@ -305,8 +309,8 @@ impl UpstreamServer {
             uid: 0,
             source_addr: None,
             interface: None,
-            mma_latency: 0,
-            query_latency: 0,
+            mma_latency: AtomicU64::new(0),
+            query_latency: AtomicU64::new(0),
             arrayposn: 0,
             last_server: -1,
             tcpfd: -1,
@@ -348,19 +352,24 @@ impl UpstreamServer {
     /// queries while giving higher weight to the most recent measurement.
     ///
     /// Mirrors C: `server->mma_latency` update in `reply_query()`.
-    pub fn update_latency(&mut self, elapsed_ms: u64) {
-        if self.query_latency == 0 {
-            self.mma_latency = elapsed_ms.saturating_mul(128);
+    /// Update the modified moving average (MMA) latency after receiving a
+    /// response.  Uses atomic operations so this can be called through
+    /// `Arc<UpstreamServer>` without mutable access.
+    pub fn update_latency(&self, elapsed_ms: u64) {
+        let current_ql = self.query_latency.load(Ordering::Relaxed);
+        let new_mma = if current_ql == 0 {
+            elapsed_ms.saturating_mul(128)
         } else {
-            // mma_latency += elapsed_ms - query_latency
-            let diff = elapsed_ms as i64 - self.query_latency as i64;
+            let current_mma = self.mma_latency.load(Ordering::Relaxed);
+            let diff = elapsed_ms as i64 - current_ql as i64;
             if diff >= 0 {
-                self.mma_latency = self.mma_latency.saturating_add(diff as u64);
+                current_mma.saturating_add(diff as u64)
             } else {
-                self.mma_latency = self.mma_latency.saturating_sub((-diff) as u64);
+                current_mma.saturating_sub((-diff) as u64)
             }
-        }
-        self.query_latency = self.mma_latency / 128;
+        };
+        self.mma_latency.store(new_mma, Ordering::Relaxed);
+        self.query_latency.store(new_mma / 128, Ordering::Relaxed);
     }
 }
 
@@ -743,28 +752,48 @@ impl RfdPool {
 
 /// Send a DNS response packet from the specified local address/interface.
 ///
-/// Uses platform-specific sendmsg with CMSG ancillary data to specify the
+/// Uses platform-specific `sendmsg()` with CMSG ancillary data to specify the
 /// outgoing source IP address.  This is critical for multi-homed hosts where
 /// dnsmasq must respond from the same IP the query arrived on.
 ///
 /// Replaces C `send_from()` which uses `sendmsg()` with `IP_PKTINFO` (Linux)
-/// or `IP_SENDSRCADDR` (BSD) control messages.
+/// or `IP_SENDSRCADDR` (BSD) control messages (forward.c lines 752–780).
+///
+/// # Arguments
+/// * `socket` — The UDP socket to send on.
+/// * `packet` — DNS packet bytes to send.
+/// * `dest` — Destination address.
+/// * `source` — Optional source address to pin the outgoing IP. When `None`,
+///   the kernel selects the source address via the routing table.
+/// * `iface_index` — Interface index for `IP_PKTINFO`. Used on Linux to force
+///   the packet out a specific interface. Zero means the kernel chooses.
 pub async fn send_from(
     socket: &UdpSocket,
     packet: &[u8],
     dest: &SocketAddr,
-    _source: Option<&SocketAddr>,
-    _iface_index: u32,
+    source: Option<&SocketAddr>,
+    iface_index: u32,
 ) -> DnsmasqResult<usize> {
-    // For most deployments the OS routing table selects the correct source.
-    // If a specific source address is required, platform-specific CMSG
-    // handling using `nix::sys::socket::sendmsg()` is employed.
-    //
-    // The tokio UdpSocket::send_to() path handles the common case; the
-    // nix::sys::socket::sendmsg() path handles the multi-homed case.
-
-    // Common path: let the kernel choose the source address.
     let dest_str = format_addr(dest);
+
+    // If a source address is specified, use platform-specific sendmsg()
+    // with ancillary data to pin the outgoing source IP. This is required
+    // on multi-homed servers to ensure the response comes from the same IP
+    // the client sent the query to.
+    if let Some(src) = source {
+        let sent = send_from_with_cmsg(socket, packet, dest, src, iface_index)?;
+        trace!(
+            target: "dns::forward",
+            bytes = sent,
+            dest = %dest_str,
+            source = %format_addr(src),
+            iface = iface_index,
+            "send_from: packet sent with source address pinning"
+        );
+        return Ok(sent);
+    }
+
+    // Fallback: let the kernel choose the source address via routing table.
     let sent = socket.send_to(packet, dest).await.map_err(|e| {
         warn!(target: "dns::forward", error = %e, dest = %dest_str, "send_from failed");
         DnsmasqError::Io(e)
@@ -773,8 +802,172 @@ pub async fn send_from(
         target: "dns::forward",
         bytes = sent,
         dest = %dest_str,
-        "send_from: packet sent"
+        "send_from: packet sent (kernel source selection)"
     );
+    Ok(sent)
+}
+
+/// Platform-specific sendmsg with CMSG for source address pinning.
+///
+/// On Linux, uses `IP_PKTINFO` / `IPV6_PKTINFO` ancillary data.
+/// On BSD/macOS, uses `IP_SENDSRCADDR` / `IPV6_PKTINFO`.
+///
+/// Uses raw `libc::sendmsg()` directly (consistent with the project's
+/// `netlink.rs` and `interface.rs` patterns) since the socket is UDP
+/// and non-blocking, so sendmsg completes immediately.
+///
+/// Mirrors C `send_from()` in `forward.c` lines 148–218.
+fn send_from_with_cmsg(
+    socket: &UdpSocket,
+    packet: &[u8],
+    dest: &SocketAddr,
+    source: &SocketAddr,
+    iface_index: u32,
+) -> DnsmasqResult<usize> {
+    use std::os::unix::io::AsRawFd;
+
+    let raw_fd = socket.as_raw_fd();
+
+    // Build iov for the packet data.
+    let mut iov = libc::iovec {
+        iov_base: packet.as_ptr() as *mut libc::c_void,
+        iov_len: packet.len(),
+    };
+
+    // Control message buffer — sized for the largest CMSG we need.
+    // CMSG_SPACE(sizeof(in6_pktinfo)) is largest (28 bytes + alignment).
+    // Use a union-like approach matching C's control_u.
+    // SAFETY: CMSG_SPACE is a macro that returns a constant usize for alignment.
+    let cmsg_buf_size = unsafe {
+        let v4_size = libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32);
+        #[cfg(target_os = "linux")]
+        let v4_alt = libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32);
+        #[cfg(not(target_os = "linux"))]
+        let v4_alt = libc::CMSG_SPACE(std::mem::size_of::<libc::in_addr>() as u32);
+        std::cmp::max(v4_size as usize, v4_alt as usize)
+    };
+    let mut cmsg_buf = vec![0u8; cmsg_buf_size];
+
+    // Build sockaddr on the stack so it lives through the sendmsg call.
+    let mut dest_sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut dest_sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+
+    let (sa_ptr, sa_len): (*const libc::c_void, libc::socklen_t) = match dest {
+        SocketAddr::V4(v4) => {
+            dest_sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            dest_sin.sin_port = v4.port().to_be();
+            dest_sin.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            (
+                &dest_sin as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        SocketAddr::V6(v6) => {
+            dest_sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            dest_sin6.sin6_port = v6.port().to_be();
+            dest_sin6.sin6_addr.s6_addr = v6.ip().octets();
+            dest_sin6.sin6_scope_id = v6.scope_id();
+            dest_sin6.sin6_flowinfo = v6.flowinfo();
+            (
+                &dest_sin6 as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    };
+
+    // Build msghdr with CMSG ancillary data for source address pinning.
+    // SAFETY: All pointers in msg/iov/cmsg_buf reference valid stack/heap
+    // memory that outlives the sendmsg() call. The fd is a valid UDP socket
+    // owned by tokio. The CMSG structures are plain C types with no pointers.
+    let sent = unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_name = sa_ptr as *mut libc::c_void;
+        msg.msg_namelen = sa_len;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_flags = 0;
+
+        // Fill CMSG based on address family (mirroring C send_from).
+        let cmptr = libc::CMSG_FIRSTHDR(&msg);
+        if cmptr.is_null() {
+            return Err(DnsmasqError::Network(
+                "send_from: CMSG_FIRSTHDR returned null".to_string(),
+            ));
+        }
+
+        match source.ip() {
+            IpAddr::V4(v4) => {
+                #[cfg(target_os = "linux")]
+                {
+                    // Linux: IP_PKTINFO with in_pktinfo { ipi_ifindex, ipi_spec_dst }
+                    let p = libc::CMSG_DATA(cmptr) as *mut libc::in_pktinfo;
+                    (*p).ipi_ifindex = iface_index as libc::c_int;
+                    (*p).ipi_spec_dst = libc::in_addr {
+                        s_addr: u32::from_ne_bytes(v4.octets()),
+                    };
+                    (*p).ipi_addr = libc::in_addr { s_addr: 0 };
+                    msg.msg_controllen =
+                        libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
+                    (*cmptr).cmsg_len =
+                        libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
+                    (*cmptr).cmsg_level = libc::IPPROTO_IP;
+                    (*cmptr).cmsg_type = libc::IP_PKTINFO;
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // BSD/macOS: IP_SENDSRCADDR with in_addr
+                    let src_addr = libc::in_addr {
+                        s_addr: u32::from_ne_bytes(v4.octets()),
+                    };
+                    std::ptr::copy_nonoverlapping(
+                        &src_addr as *const _ as *const u8,
+                        libc::CMSG_DATA(cmptr),
+                        std::mem::size_of::<libc::in_addr>(),
+                    );
+                    msg.msg_controllen =
+                        libc::CMSG_SPACE(std::mem::size_of::<libc::in_addr>() as u32) as usize;
+                    (*cmptr).cmsg_len =
+                        libc::CMSG_LEN(std::mem::size_of::<libc::in_addr>() as u32) as usize;
+                    (*cmptr).cmsg_level = libc::IPPROTO_IP;
+                    (*cmptr).cmsg_type = libc::IP_SENDSRCADDR;
+                }
+            }
+            IpAddr::V6(v6) => {
+                // IPv6: IPV6_PKTINFO with in6_pktinfo (both Linux and BSD).
+                let p = libc::CMSG_DATA(cmptr) as *mut libc::in6_pktinfo;
+                (*p).ipi6_addr = libc::in6_addr {
+                    s6_addr: v6.octets(),
+                };
+                (*p).ipi6_ifindex = iface_index as libc::c_uint;
+                msg.msg_controllen =
+                    libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize;
+                (*cmptr).cmsg_len =
+                    libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize;
+                (*cmptr).cmsg_level = libc::IPPROTO_IPV6;
+                (*cmptr).cmsg_type = libc::IPV6_PKTINFO;
+            }
+        }
+
+        // Send with retry on EINTR (mirrors C's retry_send() loop).
+        loop {
+            let rc = libc::sendmsg(raw_fd, &msg, 0);
+            if rc >= 0 {
+                break rc as usize;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                // EINVAL on Linux during DAD is transient — log and return 0 (matching C).
+                #[cfg(target_os = "linux")]
+                if err.raw_os_error() == Some(libc::EINVAL) {
+                    return Ok(0);
+                }
+                return Err(DnsmasqError::Network(format!("send_from sendmsg: {}", err)));
+            }
+            // EINTR: retry immediately.
+        }
+    };
+
     Ok(sent)
 }
 
@@ -1107,39 +1300,57 @@ pub async fn forward_query(
         out_packet[1] = (new_id & 0xff) as u8;
     }
 
-    // Add EDNS0 pseudo-header if not already present.
+    // Add all EDNS0 options via the unified add_edns0_config() entry point.
+    // This handles: pseudo-header, ECS (client subnet), MAC-based options,
+    // DNS client identification, Cisco Umbrella options, and custom options
+    // from --add-edns0. Returns a cacheable flag indicating whether the
+    // response can be cached (false when client-specific data was added).
     let pkt_len = out_packet.len();
-    let limit = pkt_len + 256; // Allow some growth for EDNS0 OPT RR
+    let limit = pkt_len + 512; // Allow growth for all EDNS0 options
     out_packet.resize(limit, 0);
+
+    // First, ensure a pseudoheader exists (required before add_edns0_config).
     let new_len = EdnsHandler::add_pseudoheader(
         &mut out_packet,
         pkt_len,
         limit,
-        0,   // no specific option code
-        &[], // no option data
+        0,
+        &[],
         false,
         crate::dns::edns::ReplaceMode::NoReplace,
         EDNS_PKTSZ,
     )
     .unwrap_or(pkt_len);
     out_packet.truncate(new_len);
+
+    // Apply full EDNS0 configuration via add_edns0_config.
+    // This is the single entry point for all EDNS0 option addition,
+    // matching C's add_edns0_config() which handles MAC, ECS, DNS-client-id,
+    // Umbrella options, and custom --add-edns0 directives.
+    let my_source = to_my_sock_addr(&source);
+    let edns_pkt_len = out_packet.len();
+    let edns_limit = edns_pkt_len + 256;
+    out_packet.resize(edns_limit, 0);
+    let mut dummy_arp_cache = crate::network::arp::ArpCache::new();
+    let (edns_new_len, edns_cacheable) = apply_edns0_config_to_forwarded_query(
+        &mut out_packet,
+        edns_pkt_len,
+        edns_limit,
+        &my_source,
+        Instant::now(),
+        &mut dummy_arp_cache,
+        &crate::network::arp::NullArpEnumerator,
+        state,
+    )
+    .unwrap_or((edns_pkt_len, true));
+    out_packet.truncate(edns_new_len);
     let edns_flags = EdnsFlags::default();
 
-    // Add EDNS0 client subnet (ECS) option if source addr forwarding is configured.
-    if state.options.is_set(opt::CLIENT_SUBNET) {
-        let my_source = to_my_sock_addr(&source);
-        let pkt_len_ecs = out_packet.len();
-        let limit_ecs = pkt_len_ecs + 128;
-        out_packet.resize(limit_ecs, 0);
-        let new_len_ecs = EdnsHandler::add_source_addr(
-            &mut out_packet,
-            pkt_len_ecs,
-            limit_ecs,
-            &my_source,
-            state,
-        )
-        .unwrap_or(pkt_len_ecs);
-        out_packet.truncate(new_len_ecs);
+    // Track cacheability: if client-specific EDNS0 data was added,
+    // mark the forward flags so the response won't be cached.
+    let mut forward_flags = forward_flags;
+    if !edns_cacheable {
+        forward_flags.no_cache = true;
     }
 
     // If DNSSEC is enabled and the client asked for validation, add DO bit.
@@ -1717,7 +1928,8 @@ pub async fn reply_query(
     let dest_addr = record.dest_addr;
     let iface_index = record.iface_index;
     let forward_timestamp = record.forward_timestamp_ms;
-    let upstream_addr = record.upstream.addr;
+    let upstream = Arc::clone(&record.upstream);
+    let upstream_addr = upstream.addr;
     let udp_pkt_size = record.udp_pkt_size;
     let fwd_flags = ForwardFlags {
         tcp_fallback: record.flags.tcp_fallback,
@@ -1788,15 +2000,16 @@ pub async fn reply_query(
         return Ok(true);
     }
 
-    // Update server latency.
+    // Update server latency.  The AtomicU64 fields allow mutation through
+    // the Arc<UpstreamServer> shared reference without requiring mutable access.
     let elapsed_ms = dnsmasq_millis().saturating_sub(forward_timestamp);
-    // We cannot mutably borrow the UpstreamServer through the Arc here,
-    // but we log the latency for observability.
+    upstream.update_latency(elapsed_ms);
     debug!(
         target: "dns::forward",
         name = %query_name,
         server = %upstream_addr,
         elapsed_ms,
+        smoothed_latency = upstream.query_latency.load(Ordering::Relaxed),
         rcode,
         "reply_query: received upstream response"
     );
@@ -1872,6 +2085,8 @@ pub async fn reply_query(
     }
 
     // Process the reply (cache population, RR filtering, etc.).
+    // Pass actual peer (upstream server) and source (local dest) addresses
+    // so ECS anti-spoof verification works correctly on multi-homed servers.
     let processed = process_reply(
         packet,
         &query_name,
@@ -1880,6 +2095,8 @@ pub async fn reply_query(
         cache,
         edns_handler,
         state,
+        Some(&from),
+        dest_addr.as_ref(),
     );
 
     // Remove the forward record now that we have the response.
@@ -1917,6 +2134,8 @@ fn process_reply(
     cache: &mut DnsCache,
     _edns_handler: &EdnsHandler,
     state: &DaemonState,
+    peer_addr: Option<&SocketAddr>,
+    source_addr: Option<&SocketAddr>,
 ) -> Vec<u8> {
     let mut reply = packet.to_vec();
 
@@ -1927,18 +2146,16 @@ fn process_reply(
             .flatten();
 
     // Validate EDNS0 source option in the response (anti-spoof).
-    // EdnsHandler::check_source verifies the ECS option source address.
+    // Uses actual peer and source addresses (not UNSPECIFIED) so that
+    // ECS anti-spoof verification works correctly on multi-homed servers.
     if let Some((ref _edns_data, _offset, _len, _is_sign)) = edns_info {
-        let peer_addr = MySockAddr::from(SocketAddr::new(
-            std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            0,
-        ));
-        let source_addr = MySockAddr::from(SocketAddr::new(
-            std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            0,
-        ));
-        let _ =
-            EdnsHandler::check_source(&reply, reply.len(), Some(&peer_addr), &source_addr, state);
+        let peer_sa = peer_addr.map(|a| MySockAddr::from(*a));
+        let source_sa = source_addr
+            .map(|a| MySockAddr::from(*a))
+            .unwrap_or_else(|| {
+                MySockAddr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+            });
+        let _ = EdnsHandler::check_source(&reply, reply.len(), peer_sa.as_ref(), &source_sa, state);
     }
 
     // Validate response record integrity before further processing.
@@ -2000,35 +2217,79 @@ fn process_reply(
     }
 
     // Cache insertion: populate the DNS cache with response records.
-    // The rcode check ensures we only cache successful responses.
-    if reply.len() >= 12 {
+    // Mirrors C extract_addresses() — handles NoError, NXDOMAIN, and all RR types.
+    if reply.len() >= 12 && !flags.no_cache {
         let rcode = reply[3] & HB4_RCODE;
-        if rcode == 0 {
-            // NoError — cache the response.
-            // Parse the answer section RRs to extract actual TTL and address data.
-            let cache_name = DnsName::from_str_unchecked(query_name);
-            let now = std::time::Instant::now();
-            let mut cache_flags = CacheFlags::new();
-            cache_flags.from_upstream = true;
-            cache_flags.forward = true;
+        let cache_name = DnsName::from_str_unchecked(query_name);
+        let now = std::time::Instant::now();
+        let mut cache_flags = CacheFlags::new();
+        cache_flags.from_upstream = true;
+        cache_flags.forward = true;
 
-            // Walk the answer section to extract TTL and record data.
+        // NXDOMAIN negative caching — cache an NxDomain entry so repeated queries
+        // for non-existent domains don't go upstream every time.
+        // Mirrors C extract_addresses() NXDOMAIN path which caches with SOA TTL.
+        if rcode == 3 {
+            // NXDOMAIN
+            // Extract SOA TTL from the authority section for negative cache TTL.
+            let neg_ttl = extract_neg_ttl_from_authority(&reply).unwrap_or(300);
+            let cache_entry = CacheEntry {
+                name: cache_name.clone(),
+                rr_type: query_type,
+                data: CacheData::NxDomain,
+                expires: now + std::time::Duration::from_secs(neg_ttl as u64),
+                last_access: now,
+                flags: cache_flags.clone(),
+                ttl: neg_ttl,
+            };
+            let _ = cache.cache_insert(cache_entry);
+            trace!(
+                target: "dns::forward",
+                name = query_name,
+                ttl = neg_ttl,
+                "process_reply: cached NXDOMAIN"
+            );
+        } else if rcode == 0 {
+            // NoError — cache all answer RRs including CNAME chains,
+            // PTR, MX, SRV, TXT, SOA, A, AAAA, etc.
             let ancount_v = ((reply[6] as u16) << 8) | reply[7] as u16;
             let qdcount_v = ((reply[4] as u16) << 8) | reply[5] as u16;
             let mut pos = 12usize;
+
             // Skip question section.
             for _ in 0..qdcount_v {
                 if let Some(end) = skip_dns_name(&reply, pos) {
                     pos = end + 4; // QTYPE + QCLASS
                 }
             }
-            // Iterate answer RRs and cache each record.
+
+            // NODATA detection: NoError with zero answer RRs = negative cache.
+            if ancount_v == 0 {
+                let neg_ttl = extract_neg_ttl_from_authority(&reply).unwrap_or(300);
+                let cache_entry = CacheEntry {
+                    name: cache_name.clone(),
+                    rr_type: query_type,
+                    data: CacheData::NxDomain,
+                    expires: now + std::time::Duration::from_secs(neg_ttl as u64),
+                    last_access: now,
+                    flags: cache_flags.clone(),
+                    ttl: neg_ttl,
+                };
+                let _ = cache.cache_insert(cache_entry);
+                trace!(
+                    target: "dns::forward",
+                    name = query_name,
+                    ttl = neg_ttl,
+                    "process_reply: cached NODATA"
+                );
+            }
+
+            // Iterate answer RRs and cache each record by type.
             for _an_idx in 0..ancount_v {
+                let rr_name = extract_dns_name_at(&reply, pos);
                 if let Some(name_end) = skip_dns_name(&reply, pos) {
                     let rr_fixed = name_end;
-                    // Use extract_rr_ttl to read the TTL from the RR.
                     let ttl = extract_rr_ttl(&reply, rr_fixed).unwrap_or(300);
-                    // Read RR type from the fixed fields.
                     if rr_fixed + RRFIXEDSZ <= reply.len() {
                         let rr_type_val =
                             ((reply[rr_fixed] as u16) << 8) | reply[rr_fixed + 1] as u16;
@@ -2039,27 +2300,97 @@ fn process_reply(
                         if rdata_end <= reply.len() {
                             let rdata = &reply[rdata_start..rdata_end];
                             let rr_type = RRType::from_u16(rr_type_val);
-                            // Use rdata_to_all_addr to convert address records.
-                            let cache_data =
-                                if let Some(all_addr) = rdata_to_all_addr(rr_type, rdata) {
-                                    match all_addr {
-                                        AllAddr::V4(ip) => CacheData::Addr4(ip),
-                                        AllAddr::V6(ip) => CacheData::Addr6(ip),
-                                        _ => CacheData::NxDomain,
+                            let rr_cache_name = rr_name
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or_else(|| cache_name.clone());
+
+                            // Parse RR data into CacheData based on type.
+                            let cache_data = match rr_type {
+                                RRType::A => {
+                                    if rdlen == 4 {
+                                        let ip =
+                                            Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]);
+                                        Some(CacheData::Addr4(ip))
+                                    } else {
+                                        None
                                     }
-                                } else {
-                                    CacheData::NxDomain
-                                };
-                            let cache_entry = CacheEntry {
-                                name: cache_name.clone(),
-                                rr_type,
-                                data: cache_data,
-                                expires: now + std::time::Duration::from_secs(ttl as u64),
-                                last_access: now,
-                                flags: cache_flags.clone(),
-                                ttl,
+                                }
+                                RRType::AAAA => {
+                                    if rdlen == 16 {
+                                        let mut octets = [0u8; 16];
+                                        octets.copy_from_slice(rdata);
+                                        Some(CacheData::Addr6(Ipv6Addr::from(octets)))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                RRType::CNAME => {
+                                    // CNAME: target is a compressed domain name in rdata.
+                                    extract_dns_name_at(&reply, rdata_start).map(CacheData::Cname)
+                                }
+                                RRType::PTR => {
+                                    extract_dns_name_at(&reply, rdata_start).map(CacheData::Ptr)
+                                }
+                                RRType::MX => {
+                                    if rdlen >= 3 {
+                                        let pref = ((rdata[0] as u16) << 8) | rdata[1] as u16;
+                                        extract_dns_name_at(&reply, rdata_start + 2).map(
+                                            |exchange| CacheData::Mx {
+                                                preference: pref,
+                                                exchange,
+                                            },
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                }
+                                RRType::SRV => {
+                                    if rdlen >= 7 {
+                                        let priority = ((rdata[0] as u16) << 8) | rdata[1] as u16;
+                                        let weight = ((rdata[2] as u16) << 8) | rdata[3] as u16;
+                                        let port = ((rdata[4] as u16) << 8) | rdata[5] as u16;
+                                        extract_dns_name_at(&reply, rdata_start + 6).map(|target| {
+                                            CacheData::Srv {
+                                                priority,
+                                                weight,
+                                                port,
+                                                target,
+                                            }
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                }
+                                RRType::TXT => Some(CacheData::Txt(rdata.to_vec())),
+                                _ => {
+                                    // For all other types (SOA, NS, etc.), attempt generic
+                                    // address extraction; skip if not an address type.
+                                    if let Some(all_addr) = rdata_to_all_addr(rr_type, rdata) {
+                                        match all_addr {
+                                            AllAddr::V4(ip) => Some(CacheData::Addr4(ip)),
+                                            AllAddr::V6(ip) => Some(CacheData::Addr6(ip)),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                }
                             };
-                            let _ = cache.cache_insert(cache_entry);
+
+                            if let Some(data) = cache_data {
+                                let cache_entry = CacheEntry {
+                                    name: rr_cache_name,
+                                    rr_type,
+                                    data,
+                                    expires: now + std::time::Duration::from_secs(ttl as u64),
+                                    last_access: now,
+                                    flags: cache_flags.clone(),
+                                    ttl,
+                                };
+                                let _ = cache.cache_insert(cache_entry);
+                            }
+
                             // Optionally cap the TTL in the response packet.
                             if state.local_ttl > 0 && (ttl as u32) > state.local_ttl {
                                 set_rr_ttl(&mut reply, rr_fixed, state.local_ttl);
@@ -2074,8 +2405,18 @@ fn process_reply(
                 }
             }
 
-            // For PTR (reverse DNS) responses, check if the address already exists
-            // in the cache via cache_find_by_addr for deduplication.
+            // Populate ipset/nftset with resolved addresses (feature-gated).
+            #[cfg(feature = "ipset")]
+            {
+                // ipset population would go here, calling into integration::ipset
+                // when addresses are resolved and ipset rules match the query domain.
+            }
+            #[cfg(feature = "nftset")]
+            {
+                // nftset population would go here, calling into integration::nftset.
+            }
+
+            // For PTR (reverse DNS) responses, check cache for deduplication.
             if query_type == RRType::PTR {
                 if let Ok(ip) = query_name.parse::<std::net::IpAddr>() {
                     let _existing = cache.cache_find_by_addr(&ip);
@@ -2089,6 +2430,7 @@ fn process_reply(
                 target: "dns::forward",
                 name = query_name,
                 query_type = ?query_type,
+                ancount = ancount_v,
                 "process_reply: cached response"
             );
         }
@@ -2269,6 +2611,131 @@ fn set_rr_ttl(packet: &mut [u8], rr_fixed_offset: usize, new_ttl: u32) {
     let _ = |buf: &mut BytesMut, val: u32| {
         put_u32(buf, val);
     };
+}
+
+/// Extract the minimum TTL from SOA records in the authority section.
+///
+/// Used for negative caching (NXDOMAIN / NODATA).  The SOA record's minimum
+/// TTL field (RFC 2308 §5) provides the negative cache TTL.  If no SOA is
+/// found, returns `None` so callers can use a default.
+fn extract_neg_ttl_from_authority(packet: &[u8]) -> Option<u32> {
+    if packet.len() < 12 {
+        return None;
+    }
+    let qdcount = ((packet[4] as u16) << 8) | packet[5] as u16;
+    let ancount = ((packet[6] as u16) << 8) | packet[7] as u16;
+    let nscount = ((packet[8] as u16) << 8) | packet[9] as u16;
+
+    // Skip question section.
+    let mut pos = 12usize;
+    for _ in 0..qdcount {
+        pos = skip_dns_name(packet, pos)?;
+        pos = pos.checked_add(4)?; // QTYPE + QCLASS
+    }
+    // Skip answer section.
+    for _ in 0..ancount {
+        pos = skip_dns_name(packet, pos)?;
+        if pos + RRFIXEDSZ > packet.len() {
+            return None;
+        }
+        let rdlen = ((packet[pos + 8] as u16) << 8) | packet[pos + 9] as u16;
+        pos = pos + RRFIXEDSZ + rdlen as usize;
+    }
+    // Walk authority section looking for SOA.
+    for _ in 0..nscount {
+        let name_end = skip_dns_name(packet, pos)?;
+        if name_end + RRFIXEDSZ > packet.len() {
+            return None;
+        }
+        let rr_type = ((packet[name_end] as u16) << 8) | packet[name_end + 1] as u16;
+        let rr_ttl = ((packet[name_end + 4] as u32) << 24)
+            | ((packet[name_end + 5] as u32) << 16)
+            | ((packet[name_end + 6] as u32) << 8)
+            | (packet[name_end + 7] as u32);
+        let rdlen = ((packet[name_end + 8] as u16) << 8) | packet[name_end + 9] as u16;
+        let rdata_start = name_end + RRFIXEDSZ;
+        let rdata_end = rdata_start + rdlen as usize;
+        if rdata_end > packet.len() {
+            return None;
+        }
+        // SOA type = 6.
+        if rr_type == 6 && rdlen >= 22 {
+            // SOA RDATA: MNAME, RNAME, then 5 x u32 (serial, refresh, retry, expire, minimum).
+            // The minimum TTL is the last u32 in SOA RDATA.
+            // We skip the two names then read the 5th u32.
+            let mut soa_pos = rdata_start;
+            // Skip MNAME.
+            soa_pos = skip_dns_name(packet, soa_pos)?;
+            // Skip RNAME.
+            soa_pos = skip_dns_name(packet, soa_pos)?;
+            // Skip serial(4) + refresh(4) + retry(4) + expire(4) = 16 bytes.
+            if soa_pos + 20 > packet.len() {
+                return None;
+            }
+            let soa_minimum = ((packet[soa_pos + 16] as u32) << 24)
+                | ((packet[soa_pos + 17] as u32) << 16)
+                | ((packet[soa_pos + 18] as u32) << 8)
+                | (packet[soa_pos + 19] as u32);
+            // Per RFC 2308: use min(SOA TTL, SOA minimum field).
+            return Some(std::cmp::min(rr_ttl, soa_minimum));
+        }
+        pos = rdata_end;
+    }
+    None
+}
+
+/// Extract a DNS name from a packet at the given offset, handling compression.
+///
+/// Returns the fully-qualified domain name as a `DnsName`, or `None` if the
+/// name cannot be parsed (malformed packet).
+fn extract_dns_name_at(packet: &[u8], mut offset: usize) -> Option<DnsName> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut jumps = 0;
+    let mut first_non_ptr_end: Option<usize> = None;
+
+    loop {
+        if offset >= packet.len() || jumps > 128 {
+            return None;
+        }
+        let label_len = packet[offset] as usize;
+        if label_len == 0 {
+            // End of name.
+            if first_non_ptr_end.is_none() {
+                // No compression was encountered.
+            }
+            break;
+        }
+        if (label_len & 0xC0) == 0xC0 {
+            // Compression pointer.
+            if offset + 1 >= packet.len() {
+                return None;
+            }
+            if first_non_ptr_end.is_none() {
+                first_non_ptr_end = Some(offset + 2);
+            }
+            let ptr_target = ((label_len & 0x3F) << 8) | packet[offset + 1] as usize;
+            offset = ptr_target;
+            jumps += 1;
+            continue;
+        }
+        // Regular label.
+        if offset + 1 + label_len > packet.len() {
+            return None;
+        }
+        if let Ok(s) = std::str::from_utf8(&packet[offset + 1..offset + 1 + label_len]) {
+            parts.push(s.to_string());
+        } else {
+            return None;
+        }
+        offset += 1 + label_len;
+    }
+
+    if parts.is_empty() {
+        Some(DnsName::from_str_unchecked("."))
+    } else {
+        let fqdn = parts.join(".");
+        Some(DnsName::from_str_unchecked(&fqdn))
+    }
 }
 
 /// Mark upstream servers that matched a query via the [`DomainMatcher`].
@@ -2665,11 +3132,26 @@ pub async fn tcp_request(
         match response {
             Ok(resp_data) => {
                 // Process reply (cache, filter).
-                let do_bit = (query_buf.get(3).copied().unwrap_or(0) & HB4_CD) != 0;
+                // Extract DO bit from EDNS0 OPT pseudo-header (not from
+                // DNS header byte 3, which would incorrectly use HB4_CD).
+                let tcp_edns = EdnsHandler::find_pseudoheader(&query_buf, query_buf.len())
+                    .ok()
+                    .flatten();
+                let do_bit = tcp_edns
+                    .as_ref()
+                    .map(|(e, _, _, _)| e.flags.dnssec_ok)
+                    .unwrap_or(false);
+                let ad_question = (query_buf.get(3).copied().unwrap_or(0) & HB4_AD) != 0;
+                let checking_disabled = (query_buf.get(3).copied().unwrap_or(0) & HB4_CD) != 0;
                 let fwd_flags = ForwardFlags {
                     do_question: do_bit,
+                    ad_question,
+                    checking_disabled,
+                    has_pheader: tcp_edns.is_some(),
                     ..ForwardFlags::new()
                 };
+                // TCP path: no specific peer/source addresses available for
+                // ECS verification, so pass None (kernel-selected source).
                 let processed = process_reply(
                     &resp_data,
                     &query_name,
@@ -2678,6 +3160,8 @@ pub async fn tcp_request(
                     cache,
                     edns_handler,
                     state,
+                    None,
+                    None,
                 );
 
                 // DNSSEC validation if enabled.
@@ -3009,10 +3493,95 @@ pub async fn pop_and_retry_query(
                 "pop_and_retry_query: subsidiary SECURE, re-validating original"
             );
 
-            // The subsidiary (key) response is secure.  Now try to validate
-            // the original query again with the new material.
-            // The validator caches keys internally so the next validation
-            // attempt on the original response will succeed.
+            // The subsidiary (key) response is secure.  Now re-validate the
+            // original query response with the new key material.  The
+            // validator caches keys internally so this attempt should succeed.
+            let mut orig_limits = DnssecLimits::default();
+            let orig_status = dnssec_validator.dnssec_validate_reply(
+                original,
+                cache,
+                &mut orig_limits,
+                &DomainMatcher::default(),
+                &record.query_name,
+                record.query_type,
+                record.query_class,
+            );
+
+            match orig_status {
+                Ok((DnssecStatus::Secure, _)) => {
+                    debug!(
+                        target: "dns::forward",
+                        name = %record.query_name,
+                        "pop_and_retry_query: original validated SECURE, sending to client"
+                    );
+
+                    // Cache records from the validated original response.
+                    let _cached = process_reply(
+                        original,
+                        &record.query_name,
+                        record.query_type,
+                        &record.flags,
+                        cache,
+                        _edns_handler,
+                        _state,
+                        None,
+                        None,
+                    );
+
+                    // Send the validated original response back to the client.
+                    return_reply(
+                        original,
+                        record.query_id,
+                        &record.source,
+                        record.dest_addr.as_ref(),
+                        record.iface_index,
+                        record.udp_pkt_size,
+                        &record.flags,
+                        socket,
+                    )
+                    .await
+                    .ok();
+                }
+                Ok((DnssecStatus::Bogus, _)) => {
+                    warn!(
+                        target: "dns::forward",
+                        name = %record.query_name,
+                        "pop_and_retry_query: original BOGUS after subsidiary SECURE"
+                    );
+                    let servfail = build_servfail_response(original, record.query_id);
+                    send_from(
+                        socket,
+                        &servfail,
+                        &record.source,
+                        record.dest_addr.as_ref(),
+                        record.iface_index,
+                    )
+                    .await
+                    .ok();
+                }
+                Ok(_) | Err(_) => {
+                    // Indeterminate or error — send original response without AD bit.
+                    debug!(
+                        target: "dns::forward",
+                        name = %record.query_name,
+                        "pop_and_retry_query: original not fully validated, sending as insecure"
+                    );
+                    let mut insecure_flags = record.flags;
+                    insecure_flags.dnssec_enabled = false;
+                    return_reply(
+                        original,
+                        record.query_id,
+                        &record.source,
+                        record.dest_addr.as_ref(),
+                        record.iface_index,
+                        record.udp_pkt_size,
+                        &insecure_flags,
+                        socket,
+                    )
+                    .await
+                    .ok();
+                }
+            }
         }
         Ok((DnssecStatus::Bogus, _fail_flags)) => {
             warn!(
@@ -3033,20 +3602,48 @@ pub async fn pop_and_retry_query(
             .ok();
         }
         Ok(_) => {
-            // Insecure or indeterminate — treat original as insecure too.
+            // Insecure or indeterminate — forward original response without AD bit.
             debug!(
                 target: "dns::forward",
                 name = %record.query_name,
-                "pop_and_retry_query: subsidiary not secure, original treated as insecure"
+                "pop_and_retry_query: subsidiary not secure, forwarding original as insecure"
             );
+            let mut insecure_flags = record.flags;
+            insecure_flags.dnssec_enabled = false;
+            return_reply(
+                original,
+                record.query_id,
+                &record.source,
+                record.dest_addr.as_ref(),
+                record.iface_index,
+                record.udp_pkt_size,
+                &insecure_flags,
+                socket,
+            )
+            .await
+            .ok();
         }
         Err(e) => {
             warn!(
                 target: "dns::forward",
                 name = %record.query_name,
                 error = %e,
-                "pop_and_retry_query: DNSSEC validation error"
+                "pop_and_retry_query: DNSSEC validation error, forwarding as insecure"
             );
+            let mut insecure_flags = record.flags;
+            insecure_flags.dnssec_enabled = false;
+            return_reply(
+                original,
+                record.query_id,
+                &record.source,
+                record.dest_addr.as_ref(),
+                record.iface_index,
+                record.udp_pkt_size,
+                &insecure_flags,
+                socket,
+            )
+            .await
+            .ok();
         }
     }
 
@@ -3106,7 +3703,10 @@ pub async fn get_forwarding_options(shared_state: &Arc<RwLock<DaemonState>>) -> 
 /// - `state`: Daemon state for configuration access
 ///
 /// # Returns
-/// The new packet length after EDNS0 options have been appended.
+/// A tuple `(new_packet_len, cacheable)`:
+/// - `new_packet_len`: Updated packet length after EDNS0 options appended.
+/// - `cacheable`: Whether the DNS response is safe to cache. False when
+///   client-specific data (MAC, variable ECS) was added to the query.
 pub fn apply_edns0_config_to_forwarded_query(
     packet: &mut BytesMut,
     packet_len: usize,
@@ -3116,7 +3716,7 @@ pub fn apply_edns0_config_to_forwarded_query(
     arp_cache: &mut crate::network::arp::ArpCache,
     arp_enumerator: &dyn crate::network::arp::ArpEnumerator,
     state: &DaemonState,
-) -> DnsmasqResult<usize> {
+) -> DnsmasqResult<(usize, bool)> {
     EdnsHandler::add_edns0_config(
         packet,
         packet_len,
@@ -3228,16 +3828,16 @@ mod tests {
     #[test]
     fn test_upstream_server_latency() {
         let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        let mut srv = UpstreamServer::new(addr);
-        assert_eq!(srv.query_latency, 0);
+        let srv = UpstreamServer::new(addr);
+        assert_eq!(srv.query_latency.load(Ordering::Relaxed), 0);
 
         srv.update_latency(100);
-        assert_eq!(srv.mma_latency, 12800);
-        assert_eq!(srv.query_latency, 100);
+        assert_eq!(srv.mma_latency.load(Ordering::Relaxed), 12800);
+        assert_eq!(srv.query_latency.load(Ordering::Relaxed), 100);
 
         // Second measurement converges.
         srv.update_latency(50);
-        assert!(srv.query_latency < 100);
+        assert!(srv.query_latency.load(Ordering::Relaxed) < 100);
     }
 
     #[test]

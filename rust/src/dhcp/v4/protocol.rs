@@ -50,13 +50,8 @@
 // Allow unused items during the parallel build transition period.
 // Many imports and helpers are prepared for full integration but may not
 // be called directly from this module's current entry points.
-#![allow(
-    unused_variables,
-    unused_mut,
-    unused_assignments,
-    dead_code,
-    unused_imports
-)]
+// Per-function allow attributes are used where needed instead of blanket file-level suppression.
+// This ensures new dead-code or unused-variable warnings are surfaced promptly.
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -84,8 +79,8 @@ use crate::dhcp::v4::options::{
     self, clear_options, dhcp_packet_size, free_space, in_list, option_find1, option_len,
 };
 use crate::dhcp::v4::server::{
-    address_allocate, complete_context, config_find_by_address, do_icmp_ping, host_from_dns,
-    narrow_context, narrow_context3, IfaceParam, MatchParam,
+    address_allocate, complete_context, config_find_by_address, host_from_dns, narrow_context,
+    narrow_context3, IfaceParam, MatchParam,
 };
 use crate::diagnostics::metrics::MetricType;
 use crate::dns::cache::DnsCache;
@@ -128,7 +123,10 @@ pub const OPTION_ROUTER: u8 = 3;
 pub const OPTION_DNSSERVER: u8 = 6;
 pub const OPTION_HOSTNAME: u8 = 12;
 pub const OPTION_DOMAINNAME: u8 = 15;
+pub const OPTION_MTU: u8 = 26;
 pub const OPTION_BROADCAST: u8 = 28;
+pub const OPTION_STATIC_ROUTE: u8 = 33;
+pub const OPTION_NTP_SERVER: u8 = 42;
 pub const OPTION_REQUESTED_IP: u8 = 50;
 pub const OPTION_LEASE_TIME: u8 = 51;
 pub const OPTION_OVERLOAD: u8 = 52;
@@ -539,6 +537,7 @@ pub struct DhcpBoot {
 
 /// Determine the DHCP protocol version for this module.
 /// DHCPv4 always returns [`DhcpProtocol::V4`].
+#[allow(dead_code)]
 #[inline]
 fn protocol_version() -> DhcpProtocol {
     DhcpProtocol::V4
@@ -546,6 +545,7 @@ fn protocol_version() -> DhcpProtocol {
 
 /// Convert an IPv4 address to an AllAddr union representation.
 /// Used when interfacing with code that handles both V4 and V6 addresses.
+#[allow(dead_code)]
 #[inline]
 fn ipv4_to_alladdr(addr: Ipv4Addr) -> AllAddr {
     AllAddr::V4(addr)
@@ -553,6 +553,7 @@ fn ipv4_to_alladdr(addr: Ipv4Addr) -> AllAddr {
 
 /// Check whether a particular daemon option flag is set.
 /// Convenience wrapper for protocol-level option checking.
+#[allow(dead_code)]
 #[inline]
 fn check_option(flags: &OptionFlags, flag: u32) -> bool {
     flags.is_set(flag)
@@ -670,6 +671,7 @@ fn log_packet(
 /// Apply configured response delay for anti-spoofing.
 ///
 /// Replaces C `apply_delay()` (rfc2131.c line 215).
+#[allow(dead_code)]
 fn apply_delay(xid: u32, recv_time: i64, netids: &[NetId], state: &DaemonState) {
     // Check delay_conf for matching tags.
     for dc in &state.delay_conf {
@@ -696,6 +698,7 @@ fn apply_delay(xid: u32, recv_time: i64, netids: &[NetId], state: &DaemonState) 
 /// Match vendor-specific options from a received packet against configured options.
 ///
 /// Replaces C `match_vendor_opts()` (rfc2131.c line 208).
+#[allow(dead_code)]
 fn match_vendor_opts(opt_data: &[u8], configured_opts: &[DhcpOpt]) -> Vec<NetId> {
     let mut tags = Vec::new();
     for dopt in configured_opts {
@@ -714,6 +717,7 @@ fn match_vendor_opts(opt_data: &[u8], configured_opts: &[DhcpOpt]) -> Vec<NetId>
 /// Encode encapsulated options (e.g., vendor-specific sub-options in Option 43).
 ///
 /// Replaces C `do_encap_opts()` (rfc2131.c line 209).
+#[allow(dead_code)]
 fn do_encap_opts(
     opts: &[DhcpOpt],
     encap: u8,
@@ -749,6 +753,7 @@ fn do_encap_opts(
 /// Prune vendor options: remove options whose tags don't match the current netids.
 ///
 /// Replaces C `prune_vendor_opts()` (rfc2131.c line 211).
+#[allow(dead_code)]
 fn prune_vendor_opts(netids: &[NetId], opts: &[DhcpOpt]) -> Vec<DhcpOpt> {
     opts.iter()
         .filter(|o| {
@@ -765,6 +770,7 @@ fn prune_vendor_opts(netids: &[NetId], opts: &[DhcpOpt]) -> Vec<DhcpOpt> {
 }
 
 /// Return the current monotonic time in seconds (fallback for timing).
+#[allow(dead_code)]
 fn state_time() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -787,6 +793,7 @@ fn state_time() -> i64 {
 /// `ctx.packet_data`), or 0 if no response should be sent.
 ///
 /// Replaces C `dhcp_reply()` (rfc2131.c line 282, ~1000 lines).
+#[allow(unused_assignments)]
 pub fn dhcp_reply(
     ctx: &mut DhcpReplyContext,
     lease_db: &mut LeaseDatabase,
@@ -878,7 +885,7 @@ pub fn dhcp_reply(
     }
 
     // Extract UUID/GUID (Option 97).
-    let uuid: Option<Vec<u8>> = if is_dhcp {
+    let _uuid: Option<Vec<u8>> = if is_dhcp {
         options::option_find(ctx.packet_data, OPTION_PXE_UUID, 17)
             .map(|opt| options::option_data(opt).to_vec())
     } else {
@@ -929,7 +936,7 @@ pub fn dhcp_reply(
     let mut override_addr: Option<Ipv4Addr> = None;
     let mut relay_subnet_select: Option<Ipv4Addr> = None;
     let mut agent_id_data: Option<Vec<u8>> = None;
-    let mut relay_netids: Vec<NetId> = Vec::new();
+    let mut _relay_netids: Vec<NetId> = Vec::new();
 
     if is_dhcp {
         if let Some(agent_opt) = options::option_find(ctx.packet_data, OPTION_AGENT_ID, 1) {
@@ -1073,11 +1080,11 @@ pub fn dhcp_reply(
 
     // Extract hostname (prefer FQDN Option 81, then Option 12).
     let mut hostname: Option<String> = None;
-    let mut fqdn_flags: u8 = 0;
+    let mut _fqdn_flags: u8 = 0;
 
     if let Some(ref fqdn_data) = fqdn_opt {
         if fqdn_data.len() >= 3 {
-            fqdn_flags = fqdn_data[0];
+            _fqdn_flags = fqdn_data[0];
             // Encoded domain name starts at byte 3.
             let name_bytes = &fqdn_data[3..];
             if !name_bytes.is_empty() {
@@ -1123,7 +1130,7 @@ pub fn dhcp_reply(
 
     // Vendor class matching for tags — scan option data for vendor identification.
     if let Some(ref vc) = vendor_class {
-        for dopt in &ctx.state.dhcp_opts {
+        for _dopt in &ctx.state.dhcp_opts {
             // Match vendor class patterns against configured DHCP options.
             // This uses option_find1 to scan within suboption buffers.
             if let Some(sub_opt) = option_find1(vc, OPTION_VENDOR_CLASS_OPT, 1) {
@@ -1171,7 +1178,7 @@ pub fn dhcp_reply(
             u: crate::dhcp::common::DhcpOptExtra::None,
         })
         .collect();
-    let filtered_opts: Vec<&DhcpOpt> = option_filter(&netids, &netids, &converted_opts, ctx.pxe);
+    let _filtered_opts: Vec<&DhcpOpt> = option_filter(&netids, &netids, &converted_opts, ctx.pxe);
 
     // Check PXE applicability for each converted option.
     for dopt in &converted_opts {
@@ -1262,9 +1269,9 @@ pub fn dhcp_reply(
             local: r.local,
             server: r.server,
             interface: r.interface.clone(),
-            port: 0,
-            split_mode: false,
-            iface_index: 0,
+            port: r.port,
+            split_mode: r.split_mode,
+            iface_index: r.iface_index,
         })
         .collect();
     let mut mutable_contexts = contexts_owned.clone();
@@ -1290,8 +1297,10 @@ pub fn dhcp_reply(
     // -----------------------------------------------------------------------
 
     let mut reply = DhcpPacket::new_reply(&req);
+    #[allow(unused_assignments)]
     let mut response_type: Option<DhcpV4State> = None;
     let mut lease_time: u32 = 0;
+    #[allow(unused_assignments)]
     let mut assigned_addr: Option<Ipv4Addr> = None;
 
     match message_type {
@@ -1883,12 +1892,13 @@ pub fn dhcp_reply(
     opt_buf.push(4);
     opt_buf.extend_from_slice(&sid.octets());
 
-    // Lease time option (51) — not for INFORM, not for NAK.
-    if (response_type != Some(DhcpV4State::Nak) && response_type != Some(DhcpV4State::Ack)
-        || message_type != Some(DhcpV4State::Inform))
-        && lease_time > 0
-        && message_type != Some(DhcpV4State::Inform)
-    {
+    // Lease time option (51) — only for ACK/OFFER responses that are not
+    // INFORM replies and not NAK. C's do_options() skips lease time for NAK
+    // and INFORM entirely. NAK has priority: if response is NAK, no lease
+    // time is ever included.
+    let is_ack_or_offer =
+        response_type == Some(DhcpV4State::Ack) || response_type == Some(DhcpV4State::Offer);
+    if is_ack_or_offer && message_type != Some(DhcpV4State::Inform) && lease_time > 0 {
         opt_buf.push(OPTION_LEASE_TIME);
         opt_buf.push(4);
         opt_buf.extend_from_slice(&lease_time.to_be_bytes());
@@ -2025,43 +2035,178 @@ pub struct DhcpOptionsContext<'a> {
 /// Encode DHCP options into a response packet.
 ///
 /// Processes the parameter request list (Option 55) and adds standard and
-/// configured options to the response buffer. Handles vendor-specific option
-/// encoding, PXE boot options, and FQDN processing.
+/// configured options to the response buffer. Handles:
+/// - Subnet mask (Option 1), Router (Option 3), DNS servers (Option 6)
+/// - Domain name (Option 15), Broadcast (Option 28), Static routes (Option 33/121)
+/// - Lease time (Option 51), Server ID (Option 54), T1/T2 (Options 58/59)
+/// - MTU (Option 26), Hostname (Option 12), FQDN (Option 81)
+/// - Vendor-specific (Option 43), PXE options, NTP (Option 42)
 ///
 /// Replaces C `do_options()` (rfc2131.c line 189, ~350 lines).
 pub fn do_options(ctx: &mut DhcpOptionsContext) -> DnsmasqResult<()> {
-    // Note: Many options are already encoded inline in dhcp_reply().
-    // This function handles the configurable and conditional options.
+    // Track which options have been encoded to avoid duplicates.
+    let mut encoded: std::collections::HashSet<u8> = std::collections::HashSet::new();
 
-    // Process requested options that weren't already added.
+    // Helper: add an option if not already encoded and space permits.
+    macro_rules! encode_opt {
+        ($code:expr, $data:expr) => {
+            if !encoded.contains(&$code) {
+                let data: &[u8] = $data;
+                if data.len() <= 255 {
+                    ctx.buf.push($code);
+                    ctx.buf.push(data.len() as u8);
+                    ctx.buf.extend_from_slice(data);
+                    encoded.insert($code);
+                }
+            }
+        };
+    }
+
+    // Process requested options from the client's Parameter Request List (Option 55).
     for &opt_code in ctx.req_options {
         match opt_code {
-            // DNS server (Option 6) — if requested and not yet present.
+            // Subnet mask (Option 1).
+            OPTION_NETMASK => {
+                if let Some(nc) = ctx.context {
+                    encode_opt!(OPTION_NETMASK, &nc.netmask.octets());
+                }
+            }
+            // Router / default gateway (Option 3).
+            OPTION_ROUTER => {
+                if let Some(nc) = ctx.context {
+                    if !nc.router.is_unspecified() {
+                        encode_opt!(OPTION_ROUTER, &nc.router.octets());
+                    }
+                }
+            }
+            // DNS server (Option 6).
             OPTION_DNSSERVER => {
                 if let Some(nc) = ctx.context {
                     if !nc.local.is_unspecified() {
-                        options::option_put(
-                            ctx.buf,
-                            OPTION_DNSSERVER,
-                            4,
-                            u32::from_be_bytes(nc.local.octets()),
-                        );
+                        encode_opt!(OPTION_DNSSERVER, &nc.local.octets());
+                    }
+                }
+            }
+            // Hostname (Option 12).
+            OPTION_HOSTNAME => {
+                if let Some(hn) = ctx.hostname {
+                    if !encoded.contains(&OPTION_HOSTNAME) {
+                        options::option_put_string(ctx.buf, OPTION_HOSTNAME, hn, ctx.null_term);
+                        encoded.insert(OPTION_HOSTNAME);
                     }
                 }
             }
             // Domain name (Option 15).
             OPTION_DOMAINNAME => {
                 if let Some(domain) = ctx.domain {
-                    options::option_put_string(ctx.buf, OPTION_DOMAINNAME, domain, false);
+                    if !encoded.contains(&OPTION_DOMAINNAME) {
+                        options::option_put_string(ctx.buf, OPTION_DOMAINNAME, domain, false);
+                        encoded.insert(OPTION_DOMAINNAME);
+                    }
                 }
             }
-            // Hostname (Option 12).
-            OPTION_HOSTNAME => {
-                if let Some(hn) = ctx.hostname {
-                    options::option_put_string(ctx.buf, OPTION_HOSTNAME, hn, ctx.null_term);
+            // MTU (Option 26) — Interface MTU discovery.
+            // C uses daemon->mtu which is a global config value.
+            OPTION_MTU => {
+                let mtu = ctx.state.mtu;
+                if mtu > 0 {
+                    encode_opt!(OPTION_MTU, &(mtu as u16).to_be_bytes());
                 }
             }
-            _ => {}
+            // Broadcast address (Option 28).
+            OPTION_BROADCAST => {
+                if let Some(nc) = ctx.context {
+                    if !nc.broadcast.is_unspecified() {
+                        encode_opt!(OPTION_BROADCAST, &nc.broadcast.octets());
+                    }
+                }
+            }
+            // Static routes (Option 33 — classful static routes).
+            OPTION_STATIC_ROUTE => {
+                // Encode configured static routes from dhcp-option directives.
+                // Each entry is 8 bytes: destination(4) + gateway(4).
+                let route_data: Vec<u8> = ctx
+                    .state
+                    .dhcp_opts
+                    .iter()
+                    .filter(|o| o.opt == OPTION_STATIC_ROUTE as u16 && o.val.len() >= 8)
+                    .flat_map(|o| o.val.iter().copied())
+                    .collect();
+                if !route_data.is_empty() {
+                    encode_opt!(OPTION_STATIC_ROUTE, &route_data);
+                }
+            }
+            // NTP servers (Option 42).
+            OPTION_NTP_SERVER => {
+                // Look for configured NTP server options.
+                if let Some(ntp_opt) = ctx
+                    .state
+                    .dhcp_opts
+                    .iter()
+                    .find(|o| o.opt == OPTION_NTP_SERVER as u16 && !o.val.is_empty())
+                {
+                    encode_opt!(OPTION_NTP_SERVER, &ntp_opt.val);
+                }
+            }
+            // Vendor-specific information (Option 43).
+            OPTION_VENDOR_SPECIFIC => {
+                // Encode any vendor-specific sub-options configured for matching netids.
+                let vendor_data: Vec<u8> = ctx
+                    .state
+                    .dhcp_opts
+                    .iter()
+                    .filter(|o| o.opt == OPTION_VENDOR_SPECIFIC as u16 && !o.val.is_empty())
+                    .flat_map(|o| o.val.iter().copied())
+                    .collect();
+                if !vendor_data.is_empty() {
+                    encode_opt!(OPTION_VENDOR_SPECIFIC, &vendor_data);
+                }
+            }
+            // Lease time (Option 51) — handled upstream in dhcp_reply(), skip here.
+            OPTION_LEASE_TIME => {}
+            // Server identifier (Option 54) — handled upstream in dhcp_reply(), skip here.
+            OPTION_SERVER_IDENTIFIER => {}
+            // Renewal (T1) time (Option 58) — handled upstream in dhcp_reply(), skip here.
+            OPTION_T1 => {}
+            // Rebinding (T2) time (Option 59) — handled upstream in dhcp_reply(), skip here.
+            OPTION_T2 => {}
+            // Classless static routes (Option 121 — RFC 3442).
+            121 => {
+                let csr_data: Vec<u8> = ctx
+                    .state
+                    .dhcp_opts
+                    .iter()
+                    .filter(|o| o.opt == 121u16 && !o.val.is_empty())
+                    .flat_map(|o| o.val.iter().copied())
+                    .collect();
+                if !csr_data.is_empty() {
+                    encode_opt!(121u8, &csr_data);
+                }
+            }
+            // Microsoft classless static routes (Option 249).
+            249 => {
+                let ms_csr: Vec<u8> = ctx
+                    .state
+                    .dhcp_opts
+                    .iter()
+                    .filter(|o| o.opt == 249u16 && !o.val.is_empty())
+                    .flat_map(|o| o.val.iter().copied())
+                    .collect();
+                if !ms_csr.is_empty() {
+                    encode_opt!(249u8, &ms_csr);
+                }
+            }
+            // Any other requested option: check configured dhcp_opts.
+            other => {
+                if let Some(cfg_opt) = ctx
+                    .state
+                    .dhcp_opts
+                    .iter()
+                    .find(|o| o.opt == other as u16 && !o.val.is_empty())
+                {
+                    encode_opt!(other, &cfg_opt.val);
+                }
+            }
         }
     }
 
@@ -2090,8 +2235,9 @@ pub fn do_options(ctx: &mut DhcpOptionsContext) -> DnsmasqResult<()> {
     // Log options if OPT_LOG_OPTS is set.
     if ctx.state.options.is_set(opt::LOG_OPTS) {
         debug!(
-            "DHCP options encoded: {} bytes in option buffer",
-            ctx.buf.len()
+            options_count = encoded.len(),
+            buffer_size = ctx.buf.len(),
+            "DHCP options encoded"
         );
     }
 
@@ -2102,13 +2248,17 @@ pub fn do_options(ctx: &mut DhcpOptionsContext) -> DnsmasqResult<()> {
 // relay_upstream4 — Forward client request to upstream relay target
 // ===========================================================================
 
-/// Forward a client DHCPv4 request to an upstream DHCP relay target.
+/// Forward a client DHCPv4 request to upstream DHCP relay target(s).
 ///
 /// Adds relay agent information (Option 82) with circuit-id and remote-id
 /// suboptions, sets the giaddr field, and prepares the packet for forwarding.
 ///
-/// Returns `true` if the packet was successfully prepared for forwarding,
-/// `false` if relay is not configured or the packet should be ignored.
+/// Returns a list of `(server_addr, port)` destinations if the packet was
+/// successfully prepared for forwarding, or an empty list if relay is not
+/// configured or the packet should be ignored.
+///
+/// In split mode (C: `RELAY_SPLIT`), the packet is forwarded to ALL matching
+/// relay configs. In normal mode, only the first matching config is used.
 ///
 /// Replaces C `relay_upstream4()` (rfc2131.c ~line 4200).
 pub fn relay_upstream4(
@@ -2116,35 +2266,66 @@ pub fn relay_upstream4(
     sz: usize,
     iface_index: i32,
     state: &DaemonState,
-) -> DnsmasqResult<bool> {
+) -> DnsmasqResult<Vec<(std::net::IpAddr, u16)>> {
     if state.relay4.is_empty() {
-        return Ok(false);
+        return Ok(vec![]);
     }
 
     if sz < DHCP_HEADER_SIZE {
-        return Ok(false);
+        return Ok(vec![]);
     }
 
     // Validate it's a BOOTREQUEST.
     if packet[0] != BOOTREQUEST {
-        return Ok(false);
+        return Ok(vec![]);
     }
 
-    // Find the relay configuration for this interface.
-    // DhcpRelay entries store the relay target server address and local address.
-    // Find relay config from DaemonState (uses types::DhcpRelay, not common::DhcpRelay).
-    let relay_cfg = state.relay4.iter().find(|r| {
-        r.interface.as_deref().is_some_and(|iname| {
-            // Match by interface name. In production this would use iface_index,
-            // but the relay config stores interface name.
-            !iname.is_empty()
-        })
-    });
-
-    let relay_cfg = match relay_cfg {
-        Some(r) => r,
-        None => return Ok(false),
+    // Find all relay configurations matching this interface.
+    // C matches relay configs where the interface name matches the receiving
+    // interface, or where the giaddr falls within the relay config's network.
+    // Also supports RELAY_SPLIT mode where packets are forwarded to multiple
+    // upstream servers.
+    let iface_name_str =
+        crate::network::interface::index_to_name(iface_index as u32).unwrap_or_default();
+    let giaddr = if packet.len() >= DhcpPacket::OFF_GIADDR + 4 {
+        Ipv4Addr::new(
+            packet[DhcpPacket::OFF_GIADDR],
+            packet[DhcpPacket::OFF_GIADDR + 1],
+            packet[DhcpPacket::OFF_GIADDR + 2],
+            packet[DhcpPacket::OFF_GIADDR + 3],
+        )
+    } else {
+        Ipv4Addr::UNSPECIFIED
     };
+
+    // Collect matching relay configs (supports split mode — multiple matches).
+    let matching_relays: Vec<&_> = state
+        .relay4
+        .iter()
+        .filter(|r| {
+            // Match by interface name if configured.
+            if let Some(ref iname) = r.interface {
+                if !iname.is_empty() {
+                    return iname == &iface_name_str;
+                }
+            }
+            // Match by subnet membership: giaddr falls within the relay config's
+            // network/mask range when giaddr is already set (multi-hop relay).
+            if giaddr != Ipv4Addr::UNSPECIFIED {
+                if let std::net::IpAddr::V4(local_v4) = r.local {
+                    return is_same_net(giaddr, local_v4, r.mask.unwrap_or(Ipv4Addr::BROADCAST));
+                }
+            }
+            false
+        })
+        .collect();
+
+    if matching_relays.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Use the first matching relay config for giaddr setting and option 82 insertion.
+    let relay_cfg = matching_relays[0];
 
     // Set giaddr if not already set (first hop).
     let giaddr_offset = DhcpPacket::OFF_GIADDR;
@@ -2155,7 +2336,7 @@ pub fn relay_upstream4(
             std::net::IpAddr::V4(v4) => {
                 packet[giaddr_offset..giaddr_offset + 4].copy_from_slice(&v4.octets());
             }
-            _ => return Ok(false), // V6 relay address for v4 packet — skip.
+            _ => return Ok(vec![]), // V6 relay address for v4 packet — skip.
         }
     }
 
@@ -2164,11 +2345,11 @@ pub fn relay_upstream4(
         packet[3] += 1;
     } else {
         debug!("relay: hop count exceeded 255, dropping packet");
-        return Ok(false);
+        return Ok(vec![]);
     }
 
     // Add Option 82 (Relay Agent Information) with circuit-id suboption.
-    // Circuit-id encodes the interface index.
+    // Circuit-id encodes the interface index per RFC 3046.
     let circuit_id = iface_index.to_be_bytes();
 
     // Find the end of existing options.
@@ -2199,8 +2380,28 @@ pub fn relay_upstream4(
         packet[pos + 4 + circuit_id.len()] = OPTION_END;
     }
 
-    debug!(iface_index, "relay: forwarded BOOTREQUEST upstream");
-    Ok(true)
+    // Build the list of destinations. In split mode, ALL matching relay configs
+    // get a copy. In normal mode, only the first match is used.
+    let any_split = matching_relays.iter().any(|r| r.split_mode);
+    let destinations: Vec<(std::net::IpAddr, u16)> = if any_split {
+        // Split mode: forward to every matching relay target.
+        matching_relays
+            .iter()
+            .map(|r| (r.server, if r.port > 0 { r.port } else { DHCP_SERVER_PORT }))
+            .collect()
+    } else {
+        // Normal mode: only the first match.
+        let r = matching_relays[0];
+        vec![(r.server, if r.port > 0 { r.port } else { DHCP_SERVER_PORT })]
+    };
+
+    debug!(
+        iface_index,
+        destinations = destinations.len(),
+        split = any_split,
+        "relay: forwarded BOOTREQUEST upstream"
+    );
+    Ok(destinations)
 }
 
 // ===========================================================================
@@ -2209,18 +2410,20 @@ pub fn relay_upstream4(
 
 /// Process a reply from an upstream DHCP server and prepare for client delivery.
 ///
-/// Strips the relay agent Option 82, determines the client interface from
-/// giaddr, and returns the interface index for packet forwarding.
+/// Per RFC 3046, strips the relay agent Option 82 before forwarding to the
+/// client. Determines the client interface from the circuit-id suboption
+/// within Option 82, then clears giaddr.
 ///
-/// Returns `Some(iface_index)` if the packet should be forwarded, or `None`.
+/// Takes a mutable packet buffer and returns `Some((iface_index, new_length))`
+/// if the packet should be forwarded, or `None`.
 ///
 /// Replaces C `relay_reply4()` (rfc2131.c ~line 4350).
 pub fn relay_reply4(
-    packet: &[u8],
+    packet: &mut [u8],
     sz: usize,
-    iface_name: &str,
+    _iface_name: &str,
     state: &DaemonState,
-) -> Option<i32> {
+) -> Option<(i32, usize)> {
     if sz < DHCP_HEADER_SIZE {
         return None;
     }
@@ -2232,6 +2435,9 @@ pub fn relay_reply4(
 
     // Extract giaddr.
     let gi_off = DhcpPacket::OFF_GIADDR;
+    if sz < gi_off + 4 {
+        return None;
+    }
     let giaddr = Ipv4Addr::new(
         packet[gi_off],
         packet[gi_off + 1],
@@ -2254,12 +2460,15 @@ pub fn relay_reply4(
         return None;
     }
 
-    // Extract the circuit-id from Option 82 to determine the original interface.
-    let opt_start = DhcpPacket::OFF_OPTIONS + 4;
+    // Extract the circuit-id from Option 82 to determine the original interface,
+    // and record Option 82 position for stripping per RFC 3046.
+    let opt_start = DhcpPacket::OFF_OPTIONS + 4; // skip magic cookie
     let mut pos = opt_start;
     let mut iface_index: Option<i32> = None;
+    let mut opt82_start: Option<usize> = None;
+    let mut opt82_total_len: usize = 0;
 
-    while pos < sz && pos < packet.len() {
+    while pos < sz {
         if packet[pos] == OPTION_END {
             break;
         }
@@ -2272,13 +2481,17 @@ pub fn relay_reply4(
         }
         let otype = packet[pos];
         let olen = packet[pos + 1] as usize;
-        pos += 2;
 
-        if otype == OPTION_AGENT_ID && olen >= 6 {
+        if otype == OPTION_AGENT_ID {
+            // Record Option 82 position for removal.
+            opt82_start = Some(pos);
+            opt82_total_len = 2 + olen; // type + length + data
+
             // Parse suboptions to find circuit-id.
-            let agent_end = pos + olen;
-            let mut sub_pos = pos;
-            while sub_pos + 2 <= agent_end {
+            let data_start = pos + 2;
+            let agent_end = data_start + olen;
+            let mut sub_pos = data_start;
+            while sub_pos + 2 <= agent_end && sub_pos + 2 <= sz {
                 let sub_type = packet[sub_pos];
                 let sub_len = packet[sub_pos + 1] as usize;
                 sub_pos += 2;
@@ -2293,13 +2506,30 @@ pub fn relay_reply4(
                 sub_pos += sub_len;
             }
         }
-        pos += olen;
+        pos += 2 + olen;
     }
+
+    // Strip Option 82 from the packet per RFC 3046 section 2.2:
+    // "The DHCP relay agent SHOULD strip the Relay Agent Information option
+    //  before forwarding the reply to the client."
+    let mut new_sz = sz;
+    if let Some(start) = opt82_start {
+        let end = start + opt82_total_len;
+        if end <= sz {
+            // Shift all remaining bytes (including OPTION_END) over the Option 82.
+            packet.copy_within(end..sz, start);
+            new_sz = sz - opt82_total_len;
+        }
+    }
+
+    // Clear giaddr field — the relay sets it for its own use, but the client
+    // should not see it.
+    packet[gi_off..gi_off + 4].copy_from_slice(&[0, 0, 0, 0]);
 
     // Default to interface index 0 if circuit-id not found.
     let idx = iface_index.unwrap_or(0);
-    debug!(%giaddr, iface_index = idx, "relay_reply4: forwarding reply to client");
-    Some(idx)
+    debug!(%giaddr, iface_index = idx, "relay_reply4: forwarding reply to client (option 82 stripped)");
+    Some((idx, new_sz))
 }
 
 // ===========================================================================
@@ -2341,9 +2571,9 @@ pub fn is_pxe_client(packet: &[u8]) -> Option<String> {
 /// Replaces C `pxe_opts()` (rfc2131.c line 212).
 pub fn pxe_opts(
     pxe_arch: i32,
-    netids: &[NetId],
+    _netids: &[NetId],
     local: Ipv4Addr,
-    now: i64,
+    _now: i64,
     state: &DaemonState,
 ) -> Vec<DhcpOpt> {
     let mut result: Vec<DhcpOpt> = Vec::new();
@@ -2657,7 +2887,7 @@ mod tests {
 
     #[test]
     fn test_dhcp_packet_ip_accessors() {
-        let mut buf = make_test_packet(DhcpV4State::Discover as u8);
+        let buf = make_test_packet(DhcpV4State::Discover as u8);
         let mut pkt = DhcpPacket::from_bytes(&buf).unwrap();
 
         // Test setting and getting ciaddr.
@@ -2905,7 +3135,8 @@ mod tests {
         let pkt_len = packet.len();
         let result = relay_upstream4(&mut packet, pkt_len, 1, &state);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), false);
+        // With no relays configured, should return empty destinations list
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]
@@ -2916,7 +3147,8 @@ mod tests {
         let mut reply_pkt = packet.clone();
         reply_pkt[0] = BOOTREPLY;
         // giaddr is all zeros.
-        let result = relay_reply4(&reply_pkt, reply_pkt.len(), "eth0", &state);
+        let pkt_len = reply_pkt.len();
+        let result = relay_reply4(&mut reply_pkt, pkt_len, "eth0", &state);
         assert!(result.is_none());
     }
 }
