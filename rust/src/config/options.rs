@@ -4014,7 +4014,13 @@ fn strip_inline_comment(line: &str) -> &str {
     for (i, &b) in bytes.iter().enumerate() {
         match b {
             b'"' => in_quote = !in_quote,
-            b'#' if !in_quote => return line[..i].trim_end(),
+            // Only treat '#' as an inline comment when preceded by whitespace
+            // (or at position 0). This preserves '#' in values like
+            // `server=8.8.8.8#5353` where '#' denotes a port separator per
+            // the C dnsmasq convention.
+            b'#' if !in_quote && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') => {
+                return line[..i].trim_end();
+            }
             _ => {}
         }
     }
@@ -4417,6 +4423,15 @@ mod tests {
         assert_eq!(strip_inline_comment("port=53 # DNS port"), "port=53");
         assert_eq!(strip_inline_comment("port=53"), "port=53");
         assert_eq!(strip_inline_comment("# full comment"), "");
+        // '#' without preceding space is NOT a comment — it's a port separator
+        assert_eq!(
+            strip_inline_comment("server=8.8.8.8#5353"),
+            "server=8.8.8.8#5353"
+        );
+        assert_eq!(
+            strip_inline_comment("server=8.8.8.8#5353 # with comment"),
+            "server=8.8.8.8#5353"
+        );
     }
 
     #[test]
