@@ -43,6 +43,16 @@
 // Feature-gated sub-module declarations
 // ---------------------------------------------------------------------------
 
+/// D-Bus message bus integration for NetworkManager compatibility.
+///
+/// Provides [`DbusController`] for programmatic dnsmasq management via the
+/// system D-Bus message bus. Exposes server reconfiguration, cache management,
+/// metrics retrieval, and DHCP lease event signalling to external clients.
+///
+/// Migrated from `src/dbus.c` (2,175 lines).
+#[cfg(feature = "dbus")]
+pub mod dbus;
+
 /// OpenWrt UBus message bus integration.
 ///
 /// Provides `UbusController` for OpenWrt embedded system integration,
@@ -100,6 +110,9 @@ pub mod ipset;
 pub mod helper;
 
 // Re-export key types when features are enabled
+#[cfg(feature = "dbus")]
+pub use dbus::{DbusController, DbusError, DBUS_OBJECT_PATH, DBUS_SERVICE_NAME};
+
 #[cfg(feature = "ubus")]
 pub use ubus::UbusController;
 
