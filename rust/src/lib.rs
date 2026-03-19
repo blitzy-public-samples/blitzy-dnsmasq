@@ -10,3 +10,4 @@ pub mod network;
 pub mod dhcp;
 
 pub mod integration;
+pub mod services;
