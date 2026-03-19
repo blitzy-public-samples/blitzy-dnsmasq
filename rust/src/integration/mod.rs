@@ -90,6 +90,15 @@ pub mod conntrack;
 #[cfg(all(feature = "ipset", target_os = "linux"))]
 pub mod ipset;
 
+/// Script execution helper for DHCP/TFTP/ARP event callbacks.
+///
+/// Provides [`ScriptHelper`] for async process spawning of user-configured
+/// lease-change scripts, with optional Lua scripting support via `mlua`.
+///
+/// Migrated from `src/helper.c` (1,528 lines).
+#[cfg(feature = "script")]
+pub mod helper;
+
 // Re-export key types when features are enabled
 #[cfg(feature = "ubus")]
 pub use ubus::UbusController;
@@ -105,3 +114,6 @@ pub use conntrack::{get_incoming_mark, ConntrackError};
 
 #[cfg(all(feature = "ipset", target_os = "linux"))]
 pub use ipset::IpsetController;
+
+#[cfg(feature = "script")]
+pub use helper::{EventAction, ScriptEvent, ScriptHelper};
