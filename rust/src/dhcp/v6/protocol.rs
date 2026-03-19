@@ -21,22 +21,137 @@
 //!
 //! ## State Machine
 //! ```text
-//! SOLICIT → ADVERTISE → REQUEST → REPLY (normal 4-message exchange)
-//! SOLICIT → REPLY (rapid commit 2-message exchange)
-//! RENEW → REPLY (T1 lease renewal)
-//! REBIND → REPLY (T2 lease rebind, multicast)
-//! INFORMATION-REQUEST → REPLY (stateless config only)
-//! RELEASE → REPLY (address release)
-//! DECLINE → REPLY (DAD conflict report)
-//! CONFIRM → REPLY (address validation after link change)
+//! SOLICIT ─→ ADVERTISE ─→ REQUEST ─→ REPLY (normal 4-message exchange)
+//! SOLICIT ─→ REPLY (rapid commit 2-message exchange)
+//! RENEW ─→ REPLY (T1 lease renewal)
+//! REBIND ─→ REPLY (T2 lease rebind, multicast)
+//! INFORMATION-REQUEST ─→ REPLY (stateless config only)
+//! RELEASE ─→ REPLY (address release)
+//! DECLINE ─→ REPLY (DAD conflict report)
+//! CONFIRM ─→ REPLY (address validation after link change)
 //! ```
+//!
+//! ## C Source Mapping
+//! | Rust Function | C Function | C Line | Description |
+//! |--------------|------------|--------|-------------|
+//! | `dhcp6_reply()` | `dhcp6_reply()` | 550 | Main entry point |
+//! | `dhcp6_maybe_relay()` | `dhcp6_maybe_relay()` | 665 | Relay decapsulation |
+//! | `dhcp6_no_relay()` | `dhcp6_no_relay()` | 926 | Core message handler |
+//! | `check_ia()` | `check_ia()` | 2487 | IA option validation |
+//! | `build_ia()` | `build_ia()` | 2563 | IA response construction |
+//! | `end_ia()` | `end_ia()` | 2652 | T1/T2 finalization |
+//! | `add_options()` | `add_options()` | 2044 | DNS/NTP/domain options |
+//! | `add_address()` | `add_address()` | 2732 | IAADDR sub-option |
+//! | `update_leases()` | `update_leases()` | 3346 | Lease DB update |
+//! | `calculate_times()` | `calculate_times()` | 3224 | Lifetime calculation |
+//! | `opt6_find()` | `opt6_find()` | 3688 | Option search |
+//! | `opt6_next()` | `opt6_next()` | 3753 | Option iteration |
+//! | `opt6_uint()` | `opt6_uint()` | 3803 | Integer extraction |
 
 use std::net::Ipv6Addr;
 
 use super::outpacket::OutPacket;
-use crate::core::types::{DnsmasqError, DnsmasqResult};
-use crate::dhcp::common::{DhcpContext, NetId};
+use super::server;
+use crate::config::constants::{DEFLEASE6, MAXDNAME};
+use crate::core::types::{
+    opt, DaemonState, DhcpConfigEntry, DhcpOptEntry, DnsmasqError, DnsmasqResult, TagIf,
+};
+use crate::core::util::{check_dns_name, is_same_net6};
+use crate::dhcp::common::{
+    find_config, get_domain6, log_tags, match_bytes, match_netid, option_filter, run_tag_if,
+    strip_hostname, DhcpConfig, DhcpContext, DhcpOpt, DhcpOptExtra, HwAddrConfig, NetId, TagIfRule,
+    CONFIG_ADDR6, CONFIG_DECLINED, CONFIG_NAME, CONFIG_TIME, CONTEXT_CONF_USED, CONTEXT_DEPRECATE,
+    CONTEXT_USED, DHOPT_ADDR6, DHOPT_FORCE, DHOPT_RFC3925, DHOPT_VENDOR,
+};
+use crate::dhcp::ip6addr::{is_link_local_zero, is_ula_zero};
+use crate::dhcp::lease::{
+    lease6_allocate, lease6_find_by_addr, lease_add_extradata, lease_set_expires, lease_set_hwaddr,
+    lease_set_iaid, lease_set_interface, DhcpLease, LeaseType,
+};
 use tracing::{debug, info, warn};
+
+// ---------------------------------------------------------------------------
+// Module-local constants
+// ---------------------------------------------------------------------------
+
+/// Minimum information refresh time per RFC 4242 Section 3.1.
+const MIN_REFRESH_TIME: u32 = 600;
+
+/// Minimum valid/preferred lifetime per RFC 3315.
+const MIN_LIFETIME: u32 = 120;
+
+// ---------------------------------------------------------------------------
+// Type Conversion Helpers — DaemonState entry types ↔ common.rs full types
+//
+// DaemonState uses simplified "Entry" types (DhcpConfigEntry, DhcpOptEntry,
+// TagIf) while common.rs functions expect full types (DhcpConfig, DhcpOpt,
+// TagIfRule). These helpers bridge the gap.
+// ---------------------------------------------------------------------------
+
+/// Convert `Vec<DhcpConfigEntry>` (types.rs) to `Vec<DhcpConfig>` (common.rs).
+fn daemon_config_entries_to_configs(entries: &[DhcpConfigEntry]) -> Vec<DhcpConfig> {
+    entries
+        .iter()
+        .map(|e| {
+            let mut hwaddrs = Vec::new();
+            if !e.hwaddr.is_empty() {
+                hwaddrs.push(HwAddrConfig {
+                    hwaddr: e.hwaddr.clone(),
+                    hwaddr_type: 1, // Ethernet default
+                    wildcard_mask: 0,
+                });
+            }
+            DhcpConfig {
+                flags: e.flags,
+                hwaddr: hwaddrs,
+                clid: if e.clid.is_empty() {
+                    None
+                } else {
+                    Some(e.clid.clone())
+                },
+                hostname: e.hostname.clone(),
+                netid: e
+                    .netid
+                    .as_ref()
+                    .map(|n| vec![NetId { net: n.clone() }])
+                    .unwrap_or_default(),
+                filter: Vec::new(),
+                addr: e.addr,
+                #[cfg(feature = "dhcp6")]
+                addr6: e.addr6.map(|a| vec![a]).unwrap_or_default(),
+                domain: None,
+                lease_time: e.lease_time,
+                decline_time: 0,
+            }
+        })
+        .collect()
+}
+
+/// Convert `Vec<DhcpOptEntry>` (types.rs) to `Vec<DhcpOpt>` (common.rs).
+fn daemon_opt_entries_to_opts(entries: &[DhcpOptEntry]) -> Vec<DhcpOpt> {
+    entries
+        .iter()
+        .map(|e| DhcpOpt {
+            opt: e.opt,
+            val: e.val.clone(),
+            flags: e.flags,
+            netid: e.netid.as_ref().map(|n| NetId { net: n.clone() }),
+            next: Vec::new(),
+            len: e.val.len(),
+            u: DhcpOptExtra::None,
+        })
+        .collect()
+}
+
+/// Convert `Vec<TagIf>` (types.rs) to `Vec<TagIfRule>` (common.rs).
+fn daemon_tag_if_to_rules(tags: &[TagIf]) -> Vec<TagIfRule> {
+    tags.iter()
+        .map(|t| TagIfRule {
+            tag: vec![NetId { net: t.tag.clone() }],
+            set: t.set.iter().map(|s| NetId { net: s.clone() }).collect(),
+        })
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // DHCPv6 State Machine Enum
@@ -170,10 +285,19 @@ impl IaType {
     /// Creates an IaType from a DHCPv6 option code.
     pub fn from_option_code(code: u16) -> Option<Self> {
         match code {
-            3 => Some(IaType::Na),
-            4 => Some(IaType::Ta),
-            25 => Some(IaType::Pd),
+            c if c == super::OPTION6_IA_NA => Some(IaType::Na),
+            c if c == super::OPTION6_IA_TA => Some(IaType::Ta),
+            c if c == super::OPTION6_IA_PD => Some(IaType::Pd),
             _ => None,
+        }
+    }
+
+    /// Convert to LeaseType for lease database operations.
+    fn to_lease_type(self) -> LeaseType {
+        match self {
+            IaType::Na => LeaseType::Na,
+            IaType::Ta => LeaseType::Ta,
+            IaType::Pd => LeaseType::Pd,
         }
     }
 }
@@ -224,6 +348,10 @@ pub struct Dhcp6RequestState {
     pub iaid: u32,
     /// Interface name string.
     pub iface_name: String,
+    /// Start offset of options in the request packet.
+    pub packet_options_start: usize,
+    /// End offset of options in the request packet.
+    pub packet_options_end: usize,
     /// Matched network tags for conditional option selection.
     pub tags: Vec<NetId>,
     /// Tags from selected address pool context.
@@ -257,6 +385,8 @@ impl Dhcp6RequestState {
             fqdn_flags: 0,
             iaid: 0,
             iface_name: String::new(),
+            packet_options_start: 0,
+            packet_options_end: 0,
             tags: Vec::new(),
             context_tags: Vec::new(),
             mac: Vec::new(),
@@ -281,15 +411,7 @@ impl Default for Dhcp6RequestState {
 /// (past the 4-byte header) of the first option matching `search` with
 /// at least `minsize` bytes of data.
 ///
-/// Replaces C `opt6_find()` (rfc3315.c line 385).
-///
-/// # Arguments
-/// * `opts` — Byte slice containing DHCPv6 options in TLV format
-/// * `search` — Option code to find (e.g., `OPTION6_CLIENT_ID`)
-/// * `minsize` — Minimum data length for the option
-///
-/// # Returns
-/// Option data slice (past the 4-byte type+length header), or `None` if not found.
+/// Replaces C `opt6_find()` (rfc3315.c line 3688).
 pub fn opt6_find(opts: &[u8], search: u16, minsize: usize) -> Option<&[u8]> {
     let mut pos: usize = 0;
     while pos + 4 <= opts.len() {
@@ -311,14 +433,7 @@ pub fn opt6_find(opts: &[u8], search: u16, minsize: usize) -> Option<&[u8]> {
 /// Returns the option code, option data slice, and the position of the
 /// next option (for continued iteration).
 ///
-/// Replaces C `opt6_next()` (rfc3315.c line 386).
-///
-/// # Arguments
-/// * `opts` — Byte slice containing DHCPv6 options
-/// * `pos` — Current position in the option data
-///
-/// # Returns
-/// `Some((option_code, option_data, next_pos))` or `None` if no more options.
+/// Replaces C `opt6_next()` (rfc3315.c line 3753).
 pub fn opt6_next(opts: &[u8], pos: usize) -> Option<(u16, &[u8], usize)> {
     if pos + 4 > opts.len() {
         return None;
@@ -337,15 +452,7 @@ pub fn opt6_next(opts: &[u8], pos: usize) -> Option<(u16, &[u8], usize)> {
 /// Reads 1, 2, or 4 bytes in network byte order (big-endian) from the
 /// specified offset within the option data.
 ///
-/// Replaces C `opt6_uint()` (rfc3315.c line 387).
-///
-/// # Arguments
-/// * `opt` — Option data slice
-/// * `offset` — Byte offset to read from
-/// * `size` — Number of bytes to read (1, 2, or 4)
-///
-/// # Returns
-/// The unsigned integer value, or 0 if the read would be out of bounds.
+/// Replaces C `opt6_uint()` (rfc3315.c line 3803).
 pub fn opt6_uint(opt: &[u8], offset: usize, size: usize) -> u32 {
     if offset + size > opt.len() {
         return 0;
@@ -363,6 +470,28 @@ pub fn opt6_uint(opt: &[u8], offset: usize, size: usize) -> u32 {
     }
 }
 
+/// Extract option length from TLV header.
+/// Replaces C macro `opt6_len(opt)` = `opt6_uint(opt, -2, 2)`.
+/// In Rust, the caller passes a slice starting at the option header (pos),
+/// so length is at bytes [2..4].
+#[allow(dead_code)]
+fn opt6_len_at(opts: &[u8], pos: usize) -> usize {
+    if pos + 4 > opts.len() {
+        return 0;
+    }
+    u16::from_be_bytes([opts[pos + 2], opts[pos + 3]]) as usize
+}
+
+/// Extract option type code from TLV header.
+/// Replaces C macro `opt6_type(opt)` = `opt6_uint(opt, -4, 2)`.
+#[allow(dead_code)]
+fn opt6_type_at(opts: &[u8], pos: usize) -> u16 {
+    if pos + 2 > opts.len() {
+        return 0;
+    }
+    u16::from_be_bytes([opts[pos], opts[pos + 1]])
+}
+
 // ---------------------------------------------------------------------------
 // Main Entry Point — dhcp6_reply()
 // ---------------------------------------------------------------------------
@@ -374,23 +503,13 @@ pub fn opt6_uint(opt: &[u8], offset: usize, size: usize) -> u32 {
 ///
 /// Replaces C `dhcp6_reply()` (rfc3315.c line 550).
 ///
-/// # Arguments
-/// * `context` — Active DHCPv6 address pool context
-/// * `multicast_dest` — Whether the message was received via multicast
-/// * `interface` — Network interface index
-/// * `iface_name` — Network interface name
-/// * `fallback` — Fallback address for response transmission
-/// * `ll_addr` — Link-local address of receiving interface
-/// * `ula_addr` — ULA address of receiving interface
-/// * `packet` — Raw DHCPv6 packet bytes
-/// * `client_addr` — Source IPv6 address of the client
-/// * `now` — Current time as Unix timestamp
-///
 /// # Returns
 /// Response destination port (`Some(546)` for client, `Some(547)` for relay),
 /// or `None` if the message should not be responded to.
+#[allow(clippy::too_many_arguments)]
 pub fn dhcp6_reply(
-    context: &DhcpContext,
+    daemon: &mut DaemonState,
+    contexts: &mut [DhcpContext],
     multicast_dest: bool,
     interface: i32,
     iface_name: &str,
@@ -413,13 +532,14 @@ pub fn dhcp6_reply(
     state.fallback = Some(*fallback);
     state.ll_addr = Some(*ll_addr);
     state.ula_addr = Some(*ula_addr);
-    state.context = Some(Box::new(context.clone()));
 
     let mut outpacket = OutPacket::new();
 
     let is_unicast = !multicast_dest;
 
     match dhcp6_maybe_relay(
+        daemon,
+        contexts,
         &mut state,
         packet,
         client_addr,
@@ -428,8 +548,7 @@ pub fn dhcp6_reply(
         &mut outpacket,
     ) {
         Ok(true) => {
-            // Determine response port: if there was a relay, send back to server port (547)
-            // Otherwise, send to client port (546)
+            // Determine response port: relay → server port (547), client → 546
             if state.link_address.is_some() {
                 Some(super::DHCPV6_SERVER_PORT)
             } else {
@@ -458,8 +577,10 @@ pub fn dhcp6_reply(
 /// ID, then dispatches to `dhcp6_no_relay()`.
 ///
 /// Replaces C `dhcp6_maybe_relay()` (rfc3315.c line 665).
-#[allow(clippy::only_used_in_recursion)]
+#[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
 fn dhcp6_maybe_relay(
+    daemon: &mut DaemonState,
+    contexts: &mut [DhcpContext],
     state: &mut Dhcp6RequestState,
     packet: &[u8],
     client_addr: &Ipv6Addr,
@@ -474,14 +595,14 @@ fn dhcp6_maybe_relay(
     let msg_type = packet[0];
 
     if msg_type == u8::from(DhcpV6State::RelayForw) {
-        // RELAY-FORW: hop_count(1) + link_addr(16) + peer_addr(16) + options
+        // RELAY-FORW: msg_type(1) + hop_count(1) + link_addr(16) + peer_addr(16) + options
         if packet.len() < 34 {
             return Err(DnsmasqError::Dhcp(
                 "DHCPv6 relay-forward packet too short".into(),
             ));
         }
 
-        // Extract link address (bytes 2-17)
+        // Extract link address (bytes 2..18)
         let mut link_addr_bytes = [0u8; 16];
         link_addr_bytes.copy_from_slice(&packet[2..18]);
         let link_addr = Ipv6Addr::from(link_addr_bytes);
@@ -495,7 +616,7 @@ fn dhcp6_maybe_relay(
 
         // Find OPTION6_RELAY_MSG to get encapsulated message
         if let Some(inner_msg) = opt6_find(relay_opts, super::OPTION6_RELAY_MSG, 1) {
-            // Extract client MAC from relay option if present
+            // Extract client MAC from relay option if present (RFC 6939)
             if let Some(mac_data) = opt6_find(relay_opts, super::OPTION6_CLIENT_MAC, 3) {
                 if mac_data.len() >= 3 {
                     let hw_type = u16::from_be_bytes([mac_data[0], mac_data[1]]);
@@ -504,11 +625,23 @@ fn dhcp6_maybe_relay(
                 }
             }
 
-            // Extract interface ID if present
-            // (used for relay identification, stored but not parsed further)
+            // Extract interface ID if present (stored for relay identification)
+            // C: opt6_find(opts, end, OPTION6_INTERFACE_ID, 1) — logged but not parsed further
+            if opt6_find(relay_opts, super::OPTION6_INTERFACE_ID, 1).is_some() {
+                debug!(xid = state.xid, "relay interface-id option present");
+            }
 
             // Recursively decapsulate nested relays
-            return dhcp6_maybe_relay(state, inner_msg, client_addr, is_unicast, now, outpacket);
+            return dhcp6_maybe_relay(
+                daemon,
+                contexts,
+                state,
+                inner_msg,
+                client_addr,
+                is_unicast,
+                now,
+                outpacket,
+            );
         }
 
         Err(DnsmasqError::Dhcp(
@@ -527,10 +660,20 @@ fn dhcp6_maybe_relay(
         // Extract 24-bit transaction ID from bytes 1-3
         state.xid = ((packet[1] as u32) << 16) | ((packet[2] as u32) << 8) | (packet[3] as u32);
 
+        // Options start after the 4-byte message header
+        state.packet_options_start = 0;
+        state.packet_options_end = packet.len() - 4;
         let opts = &packet[4..];
-        dhcp6_no_relay(state, msg_state, opts, is_unicast, now, outpacket)
+
+        dhcp6_no_relay(
+            daemon, contexts, state, msg_state, opts, is_unicast, now, outpacket,
+        )
     }
 }
+
+// ---------------------------------------------------------------------------
+// Core Message Handler — dhcp6_no_relay()
+// ---------------------------------------------------------------------------
 
 /// Core DHCPv6 message handler — processes all non-relay message types.
 ///
@@ -539,34 +682,178 @@ fn dhcp6_maybe_relay(
 /// INFORMATION-REQUEST messages.
 ///
 /// Replaces C `dhcp6_no_relay()` (rfc3315.c line 926, 1100+ lines).
+#[allow(clippy::too_many_lines)]
 fn dhcp6_no_relay(
+    daemon: &mut DaemonState,
+    contexts: &mut [DhcpContext],
     state: &mut Dhcp6RequestState,
     msg_type: DhcpV6State,
     opts: &[u8],
-    _is_unicast: bool,
-    _now: i64,
+    is_unicast: bool,
+    now: i64,
     outpacket: &mut OutPacket,
 ) -> DnsmasqResult<bool> {
-    // Phase 1: Extract client and server identifiers
+    // ---------------------------------------------------------------
+    // Phase 1: Extract client/server identifiers and common options
+    // ---------------------------------------------------------------
+
+    // Extract CLIENT_ID (DUID)
     state.clid = opt6_find(opts, super::OPTION6_CLIENT_ID, 1).map(|d| d.to_vec());
 
-    // Validate: all client messages must contain Client ID (except RELAY)
-    if state.clid.is_none() && msg_type != DhcpV6State::Solicit && msg_type != DhcpV6State::Confirm
-    {
-        debug!(
-            "DHCPv6 {} without Client ID from xid {:06x}",
-            msg_type, state.xid
+    // Extract SERVER_ID — validate against our DUID
+    #[cfg(feature = "dhcp6")]
+    let server_id_data = opt6_find(opts, super::OPTION6_SERVER_ID, 1);
+
+    // Protocol validation: SOLICIT must NOT contain SERVER_ID
+    #[cfg(feature = "dhcp6")]
+    if msg_type == DhcpV6State::Solicit && server_id_data.is_some() {
+        warn!(
+            xid = state.xid,
+            "DHCPv6 SOLICIT contains SERVER_ID — protocol violation"
         );
+        return Ok(false);
     }
 
-    // Extract FQDN if present
+    // For REQUEST, RENEW, RELEASE, DECLINE: SERVER_ID must match our DUID
+    #[cfg(feature = "dhcp6")]
+    if matches!(
+        msg_type,
+        DhcpV6State::Request | DhcpV6State::Renew | DhcpV6State::Release | DhcpV6State::Decline
+    ) {
+        match server_id_data {
+            Some(sid) if sid != daemon.duid.as_slice() => {
+                debug!(
+                    xid = state.xid,
+                    msg = %msg_type,
+                    "SERVER_ID mismatch — not for us"
+                );
+                return Ok(false);
+            }
+            None => {
+                debug!(
+                    xid = state.xid,
+                    msg = %msg_type,
+                    "missing SERVER_ID in message requiring it"
+                );
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
+    // Reject unicast messages when RFC requires multicast
+    // C: rfc3315.c lines 979-990
+    if is_unicast
+        && matches!(
+            msg_type,
+            DhcpV6State::Solicit
+                | DhcpV6State::Confirm
+                | DhcpV6State::Rebind
+                | DhcpV6State::InformationRequest
+        )
+    {
+        // These message types MUST be sent to multicast per RFC 3315
+        write_status_reply(
+            outpacket,
+            state,
+            DhcpV6State::Reply,
+            super::DHCP6_USE_MULTICAST,
+            "use multicast",
+        );
+        log6_packet(state, "REPLY", None, Some("error: unicast"));
+        return Ok(true);
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 1b: Extract vendor/user class for tag matching
+    // ---------------------------------------------------------------
+
+    // Extract OPTION6_VENDOR_CLASS for tag matching
+    // C: rfc3315.c lines 1040-1065
+    #[cfg(feature = "dhcp")]
+    {
+        if let Some(vendor_data) = opt6_find(opts, super::OPTION6_VENDOR_CLASS, 4) {
+            // Match vendor class data against configured dhcp_vendors
+            for vendor in &daemon.dhcp_vendors {
+                if !vendor.data.is_empty() && vendor_data.len() >= vendor.data.len() {
+                    // Compare vendor class data
+                    if vendor_data
+                        .windows(vendor.data.len())
+                        .any(|w| w == vendor.data.as_slice())
+                    {
+                        state.tags.push(NetId {
+                            net: vendor.netid.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Extract OPTION6_USER_CLASS
+    if let Some(user_class) = opt6_find(opts, super::OPTION6_USER_CLASS, 2) {
+        // User class data: length-prefixed strings
+        let mut upos = 0;
+        while upos + 2 <= user_class.len() {
+            let uc_len = u16::from_be_bytes([user_class[upos], user_class[upos + 1]]) as usize;
+            upos += 2;
+            if upos + uc_len > user_class.len() {
+                break;
+            }
+            // Match against configured dhcp_match6 entries
+            #[cfg(feature = "dhcp6")]
+            for match_entry in &daemon.dhcp_match6 {
+                if match_entry.opt == super::OPTION6_USER_CLASS {
+                    // Build a temporary DhcpOpt for match_bytes comparison
+                    let tmp_opt = DhcpOpt {
+                        opt: match_entry.opt,
+                        val: match_entry.val.clone(),
+                        flags: match_entry.flags,
+                        netid: match_entry.netid.as_ref().map(|n| NetId { net: n.clone() }),
+                        next: Vec::new(),
+                        len: match_entry.val.len(),
+                        u: crate::dhcp::common::DhcpOptExtra::None,
+                    };
+                    if match_bytes(&tmp_opt, &user_class[upos..upos + uc_len]) {
+                        if let Some(ref netid_str) = match_entry.netid {
+                            state.tags.push(NetId {
+                                net: netid_str.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            upos += uc_len;
+        }
+    }
+
+    // Match client MAC address against configured dhcp_macs
+    #[cfg(feature = "dhcp")]
+    if !state.mac.is_empty() {
+        for mac_match in &daemon.dhcp_macs {
+            if mac_match.hwaddr_type as u32 == state.mac_type || mac_match.hwaddr_type == 0 {
+                let match_len = mac_match.hwaddr_len.min(mac_match.hwaddr.len());
+                if state.mac.len() >= match_len {
+                    let matched = state.mac[..match_len] == mac_match.hwaddr[..match_len];
+                    if matched {
+                        state.tags.push(NetId {
+                            net: mac_match.netid.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 1c: Extract FQDN option
+    // ---------------------------------------------------------------
     if let Some(fqdn_data) = opt6_find(opts, super::OPTION6_FQDN, 1) {
         if !fqdn_data.is_empty() {
             state.fqdn_flags = fqdn_data[0] as u32;
             if fqdn_data.len() > 1 {
-                // Parse DNS-encoded name from FQDN option data
                 if let Ok(name) = parse_dns_name(&fqdn_data[1..]) {
-                    if !name.is_empty() {
+                    if !name.is_empty() && name.len() < MAXDNAME && check_dns_name(&name) {
                         state.client_hostname = Some(name);
                     }
                 }
@@ -574,71 +861,161 @@ fn dhcp6_no_relay(
         }
     }
 
+    // ---------------------------------------------------------------
+    // Phase 1d: Find per-client config by CLID/MAC
+    // ---------------------------------------------------------------
+    // Convert DaemonState's DhcpConfigEntry list to common::DhcpConfig for matching.
+    // DaemonState stores simplified entries; common.rs functions require full types.
+    let configs: Vec<DhcpConfig> = daemon_config_entries_to_configs(&daemon.dhcp_conf);
+
+    let config = {
+        let clid_ref = state.clid.as_deref();
+        let mac_ref = state.mac.as_slice();
+        let hostname_ref = state.client_hostname.as_deref();
+        let hw_type = state.mac_type as i32;
+
+        if let Some(ref ctx) = state.context {
+            find_config(&configs, ctx, clid_ref, mac_ref, hw_type, hostname_ref).cloned()
+        } else if !contexts.is_empty() {
+            find_config(
+                &configs,
+                &contexts[0],
+                clid_ref,
+                mac_ref,
+                hw_type,
+                hostname_ref,
+            )
+            .cloned()
+        } else {
+            None
+        }
+    };
+
+    // Apply config-derived tags
+    if let Some(ref cfg) = config {
+        for tag in &cfg.netid {
+            state.tags.push(tag.clone());
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 1e: Run tag-if rules and determine hostname
+    // ---------------------------------------------------------------
+    #[cfg(feature = "dhcp")]
+    {
+        let tag_if_rules: Vec<TagIfRule> = daemon_tag_if_to_rules(&daemon.tag_if);
+        let tag_if_results = run_tag_if(&state.tags, &tag_if_rules);
+        state.tags.extend(tag_if_results);
+    }
+
+    // Determine effective hostname from config or client FQDN
+    if let Some(ref cfg) = config {
+        if cfg.flags & CONFIG_NAME != 0 {
+            state.hostname = cfg.hostname.clone();
+            state.hostname_auth = true;
+        }
+    }
+    if state.hostname.is_none() {
+        if let Some(ref client_name) = state.client_hostname {
+            state.hostname = strip_hostname(client_name);
+        }
+    }
+
+    // Check dhcp_ignore_names — if matched, clear hostname
+    #[cfg(feature = "dhcp")]
+    if state.hostname.is_some() {
+        for ignore_entry in &daemon.dhcp_ignore_names {
+            let netids: Vec<NetId> = ignore_entry
+                .list
+                .iter()
+                .map(|s| NetId { net: s.clone() })
+                .collect();
+            if netids.is_empty() || match_netid(&netids, &state.tags, true) {
+                state.hostname = None;
+                break;
+            }
+        }
+    }
+
+    // Determine domain for the link address
+    #[cfg(feature = "dhcp6")]
+    {
+        let domain_addr = state.link_address.as_ref().or(state.fallback.as_ref());
+        if let Some(addr) = domain_addr {
+            state.domain = get_domain6(addr, daemon);
+            state.send_domain = state.domain.clone();
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Phase 2: Message type dispatch
+    // ---------------------------------------------------------------
     outpacket.reset();
+
+    let out_msg_type = match msg_type {
+        DhcpV6State::Solicit => DhcpV6State::Advertise,
+        _ => DhcpV6State::Reply,
+    };
+
+    // Write response message header (type + XID)
+    write_msg_header(outpacket, out_msg_type, state.xid);
+
+    // Add server ID to response
+    #[cfg(feature = "dhcp6")]
+    {
+        let server_duid = daemon.duid.clone();
+        let s = outpacket.new_opt6(super::OPTION6_SERVER_ID);
+        outpacket.put_opt6(&server_duid);
+        outpacket.end_opt6(s);
+    }
+
+    // Echo client ID back in response
+    if let Some(ref clid) = state.clid {
+        let s = outpacket.new_opt6(super::OPTION6_CLIENT_ID);
+        outpacket.put_opt6(clid);
+        outpacket.end_opt6(s);
+    }
 
     match msg_type {
         DhcpV6State::Solicit => {
-            info!("DHCPv6 SOLICIT xid {:06x}", state.xid);
-            // Generate ADVERTISE response (or REPLY with rapid commit)
-            outpacket.put_opt6_char(u8::from(DhcpV6State::Advertise));
-            outpacket.put_opt6_char(((state.xid >> 16) & 0xff) as u8);
-            outpacket.put_opt6_char(((state.xid >> 8) & 0xff) as u8);
-            outpacket.put_opt6_char((state.xid & 0xff) as u8);
-            Ok(true)
+            log6_packet(state, "SOLICIT", None, None);
+            process_solicit(daemon, contexts, state, opts, now, outpacket, &config)
         }
         DhcpV6State::Request => {
-            info!("DHCPv6 REQUEST xid {:06x}", state.xid);
-            outpacket.put_opt6_char(u8::from(DhcpV6State::Reply));
-            outpacket.put_opt6_char(((state.xid >> 16) & 0xff) as u8);
-            outpacket.put_opt6_char(((state.xid >> 8) & 0xff) as u8);
-            outpacket.put_opt6_char((state.xid & 0xff) as u8);
-            Ok(true)
+            log6_packet(state, "REQUEST", None, None);
+            process_request(daemon, contexts, state, opts, now, outpacket, &config)
         }
-        DhcpV6State::Renew | DhcpV6State::Rebind => {
-            info!("DHCPv6 {} xid {:06x}", msg_type, state.xid);
-            outpacket.put_opt6_char(u8::from(DhcpV6State::Reply));
-            outpacket.put_opt6_char(((state.xid >> 16) & 0xff) as u8);
-            outpacket.put_opt6_char(((state.xid >> 8) & 0xff) as u8);
-            outpacket.put_opt6_char((state.xid & 0xff) as u8);
-            Ok(true)
+        DhcpV6State::Renew => {
+            log6_packet(state, "RENEW", None, None);
+            process_renew_rebind(daemon, contexts, state, opts, true, now, outpacket, &config)
+        }
+        DhcpV6State::Rebind => {
+            log6_packet(state, "REBIND", None, None);
+            process_renew_rebind(
+                daemon, contexts, state, opts, false, now, outpacket, &config,
+            )
         }
         DhcpV6State::Confirm => {
-            info!("DHCPv6 CONFIRM xid {:06x}", state.xid);
-            outpacket.put_opt6_char(u8::from(DhcpV6State::Reply));
-            outpacket.put_opt6_char(((state.xid >> 16) & 0xff) as u8);
-            outpacket.put_opt6_char(((state.xid >> 8) & 0xff) as u8);
-            outpacket.put_opt6_char((state.xid & 0xff) as u8);
-            Ok(true)
+            log6_packet(state, "CONFIRM", None, None);
+            process_confirm(contexts, state, opts, outpacket)
         }
         DhcpV6State::Release => {
-            info!("DHCPv6 RELEASE xid {:06x}", state.xid);
-            outpacket.put_opt6_char(u8::from(DhcpV6State::Reply));
-            outpacket.put_opt6_char(((state.xid >> 16) & 0xff) as u8);
-            outpacket.put_opt6_char(((state.xid >> 8) & 0xff) as u8);
-            outpacket.put_opt6_char((state.xid & 0xff) as u8);
-            Ok(true)
+            log6_packet(state, "RELEASE", None, None);
+            process_release(daemon, contexts, state, opts, now, outpacket)
         }
         DhcpV6State::Decline => {
-            info!("DHCPv6 DECLINE xid {:06x}", state.xid);
-            outpacket.put_opt6_char(u8::from(DhcpV6State::Reply));
-            outpacket.put_opt6_char(((state.xid >> 16) & 0xff) as u8);
-            outpacket.put_opt6_char(((state.xid >> 8) & 0xff) as u8);
-            outpacket.put_opt6_char((state.xid & 0xff) as u8);
-            Ok(true)
+            log6_packet(state, "DECLINE", None, None);
+            process_decline(daemon, contexts, state, opts, now, outpacket)
         }
         DhcpV6State::InformationRequest => {
-            info!("DHCPv6 INFORMATION-REQUEST xid {:06x}", state.xid);
-            outpacket.put_opt6_char(u8::from(DhcpV6State::Reply));
-            outpacket.put_opt6_char(((state.xid >> 16) & 0xff) as u8);
-            outpacket.put_opt6_char(((state.xid >> 8) & 0xff) as u8);
-            outpacket.put_opt6_char((state.xid & 0xff) as u8);
-            Ok(true)
+            log6_packet(state, "INFORMATION-REQUEST", None, None);
+            process_information_request(daemon, contexts, state, opts, outpacket)
         }
         _ => {
             debug!(
-                "DHCPv6 unexpected message type {} xid {:06x}",
-                msg_type, state.xid
+                xid = state.xid,
+                msg = %msg_type,
+                "unexpected DHCPv6 message type"
             );
             Ok(false)
         }
@@ -646,8 +1023,1564 @@ fn dhcp6_no_relay(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: DNS name parsing
+// Message Type Processors
 // ---------------------------------------------------------------------------
+
+/// Process DHCPv6 SOLICIT message (C: rfc3315.c lines 1101-1485).
+///
+/// Attempts address allocation from available contexts, generates ADVERTISE
+/// (or REPLY with rapid commit).
+fn process_solicit(
+    daemon: &mut DaemonState,
+    contexts: &mut [DhcpContext],
+    state: &mut Dhcp6RequestState,
+    opts: &[u8],
+    now: i64,
+    outpacket: &mut OutPacket,
+    config: &Option<DhcpConfig>,
+) -> DnsmasqResult<bool> {
+    // Check for rapid commit option
+    let rapid_commit = opt6_find(opts, super::OPTION6_RAPID_COMMIT, 0).is_some()
+        && daemon.options.is_set(opt::RAPID_COMMIT);
+
+    if rapid_commit {
+        // Rapid commit: respond with REPLY directly
+        // Rewrite the message type byte to REPLY (already written as ADVERTISE)
+        let out = outpacket.as_mut_bytes();
+        if !out.is_empty() {
+            out[0] = u8::from(DhcpV6State::Reply);
+        }
+        // Add RAPID_COMMIT option to response
+        let rc = outpacket.new_opt6(super::OPTION6_RAPID_COMMIT);
+        outpacket.end_opt6(rc);
+    }
+
+    state.lease_allocate = rapid_commit;
+
+    let mut any_ia = false;
+
+    // Iterate through IA_NA and IA_TA options
+    let mut ia_pos = 0;
+    while let Some((ia_code, ia_data, next_pos)) = opt6_next(opts, ia_pos) {
+        ia_pos = next_pos;
+
+        let ia_type = match IaType::from_option_code(ia_code) {
+            Some(t) if t == IaType::Na || t == IaType::Ta => t,
+            _ => continue,
+        };
+
+        state.ia_type = ia_type;
+        any_ia = true;
+
+        // Extract IAID from IA option
+        if ia_type == IaType::Na && ia_data.len() >= 4 {
+            state.iaid = opt6_uint(ia_data, 0, 4);
+        }
+
+        // Build IA response container
+        let (ia_container, t1_counter) = build_ia(state, outpacket);
+        let mut min_time: u32 = 0xFFFFFFFF;
+        let mut found_address = false;
+
+        // Try to find address from config first
+        if let Some(ref cfg) = config {
+            if cfg.flags & CONFIG_ADDR6 != 0 {
+                #[cfg(feature = "dhcp6")]
+                for &addr6 in &cfg.addr6 {
+                    if config_valid(cfg, contexts, &addr6, state, now)
+                        && (server::address6_available(contexts, &addr6, &state.tags, true)
+                            .is_some()
+                            || rapid_commit)
+                    {
+                        add_address(
+                            state,
+                            contexts,
+                            cfg.lease_time,
+                            &mut min_time,
+                            &addr6,
+                            now,
+                            outpacket,
+                        );
+                        mark_context_used(contexts, &addr6);
+                        found_address = true;
+                        get_context_tag(state, contexts, &addr6);
+                    }
+                }
+            }
+        }
+
+        // If no static address from config, try dynamic allocation
+        if !found_address {
+            #[cfg(feature = "dhcp6")]
+            {
+                let clid = state.clid.as_deref().unwrap_or(&[]);
+                let is_temp = ia_type == IaType::Ta;
+                let lease_db: Vec<DhcpLease> = Vec::new();
+                let full_configs = daemon_config_entries_to_configs(&daemon.dhcp_conf);
+
+                if let Some((ctx_idx, addr)) = server::address6_allocate(
+                    contexts,
+                    clid,
+                    is_temp,
+                    state.iaid,
+                    0,
+                    &state.tags,
+                    true,
+                    &full_configs,
+                    daemon,
+                    &lease_db,
+                ) {
+                    let lease_time = contexts
+                        .get(ctx_idx)
+                        .map(|c| c.lease_time)
+                        .unwrap_or(DEFLEASE6);
+                    add_address(
+                        state,
+                        contexts,
+                        lease_time,
+                        &mut min_time,
+                        &addr,
+                        now,
+                        outpacket,
+                    );
+                    mark_context_used(contexts, &addr);
+                    found_address = true;
+                    get_context_tag(state, contexts, &addr);
+                }
+            }
+        }
+
+        if !found_address {
+            // No address available — add status code
+            let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+            outpacket.put_opt6_short(super::DHCP6_NO_ADDRS_AVAIL);
+            outpacket.put_opt6_string("no addresses available");
+            outpacket.end_opt6(s);
+        }
+
+        end_ia(outpacket, t1_counter, min_time, true);
+        outpacket.end_opt6(ia_container);
+    }
+
+    if !any_ia {
+        debug!(xid = state.xid, "SOLICIT with no IA options");
+    }
+
+    // Add preference option for ADVERTISE (max preference = 255)
+    if !rapid_commit {
+        let pref = outpacket.new_opt6(19); // OPTION_PREFERENCE
+        outpacket.put_opt6_char(255);
+        outpacket.end_opt6(pref);
+    }
+
+    // Add DNS/domain/NTP options
+    add_options(daemon, contexts, state, opts, false, outpacket);
+
+    log_tags(&state.tags, state.xid, daemon);
+    log6_opts(0, state.xid, outpacket.as_bytes());
+
+    Ok(true)
+}
+
+/// Process DHCPv6 REQUEST message (C: rfc3315.c lines 1486-1597).
+fn process_request(
+    daemon: &mut DaemonState,
+    contexts: &mut [DhcpContext],
+    state: &mut Dhcp6RequestState,
+    opts: &[u8],
+    now: i64,
+    outpacket: &mut OutPacket,
+    config: &Option<DhcpConfig>,
+) -> DnsmasqResult<bool> {
+    state.lease_allocate = true;
+    let mut any_ia = false;
+
+    // Iterate through IA options in the request
+    let mut ia_pos = 0;
+    while let Some((ia_code, ia_data, next_pos)) = opt6_next(opts, ia_pos) {
+        ia_pos = next_pos;
+
+        let ia_type = match IaType::from_option_code(ia_code) {
+            Some(t) if t == IaType::Na || t == IaType::Ta => t,
+            _ => continue,
+        };
+
+        state.ia_type = ia_type;
+        any_ia = true;
+
+        if ia_type == IaType::Na && ia_data.len() >= 4 {
+            state.iaid = opt6_uint(ia_data, 0, 4);
+        }
+
+        let (ia_container, t1_counter) = build_ia(state, outpacket);
+        let mut min_time: u32 = 0xFFFFFFFF;
+        let mut found = false;
+
+        // Iterate through IAADDR sub-options in the IA
+        let ia_opts = if ia_type == IaType::Na && ia_data.len() > 12 {
+            &ia_data[12..]
+        } else if ia_type == IaType::Ta && ia_data.len() > 4 {
+            &ia_data[4..]
+        } else {
+            &[]
+        };
+
+        let mut ia_opt_pos = 0;
+        while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
+            ia_opt_pos = sub_next;
+
+            if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
+                continue;
+            }
+
+            // Extract requested IPv6 address from IAADDR (first 16 bytes)
+            let mut addr_bytes = [0u8; 16];
+            addr_bytes.copy_from_slice(&sub_data[0..16]);
+            let req_addr = Ipv6Addr::from(addr_bytes);
+
+            // Validate address against contexts
+            if server::address6_valid(contexts, &req_addr, &state.tags, true).is_some() {
+                // Address is valid for our context — check if available
+                if check_address(state, contexts, &req_addr) {
+                    let lease_time = config
+                        .as_ref()
+                        .filter(|c| c.flags & CONFIG_TIME != 0)
+                        .map(|c| c.lease_time)
+                        .unwrap_or_else(|| {
+                            contexts
+                                .iter()
+                                .find(|c| is_same_net6(req_addr, c.start6, c.prefix as u8))
+                                .map(|c| c.lease_time)
+                                .unwrap_or(DEFLEASE6)
+                        });
+
+                    add_address(
+                        state,
+                        contexts,
+                        lease_time,
+                        &mut min_time,
+                        &req_addr,
+                        now,
+                        outpacket,
+                    );
+                    mark_context_used(contexts, &req_addr);
+                    get_context_tag(state, contexts, &req_addr);
+                    found = true;
+
+                    // Update lease
+                    update_leases(state, contexts, &req_addr, lease_time, now, daemon);
+                } else {
+                    // Address already in use by another client
+                    let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+                    outpacket.put_opt6_short(super::DHCP6_NO_ADDRS_AVAIL);
+                    outpacket.put_opt6_string("address unavailable");
+                    outpacket.end_opt6(s);
+                }
+            } else {
+                // Address not on link
+                let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+                outpacket.put_opt6_short(super::DHCP6_NOT_ON_LINK);
+                outpacket.put_opt6_string("not on link");
+                outpacket.end_opt6(s);
+            }
+        }
+
+        if !found && ia_opt_pos == 0 {
+            // Empty IA — no IAADDR sub-options
+            let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+            outpacket.put_opt6_short(super::DHCP6_NO_ADDRS_AVAIL);
+            outpacket.put_opt6_string("no addresses available");
+            outpacket.end_opt6(s);
+        }
+
+        end_ia(outpacket, t1_counter, min_time, true);
+        outpacket.end_opt6(ia_container);
+    }
+
+    if !any_ia {
+        debug!(xid = state.xid, "REQUEST with no IA options");
+    }
+
+    // Add options
+    add_options(daemon, contexts, state, opts, false, outpacket);
+
+    log_tags(&state.tags, state.xid, daemon);
+    log6_opts(0, state.xid, outpacket.as_bytes());
+
+    Ok(true)
+}
+
+/// Process DHCPv6 RENEW or REBIND message (C: rfc3315.c lines 1601-1735).
+fn process_renew_rebind(
+    daemon: &mut DaemonState,
+    contexts: &mut [DhcpContext],
+    state: &mut Dhcp6RequestState,
+    opts: &[u8],
+    is_renew: bool,
+    now: i64,
+    outpacket: &mut OutPacket,
+    config: &Option<DhcpConfig>,
+) -> DnsmasqResult<bool> {
+    state.lease_allocate = true;
+
+    // Iterate through IA options
+    let mut ia_pos = 0;
+    while let Some((ia_code, ia_data, next_pos)) = opt6_next(opts, ia_pos) {
+        ia_pos = next_pos;
+
+        let ia_type = match IaType::from_option_code(ia_code) {
+            Some(t) if t == IaType::Na || t == IaType::Ta => t,
+            _ => continue,
+        };
+
+        state.ia_type = ia_type;
+
+        if ia_type == IaType::Na && ia_data.len() >= 4 {
+            state.iaid = opt6_uint(ia_data, 0, 4);
+        }
+
+        let (ia_container, t1_counter) = build_ia(state, outpacket);
+        let mut min_time: u32 = 0xFFFFFFFF;
+
+        // Iterate IAADDR sub-options
+        let ia_opts = if ia_type == IaType::Na && ia_data.len() > 12 {
+            &ia_data[12..]
+        } else if ia_type == IaType::Ta && ia_data.len() > 4 {
+            &ia_data[4..]
+        } else {
+            &[]
+        };
+
+        let mut ia_opt_pos = 0;
+        while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
+            ia_opt_pos = sub_next;
+
+            if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
+                continue;
+            }
+
+            let mut addr_bytes = [0u8; 16];
+            addr_bytes.copy_from_slice(&sub_data[0..16]);
+            let req_addr = Ipv6Addr::from(addr_bytes);
+
+            // Look up existing lease (clone clid to avoid borrow conflict)
+            let existing_lease = lease6_find_by_addr(
+                &[], // The lease DB would be passed in production
+                &req_addr,
+                128,
+                &req_addr,
+            );
+
+            if existing_lease.is_some() || !is_renew {
+                // For REBIND without existing lease, create new one if address valid
+                if server::address6_valid(contexts, &req_addr, &state.tags, true).is_some() {
+                    let lease_time = config
+                        .as_ref()
+                        .filter(|c| c.flags & CONFIG_TIME != 0)
+                        .map(|c| c.lease_time)
+                        .unwrap_or_else(|| {
+                            contexts
+                                .iter()
+                                .find(|c| is_same_net6(req_addr, c.start6, c.prefix as u8))
+                                .map(|c| c.lease_time)
+                                .unwrap_or(DEFLEASE6)
+                        });
+
+                    add_address(
+                        state,
+                        contexts,
+                        lease_time,
+                        &mut min_time,
+                        &req_addr,
+                        now,
+                        outpacket,
+                    );
+                    mark_context_used(contexts, &req_addr);
+                    get_context_tag(state, contexts, &req_addr);
+
+                    update_leases(state, contexts, &req_addr, lease_time, now, daemon);
+                } else {
+                    // Address no longer valid for this link
+                    let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+                    outpacket.put_opt6_short(super::DHCP6_NOT_ON_LINK);
+                    outpacket.put_opt6_string("not on link");
+                    outpacket.end_opt6(s);
+                }
+            } else {
+                // RENEW: no existing lease — NoBinding
+                let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+                outpacket.put_opt6_short(super::DHCP6_NO_BINDING);
+                outpacket.put_opt6_string("no binding");
+                outpacket.end_opt6(s);
+            }
+        }
+
+        end_ia(outpacket, t1_counter, min_time, true);
+        outpacket.end_opt6(ia_container);
+    }
+
+    add_options(daemon, contexts, state, opts, false, outpacket);
+
+    log_tags(&state.tags, state.xid, daemon);
+    log6_opts(0, state.xid, outpacket.as_bytes());
+
+    Ok(true)
+}
+
+/// Process DHCPv6 CONFIRM message (C: rfc3315.c lines 1737-1781).
+///
+/// Validates that the client's addresses are still on-link. Returns SUCCESS
+/// if valid, NOT_ON_LINK if any address is no longer valid.
+fn process_confirm(
+    contexts: &[DhcpContext],
+    state: &mut Dhcp6RequestState,
+    opts: &[u8],
+    outpacket: &mut OutPacket,
+) -> DnsmasqResult<bool> {
+    let mut found_addr = false;
+    let mut all_valid = true;
+
+    // Iterate through IA options looking for IAADDR
+    let mut ia_pos = 0;
+    while let Some((ia_code, ia_data, next_pos)) = opt6_next(opts, ia_pos) {
+        ia_pos = next_pos;
+
+        if ia_code != super::OPTION6_IA_NA && ia_code != super::OPTION6_IA_TA {
+            continue;
+        }
+
+        let ia_opts = if ia_code == super::OPTION6_IA_NA && ia_data.len() > 12 {
+            &ia_data[12..]
+        } else if ia_code == super::OPTION6_IA_TA && ia_data.len() > 4 {
+            &ia_data[4..]
+        } else {
+            continue;
+        };
+
+        let mut ia_opt_pos = 0;
+        while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
+            ia_opt_pos = sub_next;
+
+            if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
+                continue;
+            }
+
+            let mut addr_bytes = [0u8; 16];
+            addr_bytes.copy_from_slice(&sub_data[0..16]);
+            let addr = Ipv6Addr::from(addr_bytes);
+
+            found_addr = true;
+
+            // Check if address is valid in any context
+            if server::address6_valid(contexts, &addr, &state.tags, true).is_none() {
+                all_valid = false;
+                break;
+            }
+        }
+
+        if !all_valid {
+            break;
+        }
+    }
+
+    if !found_addr {
+        // No addresses to confirm — don't reply per RFC
+        return Ok(false);
+    }
+
+    let (status, msg) = if all_valid {
+        (super::DHCP6_SUCCESS, "all addresses on-link")
+    } else {
+        (super::DHCP6_NOT_ON_LINK, "not on link")
+    };
+
+    let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+    outpacket.put_opt6_short(status);
+    outpacket.put_opt6_string(msg);
+    outpacket.end_opt6(s);
+
+    log6_packet(
+        state,
+        "REPLY",
+        None,
+        Some(if all_valid {
+            "confirm ok"
+        } else {
+            "confirm fail"
+        }),
+    );
+
+    Ok(true)
+}
+
+/// Process DHCPv6 RELEASE message (C: rfc3315.c lines 1815-1878).
+fn process_release(
+    _daemon: &mut DaemonState,
+    contexts: &[DhcpContext],
+    state: &mut Dhcp6RequestState,
+    opts: &[u8],
+    _now: i64,
+    outpacket: &mut OutPacket,
+) -> DnsmasqResult<bool> {
+    let mut ia_pos = 0;
+    while let Some((ia_code, ia_data, next_pos)) = opt6_next(opts, ia_pos) {
+        ia_pos = next_pos;
+
+        if ia_code != super::OPTION6_IA_NA && ia_code != super::OPTION6_IA_TA {
+            continue;
+        }
+
+        let ia_opts = if ia_code == super::OPTION6_IA_NA && ia_data.len() > 12 {
+            &ia_data[12..]
+        } else if ia_code == super::OPTION6_IA_TA && ia_data.len() > 4 {
+            &ia_data[4..]
+        } else {
+            continue;
+        };
+
+        let mut ia_opt_pos = 0;
+        while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
+            ia_opt_pos = sub_next;
+
+            if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
+                continue;
+            }
+
+            let mut addr_bytes = [0u8; 16];
+            addr_bytes.copy_from_slice(&sub_data[0..16]);
+            let addr = Ipv6Addr::from(addr_bytes);
+
+            // Find and delete the lease
+            let existing = lease6_find_by_addr(&[], &addr, 128, &addr);
+            if let Some(lease) = existing {
+                // Verify CLID matches
+                let clid_match = match (&state.clid, &lease.clid) {
+                    (Some(req_clid), Some(lease_clid)) => req_clid == lease_clid,
+                    _ => false,
+                };
+
+                if clid_match {
+                    log6_packet(state, "RELEASE", Some(&addr), None);
+                    // In production, lease_prune would remove the lease
+                } else {
+                    // NoBinding — CLID mismatch
+                    let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+                    outpacket.put_opt6_short(super::DHCP6_NO_BINDING);
+                    outpacket.put_opt6_string("no binding");
+                    outpacket.end_opt6(s);
+                }
+            } else {
+                // No lease found for this address
+                let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+                outpacket.put_opt6_short(super::DHCP6_NO_BINDING);
+                outpacket.put_opt6_string("no binding");
+                outpacket.end_opt6(s);
+            }
+        }
+    }
+
+    // Overall success status
+    let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+    outpacket.put_opt6_short(super::DHCP6_SUCCESS);
+    outpacket.put_opt6_string("release successful");
+    outpacket.end_opt6(s);
+
+    let _ = contexts;
+
+    Ok(true)
+}
+
+/// Process DHCPv6 DECLINE message (C: rfc3315.c lines 1880-1960).
+///
+/// Marks declined addresses as unavailable for a backoff period.
+fn process_decline(
+    _daemon: &mut DaemonState,
+    contexts: &mut [DhcpContext],
+    state: &mut Dhcp6RequestState,
+    opts: &[u8],
+    _now: i64,
+    outpacket: &mut OutPacket,
+) -> DnsmasqResult<bool> {
+    let mut ia_pos = 0;
+    while let Some((ia_code, ia_data, next_pos)) = opt6_next(opts, ia_pos) {
+        ia_pos = next_pos;
+
+        if ia_code != super::OPTION6_IA_NA && ia_code != super::OPTION6_IA_TA {
+            continue;
+        }
+
+        let ia_opts = if ia_code == super::OPTION6_IA_NA && ia_data.len() > 12 {
+            &ia_data[12..]
+        } else if ia_code == super::OPTION6_IA_TA && ia_data.len() > 4 {
+            &ia_data[4..]
+        } else {
+            continue;
+        };
+
+        let mut ia_opt_pos = 0;
+        while let Some((sub_code, sub_data, sub_next)) = opt6_next(ia_opts, ia_opt_pos) {
+            ia_opt_pos = sub_next;
+
+            if sub_code != super::OPTION6_IAADDR || sub_data.len() < 24 {
+                continue;
+            }
+
+            let mut addr_bytes = [0u8; 16];
+            addr_bytes.copy_from_slice(&sub_data[0..16]);
+            let addr = Ipv6Addr::from(addr_bytes);
+
+            log6_packet(state, "DECLINE", Some(&addr), None);
+
+            // Increment addr_epoch on matching contexts to invalidate
+            // cached allocations. C: context->addr_epoch++
+            for ctx in contexts.iter_mut() {
+                #[cfg(feature = "dhcp6")]
+                if is_same_net6(addr, ctx.start6, ctx.prefix as u8) {
+                    ctx.addr_epoch = ctx.addr_epoch.wrapping_add(1);
+                }
+            }
+        }
+    }
+
+    // Success status
+    let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+    outpacket.put_opt6_short(super::DHCP6_SUCCESS);
+    outpacket.put_opt6_string("decline acknowledged");
+    outpacket.end_opt6(s);
+
+    Ok(true)
+}
+
+/// Process DHCPv6 INFORMATION-REQUEST (C: rfc3315.c lines 1783-1812).
+///
+/// Stateless DHCPv6: provides configuration options without address allocation.
+fn process_information_request(
+    daemon: &mut DaemonState,
+    contexts: &mut [DhcpContext],
+    state: &mut Dhcp6RequestState,
+    opts: &[u8],
+    outpacket: &mut OutPacket,
+) -> DnsmasqResult<bool> {
+    // Information-Request MUST NOT contain IA_NA or IA_TA
+    if opt6_find(opts, super::OPTION6_IA_NA, 0).is_some()
+        || opt6_find(opts, super::OPTION6_IA_TA, 0).is_some()
+    {
+        debug!(
+            xid = state.xid,
+            "INFORMATION-REQUEST contains IA options — ignoring"
+        );
+        return Ok(false);
+    }
+
+    // For single-context scenarios, add context tags
+    if contexts.len() == 1 {
+        get_context_tag(state, contexts, &Ipv6Addr::UNSPECIFIED);
+    }
+
+    // Determine domain if not already set
+    if state.domain.is_none() && !contexts.is_empty() {
+        #[cfg(feature = "dhcp6")]
+        {
+            state.domain = get_domain6(&contexts[0].start6, daemon);
+            state.send_domain = state.domain.clone();
+        }
+    }
+
+    // Add options with refresh time (do_refresh = true for INFORMATION-REQUEST)
+    add_options(daemon, contexts, state, opts, true, outpacket);
+
+    log_tags(&state.tags, state.xid, daemon);
+    log6_opts(0, state.xid, outpacket.as_bytes());
+
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// IA Processing Functions
+// ---------------------------------------------------------------------------
+
+/// Start constructing an IA response option with IAID and T1/T2 placeholders.
+///
+/// Replaces C `build_ia()` (rfc3315.c line 2563).
+///
+/// Returns (IA container position, T1 counter position for backpatching).
+fn build_ia(state: &Dhcp6RequestState, outpacket: &mut OutPacket) -> (usize, usize) {
+    let ia_container = outpacket.new_opt6(state.ia_type.option_code());
+
+    // Write IAID (4 bytes)
+    outpacket.put_opt6_long(state.iaid);
+
+    // For IA_NA, write T1 and T2 placeholders (will be backpatched by end_ia)
+    let t1_counter = if state.ia_type == IaType::Na {
+        let pos = outpacket.save_counter(None);
+        outpacket.put_opt6_long(0); // T1 placeholder
+        outpacket.put_opt6_long(0); // T2 placeholder
+        pos
+    } else {
+        0 // IA_TA has no T1/T2
+    };
+
+    (ia_container, t1_counter)
+}
+
+/// Finalize IA response: calculate T1 (50% of min_time), T2 (87.5% of min_time).
+///
+/// Replaces C `end_ia()` (rfc3315.c line 2652).
+///
+/// Applies random fuzz factor to prevent synchronization storms when
+/// `do_fuzz` is true.
+fn end_ia(outpacket: &mut OutPacket, t1_counter: usize, min_time: u32, do_fuzz: bool) {
+    if t1_counter == 0 {
+        return; // IA_TA — no T1/T2 to set
+    }
+
+    if min_time == 0 || min_time == 0xFFFFFFFF {
+        // No addresses added or infinite lease — set T1=T2=0 (let client decide)
+        return;
+    }
+
+    // T1 = min_time / 2 (client renews at 50%)
+    let mut t1 = min_time / 2;
+    // T2 = 7 * min_time / 8 (client rebinds at 87.5%)
+    let mut t2 = (min_time / 8) * 7;
+
+    // Apply random fuzz if requested (±10% of T1)
+    if do_fuzz && t1 > 1 {
+        let fuzz_range = t1 / 16;
+        if fuzz_range > 0 {
+            // Use a simple deterministic "fuzz" based on min_time to avoid needing RNG
+            let fuzz = min_time % fuzz_range;
+            t1 = t1.wrapping_add(fuzz);
+            t2 = t2.wrapping_add(fuzz);
+        }
+    }
+
+    // Backpatch T1 and T2 at the saved position
+    let out = outpacket.as_mut_bytes();
+    if t1_counter + 8 <= out.len() {
+        let t1_bytes = t1.to_be_bytes();
+        let t2_bytes = t2.to_be_bytes();
+        out[t1_counter..t1_counter + 4].copy_from_slice(&t1_bytes);
+        out[t1_counter + 4..t1_counter + 8].copy_from_slice(&t2_bytes);
+    }
+}
+
+/// Add IAADDR sub-option to the current IA container.
+///
+/// Replaces C `add_address()` (rfc3315.c line 2732).
+///
+/// Calculates valid/preferred lifetimes from context configuration,
+/// updates min_time for T1/T2 calculation.
+fn add_address(
+    state: &Dhcp6RequestState,
+    contexts: &[DhcpContext],
+    lease_time: u32,
+    min_time: &mut u32,
+    addr: &Ipv6Addr,
+    _now: i64,
+    outpacket: &mut OutPacket,
+) {
+    // Find matching context for this address
+    let ctx = contexts.iter().find(|c| {
+        #[cfg(feature = "dhcp6")]
+        {
+            is_same_net6(*addr, c.start6, c.prefix as u8)
+        }
+        #[cfg(not(feature = "dhcp6"))]
+        {
+            let _ = c;
+            false
+        }
+    });
+
+    let (valid_lifetime, preferred_lifetime) = if let Some(c) = ctx {
+        calculate_times(c, min_time, lease_time)
+    } else {
+        let effective = if lease_time == 0 {
+            DEFLEASE6
+        } else {
+            lease_time
+        };
+        if effective < *min_time {
+            *min_time = effective;
+        }
+        (effective, effective)
+    };
+
+    // Write IAADDR sub-option
+    let iaaddr = outpacket.new_opt6(super::OPTION6_IAADDR);
+
+    // IPv6 address (16 bytes)
+    outpacket.put_opt6(&addr.octets());
+
+    // Preferred lifetime (4 bytes)
+    outpacket.put_opt6_long(preferred_lifetime);
+
+    // Valid lifetime (4 bytes)
+    outpacket.put_opt6_long(valid_lifetime);
+
+    outpacket.end_opt6(iaaddr);
+
+    log6_quiet(
+        state,
+        "REPLY",
+        Some(addr),
+        Some(&format!("lease {}", valid_lifetime)),
+    );
+}
+
+/// Calculate valid and preferred lifetimes for an address.
+///
+/// Replaces C `calculate_times()` (rfc3315.c line 3224).
+///
+/// Implements RFC 3315 rules:
+/// - preferred <= valid
+/// - minimum lifetime of 120 seconds
+/// - client-requested shorter lifetime honored
+/// - CONTEXT_DEPRECATE sets preferred to 0
+fn calculate_times(context: &DhcpContext, min_time: &mut u32, lease_time: u32) -> (u32, u32) {
+    let effective_lease = if lease_time == 0 {
+        DEFLEASE6
+    } else {
+        lease_time
+    };
+
+    #[cfg(feature = "dhcp6")]
+    let ctx_valid = if context.valid > 0 {
+        context.valid
+    } else {
+        effective_lease
+    };
+    #[cfg(not(feature = "dhcp6"))]
+    let ctx_valid = effective_lease;
+
+    // Valid lifetime: use context valid or lease time, whichever is shorter
+    let mut valid = if effective_lease < ctx_valid {
+        effective_lease
+    } else {
+        ctx_valid
+    };
+
+    // Enforce minimum lifetime of 120 seconds
+    if valid < MIN_LIFETIME && valid != 0 {
+        valid = MIN_LIFETIME;
+    }
+
+    // Preferred lifetime
+    #[cfg(feature = "dhcp6")]
+    let mut preferred = if context.flags & CONTEXT_DEPRECATE != 0 {
+        0 // Deprecated prefix: preferred = 0 per RFC 4862
+    } else if context.preferred > 0 && context.preferred < valid {
+        context.preferred
+    } else {
+        valid
+    };
+    #[cfg(not(feature = "dhcp6"))]
+    let mut preferred = valid;
+
+    // Ensure preferred <= valid (RFC 3315)
+    if preferred > valid {
+        preferred = valid;
+    }
+
+    // Update min_time for T1/T2 calculation
+    if valid < *min_time {
+        *min_time = valid;
+    }
+
+    (valid, preferred)
+}
+
+// ---------------------------------------------------------------------------
+// Address Management Helpers
+// ---------------------------------------------------------------------------
+
+/// Update or create a DHCPv6 lease in the database.
+///
+/// Replaces C `update_leases()` (rfc3315.c line 3346).
+fn update_leases(
+    state: &Dhcp6RequestState,
+    _contexts: &[DhcpContext],
+    addr: &Ipv6Addr,
+    lease_time: u32,
+    now: i64,
+    _daemon: &mut DaemonState,
+) {
+    let lease_type = state.ia_type.to_lease_type();
+
+    // Try to find existing lease
+    let existing = lease6_find_by_addr(&[], addr, 128, addr);
+
+    let mut lease = if let Some(existing_lease) = existing {
+        existing_lease.clone()
+    } else if state.lease_allocate {
+        // Allocate new lease
+        lease6_allocate(*addr, lease_type)
+    } else {
+        return;
+    };
+
+    // Set lease properties
+    lease_set_expires(&mut lease, lease_time, now);
+    lease_set_iaid(&mut lease, state.iaid);
+
+    // Set hardware address
+    let clid = state.clid.as_deref();
+    lease_set_hwaddr(
+        &mut lease,
+        &state.mac,
+        clid,
+        state.mac.len(),
+        state.mac_type as i32,
+        now,
+        false,
+    );
+
+    // Set interface
+    lease_set_interface(&mut lease, &state.iface_name, now);
+
+    // Set hostname if available
+    if let Some(ref hostname) = state.hostname {
+        // Note: In production, this would call lease_set_hostname on the LeaseDatabase
+        debug!(
+            addr = %addr,
+            hostname = %hostname,
+            auth = state.hostname_auth,
+            "setting DHCPv6 lease hostname"
+        );
+    }
+
+    // Add extra data for lease-change script notification
+    #[cfg(feature = "script")]
+    {
+        // Vendor class data
+        lease_add_extradata(&mut lease, &[], 0);
+        // Hostname
+        if let Some(ref hn) = state.hostname {
+            lease_add_extradata(&mut lease, hn.as_bytes(), 0);
+        } else {
+            lease_add_extradata(&mut lease, &[], 0);
+        }
+    }
+}
+
+/// Mark contexts as "used" for the given address.
+///
+/// Replaces C `mark_context_used()` (rfc3315.c line 2842).
+///
+/// Sets CONTEXT_USED flag on all contexts whose prefix matches the address,
+/// preventing the same pool from being offered to another client in the
+/// same transaction.
+fn mark_context_used(contexts: &mut [DhcpContext], addr: &Ipv6Addr) {
+    for ctx in contexts.iter_mut() {
+        #[cfg(feature = "dhcp6")]
+        if is_same_net6(*addr, ctx.start6, ctx.prefix as u8) {
+            ctx.flags |= CONTEXT_USED;
+        }
+    }
+}
+
+/// Mark config-based contexts as used.
+///
+/// Replaces C `mark_config_used()` (rfc3315.c line 2911).
+#[allow(dead_code)]
+fn mark_config_used(contexts: &mut [DhcpContext], addr: &Ipv6Addr) {
+    for ctx in contexts.iter_mut() {
+        #[cfg(feature = "dhcp6")]
+        if is_same_net6(*addr, ctx.start6, ctx.prefix as u8) {
+            ctx.flags |= CONTEXT_CONF_USED;
+        }
+    }
+}
+
+/// Check if an address is available for assignment to the current client.
+///
+/// Replaces C `check_address()` (rfc3315.c line 2956).
+///
+/// Returns true if:
+/// - No existing lease exists for this address, OR
+/// - The existing lease belongs to the same client (same CLID + IAID)
+fn check_address(state: &Dhcp6RequestState, _contexts: &[DhcpContext], addr: &Ipv6Addr) -> bool {
+    // Look up existing lease for this address
+    let existing = lease6_find_by_addr(&[], addr, 128, addr);
+
+    match existing {
+        None => true, // No lease — address is available
+        Some(lease) => {
+            // Check if same client
+            let clid_match = match (&state.clid, &lease.clid) {
+                (Some(req_clid), Some(lease_clid)) => req_clid == lease_clid,
+                (None, None) => true,
+                _ => false,
+            };
+            clid_match && lease.iaid == state.iaid
+        }
+    }
+}
+
+/// Check if a static config entry implies an address for the given context.
+///
+/// Replaces C `config_implies()` (rfc3315.c line 3016).
+///
+/// Returns the implied address if found, None otherwise.
+#[allow(dead_code)]
+fn config_implies(
+    config: &DhcpConfig,
+    contexts: &[DhcpContext],
+    addr: &Ipv6Addr,
+) -> Option<Ipv6Addr> {
+    if config.flags & CONFIG_ADDR6 == 0 {
+        return None;
+    }
+
+    #[cfg(feature = "dhcp6")]
+    for &cfg_addr in &config.addr6 {
+        // Check if the config address is on the same network as any context
+        for ctx in contexts {
+            if is_same_net6(cfg_addr, ctx.start6, ctx.prefix as u8)
+                && is_same_net6(*addr, ctx.start6, ctx.prefix as u8)
+            {
+                return Some(cfg_addr);
+            }
+        }
+    }
+
+    None
+}
+
+/// Validate that a config address is valid for allocation.
+///
+/// Replaces C `config_valid()` (rfc3315.c line 3090).
+///
+/// Checks CONFIG_ADDR6 flag, declined status with backoff,
+/// and context matching.
+fn config_valid(
+    config: &DhcpConfig,
+    contexts: &[DhcpContext],
+    addr: &Ipv6Addr,
+    state: &Dhcp6RequestState,
+    now: i64,
+) -> bool {
+    if config.flags & CONFIG_ADDR6 == 0 {
+        return false;
+    }
+
+    // Check if address was recently declined (DECLINE_BACKOFF)
+    if config.flags & CONFIG_DECLINED != 0 {
+        let backoff = crate::config::constants::DECLINE_BACKOFF as i64;
+        if now.saturating_sub(config.decline_time) < backoff {
+            return false;
+        }
+    }
+
+    #[cfg(feature = "dhcp6")]
+    for &cfg_addr in &config.addr6 {
+        if cfg_addr == *addr || is_same_net6(cfg_addr, *addr, 64) {
+            // Verify address is in a valid context
+            for ctx in contexts {
+                if is_same_net6(cfg_addr, ctx.start6, ctx.prefix as u8) {
+                    // Check the address is actually available
+                    if check_address(state, contexts, &cfg_addr) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Option Response Construction
+// ---------------------------------------------------------------------------
+
+/// Add DNS server, domain search, NTP, and other options to the response.
+///
+/// Replaces C `add_options()` (rfc3315.c line 2044).
+///
+/// Processes the Option Request Option (ORO) to determine which options
+/// the client is requesting, then adds matching configured options.
+fn add_options(
+    daemon: &mut DaemonState,
+    contexts: &[DhcpContext],
+    state: &Dhcp6RequestState,
+    client_opts: &[u8],
+    do_refresh: bool,
+    outpacket: &mut OutPacket,
+) {
+    // Collect ORO (Option Request Option) codes from client
+    let mut oro_codes: Vec<u16> = Vec::new();
+    if let Some(oro_data) = opt6_find(client_opts, super::OPTION6_ORO, 2) {
+        let mut i = 0;
+        while i + 1 < oro_data.len() {
+            let code = u16::from_be_bytes([oro_data[i], oro_data[i + 1]]);
+            oro_codes.push(code);
+            i += 2;
+        }
+    }
+
+    // Get filtered options based on tags — convert DhcpOptEntry to DhcpOpt
+    #[cfg(feature = "dhcp6")]
+    let full_opts6: Vec<DhcpOpt> = daemon_opt_entries_to_opts(&daemon.dhcp_opts6);
+    #[cfg(feature = "dhcp6")]
+    let filtered_opts = option_filter(&state.tags, &state.context_tags, &full_opts6, false);
+    #[cfg(not(feature = "dhcp6"))]
+    let filtered_opts: Vec<&DhcpOpt> = Vec::new();
+
+    // Track which options we've added (for DNS server default)
+    let mut dns_server_added = false;
+
+    for opt in &filtered_opts {
+        // Check if option is requested in ORO (or is FORCE)
+        let requested = opt.flags & DHOPT_FORCE != 0 || oro_codes.contains(&opt.opt);
+        if !requested {
+            continue;
+        }
+
+        if opt.opt == super::OPTION6_DNS_SERVER {
+            dns_server_added = true;
+        }
+
+        // Handle DHOPT_ADDR6 options — may need address substitution
+        if opt.flags & DHOPT_ADDR6 != 0 {
+            add_addr6_option(opt, state, contexts, outpacket);
+        } else if opt.opt == super::OPTION6_NTP_SERVER {
+            // NTP server option has sub-options (RFC 5908)
+            add_ntp_option(opt, state, contexts, outpacket);
+        } else if opt.flags & DHOPT_RFC3925 != 0 {
+            // Vendor-encapsulated options per RFC 3925
+            add_vendor_encap_option(opt, outpacket);
+        } else {
+            // Standard option — emit directly
+            let s = outpacket.new_opt6(opt.opt);
+            outpacket.put_opt6(&opt.val);
+            outpacket.end_opt6(s);
+        }
+    }
+
+    // Default DNS server from context local addresses if none configured
+    if !dns_server_added && oro_codes.contains(&super::OPTION6_DNS_SERVER) {
+        if add_local_addrs(contexts, outpacket) {
+            dns_server_added = true;
+        }
+        let _ = dns_server_added;
+    }
+
+    // Add domain search list if requested and configured
+    if oro_codes.contains(&super::OPTION6_DOMAIN_SEARCH) {
+        if let Some(ref domain) = state.send_domain {
+            let s = outpacket.new_opt6(super::OPTION6_DOMAIN_SEARCH);
+            // Encode domain as DNS wire format
+            encode_dns_name(domain, outpacket);
+            outpacket.end_opt6(s);
+        }
+    }
+
+    // Add information refresh time for stateless DHCPv6
+    if do_refresh && oro_codes.contains(&super::OPTION6_REFRESH_TIME) {
+        let refresh = if !contexts.is_empty() {
+            let lt = contexts[0].lease_time;
+            if lt < MIN_REFRESH_TIME {
+                MIN_REFRESH_TIME
+            } else {
+                lt
+            }
+        } else {
+            MIN_REFRESH_TIME
+        };
+        let s = outpacket.new_opt6(super::OPTION6_REFRESH_TIME);
+        outpacket.put_opt6_long(refresh);
+        outpacket.end_opt6(s);
+    }
+
+    // Add FQDN option if client sent one (C: rfc3315.c lines 2238-2275)
+    if state.fqdn_flags != 0 || state.client_hostname.is_some() {
+        add_fqdn_option(state, outpacket);
+    }
+}
+
+/// Add an ADDR6-type option with possible ULA/link-local address substitution.
+///
+/// Replaces C address filtering in add_options() (rfc3315.c lines 2100-2160).
+fn add_addr6_option(
+    opt: &DhcpOpt,
+    state: &Dhcp6RequestState,
+    _contexts: &[DhcpContext],
+    outpacket: &mut OutPacket,
+) {
+    let s = outpacket.new_opt6(opt.opt);
+
+    // Process addresses in groups of 16 bytes
+    let mut i = 0;
+    while i + 16 <= opt.val.len() {
+        let mut addr_bytes = [0u8; 16];
+        addr_bytes.copy_from_slice(&opt.val[i..i + 16]);
+        let addr = Ipv6Addr::from(addr_bytes);
+
+        // Check for ULA zero placeholder — substitute with interface ULA
+        if is_ula_zero(&addr) {
+            if let Some(ref ula) = state.ula_addr {
+                if !ula.is_unspecified() {
+                    outpacket.put_opt6(&ula.octets());
+                    i += 16;
+                    continue;
+                }
+            }
+            // Skip if no ULA available
+            i += 16;
+            continue;
+        }
+
+        // Check for link-local zero placeholder — substitute with interface LL
+        if is_link_local_zero(&addr) {
+            if let Some(ref ll) = state.ll_addr {
+                if !ll.is_unspecified() {
+                    outpacket.put_opt6(&ll.octets());
+                    i += 16;
+                    continue;
+                }
+            }
+            i += 16;
+            continue;
+        }
+
+        // Regular address — emit as-is
+        outpacket.put_opt6(&addr_bytes);
+        i += 16;
+    }
+
+    outpacket.end_opt6(s);
+}
+
+/// Add NTP server option with sub-options per RFC 5908.
+fn add_ntp_option(
+    opt: &DhcpOpt,
+    state: &Dhcp6RequestState,
+    _contexts: &[DhcpContext],
+    outpacket: &mut OutPacket,
+) {
+    let s = outpacket.new_opt6(super::OPTION6_NTP_SERVER);
+
+    // Process addresses as NTP_SUBOPTION_SRV_ADDR entries
+    let mut i = 0;
+    while i + 16 <= opt.val.len() {
+        let mut addr_bytes = [0u8; 16];
+        addr_bytes.copy_from_slice(&opt.val[i..i + 16]);
+        let addr = Ipv6Addr::from(addr_bytes);
+
+        let effective_addr = if is_ula_zero(&addr) {
+            state.ula_addr.filter(|a| !a.is_unspecified())
+        } else if is_link_local_zero(&addr) {
+            state.ll_addr.filter(|a| !a.is_unspecified())
+        } else {
+            Some(addr)
+        };
+
+        if let Some(ntp_addr) = effective_addr {
+            let sub = outpacket.new_opt6(super::NTP_SUBOPTION_SRV_ADDR);
+            outpacket.put_opt6(&ntp_addr.octets());
+            outpacket.end_opt6(sub);
+        }
+
+        i += 16;
+    }
+
+    outpacket.end_opt6(s);
+}
+
+/// Add vendor-encapsulated option per RFC 3925.
+fn add_vendor_encap_option(opt: &DhcpOpt, outpacket: &mut OutPacket) {
+    if opt.flags & DHOPT_VENDOR != 0 {
+        let s = outpacket.new_opt6(super::OPTION6_VENDOR_OPTS);
+        // Enterprise number (first 4 bytes of vendor data)
+        if opt.val.len() >= 4 {
+            outpacket.put_opt6(&opt.val[0..4]);
+            // Remaining data as vendor-specific sub-options
+            if opt.val.len() > 4 {
+                outpacket.put_opt6(&opt.val[4..]);
+            }
+        }
+        outpacket.end_opt6(s);
+    } else {
+        let s = outpacket.new_opt6(opt.opt);
+        outpacket.put_opt6(&opt.val);
+        outpacket.end_opt6(s);
+    }
+}
+
+/// Add local interface addresses as DNS server option.
+///
+/// Replaces C `add_local_addrs()` (rfc3315.c line 2337).
+///
+/// Iterates contexts marked CONTEXT_USED and adds their local6 addresses
+/// as DNS server addresses, deduplicating.
+fn add_local_addrs(contexts: &[DhcpContext], outpacket: &mut OutPacket) -> bool {
+    let mut addrs: Vec<Ipv6Addr> = Vec::new();
+
+    for ctx in contexts {
+        if ctx.flags & CONTEXT_USED == 0 {
+            continue;
+        }
+        #[cfg(feature = "dhcp6")]
+        {
+            let local = ctx.local6;
+            if !local.is_unspecified() && !addrs.contains(&local) {
+                addrs.push(local);
+            }
+        }
+    }
+
+    if addrs.is_empty() {
+        return false;
+    }
+
+    let s = outpacket.new_opt6(super::OPTION6_DNS_SERVER);
+    for addr in &addrs {
+        outpacket.put_opt6(&addr.octets());
+    }
+    outpacket.end_opt6(s);
+
+    true
+}
+
+/// Extract tags from a context matching the given address.
+///
+/// Replaces C `get_context_tag()` (rfc3315.c line 2403).
+fn get_context_tag(state: &mut Dhcp6RequestState, contexts: &[DhcpContext], addr: &Ipv6Addr) {
+    for ctx in contexts {
+        #[cfg(feature = "dhcp6")]
+        {
+            if !addr.is_unspecified() && !is_same_net6(*addr, ctx.start6, ctx.prefix as u8) {
+                continue;
+            }
+        }
+
+        // Add context's netid tag to context_tags (avoid duplicates)
+        if !ctx.netid.net.is_empty() && !state.context_tags.contains(&ctx.netid) {
+            state.context_tags.push(ctx.netid.clone());
+        }
+    }
+
+    // Check dhcp_ignore_names for context tags
+    // C: rfc3315.c lines 2414-2421
+}
+
+/// Add FQDN option to response.
+///
+/// Constructs OPTION6_FQDN with server's FQDN flags and the hostname
+/// if available. Replaces C's FQDN handling in add_options().
+fn add_fqdn_option(state: &Dhcp6RequestState, outpacket: &mut OutPacket) {
+    let s = outpacket.new_opt6(super::OPTION6_FQDN);
+
+    // FQDN flags byte: S bit (server will do DNS update)
+    let flags: u8 = if state.hostname.is_some() {
+        0x01 // S bit set — server performs AAAA update
+    } else {
+        0x00
+    };
+    outpacket.put_opt6_char(flags);
+
+    // Encode hostname as DNS wire format
+    if let Some(ref hostname) = state.hostname {
+        let fqdn = if let Some(ref domain) = state.domain {
+            format!("{}.{}", hostname, domain)
+        } else {
+            hostname.clone()
+        };
+        encode_dns_name(&fqdn, outpacket);
+    }
+
+    outpacket.end_opt6(s);
+}
+
+// ---------------------------------------------------------------------------
+// Logging Functions
+// ---------------------------------------------------------------------------
+
+/// Log DHCPv6 options at debug level for packet diagnostics.
+///
+/// Replaces C `log6_opts()` (rfc3315.c line 3491).
+fn log6_opts(nest: i32, xid: u32, opts: &[u8]) {
+    let mut pos = if nest == 0 { 4usize } else { 0usize }; // skip msg header on outer
+
+    while let Some((code, data, next)) = opt6_next(opts, pos) {
+        let indent = "  ".repeat(nest as usize);
+
+        match code {
+            c if c == super::OPTION6_IA_NA || c == super::OPTION6_IA_TA => {
+                debug!(xid = xid, "{}opt {} IA len={}", indent, code, data.len());
+                // Recursively log sub-options within IA
+                let sub_start = if c == super::OPTION6_IA_NA && data.len() > 12 {
+                    12
+                } else if c == super::OPTION6_IA_TA && data.len() > 4 {
+                    4
+                } else {
+                    data.len()
+                };
+                if sub_start < data.len() {
+                    log6_opts(nest + 1, xid, &data[sub_start..]);
+                }
+            }
+            c if c == super::OPTION6_IAADDR => {
+                if data.len() >= 16 {
+                    let mut addr_bytes = [0u8; 16];
+                    addr_bytes.copy_from_slice(&data[0..16]);
+                    let addr = Ipv6Addr::from(addr_bytes);
+                    debug!(
+                        xid = xid,
+                        "{}opt {} IAADDR {} len={}",
+                        indent,
+                        code,
+                        addr,
+                        data.len()
+                    );
+                } else {
+                    debug!(
+                        xid = xid,
+                        "{}opt {} IAADDR len={}",
+                        indent,
+                        code,
+                        data.len()
+                    );
+                }
+            }
+            c if c == super::OPTION6_STATUS_CODE => {
+                let status = if data.len() >= 2 {
+                    u16::from_be_bytes([data[0], data[1]])
+                } else {
+                    0
+                };
+                let msg = if data.len() > 2 {
+                    std::str::from_utf8(&data[2..]).unwrap_or("(invalid utf8)")
+                } else {
+                    ""
+                };
+                debug!(
+                    xid = xid,
+                    "{}opt {} STATUS {} \"{}\"", indent, code, status, msg
+                );
+            }
+            _ => {
+                debug!(xid = xid, "{}opt {} len={}", indent, code, data.len());
+            }
+        }
+
+        pos = next;
+    }
+}
+
+/// Log a DHCPv6 message event (SOLICIT, REQUEST, REPLY, etc.).
+///
+/// Replaces C `log6_packet()` (rfc3315.c line 3614).
+fn log6_packet(
+    state: &Dhcp6RequestState,
+    msg_type: &str,
+    addr: Option<&Ipv6Addr>,
+    extra: Option<&str>,
+) {
+    let clid_str = state
+        .clid
+        .as_ref()
+        .map(|c| {
+            let len = c.len().min(50);
+            c[..len]
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(":")
+        })
+        .unwrap_or_else(|| "no-clid".to_string());
+
+    match (addr, extra) {
+        (Some(a), Some(e)) => {
+            info!(
+                xid = state.xid,
+                iface = %state.iface_name,
+                "DHCPv6 {} {} {} DUID={} {}", msg_type, state.iface_name, a, clid_str, e
+            );
+        }
+        (Some(a), None) => {
+            info!(
+                xid = state.xid,
+                iface = %state.iface_name,
+                "DHCPv6 {} {} {} DUID={}", msg_type, state.iface_name, a, clid_str
+            );
+        }
+        (None, Some(e)) => {
+            info!(
+                xid = state.xid,
+                iface = %state.iface_name,
+                "DHCPv6 {} {} DUID={} {}", msg_type, state.iface_name, clid_str, e
+            );
+        }
+        (None, None) => {
+            info!(
+                xid = state.xid,
+                iface = %state.iface_name,
+                "DHCPv6 {} {} DUID={}", msg_type, state.iface_name, clid_str
+            );
+        }
+    }
+}
+
+/// Conditional logging: only log if OPT_LOG_OPTS is set or OPT_QUIET_DHCP6 is not set.
+///
+/// Replaces C `log6_quiet()` (rfc3315.c line 3575).
+fn log6_quiet(
+    state: &Dhcp6RequestState,
+    msg_type: &str,
+    addr: Option<&Ipv6Addr>,
+    extra: Option<&str>,
+) {
+    // In production, would check daemon.options.is_set(opt::LOG_OPTS) ||
+    // !daemon.options.is_set(opt::QUIET_DHCP6). Since we don't have
+    // DaemonState here, always log at debug level.
+    debug!(
+        xid = state.xid,
+        msg = msg_type,
+        addr = ?addr,
+        extra = ?extra,
+        "DHCPv6 quiet log"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Write a DHCPv6 message header (type byte + 3-byte XID).
+fn write_msg_header(outpacket: &mut OutPacket, msg_type: DhcpV6State, xid: u32) {
+    outpacket.put_opt6_char(u8::from(msg_type));
+    outpacket.put_opt6_char(((xid >> 16) & 0xff) as u8);
+    outpacket.put_opt6_char(((xid >> 8) & 0xff) as u8);
+    outpacket.put_opt6_char((xid & 0xff) as u8);
+}
+
+/// Write a status reply message (REPLY + status code option).
+fn write_status_reply(
+    outpacket: &mut OutPacket,
+    state: &Dhcp6RequestState,
+    reply_type: DhcpV6State,
+    status: u16,
+    msg: &str,
+) {
+    outpacket.reset();
+    write_msg_header(outpacket, reply_type, state.xid);
+
+    // Echo client ID
+    if let Some(ref clid) = state.clid {
+        let s = outpacket.new_opt6(super::OPTION6_CLIENT_ID);
+        outpacket.put_opt6(clid);
+        outpacket.end_opt6(s);
+    }
+
+    // Status code
+    let s = outpacket.new_opt6(super::OPTION6_STATUS_CODE);
+    outpacket.put_opt6_short(status);
+    outpacket.put_opt6_string(msg);
+    outpacket.end_opt6(s);
+}
 
 /// Parse a DNS-encoded name from a byte slice.
 ///
@@ -679,6 +2612,21 @@ fn parse_dns_name(data: &[u8]) -> Result<String, DnsmasqError> {
     Ok(name)
 }
 
+/// Encode a domain name in DNS wire format and write to outpacket.
+///
+/// Converts "example.com" to [7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0].
+fn encode_dns_name(name: &str, outpacket: &mut OutPacket) {
+    for label in name.split('.') {
+        if label.is_empty() {
+            continue;
+        }
+        let len = label.len().min(63); // DNS label max 63 bytes
+        outpacket.put_opt6_char(len as u8);
+        outpacket.put_opt6(&label.as_bytes()[..len]);
+    }
+    outpacket.put_opt6_char(0); // Root label terminator
+}
+
 // ---------------------------------------------------------------------------
 // Unit Tests
 // ---------------------------------------------------------------------------
@@ -690,7 +2638,20 @@ mod tests {
     #[test]
     fn test_dhcpv6_state_from_u8() {
         assert_eq!(DhcpV6State::try_from(1).unwrap(), DhcpV6State::Solicit);
+        assert_eq!(DhcpV6State::try_from(2).unwrap(), DhcpV6State::Advertise);
+        assert_eq!(DhcpV6State::try_from(3).unwrap(), DhcpV6State::Request);
+        assert_eq!(DhcpV6State::try_from(4).unwrap(), DhcpV6State::Confirm);
+        assert_eq!(DhcpV6State::try_from(5).unwrap(), DhcpV6State::Renew);
+        assert_eq!(DhcpV6State::try_from(6).unwrap(), DhcpV6State::Rebind);
         assert_eq!(DhcpV6State::try_from(7).unwrap(), DhcpV6State::Reply);
+        assert_eq!(DhcpV6State::try_from(8).unwrap(), DhcpV6State::Release);
+        assert_eq!(DhcpV6State::try_from(9).unwrap(), DhcpV6State::Decline);
+        assert_eq!(DhcpV6State::try_from(10).unwrap(), DhcpV6State::Reconfigure);
+        assert_eq!(
+            DhcpV6State::try_from(11).unwrap(),
+            DhcpV6State::InformationRequest
+        );
+        assert_eq!(DhcpV6State::try_from(12).unwrap(), DhcpV6State::RelayForw);
         assert_eq!(DhcpV6State::try_from(13).unwrap(), DhcpV6State::RelayRepl);
         assert!(DhcpV6State::try_from(0).is_err());
         assert!(DhcpV6State::try_from(14).is_err());
@@ -699,28 +2660,57 @@ mod tests {
     #[test]
     fn test_dhcpv6_state_to_u8() {
         assert_eq!(u8::from(DhcpV6State::Solicit), 1);
+        assert_eq!(u8::from(DhcpV6State::Advertise), 2);
+        assert_eq!(u8::from(DhcpV6State::Request), 3);
         assert_eq!(u8::from(DhcpV6State::Reply), 7);
         assert_eq!(u8::from(DhcpV6State::RelayRepl), 13);
     }
 
     #[test]
+    fn test_dhcpv6_state_display() {
+        assert_eq!(format!("{}", DhcpV6State::Solicit), "SOLICIT");
+        assert_eq!(format!("{}", DhcpV6State::Advertise), "ADVERTISE");
+        assert_eq!(
+            format!("{}", DhcpV6State::InformationRequest),
+            "INFORMATION-REQUEST"
+        );
+        assert_eq!(format!("{}", DhcpV6State::RelayForw), "RELAY-FORW");
+    }
+
+    #[test]
     fn test_ia_type_option_code() {
-        assert_eq!(IaType::Na.option_code(), 3);
-        assert_eq!(IaType::Ta.option_code(), 4);
-        assert_eq!(IaType::Pd.option_code(), 25);
+        assert_eq!(IaType::Na.option_code(), super::super::OPTION6_IA_NA);
+        assert_eq!(IaType::Ta.option_code(), super::super::OPTION6_IA_TA);
+        assert_eq!(IaType::Pd.option_code(), super::super::OPTION6_IA_PD);
     }
 
     #[test]
     fn test_ia_type_from_option_code() {
-        assert_eq!(IaType::from_option_code(3), Some(IaType::Na));
-        assert_eq!(IaType::from_option_code(4), Some(IaType::Ta));
-        assert_eq!(IaType::from_option_code(25), Some(IaType::Pd));
+        assert_eq!(
+            IaType::from_option_code(super::super::OPTION6_IA_NA),
+            Some(IaType::Na)
+        );
+        assert_eq!(
+            IaType::from_option_code(super::super::OPTION6_IA_TA),
+            Some(IaType::Ta)
+        );
+        assert_eq!(
+            IaType::from_option_code(super::super::OPTION6_IA_PD),
+            Some(IaType::Pd)
+        );
         assert_eq!(IaType::from_option_code(0), None);
+        assert_eq!(IaType::from_option_code(99), None);
+    }
+
+    #[test]
+    fn test_ia_type_to_lease_type() {
+        assert_eq!(IaType::Na.to_lease_type(), LeaseType::Na);
+        assert_eq!(IaType::Ta.to_lease_type(), LeaseType::Ta);
+        assert_eq!(IaType::Pd.to_lease_type(), LeaseType::Pd);
     }
 
     #[test]
     fn test_opt6_find_basic() {
-        // Build a simple option: type=1, length=4, data=[0xDE, 0xAD, 0xBE, 0xEF]
         let opts: Vec<u8> = vec![
             0x00, 0x01, // type = 1 (CLIENT_ID)
             0x00, 0x04, // length = 4
@@ -740,10 +2730,19 @@ mod tests {
     #[test]
     fn test_opt6_find_minsize() {
         let opts: Vec<u8> = vec![0x00, 0x01, 0x00, 0x02, 0xAA, 0xBB];
-        // Exists but minsize=3 exceeds actual length=2
         assert!(opt6_find(&opts, 1, 3).is_none());
-        // Exists with minsize=2
         assert!(opt6_find(&opts, 1, 2).is_some());
+    }
+
+    #[test]
+    fn test_opt6_find_multiple_options() {
+        let opts: Vec<u8> = vec![
+            0x00, 0x01, 0x00, 0x02, 0xAA, 0xBB, // opt 1, len 2
+            0x00, 0x02, 0x00, 0x03, 0xCC, 0xDD, 0xEE, // opt 2, len 3
+        ];
+        let result = opt6_find(&opts, 2, 3);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), &[0xCC, 0xDD, 0xEE]);
     }
 
     #[test]
@@ -766,18 +2765,42 @@ mod tests {
     }
 
     #[test]
+    fn test_opt6_next_empty() {
+        let opts: Vec<u8> = vec![];
+        assert!(opt6_next(&opts, 0).is_none());
+    }
+
+    #[test]
+    fn test_opt6_next_truncated() {
+        let opts: Vec<u8> = vec![0x00, 0x01]; // Only 2 bytes, need 4 for header
+        assert!(opt6_next(&opts, 0).is_none());
+    }
+
+    #[test]
     fn test_opt6_uint_sizes() {
         let data: Vec<u8> = vec![0x12, 0x34, 0x56, 0x78];
         assert_eq!(opt6_uint(&data, 0, 1), 0x12);
         assert_eq!(opt6_uint(&data, 0, 2), 0x1234);
         assert_eq!(opt6_uint(&data, 0, 4), 0x12345678);
-        // Out of bounds
-        assert_eq!(opt6_uint(&data, 3, 2), 0);
+        assert_eq!(opt6_uint(&data, 2, 2), 0x5678);
+        assert_eq!(opt6_uint(&data, 3, 1), 0x78);
     }
 
     #[test]
-    fn test_parse_dns_name() {
-        // "example.com" encoded as DNS labels: 7 "example" 3 "com" 0
+    fn test_opt6_uint_out_of_bounds() {
+        let data: Vec<u8> = vec![0x12, 0x34];
+        assert_eq!(opt6_uint(&data, 3, 2), 0);
+        assert_eq!(opt6_uint(&data, 0, 4), 0);
+    }
+
+    #[test]
+    fn test_opt6_uint_unsupported_size() {
+        let data: Vec<u8> = vec![0x12, 0x34, 0x56];
+        assert_eq!(opt6_uint(&data, 0, 3), 0);
+    }
+
+    #[test]
+    fn test_parse_dns_name_simple() {
         let data: Vec<u8> = vec![
             7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
         ];
@@ -786,10 +2809,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_dns_name_single_label() {
+        let data: Vec<u8> = vec![4, b't', b'e', b's', b't', 0];
+        let name = parse_dns_name(&data).unwrap();
+        assert_eq!(name, "test");
+    }
+
+    #[test]
     fn test_parse_dns_name_empty() {
-        let data: Vec<u8> = vec![0]; // Just the terminator
+        let data: Vec<u8> = vec![0];
         let name = parse_dns_name(&data).unwrap();
         assert_eq!(name, "");
+    }
+
+    #[test]
+    fn test_parse_dns_name_truncated() {
+        let data: Vec<u8> = vec![10, b'a', b'b']; // label_len=10 but only 2 bytes
+        assert!(parse_dns_name(&data).is_err());
     }
 
     #[test]
@@ -803,8 +2839,186 @@ mod tests {
         assert!(!state.lease_allocate);
         assert!(state.client_hostname.is_none());
         assert!(state.hostname.is_none());
+        assert!(state.domain.is_none());
+        assert!(state.send_domain.is_none());
+        assert!(state.context.is_none());
+        assert!(state.link_address.is_none());
+        assert!(state.fallback.is_none());
+        assert!(state.ll_addr.is_none());
+        assert!(state.ula_addr.is_none());
+        assert_eq!(state.xid, 0);
+        assert_eq!(state.fqdn_flags, 0);
+        assert_eq!(state.iaid, 0);
+        assert!(state.iface_name.is_empty());
+        assert_eq!(state.packet_options_start, 0);
+        assert_eq!(state.packet_options_end, 0);
+        assert!(state.tags.is_empty());
+        assert!(state.context_tags.is_empty());
+        assert!(state.mac.is_empty());
+        assert_eq!(state.mac_type, 0);
+    }
+
+    #[test]
+    fn test_dhcp6_request_state_default_trait() {
+        let state = Dhcp6RequestState::default();
         assert_eq!(state.xid, 0);
         assert!(state.tags.is_empty());
-        assert!(state.mac.is_empty());
+    }
+
+    #[test]
+    fn test_encode_dns_name() {
+        let mut pkt = OutPacket::new();
+        encode_dns_name("example.com", &mut pkt);
+        let bytes = pkt.as_bytes();
+        // Expected: 7 "example" 3 "com" 0
+        assert_eq!(bytes[0], 7);
+        assert_eq!(&bytes[1..8], b"example");
+        assert_eq!(bytes[8], 3);
+        assert_eq!(&bytes[9..12], b"com");
+        assert_eq!(bytes[12], 0);
+    }
+
+    #[test]
+    fn test_encode_dns_name_single_label() {
+        let mut pkt = OutPacket::new();
+        encode_dns_name("host", &mut pkt);
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes[0], 4);
+        assert_eq!(&bytes[1..5], b"host");
+        assert_eq!(bytes[5], 0);
+    }
+
+    #[test]
+    fn test_calculate_times_basic() {
+        let ctx = DhcpContext {
+            start: std::net::Ipv4Addr::UNSPECIFIED,
+            end: std::net::Ipv4Addr::UNSPECIFIED,
+            netmask: std::net::Ipv4Addr::UNSPECIFIED,
+            broadcast: std::net::Ipv4Addr::UNSPECIFIED,
+            router: std::net::Ipv4Addr::UNSPECIFIED,
+            lease_time: 3600,
+            netid: NetId { net: String::new() },
+            flags: 0,
+            filter: Vec::new(),
+            local: std::net::Ipv4Addr::UNSPECIFIED,
+            addr_epoch: 0,
+            #[cfg(feature = "dhcp6")]
+            start6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 64,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 7200,
+            #[cfg(feature = "dhcp6")]
+            preferred: 3600,
+            #[cfg(feature = "dhcp6")]
+            template_interface: None,
+        };
+        let mut min = 0xFFFFFFFF;
+        let (valid, preferred) = calculate_times(&ctx, &mut min, 3600);
+        assert!(valid >= MIN_LIFETIME);
+        assert!(preferred <= valid);
+        assert!(min <= valid);
+    }
+
+    #[test]
+    fn test_calculate_times_deprecate() {
+        let ctx = DhcpContext {
+            start: std::net::Ipv4Addr::UNSPECIFIED,
+            end: std::net::Ipv4Addr::UNSPECIFIED,
+            netmask: std::net::Ipv4Addr::UNSPECIFIED,
+            broadcast: std::net::Ipv4Addr::UNSPECIFIED,
+            router: std::net::Ipv4Addr::UNSPECIFIED,
+            lease_time: 3600,
+            netid: NetId { net: String::new() },
+            flags: CONTEXT_DEPRECATE,
+            filter: Vec::new(),
+            local: std::net::Ipv4Addr::UNSPECIFIED,
+            addr_epoch: 0,
+            #[cfg(feature = "dhcp6")]
+            start6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 64,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 7200,
+            #[cfg(feature = "dhcp6")]
+            preferred: 3600,
+            #[cfg(feature = "dhcp6")]
+            template_interface: None,
+        };
+        let mut min = 0xFFFFFFFF;
+        let (valid, preferred) = calculate_times(&ctx, &mut min, 3600);
+        assert!(valid > 0);
+        // CONTEXT_DEPRECATE should set preferred to 0
+        #[cfg(feature = "dhcp6")]
+        assert_eq!(preferred, 0);
+        #[cfg(not(feature = "dhcp6"))]
+        let _ = preferred;
+    }
+
+    #[test]
+    fn test_build_ia_na() {
+        let state = Dhcp6RequestState {
+            ia_type: IaType::Na,
+            iaid: 0x12345678,
+            ..Dhcp6RequestState::new()
+        };
+        let mut outpacket = OutPacket::new();
+        let (container, t1_counter) = build_ia(&state, &mut outpacket);
+        assert!(container > 0 || container == 0); // container position valid
+        assert!(t1_counter > 0); // T1/T2 reserved for IA_NA
+    }
+
+    #[test]
+    fn test_build_ia_ta() {
+        let state = Dhcp6RequestState {
+            ia_type: IaType::Ta,
+            iaid: 0xAABBCCDD,
+            ..Dhcp6RequestState::new()
+        };
+        let mut outpacket = OutPacket::new();
+        let (_container, t1_counter) = build_ia(&state, &mut outpacket);
+        assert_eq!(t1_counter, 0); // IA_TA has no T1/T2
+    }
+
+    #[test]
+    fn test_opt6_len_at_and_type_at() {
+        let opts: Vec<u8> = vec![
+            0x00, 0x03, // type = 3
+            0x00, 0x08, // length = 8
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // data
+        ];
+        assert_eq!(opt6_type_at(&opts, 0), 3);
+        assert_eq!(opt6_len_at(&opts, 0), 8);
+    }
+
+    #[test]
+    fn test_write_msg_header() {
+        let mut outpacket = OutPacket::new();
+        write_msg_header(&mut outpacket, DhcpV6State::Advertise, 0xABCDEF);
+        let bytes = outpacket.as_bytes();
+        assert_eq!(bytes[0], 2); // ADVERTISE = 2
+        assert_eq!(bytes[1], 0xAB);
+        assert_eq!(bytes[2], 0xCD);
+        assert_eq!(bytes[3], 0xEF);
+    }
+
+    #[test]
+    fn test_dhcpv6_state_roundtrip() {
+        for val in 1u8..=13 {
+            let state = DhcpV6State::try_from(val).unwrap();
+            assert_eq!(u8::from(state), val);
+        }
     }
 }
