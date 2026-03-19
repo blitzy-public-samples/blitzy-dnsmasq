@@ -10,6 +10,7 @@ pub mod cache;
 pub mod domain;
 pub mod domain_match;
 pub mod edns;
+pub mod forward;
 pub mod protocol;
 pub mod rrfilter;
 

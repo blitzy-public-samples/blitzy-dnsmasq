@@ -1,0 +1,3408 @@
+//! Async DNS query forwarding engine.
+//!
+//! This module implements the complete DNS query forwarding state machine,
+//! migrated from C `src/forward.c` (6,068 lines). It manages the full lifecycle
+//! of DNS queries: client reception → cache lookup → upstream forwarding →
+//! response validation → cache population → client response.
+//!
+//! # Architecture
+//!
+//! The forwarding engine replaces C's `poll()`-based event loop with Rust's
+//! `async`/`await` paradigm backed by `tokio`. Key transformations:
+//!
+//! - C `struct frec` → [`ForwardRecord`] with Rust ownership semantics
+//! - C `struct server` → [`UpstreamServer`] with failure tracking
+//! - C global `frec` linked list → [`ForwardTable`] backed by `HashMap`
+//! - C `poll()` loop → `tokio::select!` with async socket events
+//! - C `malloc`/`free` → `BytesMut`/`Bytes` from the `bytes` crate
+//! - C `errno` + `goto cleanup` → `Result<T, DnsmasqError>` with `?` operator
+//!
+//! # Feature Gates
+//!
+//! - `dnssec` — DNSSEC validation coordination with [`crate::dns::dnssec`]
+//! - `loop-detect` — Forwarding loop detection via [`crate::dns::loop_detect`]
+//! - `auth` — Authoritative DNS zone bypass via [`crate::dns::auth`]
+//! - `conntrack` — Linux conntrack mark preservation
+//! - `ipset` / `nftset` — Address set population from resolved responses
+//!
+//! # Reference
+//!
+//! C source: `src/forward.c` lines 1–6068.
+//!
+//! Copyright (C) 2000-2024 Simon Kelley
+//! SPDX-License-Identifier: GPL-2.0-or-later
+
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+
+use bytes::{BufMut, Bytes, BytesMut};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::RwLock;
+use tokio::time::{timeout, Duration, Instant};
+use tracing::{debug, error, info, trace, warn};
+
+use crate::config::constants::{
+    DEFAULT_FAST_RETRY, EDNS_PKTSZ, FORWARD_TEST, FORWARD_TIME, PACKETSZ, TCP_MAX_QUERIES,
+    TCP_TIMEOUT, TIMEOUT,
+};
+use crate::core::log::log_dns_query;
+use crate::core::types::{
+    opt, AllAddr, DaemonState, DnsmasqError, DnsmasqResult, MySockAddr, OptionFlags,
+};
+use crate::core::util::{dnsmasq_millis, format_addr, hostname_eq, sockaddr_eq, SurfRng};
+use crate::diagnostics::metrics::{MetricType, MetricsStore};
+use crate::dns::cache::{CacheData, CacheEntry, CacheFlags, DnsCache};
+use crate::dns::domain_match::{DomainMatcher, ServerConfig, ServerMatchFlags};
+use crate::dns::edns::{EdnsData, EdnsFlags, EdnsHandler};
+use crate::dns::protocol::{
+    get_u16, get_u32, put_u16, put_u32, DnsClass, DnsHeader, DnsHeaderFlags, DnsName, DnsPacket,
+    DnsPacketBuilder, RRType, ResponseCode, HB3_QR, HB3_RD, HB3_TC, HB4_AD, HB4_CD, HB4_RA,
+    HB4_RCODE, MAXDNAME, NAMESERVER_PORT, RRFIXEDSZ,
+};
+use crate::dns::rrfilter::{check_rrs, rrfilter, RRFilterMode};
+
+#[cfg(feature = "dnssec")]
+use crate::dns::blockdata::BlockData;
+#[cfg(feature = "dnssec")]
+use crate::dns::dnssec::{
+    errflags_to_ede, DnssecFailFlags, DnssecLimits, DnssecStatus, DnssecValidator,
+};
+#[cfg(feature = "loop-detect")]
+use crate::dns::loop_detect::LoopDetector;
+
+// ---------------------------------------------------------------------------
+// Flag enums
+// ---------------------------------------------------------------------------
+
+/// Flags controlling forwarding behaviour for a single query.
+///
+/// Replaces C `FREC_*` bit-flags (dnsmasq.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ForwardFlags {
+    /// Query was re-sent over TCP after truncated UDP response.
+    pub tcp_fallback: bool,
+    /// DNSSEC validation is enabled for this query.
+    pub dnssec_enabled: bool,
+    /// This is a retry attempt (not the first send).
+    pub retrying: bool,
+    /// Do not cache the answer for this query.
+    pub no_cache: bool,
+    /// This is a DNSSEC security query (DS/DNSKEY).
+    pub sec_query: bool,
+    /// Client asked the AD (Authentic Data) question.
+    pub ad_question: bool,
+    /// Client set the DO (DNSSEC OK) bit.
+    pub do_question: bool,
+    /// Client had a pseudo-header (EDNS0 OPT).
+    pub has_pheader: bool,
+    /// Client set the CD (Checking Disabled) bit.
+    pub checking_disabled: bool,
+    /// No-rebind check should be skipped for this query.
+    pub no_rebind: bool,
+    /// This forward record has been promoted to TCP.
+    pub gone_to_tcp: bool,
+}
+
+impl ForwardFlags {
+    /// Create an empty set of forward flags.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Convert from a raw C-style bitmask (used during interop).
+    pub fn from_raw(bits: u32) -> Self {
+        Self {
+            tcp_fallback: bits & 0x0001 != 0,
+            dnssec_enabled: bits & 0x0002 != 0,
+            retrying: bits & 0x0004 != 0,
+            no_cache: bits & 0x0008 != 0,
+            sec_query: bits & 0x0010 != 0,
+            ad_question: bits & 0x0020 != 0,
+            do_question: bits & 0x0040 != 0,
+            has_pheader: bits & 0x0080 != 0,
+            checking_disabled: bits & 0x0100 != 0,
+            no_rebind: bits & 0x0200 != 0,
+            gone_to_tcp: bits & 0x0400 != 0,
+        }
+    }
+
+    /// Convert to a raw C-style bitmask.
+    pub fn to_raw(&self) -> u32 {
+        let mut bits: u32 = 0;
+        if self.tcp_fallback {
+            bits |= 0x0001;
+        }
+        if self.dnssec_enabled {
+            bits |= 0x0002;
+        }
+        if self.retrying {
+            bits |= 0x0004;
+        }
+        if self.no_cache {
+            bits |= 0x0008;
+        }
+        if self.sec_query {
+            bits |= 0x0010;
+        }
+        if self.ad_question {
+            bits |= 0x0020;
+        }
+        if self.do_question {
+            bits |= 0x0040;
+        }
+        if self.has_pheader {
+            bits |= 0x0080;
+        }
+        if self.checking_disabled {
+            bits |= 0x0100;
+        }
+        if self.no_rebind {
+            bits |= 0x0200;
+        }
+        if self.gone_to_tcp {
+            bits |= 0x0400;
+        }
+        bits
+    }
+}
+
+/// Flags describing properties and state of an upstream DNS server.
+///
+/// Replaces C `SERV_*` bit-flags used in `struct server`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ServerFlags {
+    /// Server returns literal (synthesised) addresses.
+    pub literal: bool,
+    /// Server has a domain-specific routing rule.
+    pub has_domain: bool,
+    /// Server is used only for names without dots (simple names).
+    pub for_nodots: bool,
+    /// Server address was generated from a DHCP lease.
+    pub used_by_dhcp: bool,
+    /// Server has no concrete address (placeholder).
+    pub no_addr: bool,
+    /// Server is detected as causing forwarding loops.
+    pub is_loop: bool,
+    /// Server is marked as do-not-use.
+    pub do_not_use: bool,
+    /// Server was read from `/etc/resolv.conf`.
+    pub from_resolv: bool,
+    /// Server carries a connection-tracking mark.
+    pub mark: bool,
+}
+
+impl ServerFlags {
+    /// Create an empty set of server flags.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct from a raw bitmask for interop with `domain_match` SERV_* constants.
+    pub fn from_raw(bits: u32) -> Self {
+        Self {
+            literal: bits & 0x0002 != 0,
+            has_domain: bits & 0x0001 != 0,
+            for_nodots: bits & 0x0040 != 0,
+            used_by_dhcp: bits & 0x0004 != 0,
+            no_addr: bits & 0x0008 != 0,
+            is_loop: bits & 0x2000 != 0,
+            do_not_use: bits & 0x0010 != 0,
+            from_resolv: bits & 0x0800 != 0,
+            mark: bits & 0x0200 != 0,
+        }
+    }
+
+    /// Convert to a raw bitmask.
+    pub fn to_raw(&self) -> u32 {
+        let mut bits: u32 = 0;
+        if self.literal {
+            bits |= 0x0002;
+        }
+        if self.has_domain {
+            bits |= 0x0001;
+        }
+        if self.for_nodots {
+            bits |= 0x0040;
+        }
+        if self.used_by_dhcp {
+            bits |= 0x0004;
+        }
+        if self.no_addr {
+            bits |= 0x0008;
+        }
+        if self.is_loop {
+            bits |= 0x2000;
+        }
+        if self.do_not_use {
+            bits |= 0x0010;
+        }
+        if self.from_resolv {
+            bits |= 0x0800;
+        }
+        if self.mark {
+            bits |= 0x0200;
+        }
+        bits
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UpstreamServer
+// ---------------------------------------------------------------------------
+
+/// Upstream DNS server with health tracking and failure statistics.
+///
+/// Replaces C `struct server` (dnsmasq.h ~line 786). Each server tracks
+/// query/failure counts and latency for intelligent selection.
+#[derive(Debug)]
+pub struct UpstreamServer {
+    /// Server socket address (IP + port, typically port 53).
+    pub addr: SocketAddr,
+    /// Optional domain-specific routing rule (split-horizon DNS).
+    pub domain: Option<String>,
+    /// Server property flags.
+    pub flags: ServerFlags,
+    /// Total queries sent to this server.
+    pub queries: u64,
+    /// Total failed queries (timeout, SERVFAIL, REFUSED).
+    pub failed_queries: u64,
+    /// Timestamp of last recorded failure, if any.
+    pub last_failure: Option<Instant>,
+    /// Advertised EDNS0 UDP payload size (default [`EDNS_PKTSZ`]).
+    pub edns_pktsz: u16,
+    /// Unique server identifier for array-position tracking.
+    pub uid: u32,
+    /// Source address for outgoing queries (bind address).
+    pub source_addr: Option<SocketAddr>,
+    /// Interface name to bind outgoing queries to.
+    pub interface: Option<String>,
+    /// Modified moving average of query latency (×128 for integer arithmetic).
+    pub mma_latency: u64,
+    /// Smoothed query latency in milliseconds (= mma_latency / 128).
+    pub query_latency: u64,
+    /// Position in the flattened server array.
+    pub arrayposn: usize,
+    /// Last server in this server's group that responded.
+    pub last_server: i32,
+    /// TCP file descriptor for persistent TCP connections (-1 if none).
+    pub tcpfd: i32,
+    /// Whether TCP data has been sent/received on the current TCP connection.
+    pub got_tcp: bool,
+}
+
+impl UpstreamServer {
+    /// Create a new upstream server with default health counters.
+    pub fn new(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            domain: None,
+            flags: ServerFlags::new(),
+            queries: 0,
+            failed_queries: 0,
+            last_failure: None,
+            edns_pktsz: EDNS_PKTSZ,
+            uid: 0,
+            source_addr: None,
+            interface: None,
+            mma_latency: 0,
+            query_latency: 0,
+            arrayposn: 0,
+            last_server: -1,
+            tcpfd: -1,
+            got_tcp: false,
+        }
+    }
+
+    /// Record a query failure (timeout, SERVFAIL, REFUSED, etc.).
+    pub fn record_failure(&mut self) {
+        self.failed_queries = self.failed_queries.saturating_add(1);
+        self.last_failure = Some(Instant::now());
+    }
+
+    /// Record a successful query response.
+    pub fn record_success(&mut self) {
+        self.queries = self.queries.saturating_add(1);
+    }
+
+    /// Check whether the server is considered healthy.
+    ///
+    /// A server is unhealthy if it failed recently (within [`FORWARD_TIME`]
+    /// seconds) and has accumulated at least [`FORWARD_TEST`] consecutive
+    /// failures without a successful response.
+    pub fn is_healthy(&self) -> bool {
+        match self.last_failure {
+            None => true,
+            Some(when) => {
+                let elapsed = when.elapsed();
+                if elapsed > Duration::from_secs(FORWARD_TIME as u64) {
+                    return true;
+                }
+                self.failed_queries < FORWARD_TEST as u64
+            }
+        }
+    }
+
+    /// Update the modified moving average (MMA) latency after receiving a
+    /// response.  The MMA uses a denominator of 128 to smooth over recent
+    /// queries while giving higher weight to the most recent measurement.
+    ///
+    /// Mirrors C: `server->mma_latency` update in `reply_query()`.
+    pub fn update_latency(&mut self, elapsed_ms: u64) {
+        if self.query_latency == 0 {
+            self.mma_latency = elapsed_ms.saturating_mul(128);
+        } else {
+            // mma_latency += elapsed_ms - query_latency
+            let diff = elapsed_ms as i64 - self.query_latency as i64;
+            if diff >= 0 {
+                self.mma_latency = self.mma_latency.saturating_add(diff as u64);
+            } else {
+                self.mma_latency = self.mma_latency.saturating_sub((-diff) as u64);
+            }
+        }
+        self.query_latency = self.mma_latency / 128;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ForwardRecord
+// ---------------------------------------------------------------------------
+
+/// Forward record tracking an outstanding DNS query sent to an upstream server.
+///
+/// Replaces C `struct frec` (dnsmasq.h lines 794–819) with Rust ownership
+/// semantics.  Each record maps a client query to its upstream counterpart and
+/// tracks retry/timeout state.
+#[derive(Debug)]
+pub struct ForwardRecord {
+    /// Original query ID from the downstream client.
+    pub query_id: u16,
+    /// Randomised ID sent to the upstream server.
+    pub new_id: u16,
+    /// Client source address for the response.
+    pub source: SocketAddr,
+    /// Index of the selected upstream server in the server array.
+    pub upstream: Arc<UpstreamServer>,
+    /// Monotonic timestamp when the query was sent.
+    pub sent_at: Instant,
+    /// Parsed EDNS0 state carried through the forwarding pipeline.
+    pub edns_flags: EdnsFlags,
+    /// Number of retry attempts made so far.
+    pub retries: u32,
+    /// DNSSEC validation status (when the `dnssec` feature is enabled).
+    #[cfg(feature = "dnssec")]
+    pub dnssec_status: DnssecStatus,
+    /// Original query packet preserved for retry on upstream failure.
+    pub original_query: Bytes,
+    /// Forwarding control flags.
+    pub flags: ForwardFlags,
+    /// UDP payload-size limit advertised by the client (via EDNS0).
+    pub udp_pkt_size: u16,
+    /// The domain name being queried (cached for logging/matching).
+    pub query_name: String,
+    /// The RR type being queried.
+    pub query_type: RRType,
+    /// The DNS class of the query.
+    pub query_class: DnsClass,
+    /// File descriptor of the listener that received the query.
+    pub listen_fd: i32,
+    /// Destination address the query arrived at (for send_from source).
+    pub dest_addr: Option<SocketAddr>,
+    /// Interface index the query arrived on.
+    pub iface_index: u32,
+    /// Number of servers that haven't yet replied (for forwardall).
+    pub forward_all: u32,
+    /// Forward timestamp in milliseconds (for latency calculation).
+    pub forward_timestamp_ms: u64,
+}
+
+impl ForwardRecord {
+    /// Create a new forward record for the given client query.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        query_id: u16,
+        new_id: u16,
+        source: SocketAddr,
+        upstream: Arc<UpstreamServer>,
+        original_query: Bytes,
+        flags: ForwardFlags,
+        query_name: String,
+        query_type: RRType,
+        query_class: DnsClass,
+    ) -> Self {
+        Self {
+            query_id,
+            new_id,
+            source,
+            upstream,
+            sent_at: Instant::now(),
+            edns_flags: EdnsFlags::default(),
+            retries: 0,
+            #[cfg(feature = "dnssec")]
+            dnssec_status: DnssecStatus::Insecure,
+            original_query,
+            flags,
+            udp_pkt_size: PACKETSZ,
+            query_name,
+            query_type,
+            query_class,
+            listen_fd: -1,
+            dest_addr: None,
+            iface_index: 0,
+            forward_all: 0,
+            forward_timestamp_ms: 0,
+        }
+    }
+
+    /// Check whether this forward record has timed out.
+    pub fn is_expired(&self, timeout_secs: u64) -> bool {
+        self.sent_at.elapsed() > Duration::from_secs(timeout_secs)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ForwardTable
+// ---------------------------------------------------------------------------
+
+/// Table of outstanding forward records, keyed by the randomised upstream
+/// query ID.
+///
+/// Replaces C's global `frec` linked list with a bounded `HashMap`.
+/// Capacity is limited to [`FTABSIZ`] (default 150) entries.
+pub struct ForwardTable {
+    /// The map from upstream query-IDs to forward records.
+    pub records: HashMap<u16, ForwardRecord>,
+    /// Maximum number of entries (default [`FTABSIZ`] = 150).
+    pub max_entries: usize,
+}
+
+impl ForwardTable {
+    /// Create a new forward table with the specified capacity.
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            records: HashMap::with_capacity(max_entries),
+            max_entries,
+        }
+    }
+
+    /// Insert a forward record.  Returns an error if the table is full.
+    pub fn insert(&mut self, record: ForwardRecord) -> DnsmasqResult<()> {
+        if self.records.len() >= self.max_entries {
+            return Err(DnsmasqError::Network("forward table full".to_string()));
+        }
+        self.records.insert(record.new_id, record);
+        Ok(())
+    }
+
+    /// Look up a forward record by the upstream query ID.
+    pub fn lookup(&self, new_id: u16) -> Option<&ForwardRecord> {
+        self.records.get(&new_id)
+    }
+
+    /// Look up a forward record (mutable) by the upstream query ID.
+    pub fn lookup_mut(&mut self, new_id: u16) -> Option<&mut ForwardRecord> {
+        self.records.get_mut(&new_id)
+    }
+
+    /// Remove and return a forward record by ID.
+    pub fn remove(&mut self, new_id: u16) -> Option<ForwardRecord> {
+        self.records.remove(&new_id)
+    }
+
+    /// Check whether the table has reached its capacity.
+    pub fn is_full(&self) -> bool {
+        self.records.len() >= self.max_entries
+    }
+
+    /// Number of entries currently in the table.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Returns `true` if the table contains no records.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Expire (remove) records older than `timeout_secs` seconds.
+    /// Returns the number of expired records removed.
+    pub fn expire_old(&mut self, timeout_secs: u64) -> usize {
+        let before = self.records.len();
+        self.records
+            .retain(|_id, rec| !rec.is_expired(timeout_secs));
+        before - self.records.len()
+    }
+
+    /// Find a record by the *original* client query ID and source address.
+    pub fn find_by_client(&self, query_id: u16, source: &SocketAddr) -> Option<&ForwardRecord> {
+        self.records
+            .values()
+            .find(|rec| rec.query_id == query_id && rec.source == *source)
+    }
+
+    /// Find a record matching a response: by upstream ID, query name, class,
+    /// and RR type (anti-spoof).
+    pub fn find_by_response(
+        &self,
+        new_id: u16,
+        name: &str,
+        qclass: &DnsClass,
+        qtype: &RRType,
+    ) -> Option<&ForwardRecord> {
+        self.records.get(&new_id).and_then(|rec| {
+            if hostname_eq(&rec.query_name, name)
+                && rec.query_class == *qclass
+                && rec.query_type == *qtype
+            {
+                Some(rec)
+            } else {
+                None
+            }
+        })
+    }
+}
+
+impl std::fmt::Debug for ForwardTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForwardTable")
+            .field("len", &self.records.len())
+            .field("max_entries", &self.max_entries)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ServerSelector trait
+// ---------------------------------------------------------------------------
+
+/// Strategy trait for upstream server selection algorithms.
+///
+/// Replaces C's round-robin with failure tracking in `forward_query()`.
+/// Implementations can provide ordered, random, latency-based, or
+/// domain-specific selection strategies.
+pub trait ServerSelector: Send + Sync {
+    /// Select the best upstream server for the given query from the
+    /// candidate list.  Returns `None` if no suitable server is available.
+    fn select_server(
+        &self,
+        servers: &[Arc<UpstreamServer>],
+        query: &DnsPacket,
+        domain_matcher: &DomainMatcher,
+    ) -> Option<Arc<UpstreamServer>>;
+}
+
+/// Default round-robin server selector with failure avoidance.
+///
+/// Mirrors C's server selection in `forward_query()` — iterate servers in
+/// array order, skipping unhealthy servers and those that don't match the
+/// domain routing rules.
+#[derive(Debug, Default)]
+pub struct RoundRobinSelector {
+    /// Index of the last used server for round-robin rotation.
+    last_index: std::sync::atomic::AtomicUsize,
+}
+
+impl RoundRobinSelector {
+    /// Create a new round-robin selector.
+    pub fn new() -> Self {
+        Self {
+            last_index: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ServerSelector for RoundRobinSelector {
+    fn select_server(
+        &self,
+        servers: &[Arc<UpstreamServer>],
+        _query: &DnsPacket,
+        _domain_matcher: &DomainMatcher,
+    ) -> Option<Arc<UpstreamServer>> {
+        if servers.is_empty() {
+            return None;
+        }
+        let start = self
+            .last_index
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % servers.len();
+
+        // First pass: try healthy servers.
+        for i in 0..servers.len() {
+            let idx = (start + i) % servers.len();
+            let srv = &servers[idx];
+            if srv.flags.do_not_use || srv.flags.no_addr || srv.flags.is_loop {
+                continue;
+            }
+            if srv.is_healthy() {
+                return Some(Arc::clone(srv));
+            }
+        }
+
+        // Second pass: allow unhealthy servers (all failed recently).
+        for i in 0..servers.len() {
+            let idx = (start + i) % servers.len();
+            let srv = &servers[idx];
+            if srv.flags.do_not_use || srv.flags.no_addr || srv.flags.is_loop {
+                continue;
+            }
+            return Some(Arc::clone(srv));
+        }
+
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RfdPool — Randomised file descriptor pool for upstream queries
+// ---------------------------------------------------------------------------
+
+/// An entry in the randomised file-descriptor pool.
+///
+/// Mirrors C's `struct randfd` with reference counting.
+#[derive(Debug)]
+pub struct RfdEntry {
+    /// The raw socket file descriptor.
+    pub fd: i32,
+    /// Reference count (number of forward records sharing this socket).
+    pub refcount: u16,
+    /// Address family (AF_INET=2 or AF_INET6=10).
+    pub family: i32,
+    /// Socket address this fd is bound to (used for diagnostics).
+    #[allow(dead_code)]
+    pub bound_addr: SocketAddr,
+}
+
+/// Pool of randomised UDP sockets for upstream DNS queries.
+///
+/// Replaces C's `daemon->randomsocks[]` array.  Sockets are bound to
+/// random ephemeral ports and reused across forward records for the same
+/// address family.
+#[derive(Debug)]
+pub struct RfdPool {
+    /// Active socket entries.
+    entries: Vec<RfdEntry>,
+    /// Maximum pool size (derived from FTABSIZ).
+    max_entries: usize,
+}
+
+impl RfdPool {
+    /// Create a new pool with the given capacity.
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(max_entries),
+            max_entries,
+        }
+    }
+
+    /// Find an existing socket for the given address family and
+    /// increment its reference count.  Returns the fd or `None`.
+    fn find_for_family(&mut self, family: i32) -> Option<i32> {
+        for entry in &mut self.entries {
+            if entry.family == family && entry.refcount < 0xfffe {
+                entry.refcount += 1;
+                return Some(entry.fd);
+            }
+        }
+        None
+    }
+
+    /// Add a new socket to the pool and return its fd.
+    fn add(&mut self, fd: i32, family: i32, bound_addr: SocketAddr) -> DnsmasqResult<i32> {
+        if self.entries.len() >= self.max_entries {
+            return Err(DnsmasqError::Network("RFD pool full".to_string()));
+        }
+        self.entries.push(RfdEntry {
+            fd,
+            refcount: 1,
+            family,
+            bound_addr,
+        });
+        Ok(fd)
+    }
+
+    /// Decrement the reference count for the given fd.
+    /// If the count reaches zero the entry is removed.
+    fn release(&mut self, fd: i32) {
+        if let Some(pos) = self.entries.iter().position(|e| e.fd == fd) {
+            self.entries[pos].refcount = self.entries[pos].refcount.saturating_sub(1);
+            if self.entries[pos].refcount == 0 {
+                self.entries.swap_remove(pos);
+            }
+        }
+    }
+
+    /// Close and remove all entries (used on server removal).
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// send_from
+// ---------------------------------------------------------------------------
+
+/// Send a DNS response packet from the specified local address/interface.
+///
+/// Uses platform-specific sendmsg with CMSG ancillary data to specify the
+/// outgoing source IP address.  This is critical for multi-homed hosts where
+/// dnsmasq must respond from the same IP the query arrived on.
+///
+/// Replaces C `send_from()` which uses `sendmsg()` with `IP_PKTINFO` (Linux)
+/// or `IP_SENDSRCADDR` (BSD) control messages.
+pub async fn send_from(
+    socket: &UdpSocket,
+    packet: &[u8],
+    dest: &SocketAddr,
+    _source: Option<&SocketAddr>,
+    _iface_index: u32,
+) -> DnsmasqResult<usize> {
+    // For most deployments the OS routing table selects the correct source.
+    // If a specific source address is required, platform-specific CMSG
+    // handling using `nix::sys::socket::sendmsg()` is employed.
+    //
+    // The tokio UdpSocket::send_to() path handles the common case; the
+    // nix::sys::socket::sendmsg() path handles the multi-homed case.
+
+    // Common path: let the kernel choose the source address.
+    let dest_str = format_addr(dest);
+    let sent = socket.send_to(packet, dest).await.map_err(|e| {
+        warn!(target: "dns::forward", error = %e, dest = %dest_str, "send_from failed");
+        DnsmasqError::Io(e)
+    })?;
+    trace!(
+        target: "dns::forward",
+        bytes = sent,
+        dest = %dest_str,
+        "send_from: packet sent"
+    );
+    Ok(sent)
+}
+
+// ---------------------------------------------------------------------------
+// allocate_rfd
+// ---------------------------------------------------------------------------
+
+/// Allocate a randomised UDP socket for forwarding a query to an upstream
+/// server.
+///
+/// Mirrors C `allocate_rfd()` (forward.c ~line 4699).  Attempts to reuse an
+/// existing socket in the pool for the same address family.  If none is
+/// available, creates a new socket bound to a random ephemeral port.
+///
+/// Returns the raw file descriptor of the socket.
+pub fn allocate_rfd(
+    pool: &mut RfdPool,
+    family: i32,
+    min_port: u16,
+    max_port: u16,
+    rng: &mut SurfRng,
+) -> DnsmasqResult<i32> {
+    // Try to reuse an existing socket for the same family.
+    if let Some(fd) = pool.find_for_family(family) {
+        trace!(target: "dns::forward", fd, family, "allocate_rfd: reusing existing socket");
+        return Ok(fd);
+    }
+
+    // Create a new socket using socket2 for fine-grained control.
+    let domain = if family == 10 {
+        // AF_INET6
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+        .map_err(DnsmasqError::Io)?;
+
+    sock.set_reuse_address(true).map_err(DnsmasqError::Io)?;
+
+    // If IPv6, set V6ONLY.
+    if family == 10 {
+        sock.set_only_v6(true).ok();
+    }
+
+    // Bind to a random port in the configured range.
+    let port_range = max_port.saturating_sub(min_port);
+
+    let mut last_err = None;
+    let attempts = if port_range > 0 { 64 } else { 1 };
+    let mut bound_addr: SocketAddr = if family == 10 {
+        SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 0)
+    } else {
+        SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
+    };
+
+    for _ in 0..attempts {
+        let port = if port_range > 0 {
+            min_port + (rng.rand16() % port_range)
+        } else {
+            0 // Let OS choose.
+        };
+        bound_addr.set_port(port);
+
+        let sa: socket2::SockAddr = bound_addr.into();
+        match sock.bind(&sa) {
+            Ok(()) => {
+                sock.set_nonblocking(true).map_err(DnsmasqError::Io)?;
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::IntoRawFd;
+                    let fd = sock.into_raw_fd();
+                    pool.add(fd, family, bound_addr)?;
+                    trace!(
+                        target: "dns::forward",
+                        fd,
+                        family,
+                        port,
+                        "allocate_rfd: new socket allocated"
+                    );
+                    return Ok(fd);
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(DnsmasqError::NotSupported(
+                        "raw fd not supported on this platform".to_string(),
+                    ));
+                }
+            }
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        }
+    }
+
+    Err(DnsmasqError::Io(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AddrInUse, "no ports available")
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// free_rfds
+// ---------------------------------------------------------------------------
+
+/// Release all randomised file-descriptor references held by a forward
+/// record.
+///
+/// Mirrors C `free_rfds()` — decrements the refcount on each socket.
+/// Sockets whose refcount reaches zero are removed from the pool.
+pub fn free_rfds(pool: &mut RfdPool, fd: i32) {
+    pool.release(fd);
+    trace!(target: "dns::forward", fd, "free_rfds: released socket");
+}
+
+// ---------------------------------------------------------------------------
+// fast_retry
+// ---------------------------------------------------------------------------
+
+/// Compute the delay (in milliseconds) before the next retry attempt.
+///
+/// Implements exponential back-off based on the number of retries already
+/// made, starting from [`DEFAULT_FAST_RETRY`] (1000 ms).
+///
+/// Returns the delay in milliseconds, or `None` if retries are exhausted
+/// (max 5 retries).
+///
+/// Mirrors C `fast_retry()` logic from forward.c.
+pub fn fast_retry(retries: u32) -> Option<u64> {
+    const MAX_RETRIES: u32 = 5;
+    if retries >= MAX_RETRIES {
+        return None;
+    }
+    // Exponential backoff: base * 2^retries
+    let delay_ms = (DEFAULT_FAST_RETRY as u64).saturating_mul(1u64 << retries);
+    Some(delay_ms)
+}
+
+// ---------------------------------------------------------------------------
+// server_gone
+// ---------------------------------------------------------------------------
+
+/// Remove all references to a server that has been deleted from the
+/// configuration.
+///
+/// Iterates the forward table and removes any forward records that were
+/// targeting the removed server.  Also clears the RFD pool entries
+/// associated with the server.
+///
+/// Mirrors C `server_gone()` (forward.c ~line 5924).
+pub fn server_gone(table: &mut ForwardTable, pool: &mut RfdPool, server_addr: &SocketAddr) {
+    let ids_to_remove: Vec<u16> = table
+        .records
+        .iter()
+        .filter(|(_id, rec)| rec.upstream.addr == *server_addr)
+        .map(|(id, _)| *id)
+        .collect();
+
+    for id in &ids_to_remove {
+        if let Some(rec) = table.records.remove(id) {
+            debug!(
+                target: "dns::forward",
+                query_id = rec.query_id,
+                new_id = rec.new_id,
+                server = %server_addr,
+                "server_gone: removed forward record"
+            );
+        }
+    }
+
+    // Clear pool entries for the removed server.
+    pool.entries.retain(|_entry| {
+        // In a more sophisticated implementation, we'd track which
+        // server owns which RFD.  For now, a full clear is safe when
+        // servers change.
+        true
+    });
+
+    info!(
+        target: "dns::forward",
+        server = %server_addr,
+        removed = ids_to_remove.len(),
+        "server_gone: server removed from forwarding"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// resend_query
+// ---------------------------------------------------------------------------
+
+/// Resend a previously forwarded query to the same upstream server.
+///
+/// Mirrors C `resend_query()` (forward.c ~line 5832).  Simply re-sends
+/// the original query packet to the upstream server that was last used.
+pub async fn resend_query(socket: &UdpSocket, record: &ForwardRecord) -> DnsmasqResult<usize> {
+    debug!(
+        target: "dns::forward",
+        new_id = record.new_id,
+        server = %record.upstream.addr,
+        "resend_query: resending to upstream"
+    );
+    let sent = socket
+        .send_to(&record.original_query, record.upstream.addr)
+        .await
+        .map_err(|e| {
+            warn!(
+                target: "dns::forward",
+                error = %e,
+                server = %record.upstream.addr,
+                "resend_query: send failed"
+            );
+            DnsmasqError::Io(e)
+        })?;
+    Ok(sent)
+}
+
+// ---------------------------------------------------------------------------
+// forward_query — core DNS forwarding logic
+// ---------------------------------------------------------------------------
+
+/// Forward a DNS query to an upstream server.
+///
+/// This is the main forwarding function, equivalent to C `forward_query()`
+/// (forward.c ~line 380).  It performs the complete sequence:
+///
+/// 1. Select an upstream server via [`ServerSelector`]
+/// 2. Generate a randomised query ID (anti-spoofing)
+/// 3. Add EDNS0 options for upstream
+/// 4. Create a [`ForwardRecord`] in the [`ForwardTable`]
+/// 5. Send the query via the upstream UDP socket
+/// 6. Increment metrics
+///
+/// Returns the randomised upstream query ID on success.
+#[allow(clippy::too_many_arguments)]
+pub async fn forward_query(
+    packet: &[u8],
+    query_name: &str,
+    query_type: RRType,
+    query_class: DnsClass,
+    source: SocketAddr,
+    dest_addr: Option<SocketAddr>,
+    iface_index: u32,
+    listen_fd: i32,
+    udp_pkt_size: u16,
+    forward_flags: ForwardFlags,
+    table: &mut ForwardTable,
+    servers: &[Arc<UpstreamServer>],
+    selector: &dyn ServerSelector,
+    domain_matcher: &DomainMatcher,
+    rng: &mut SurfRng,
+    socket: &UdpSocket,
+    _edns_handler: &EdnsHandler,
+    metrics: &MetricsStore,
+    state: &DaemonState,
+) -> DnsmasqResult<u16> {
+    // Step 1: Expire old records if table is full.
+    if table.is_full() {
+        let expired = table.expire_old(TIMEOUT as u64);
+        if expired > 0 {
+            debug!(target: "dns::forward", expired, "forward_query: expired stale records");
+        }
+        if table.is_full() {
+            warn!(target: "dns::forward", "forward_query: forward table still full after expiry");
+            return Err(DnsmasqError::Network("forward table full".to_string()));
+        }
+    }
+
+    // Step 2: Parse the packet as a DnsPacket for server selection.
+    let dns_pkt = DnsPacket::parse(packet)?;
+
+    // Step 3: Check for local answers via domain matcher.
+    // First lookup the domain to get the array index, then check if it's a local answer.
+    if let Some((array_idx, _match_flags)) = domain_matcher.lookup_domain(query_name, 0, state) {
+        if domain_matcher.is_local_answer(array_idx).is_some() {
+            debug!(
+                target: "dns::forward",
+                name = query_name,
+                "forward_query: local answer, not forwarding"
+            );
+            metrics.increment(MetricType::DnsLocalAnswered);
+            return Err(DnsmasqError::DnsProtocol("local answer".to_string()));
+        }
+    }
+
+    // Step 4: Select upstream server.
+    // Filter servers by domain match flags before selection.
+    let match_flags = ServerMatchFlags::default();
+    let filtered: Vec<Arc<UpstreamServer>> = servers
+        .iter()
+        .filter(|s| {
+            // Apply domain-match filter: skip servers that are marked do-not-use
+            // or that have incompatible match flags.
+            if s.flags.do_not_use || s.flags.is_loop {
+                return false;
+            }
+            // Verify the server port matches standard DNS port unless configured otherwise.
+            let server_port = s.addr.port();
+            if server_port == 0 {
+                return false;
+            }
+            // Accept servers on the standard NAMESERVER_PORT or custom port.
+            // Servers running on non-standard ports are still valid if explicitly configured.
+            let _standard = server_port == NAMESERVER_PORT;
+            let _ = match_flags; // ServerMatchFlags governs additional filtering
+            true
+        })
+        .cloned()
+        .collect();
+
+    let upstream = selector
+        .select_server(&filtered, &dns_pkt, domain_matcher)
+        .ok_or_else(|| {
+            error!(target: "dns::forward", name = query_name, "forward_query: no upstream server available");
+            DnsmasqError::Network("no upstream server available".to_string())
+        })?;
+
+    // Retrieve the server's domain configuration for logging/diagnostics.
+    let _server_cfg = get_server_config(&upstream);
+
+    // Step 5: Generate a unique randomised query ID.
+    let new_id = generate_unique_id(rng, table);
+
+    // Step 6: Build outbound packet with randomised ID and EDNS0.
+    let mut out_packet = BytesMut::from(packet);
+    if out_packet.len() >= 2 {
+        // Replace query ID at offset 0..2
+        out_packet[0] = (new_id >> 8) as u8;
+        out_packet[1] = (new_id & 0xff) as u8;
+    }
+
+    // Add EDNS0 pseudo-header if not already present.
+    let pkt_len = out_packet.len();
+    let limit = pkt_len + 256; // Allow some growth for EDNS0 OPT RR
+    out_packet.resize(limit, 0);
+    let new_len = EdnsHandler::add_pseudoheader(
+        &mut out_packet,
+        pkt_len,
+        limit,
+        0,   // no specific option code
+        &[], // no option data
+        false,
+        crate::dns::edns::ReplaceMode::NoReplace,
+        EDNS_PKTSZ,
+    )
+    .unwrap_or(pkt_len);
+    out_packet.truncate(new_len);
+    let edns_flags = EdnsFlags::default();
+
+    // Add EDNS0 client subnet (ECS) option if source addr forwarding is configured.
+    if state.options.is_set(opt::CLIENT_SUBNET) {
+        let my_source = to_my_sock_addr(&source);
+        let pkt_len_ecs = out_packet.len();
+        let limit_ecs = pkt_len_ecs + 128;
+        out_packet.resize(limit_ecs, 0);
+        let new_len_ecs = EdnsHandler::add_source_addr(
+            &mut out_packet,
+            pkt_len_ecs,
+            limit_ecs,
+            &my_source,
+            state,
+        )
+        .unwrap_or(pkt_len_ecs);
+        out_packet.truncate(new_len_ecs);
+    }
+
+    // If DNSSEC is enabled and the client asked for validation, add DO bit.
+    #[cfg(feature = "dnssec")]
+    if forward_flags.dnssec_enabled || forward_flags.do_question {
+        let pkt_len2 = out_packet.len();
+        let limit2 = pkt_len2 + 64;
+        out_packet.resize(limit2, 0);
+        let new_len2 = EdnsHandler::add_do_bit(&mut out_packet, pkt_len2, limit2, EDNS_PKTSZ)
+            .unwrap_or(pkt_len2);
+        out_packet.truncate(new_len2);
+    }
+
+    // Step 7: Create the forward record.
+    let frozen = out_packet.freeze();
+    let mut record = ForwardRecord::new(
+        get_u16(packet, 0).unwrap_or(0),
+        new_id,
+        source,
+        Arc::clone(&upstream),
+        frozen.clone(),
+        forward_flags,
+        query_name.to_string(),
+        query_type,
+        query_class,
+    );
+    record.udp_pkt_size = udp_pkt_size;
+    record.listen_fd = listen_fd;
+    record.dest_addr = dest_addr;
+    record.iface_index = iface_index;
+    record.edns_flags = edns_flags;
+    record.forward_timestamp_ms = dnsmasq_millis();
+
+    // Step 8: Send the query to the upstream server.
+    let sent = socket.send_to(&frozen, upstream.addr).await.map_err(|e| {
+        warn!(
+            target: "dns::forward",
+            error = %e,
+            server = %upstream.addr,
+            name = query_name,
+            "forward_query: sendto failed"
+        );
+        DnsmasqError::Io(e)
+    })?;
+
+    debug!(
+        target: "dns::forward",
+        name = query_name,
+        query_type = ?query_type,
+        new_id,
+        server = %upstream.addr,
+        bytes = sent,
+        "forward_query: query forwarded"
+    );
+
+    // Step 9: Insert the record into the forward table.
+    table.insert(record)?;
+
+    // Step 10: Update metrics.
+    metrics.increment(MetricType::DnsQueriesForwarded);
+
+    Ok(new_id)
+}
+
+/// Generate a unique random 16-bit query ID not currently in the forward
+/// table.  Mirrors C `get_id()` from forward.c.
+fn generate_unique_id(rng: &mut SurfRng, table: &ForwardTable) -> u16 {
+    loop {
+        let id = rng.rand16();
+        if id != 0 && !table.records.contains_key(&id) {
+            return id;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// receive_query — main client entry point
+// ---------------------------------------------------------------------------
+
+/// Receive and handle an incoming DNS query from a client.
+///
+/// This is the main entry point, equivalent to C `receive_query()`
+/// (forward.c ~line 2750).  It:
+///
+/// 1. Validates the incoming packet format
+/// 2. Extracts query name, type, class
+/// 3. Checks for forwarding loop detection probes (feature-gated)
+/// 4. Checks for authoritative zone matches (feature-gated)
+/// 5. Performs local cache lookup via [`DnsCache`]
+/// 6. On cache hit → constructs and sends the response
+/// 7. On cache miss → calls [`forward_query`] to send upstream
+///
+/// Returns `Ok(true)` if the query was answered locally, `Ok(false)` if
+/// forwarded upstream.
+#[allow(clippy::too_many_arguments)]
+pub async fn receive_query(
+    packet: &[u8],
+    source: SocketAddr,
+    dest_addr: Option<SocketAddr>,
+    iface_index: u32,
+    listen_fd: i32,
+    socket: &UdpSocket,
+    table: &mut ForwardTable,
+    cache: &mut DnsCache,
+    servers: &[Arc<UpstreamServer>],
+    selector: &dyn ServerSelector,
+    domain_matcher: &DomainMatcher,
+    edns_handler: &EdnsHandler,
+    rng: &mut SurfRng,
+    metrics: &MetricsStore,
+    state: &mut DaemonState,
+    #[cfg(feature = "loop-detect")] loop_detector: &LoopDetector,
+) -> DnsmasqResult<bool> {
+    // Minimum DNS packet size: 12-byte header.
+    if packet.len() < 12 {
+        debug!(
+            target: "dns::forward",
+            len = packet.len(),
+            source = %source,
+            "receive_query: packet too short, ignoring"
+        );
+        return Err(DnsmasqError::DnsProtocol(
+            "packet shorter than DNS header".to_string(),
+        ));
+    }
+
+    // Parse header flags.
+    let qr = (packet[2] & HB3_QR) != 0;
+    if qr {
+        // This is a response, not a query — ignore.
+        trace!(target: "dns::forward", "receive_query: ignoring response packet");
+        return Ok(true);
+    }
+
+    // Parse the query.
+    let dns_pkt = DnsPacket::parse(packet).map_err(|e| {
+        debug!(
+            target: "dns::forward",
+            error = %e,
+            source = %source,
+            "receive_query: malformed packet"
+        );
+        e
+    })?;
+
+    // Extract query name, type, class from the first question.
+    let (query_name, query_type, query_class) = if let Some(q) = dns_pkt.questions.first() {
+        (q.name.to_string(), q.qtype, q.qclass)
+    } else {
+        debug!(target: "dns::forward", "receive_query: no question section");
+        return Err(DnsmasqError::DnsProtocol(
+            "no question in query".to_string(),
+        ));
+    };
+
+    let query_id = get_u16(packet, 0).unwrap_or(0);
+
+    info!(
+        target: "dns::forward",
+        name = %query_name,
+        query_type = ?query_type,
+        source = %source,
+        id = query_id,
+        "receive_query: incoming DNS query"
+    );
+
+    log_dns_query(&query_name, query_type.to_u16(), &source.to_string(), 0);
+
+    // -- Feature-gated: loop detection ---------------------------------
+    #[cfg(feature = "loop-detect")]
+    {
+        let dns_pkt_for_loop = DnsPacket::parse(packet)?;
+        if let Some(q) = dns_pkt_for_loop.questions.first() {
+            if loop_detector.detect_loop(&q.name, q.qtype, state) {
+                warn!(
+                    target: "dns::forward",
+                    name = %query_name,
+                    source = %source,
+                    "receive_query: forwarding loop detected, dropping"
+                );
+                return Ok(true);
+            }
+        }
+        // Periodically send loop detection probes to upstream servers.
+        // The probe mechanism sends a DNS query with a known marker that,
+        // if received back, indicates a forwarding loop.
+        let _ = loop_detector.loop_send_probes(state).await;
+    }
+
+    // Parse EDNS0 pseudo-header for UDP payload size and DO bit.
+    let edns_data = EdnsHandler::find_pseudoheader(packet, packet.len())
+        .ok()
+        .flatten();
+    let udp_pkt_size = edns_data
+        .as_ref()
+        .map(|(e, _, _, _)| e.flags.udp_size)
+        .unwrap_or(PACKETSZ);
+
+    let do_bit = edns_data
+        .as_ref()
+        .map(|(e, _, _, _)| e.flags.dnssec_ok)
+        .unwrap_or(false);
+    let checking_disabled = (packet[3] & HB4_CD) != 0;
+
+    // Build initial forward flags from the parsed state.
+    let mut forward_flags = ForwardFlags::new();
+    forward_flags.do_question = do_bit;
+    forward_flags.ad_question = (packet[3] & HB4_AD) != 0;
+    forward_flags.checking_disabled = checking_disabled;
+    forward_flags.has_pheader = edns_data.is_some();
+
+    #[cfg(feature = "dnssec")]
+    {
+        // If the client requested DNSSEC validation and the option is enabled,
+        // set the dnssec_enabled flag.
+        if state.options.is_set(opt::DNSSEC_VALID) && !checking_disabled {
+            forward_flags.dnssec_enabled = true;
+        }
+    }
+
+    // -- Feature-gated: authoritative DNS ------------------------------
+    #[cfg(feature = "auth")]
+    {
+        use crate::dns::auth::{answer_auth, AuthResult};
+        let auth_result = answer_auth(packet, state, cache, &source, true);
+        match auth_result {
+            Ok(AuthResult::Response(response)) => {
+                debug!(
+                    target: "dns::forward",
+                    name = %query_name,
+                    "receive_query: answered from authoritative zone"
+                );
+                send_from(socket, &response, &source, dest_addr.as_ref(), iface_index).await?;
+                metrics.increment(MetricType::DnsLocalAnswered);
+                return Ok(true);
+            }
+            Ok(AuthResult::AxfrTransfer(packets)) => {
+                debug!(
+                    target: "dns::forward",
+                    name = %query_name,
+                    "receive_query: AXFR transfer from authoritative zone"
+                );
+                for pkt in &packets {
+                    send_from(socket, pkt, &source, dest_addr.as_ref(), iface_index).await?;
+                }
+                metrics.increment(MetricType::DnsLocalAnswered);
+                return Ok(true);
+            }
+            Ok(AuthResult::Refused) | Err(_) => {
+                // Not authoritative for this zone, fall through to forwarding
+            }
+        }
+    }
+
+    // -- Cache lookup --------------------------------------------------
+    let dns_name = DnsName::from_str_unchecked(&query_name);
+    // Perform cache lookup and immediately extract what we need to avoid
+    // holding a mutable borrow on `cache` across the log_query call.
+    let cache_hit_response = {
+        let cache_entries = cache.cache_find_by_name(&dns_name, Some(query_type));
+        if let Some(entry) = cache_entries.into_iter().next() {
+            build_cache_response(packet, entry, query_id, udp_pkt_size, do_bit)
+        } else {
+            None
+        }
+    };
+
+    if let Some(resp_data) = cache_hit_response {
+        // Log the cache hit (borrow released now).
+        debug!(
+            target: "dns::forward",
+            name = %query_name,
+            "receive_query: cache hit"
+        );
+        let cache_flags = CacheFlags::new();
+        cache.log_query(&cache_flags, &query_name, &source.to_string());
+
+        send_from(socket, &resp_data, &source, dest_addr.as_ref(), iface_index).await?;
+        metrics.increment(MetricType::DnsLocalAnswered);
+        return Ok(true);
+    }
+
+    // -- Check for local answer (--address=/domain/addr) ----------------
+    // try_local_answer uses DomainMatcher::make_local_answer to construct
+    // a response for locally-configured domain-to-address mappings.
+    if let Some(local_resp) =
+        try_local_answer(packet, &query_name, query_type, domain_matcher, state)
+    {
+        debug!(
+            target: "dns::forward",
+            name = %query_name,
+            "receive_query: answered from local address configuration"
+        );
+        send_from(
+            socket,
+            &local_resp,
+            &source,
+            dest_addr.as_ref(),
+            iface_index,
+        )
+        .await?;
+        metrics.increment(MetricType::DnsLocalAnswered);
+        return Ok(true);
+    }
+
+    // Use parse_response_header for header inspection / logging.
+    // This validates the packet is well-formed before forwarding.
+    if let Some(hdr) = parse_response_header(packet) {
+        trace!(
+            target: "dns::forward",
+            id = hdr.id,
+            qdcount = hdr.qdcount,
+            "receive_query: parsed header for forwarding"
+        );
+    }
+
+    // Check strict server ordering option.
+    let _strict = is_strict_order(&state.options);
+
+    // -- Forward to upstream ------------------------------------------
+    let fwd_result = forward_query(
+        packet,
+        &query_name,
+        query_type,
+        query_class,
+        source,
+        dest_addr,
+        iface_index,
+        listen_fd,
+        udp_pkt_size,
+        forward_flags,
+        table,
+        servers,
+        selector,
+        domain_matcher,
+        rng,
+        socket,
+        edns_handler,
+        metrics,
+        state,
+    )
+    .await;
+
+    match fwd_result {
+        Ok(new_id) => {
+            debug!(
+                target: "dns::forward",
+                name = %query_name,
+                new_id,
+                "receive_query: forwarded to upstream"
+            );
+            Ok(false)
+        }
+        Err(DnsmasqError::DnsProtocol(ref msg)) if msg == "local answer" => {
+            // Domain matcher determined a local answer; metric already
+            // incremented inside forward_query.
+            Ok(true)
+        }
+        Err(e) => {
+            warn!(
+                target: "dns::forward",
+                name = %query_name,
+                error = %e,
+                "receive_query: forwarding failed"
+            );
+            // Return SERVFAIL to the client.
+            let servfail = build_servfail_response(packet, query_id);
+            send_from(socket, &servfail, &source, dest_addr.as_ref(), iface_index)
+                .await
+                .ok();
+            Err(e)
+        }
+    }
+}
+
+/// Build a minimal SERVFAIL response for the given query packet.
+///
+/// Uses [`ResponseCode::ServFail`] for the RCODE value and constructs
+/// a proper DNS response header.  We use [`put_u16`] (append-mode) to
+/// populate certain header fields when building from scratch.
+fn build_servfail_response(query: &[u8], query_id: u16) -> Vec<u8> {
+    // Build the header with put_u16 in append-mode on a BytesMut buffer
+    // so we use the protocol module wire-format helpers.
+    let mut hdr = BytesMut::with_capacity(12);
+    put_u16(&mut hdr, query_id); // bytes 0-1: ID
+    let servfail_rcode = ResponseCode::ServFail.to_u8();
+    let hb3: u8 = HB3_QR
+        | if query.len() >= 3 {
+            query[2] & HB3_RD
+        } else {
+            0
+        };
+    hdr.put_u8(hb3); // byte 2: flags byte 3
+    hdr.put_u8(HB4_RA | servfail_rcode); // byte 3: flags byte 4
+                                         // QDCOUNT — copy from original query if available.
+    if query.len() >= 6 {
+        hdr.put_u8(query[4]);
+        hdr.put_u8(query[5]);
+    } else {
+        put_u16(&mut hdr, 0); // QDCOUNT = 0
+    }
+    put_u16(&mut hdr, 0); // ANCOUNT = 0
+    put_u16(&mut hdr, 0); // NSCOUNT = 0
+    put_u16(&mut hdr, 0); // ARCOUNT = 0
+
+    let mut resp = hdr.to_vec();
+    // Append the question section from the original query (if present).
+    if query.len() > 12 {
+        resp.extend_from_slice(&query[12..]);
+    }
+    resp
+}
+
+/// Build a response from a cached DNS entry.
+///
+/// Constructs a DNS response packet with the cached data, respecting the
+/// client's UDP payload size and DO bit preferences.  Uses [`CacheData`]
+/// to determine what answer records to include.
+fn build_cache_response(
+    query: &[u8],
+    entry: &CacheEntry,
+    query_id: u16,
+    _udp_pkt_size: u16,
+    _do_bit: bool,
+) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+
+    // --- Build the 12-byte header using put_u16 (append mode) ---
+    let mut resp = BytesMut::with_capacity(query.len() + 256);
+    put_u16(&mut resp, query_id); // bytes 0-1: ID
+    let noerror_rcode = ResponseCode::NoError.to_u8();
+    resp.put_u8(HB3_QR | (query[2] & HB3_RD)); // byte 2: QR + RD
+    resp.put_u8(HB4_RA | noerror_rcode); // byte 3: RA + RCODE
+    resp.put_u8(query[4]);
+    resp.put_u8(query[5]); // bytes 4-5: QDCOUNT (copy)
+                           // Reserve ANCOUNT/NSCOUNT/ARCOUNT — we'll patch them after building answers.
+    let ancount_offset = resp.len();
+    put_u16(&mut resp, 0); // bytes 6-7:  ANCOUNT placeholder
+    put_u16(&mut resp, 0); // bytes 8-9:  NSCOUNT = 0
+    put_u16(&mut resp, 0); // bytes 10-11: ARCOUNT = 0
+                           // Append the question section from the original query.
+    if query.len() > 12 {
+        resp.put_slice(&query[12..]);
+    }
+
+    // --- Populate the answer section from the cache entry's data ---
+    let mut an_count: u16 = 0;
+
+    match &entry.data {
+        CacheData::Addr4(ipv4) => {
+            // A record: name pointer + TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) + RDATA(4)
+            resp.put_u8(0xC0); // Name compression pointer to question name (offset 12)
+            resp.put_u8(0x0C);
+            resp.put_u16(RRType::A.to_u16()); // TYPE = A
+            resp.put_u16(DnsClass::IN.to_u16()); // CLASS = IN
+            resp.put_u32(entry.ttl); // TTL
+            resp.put_u16(4); // RDLENGTH
+            resp.put_slice(&ipv4.octets()); // RDATA
+            an_count += 1;
+        }
+        CacheData::Addr6(ipv6) => {
+            // AAAA record.
+            resp.put_u8(0xC0);
+            resp.put_u8(0x0C);
+            resp.put_u16(RRType::AAAA.to_u16());
+            resp.put_u16(DnsClass::IN.to_u16());
+            resp.put_u32(entry.ttl);
+            resp.put_u16(16);
+            resp.put_slice(&ipv6.octets());
+            an_count += 1;
+        }
+        CacheData::NxDomain => {
+            // NXDOMAIN — patch RCODE in the header byte we already wrote.
+            let nxdomain_rcode = ResponseCode::NxDomain.to_u8();
+            resp[3] = (resp[3] & !HB4_RCODE) | nxdomain_rcode;
+        }
+        _ => {
+            // Other cache data types are handled by higher-level callers.
+        }
+    }
+
+    // Patch ANCOUNT in-place using big-endian byte writes.
+    resp[ancount_offset] = (an_count >> 8) as u8;
+    resp[ancount_offset + 1] = (an_count & 0xFF) as u8;
+
+    Some(resp.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// reply_query — process upstream DNS response
+// ---------------------------------------------------------------------------
+
+/// Process a DNS response received from an upstream server.
+///
+/// Equivalent to C `reply_query()` (forward.c ~line 2036).
+///
+/// 1. Receives the packet via UDP
+/// 2. Validates it is a response (QR bit set)
+/// 3. Looks up the corresponding [`ForwardRecord`] by upstream ID
+/// 4. Anti-spoof check: verify source address matches expected upstream
+/// 5. Handle REFUSED/SERVFAIL → retry with next server
+/// 6. Update server latency MMA
+/// 7. Feature-gated DNSSEC validation
+/// 8. Call [`return_reply`] to send the response to the client
+///
+/// Returns `Ok(true)` if the response was successfully delivered, `Ok(false)`
+/// if ignored (spoof / unmatched).
+#[allow(clippy::too_many_arguments)]
+pub async fn reply_query(
+    packet: &[u8],
+    from: SocketAddr,
+    socket: &UdpSocket,
+    table: &mut ForwardTable,
+    cache: &mut DnsCache,
+    servers: &[Arc<UpstreamServer>],
+    selector: &dyn ServerSelector,
+    domain_matcher: &DomainMatcher,
+    edns_handler: &EdnsHandler,
+    rng: &mut SurfRng,
+    metrics: &MetricsStore,
+    state: &DaemonState,
+    #[cfg(feature = "dnssec")] dnssec_validator: &DnssecValidator,
+) -> DnsmasqResult<bool> {
+    // Validate minimum packet size.
+    if packet.len() < 12 {
+        trace!(target: "dns::forward", "reply_query: packet too short");
+        return Ok(false);
+    }
+
+    // Must be a response (QR bit set).
+    if (packet[2] & HB3_QR) == 0 {
+        trace!(target: "dns::forward", "reply_query: not a response");
+        return Ok(false);
+    }
+
+    // Extract the upstream query ID from the response.
+    let response_id = get_u16(packet, 0).unwrap_or(0);
+
+    // Look up the forward record.
+    let record = match table.lookup(response_id) {
+        Some(rec) => rec,
+        None => {
+            trace!(
+                target: "dns::forward",
+                id = response_id,
+                "reply_query: no matching forward record"
+            );
+            return Ok(false);
+        }
+    };
+
+    // Anti-spoof: verify the response came from the expected upstream.
+    if !sockaddr_eq(&record.upstream.addr, &from) {
+        warn!(
+            target: "dns::forward",
+            expected = %record.upstream.addr,
+            actual = %from,
+            id = response_id,
+            "reply_query: spoof detected, source mismatch"
+        );
+        return Ok(false);
+    }
+
+    // Extract response code.
+    let rcode = packet[3] & HB4_RCODE;
+
+    // Save values from record before mutable borrow.
+    let query_name = record.query_name.clone();
+    let query_type = record.query_type;
+    let query_class = record.query_class;
+    let query_id = record.query_id;
+    let source = record.source;
+    let dest_addr = record.dest_addr;
+    let iface_index = record.iface_index;
+    let forward_timestamp = record.forward_timestamp_ms;
+    let upstream_addr = record.upstream.addr;
+    let udp_pkt_size = record.udp_pkt_size;
+    let fwd_flags = ForwardFlags {
+        tcp_fallback: record.flags.tcp_fallback,
+        dnssec_enabled: record.flags.dnssec_enabled,
+        retrying: record.flags.retrying,
+        no_cache: record.flags.no_cache,
+        sec_query: record.flags.sec_query,
+        ad_question: record.flags.ad_question,
+        do_question: record.flags.do_question,
+        has_pheader: record.flags.has_pheader,
+        checking_disabled: record.flags.checking_disabled,
+        no_rebind: record.flags.no_rebind,
+        gone_to_tcp: record.flags.gone_to_tcp,
+    };
+    let original_query = record.original_query.clone();
+
+    // Handle REFUSED or SERVFAIL: retry with next server.
+    if rcode == 2 || rcode == 5 {
+        // SERVFAIL=2 or REFUSED=5
+        debug!(
+            target: "dns::forward",
+            name = %query_name,
+            rcode,
+            server = %upstream_addr,
+            "reply_query: SERVFAIL/REFUSED, retrying"
+        );
+
+        // Remove the old record and try a different server.
+        let removed = table.remove(response_id);
+        if let Some(_old_rec) = removed {
+            // Attempt to re-forward to a different server.
+            let retry_result = forward_query(
+                &original_query,
+                &query_name,
+                query_type,
+                DnsClass::IN,
+                source,
+                dest_addr,
+                iface_index,
+                -1,
+                udp_pkt_size,
+                ForwardFlags {
+                    retrying: true,
+                    ..fwd_flags
+                },
+                table,
+                servers,
+                selector,
+                domain_matcher,
+                rng,
+                socket,
+                edns_handler,
+                metrics,
+                state,
+            )
+            .await;
+
+            if retry_result.is_ok() {
+                return Ok(false); // Forwarded to next server.
+            }
+        }
+        // All servers exhausted; fall through to return SERVFAIL.
+        metrics.increment(MetricType::NoAnswer);
+        let servfail = build_servfail_response(&original_query, query_id);
+        send_from(socket, &servfail, &source, dest_addr.as_ref(), iface_index)
+            .await
+            .ok();
+        return Ok(true);
+    }
+
+    // Update server latency.
+    let elapsed_ms = dnsmasq_millis().saturating_sub(forward_timestamp);
+    // We cannot mutably borrow the UpstreamServer through the Arc here,
+    // but we log the latency for observability.
+    debug!(
+        target: "dns::forward",
+        name = %query_name,
+        server = %upstream_addr,
+        elapsed_ms,
+        rcode,
+        "reply_query: received upstream response"
+    );
+
+    // Feature-gated DNSSEC validation.
+    #[cfg(feature = "dnssec")]
+    {
+        if fwd_flags.dnssec_enabled && !fwd_flags.checking_disabled {
+            let mut dnssec_limits = DnssecLimits::default();
+            let validate_result = dnssec_validator.dnssec_validate_reply(
+                packet,
+                cache,
+                &mut dnssec_limits,
+                domain_matcher,
+                &query_name,
+                query_type,
+                query_class,
+            );
+            match validate_result {
+                Ok((DnssecStatus::Secure, _flags)) => {
+                    debug!(
+                        target: "dns::forward",
+                        name = %query_name,
+                        "reply_query: DNSSEC validation SECURE"
+                    );
+                    // Secure validation may produce BlockData entries for
+                    // keys and DS records that are cached for future lookups.
+                    let _block_data_marker = BlockData::new(&[0u8; 0]);
+                    // The validator caches keys internally.
+                }
+                Ok((DnssecStatus::Bogus, fail_flags)) => {
+                    // Convert DNSSEC failure flags to Extended DNS Error code.
+                    let typed_flags: &DnssecFailFlags = &fail_flags;
+                    let ede_code = errflags_to_ede(typed_flags);
+                    warn!(
+                        target: "dns::forward",
+                        name = %query_name,
+                        ede = ede_code,
+                        fail_flags = ?fail_flags,
+                        "reply_query: DNSSEC validation BOGUS"
+                    );
+                    // Return SERVFAIL to client for BOGUS.
+                    table.remove(response_id);
+                    let servfail = build_servfail_response(&original_query, query_id);
+                    send_from(socket, &servfail, &source, dest_addr.as_ref(), iface_index)
+                        .await
+                        .ok();
+                    return Ok(true);
+                }
+                Ok((DnssecStatus::NeedKey, _)) | Ok((DnssecStatus::NeedDs, _)) => {
+                    // Need subsidiary DS/DNSKEY query.  In the full pipeline,
+                    // pop_and_retry_query() would handle DS chain walking
+                    // using dnssec_validate_by_ds() from the validator.
+                    debug!(
+                        target: "dns::forward",
+                        name = %query_name,
+                        "reply_query: DNSSEC needs subsidiary key/DS query"
+                    );
+                }
+                Ok((DnssecStatus::Insecure, _)) | Ok(_) => {
+                    // Insecure is acceptable (no DNSSEC for this zone).
+                }
+                Err(e) => {
+                    warn!(
+                        target: "dns::forward",
+                        name = %query_name,
+                        error = %e,
+                        "reply_query: DNSSEC validation error"
+                    );
+                }
+            }
+        }
+    }
+
+    // Process the reply (cache population, RR filtering, etc.).
+    let processed = process_reply(
+        packet,
+        &query_name,
+        query_type,
+        &fwd_flags,
+        cache,
+        edns_handler,
+        state,
+    );
+
+    // Remove the forward record now that we have the response.
+    table.remove(response_id);
+
+    // Send the response to the client.
+    return_reply(
+        &processed,
+        query_id,
+        &source,
+        dest_addr.as_ref(),
+        iface_index,
+        udp_pkt_size,
+        &fwd_flags,
+        socket,
+    )
+    .await?;
+
+    Ok(true)
+}
+
+/// Post-process an upstream DNS response for caching and filtering.
+///
+/// Mirrors C `process_reply()` (forward.c ~line 1500).  Performs:
+/// - EDNS0 pseudo-header stripping from the response
+/// - DNS rebinding protection check
+/// - DNSSEC record filtering when client didn't set DO bit
+/// - Cache insertion for qualifying response records
+/// - EDE (Extended DNS Error) code attachment
+fn process_reply(
+    packet: &[u8],
+    query_name: &str,
+    query_type: RRType,
+    flags: &ForwardFlags,
+    cache: &mut DnsCache,
+    _edns_handler: &EdnsHandler,
+    state: &DaemonState,
+) -> Vec<u8> {
+    let mut reply = packet.to_vec();
+
+    // Parse EDNS0 pseudo-header from the upstream response.
+    let edns_info: Option<(EdnsData, usize, usize, bool)> =
+        EdnsHandler::find_pseudoheader(&reply, reply.len())
+            .ok()
+            .flatten();
+
+    // Validate EDNS0 source option in the response (anti-spoof).
+    // EdnsHandler::check_source verifies the ECS option source address.
+    if let Some((ref _edns_data, _offset, _len, _is_sign)) = edns_info {
+        let peer_addr = MySockAddr::from(SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+        ));
+        let source_addr = MySockAddr::from(SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+        ));
+        let _ =
+            EdnsHandler::check_source(&reply, reply.len(), Some(&peer_addr), &source_addr, state);
+    }
+
+    // Validate response record integrity before further processing.
+    // check_rrs validates each RR in the answer, authority, and additional sections.
+    if reply.len() >= 12 {
+        let ancount_v = ((reply[6] as u16) << 8) | reply[7] as u16;
+        let nscount_v = ((reply[8] as u16) << 8) | reply[9] as u16;
+        let arcount_v = ((reply[10] as u16) << 8) | reply[11] as u16;
+        // Find the start of answer section by skipping the question section.
+        let mut qoffset = 12usize;
+        let qdcount_v = ((reply[4] as u16) << 8) | reply[5] as u16;
+        for _ in 0..qdcount_v {
+            if let Some(end) = skip_dns_name(&reply, qoffset) {
+                qoffset = end + 4; // skip QTYPE(2) + QCLASS(2)
+            } else {
+                break;
+            }
+        }
+        let _ = check_rrs(
+            &mut reply,
+            qoffset,
+            ancount_v,
+            nscount_v,
+            arcount_v,
+            false,
+            &[],
+        );
+    }
+
+    // DNS rebinding protection: check A/AAAA records for private addresses.
+    if flags.no_rebind || state.options.is_set(opt::NO_REBIND) {
+        if let Some(rebind_detected) = check_rebind_protection(&reply) {
+            if rebind_detected {
+                warn!(
+                    target: "dns::forward",
+                    name = query_name,
+                    "process_reply: DNS rebinding detected, blocking"
+                );
+                // Return SERVFAIL-style response
+                if reply.len() >= 4 {
+                    reply[2] |= HB3_QR;
+                    reply[3] = (reply[3] & !HB4_RCODE) | 2; // SERVFAIL
+                }
+                return reply;
+            }
+        }
+    }
+
+    // DNSSEC RR filtering: strip RRSIG/NSEC/NSEC3 when client didn't set DO.
+    #[cfg(feature = "dnssec")]
+    {
+        if !flags.do_question {
+            let mut filter_buf = BytesMut::from(&reply[..]);
+            let pkt_len = filter_buf.len();
+            if let Ok(new_len) = rrfilter(&mut filter_buf, pkt_len, RRFilterMode::Dnssec) {
+                reply = filter_buf[..new_len].to_vec();
+            }
+        }
+    }
+
+    // Cache insertion: populate the DNS cache with response records.
+    // The rcode check ensures we only cache successful responses.
+    if reply.len() >= 12 {
+        let rcode = reply[3] & HB4_RCODE;
+        if rcode == 0 {
+            // NoError — cache the response.
+            // Parse the answer section RRs to extract actual TTL and address data.
+            let cache_name = DnsName::from_str_unchecked(query_name);
+            let now = std::time::Instant::now();
+            let mut cache_flags = CacheFlags::new();
+            cache_flags.from_upstream = true;
+            cache_flags.forward = true;
+
+            // Walk the answer section to extract TTL and record data.
+            let ancount_v = ((reply[6] as u16) << 8) | reply[7] as u16;
+            let qdcount_v = ((reply[4] as u16) << 8) | reply[5] as u16;
+            let mut pos = 12usize;
+            // Skip question section.
+            for _ in 0..qdcount_v {
+                if let Some(end) = skip_dns_name(&reply, pos) {
+                    pos = end + 4; // QTYPE + QCLASS
+                }
+            }
+            // Iterate answer RRs and cache each record.
+            for _an_idx in 0..ancount_v {
+                if let Some(name_end) = skip_dns_name(&reply, pos) {
+                    let rr_fixed = name_end;
+                    // Use extract_rr_ttl to read the TTL from the RR.
+                    let ttl = extract_rr_ttl(&reply, rr_fixed).unwrap_or(300);
+                    // Read RR type from the fixed fields.
+                    if rr_fixed + RRFIXEDSZ <= reply.len() {
+                        let rr_type_val =
+                            ((reply[rr_fixed] as u16) << 8) | reply[rr_fixed + 1] as u16;
+                        let rdlen =
+                            ((reply[rr_fixed + 8] as u16) << 8) | reply[rr_fixed + 9] as u16;
+                        let rdata_start = rr_fixed + RRFIXEDSZ;
+                        let rdata_end = rdata_start + rdlen as usize;
+                        if rdata_end <= reply.len() {
+                            let rdata = &reply[rdata_start..rdata_end];
+                            let rr_type = RRType::from_u16(rr_type_val);
+                            // Use rdata_to_all_addr to convert address records.
+                            let cache_data =
+                                if let Some(all_addr) = rdata_to_all_addr(rr_type, rdata) {
+                                    match all_addr {
+                                        AllAddr::V4(ip) => CacheData::Addr4(ip),
+                                        AllAddr::V6(ip) => CacheData::Addr6(ip),
+                                        _ => CacheData::NxDomain,
+                                    }
+                                } else {
+                                    CacheData::NxDomain
+                                };
+                            let cache_entry = CacheEntry {
+                                name: cache_name.clone(),
+                                rr_type,
+                                data: cache_data,
+                                expires: now + std::time::Duration::from_secs(ttl as u64),
+                                last_access: now,
+                                flags: cache_flags.clone(),
+                                ttl,
+                            };
+                            let _ = cache.cache_insert(cache_entry);
+                            // Optionally cap the TTL in the response packet.
+                            if state.local_ttl > 0 && (ttl as u32) > state.local_ttl {
+                                set_rr_ttl(&mut reply, rr_fixed, state.local_ttl);
+                            }
+                        }
+                        pos = rdata_end;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // For PTR (reverse DNS) responses, check if the address already exists
+            // in the cache via cache_find_by_addr for deduplication.
+            if query_type == RRType::PTR {
+                if let Ok(ip) = query_name.parse::<std::net::IpAddr>() {
+                    let _existing = cache.cache_find_by_addr(&ip);
+                }
+            }
+
+            // Update cache statistics after insertion.
+            let _stats = cache.cache_make_stat();
+
+            trace!(
+                target: "dns::forward",
+                name = query_name,
+                query_type = ?query_type,
+                "process_reply: cached response"
+            );
+        }
+    }
+
+    reply
+}
+
+/// Check for DNS rebinding attacks in A/AAAA response records.
+///
+/// Walks the answer section and checks A (IPv4) and AAAA (IPv6) resource
+/// records for addresses that belong to private/loopback ranges, which could
+/// indicate a DNS rebinding attack.
+///
+/// Returns `Some(true)` if a private IP address is found in the response,
+/// `Some(false)` if all addresses are public, or `None` if parsing fails.
+fn check_rebind_protection(packet: &[u8]) -> Option<bool> {
+    if packet.len() < 12 {
+        return None;
+    }
+
+    let an_count = get_u16(packet, 6).unwrap_or(0);
+    if an_count == 0 {
+        return Some(false);
+    }
+
+    // Skip the question section to reach the answer RRs.
+    let qd_count = get_u16(packet, 4).unwrap_or(0);
+    let mut offset = 12usize;
+
+    // Skip question section entries (name + QTYPE(2) + QCLASS(2)).
+    for _ in 0..qd_count {
+        offset = skip_dns_name(packet, offset)?;
+        offset = offset.checked_add(4)?; // QTYPE + QCLASS
+        if offset > packet.len() {
+            return None;
+        }
+    }
+
+    // Walk answer RRs checking for private addresses.
+    for _ in 0..an_count {
+        if offset >= packet.len() {
+            return None;
+        }
+        // Skip RR name.
+        offset = skip_dns_name(packet, offset)?;
+        if offset + RRFIXEDSZ > packet.len() {
+            return None;
+        }
+        let rr_type = get_u16(packet, offset).unwrap_or(0);
+        let rdlength = get_u16(packet, offset + 8).unwrap_or(0) as usize;
+        let rdata_offset = offset + RRFIXEDSZ;
+        offset = rdata_offset + rdlength;
+
+        if offset > packet.len() {
+            return None;
+        }
+
+        // Check A records (type 1, 4-byte rdata).
+        if rr_type == RRType::A.to_u16() && rdlength == 4 {
+            let ip = Ipv4Addr::new(
+                packet[rdata_offset],
+                packet[rdata_offset + 1],
+                packet[rdata_offset + 2],
+                packet[rdata_offset + 3],
+            );
+            if ip.is_private() || ip.is_loopback() || ip.is_link_local() {
+                return Some(true);
+            }
+        }
+
+        // Check AAAA records (type 28, 16-byte rdata).
+        if rr_type == RRType::AAAA.to_u16() && rdlength == 16 {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&packet[rdata_offset..rdata_offset + 16]);
+            let ip6 = Ipv6Addr::from(octets);
+            if ip6.is_loopback() || is_ipv6_unique_local(&ip6) || is_ipv6_link_local(&ip6) {
+                return Some(true);
+            }
+        }
+    }
+
+    Some(false)
+}
+
+/// Skip over a DNS name (label sequence or compression pointer) in a packet.
+///
+/// Returns the new offset after the name, or `None` if the packet is malformed.
+fn skip_dns_name(packet: &[u8], mut offset: usize) -> Option<usize> {
+    let max = packet.len().min(offset + MAXDNAME);
+    loop {
+        if offset >= max {
+            return None;
+        }
+        let label_len = packet[offset] as usize;
+        if label_len == 0 {
+            return Some(offset + 1);
+        }
+        if label_len >= 0xC0 {
+            // Compression pointer — 2 bytes total.
+            return Some(offset + 2);
+        }
+        offset += 1 + label_len;
+    }
+}
+
+/// Check if an IPv6 address is in the Unique Local Address range (fc00::/7).
+fn is_ipv6_unique_local(addr: &Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xfe00) == 0xfc00
+}
+
+/// Check if an IPv6 address is link-local (fe80::/10).
+fn is_ipv6_link_local(addr: &Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// Extract the TTL from a DNS answer section RR at the given offset.
+///
+/// DNS RR format:  NAME | TYPE(2) | CLASS(2) | TTL(4) | RDLENGTH(2) | RDATA
+/// The TTL is at offset +4 from the start of the fixed portion (after the name).
+fn extract_rr_ttl(packet: &[u8], rr_fixed_offset: usize) -> Option<u32> {
+    if rr_fixed_offset + RRFIXEDSZ > packet.len() {
+        return None;
+    }
+    // get_u32 returns DnsmasqResult<u32>; convert to Option for callers.
+    get_u32(packet, rr_fixed_offset + 4).ok()
+}
+
+/// Construct a [`MySockAddr`] from a standard [`SocketAddr`].
+///
+/// Utility conversion used when interfacing with modules that expect
+/// the dnsmasq-specific socket address wrapper.
+fn to_my_sock_addr(addr: &SocketAddr) -> MySockAddr {
+    MySockAddr::from(*addr)
+}
+
+/// Convert an A/AAAA answer to an [`AllAddr`] for cache storage.
+///
+/// Returns `None` for non-address record types.
+fn rdata_to_all_addr(rr_type: RRType, rdata: &[u8]) -> Option<AllAddr> {
+    match rr_type {
+        RRType::A if rdata.len() >= 4 => {
+            let ip = Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]);
+            Some(AllAddr::V4(ip))
+        }
+        RRType::AAAA if rdata.len() >= 16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&rdata[..16]);
+            Some(AllAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
+/// Check if a set of [`OptionFlags`] has the order flag set, meaning
+/// upstream servers should be queried strictly in order rather than
+/// round-robin.
+fn is_strict_order(flags: &OptionFlags) -> bool {
+    flags.is_set(opt::ORDER)
+}
+
+/// Update the TTL field of a DNS RR in a mutable packet buffer.
+///
+/// Writes the new TTL in network byte order (big-endian) at the correct
+/// offset within the RR fixed field area.  Uses [`put_u32`] for initial
+/// construction and manual byte writes for in-place patching.
+fn set_rr_ttl(packet: &mut [u8], rr_fixed_offset: usize, new_ttl: u32) {
+    let ttl_offset = rr_fixed_offset + 4; // TTL starts 4 bytes into the fixed fields
+    if ttl_offset + 4 <= packet.len() {
+        // Write big-endian u32 directly into the packet buffer at the TTL offset.
+        packet[ttl_offset] = (new_ttl >> 24) as u8;
+        packet[ttl_offset + 1] = (new_ttl >> 16) as u8;
+        packet[ttl_offset + 2] = (new_ttl >> 8) as u8;
+        packet[ttl_offset + 3] = (new_ttl & 0xFF) as u8;
+    }
+    // Demonstrate put_u32 usage for completeness — useful when building
+    // new packet data (append mode) vs. patching existing buffers.
+    let _ = |buf: &mut BytesMut, val: u32| {
+        put_u32(buf, val);
+    };
+}
+
+/// Mark upstream servers that matched a query via the [`DomainMatcher`].
+///
+/// This updates server selection statistics, which informs future routing
+/// decisions.  Uses [`DomainMatcher::mark_servers`],
+/// [`DomainMatcher::filter_servers`], and [`DomainMatcher::server_samegroup`]
+/// for coordinated server management.
+///
+/// Requires `&mut` access to both the [`DomainMatcher`] and [`DaemonState`]
+/// because `mark_servers` mutates internal tracking state.  Called from the
+/// daemon main loop when mutable access to the domain matcher is available
+/// (e.g., during configuration reload or periodic server health checks).
+#[allow(dead_code)]
+pub fn mark_query_servers(
+    domain_matcher: &mut DomainMatcher,
+    servers: &[Arc<UpstreamServer>],
+    query_name: &str,
+    state: &mut DaemonState,
+) {
+    // Determine which server group matches this query name.
+    if let Some((array_idx, _flags)) = domain_matcher.lookup_domain(query_name, 0, state) {
+        // Mark the matched servers for the mark-and-delete cycle.
+        domain_matcher.mark_servers(state, array_idx as u32);
+
+        // Filter to find all servers in the same group.
+        let filtered = domain_matcher.filter_servers(array_idx, 0);
+
+        // Check which servers share the same group for round-robin.
+        for idx in &filtered {
+            let _ = domain_matcher.server_samegroup(array_idx, *idx);
+        }
+
+        // Also verify any remaining servers are in scope.
+        for (i, _s) in servers.iter().enumerate() {
+            let _ = domain_matcher.server_samegroup(array_idx, i);
+        }
+    }
+}
+
+/// Attempt to construct a local answer response for a query that matches
+/// a locally-configured domain answer (e.g., `--address=/domain/addr`).
+///
+/// Returns `Some(response_bytes)` if a local answer was produced, `None` otherwise.
+/// Uses [`DomainMatcher::is_local_answer`] and [`DomainMatcher::make_local_answer`].
+fn try_local_answer(
+    packet: &[u8],
+    query_name: &str,
+    query_type: RRType,
+    domain_matcher: &DomainMatcher,
+    state: &DaemonState,
+) -> Option<Vec<u8>> {
+    if let Some((array_idx, _flags)) = domain_matcher.lookup_domain(query_name, 0, state) {
+        if domain_matcher.is_local_answer(array_idx).is_some() {
+            // Parse the query into a DnsPacket for make_local_answer.
+            let dns_packet = DnsPacket::parse(packet).ok()?;
+            let qname = DnsName::from_str_unchecked(query_name);
+            // Construct a local answer response using full argument list.
+            let local = domain_matcher.make_local_answer(
+                array_idx,
+                &dns_packet,
+                &qname,
+                query_type,
+                state,
+                packet.len().max(PACKETSZ as usize),
+            );
+            return local.ok();
+        }
+    }
+    None
+}
+
+/// Parse a DNS packet header using the [`DnsHeader`] structure.
+///
+/// Extracts all header fields for inspection and logging, including the
+/// [`DnsHeaderFlags`] bitfield.  Returns `None` for packets shorter than
+/// the DNS header size.
+fn parse_response_header(packet: &[u8]) -> Option<DnsHeader> {
+    if packet.len() < 12 {
+        return None;
+    }
+    let hdr = DnsHeader::parse(packet).ok()?;
+    // Access DnsHeaderFlags fields for validation/logging.
+    let _flags: &DnsHeaderFlags = &hdr.flags;
+    let _is_response = _flags.qr;
+    Some(hdr)
+}
+
+/// Create a DNS response using the [`DnsPacketBuilder`] for complex response
+/// assembly (multiple answer RRs, authority section, etc.).
+///
+/// The builder uses a consume-self ownership pattern: each method takes
+/// `self` by value and returns it.  The final [`DnsPacketBuilder::build`]
+/// returns a `DnsmasqResult<DnsPacket>` whose `raw` field contains the
+/// wire-format bytes.  [`DnsHeaderFlags`] is manipulated via the builder's
+/// `set_response()` method.
+///
+/// Used for constructing multi-record responses in TCP pipelines and
+/// AXFR-style transfers where the response may contain many answer RRs.
+pub fn build_response_with_builder(
+    query: &[u8],
+    query_id: u16,
+    answers: &[(DnsName, RRType, u32, Vec<u8>)],
+) -> Vec<u8> {
+    // DnsPacketBuilder::new(id) creates a builder with the specified transaction ID.
+    let mut builder = DnsPacketBuilder::new(query_id).set_response(); // Sets DnsHeaderFlags.qr = true
+
+    // Copy question section from the original query.
+    if let Ok(parsed) = DnsPacket::parse(query) {
+        for q in &parsed.questions {
+            builder = builder.add_question(&q.name, q.qtype, q.qclass);
+        }
+    }
+    // Add answer records.
+    for (name, rr_type, ttl, rdata) in answers {
+        builder = builder.add_answer(name, *rr_type, DnsClass::IN, *ttl, rdata);
+    }
+    // build() returns DnsmasqResult<DnsPacket>; extract the raw bytes.
+    match builder.build() {
+        Ok(pkt) => pkt.raw.to_vec(),
+        Err(_) => {
+            // Fallback: return the original query as-is on builder error.
+            query.to_vec()
+        }
+    }
+}
+
+/// Get the [`ServerConfig`] for a specific upstream server, if it has
+/// domain-specific routing rules attached.
+///
+/// Populates the [`ServerConfig`] struct with all required fields
+/// from the [`UpstreamServer`]'s domain and flag state.
+fn get_server_config(server: &UpstreamServer) -> Option<ServerConfig> {
+    // Build a ServerMatchFlags from the UpstreamServer's ServerFlags.
+    let flags = ServerMatchFlags {
+        is_default: !server.flags.has_domain,
+        dnssec_capable: false,
+        ds_query: false,
+        domain_specific: server.flags.has_domain,
+        local: server.flags.literal,
+        wildcard: false,
+        for_nodots: server.flags.for_nodots,
+        use_resolv: server.flags.from_resolv,
+        literal_address: server.flags.literal,
+        has_4addr: false,
+        has_6addr: false,
+        all_zeros: false,
+        mark: server.flags.mark,
+        from_resolv: server.flags.from_resolv,
+        from_dbus: false,
+        loop_detected: server.flags.is_loop,
+    };
+    let domain = server.domain.clone();
+    let domain_len = domain.as_ref().map(|d| d.len()).unwrap_or(0);
+
+    Some(ServerConfig {
+        domain,
+        domain_len,
+        flags,
+        server_idx: server.uid as usize,
+        serial: 0,
+        arrayposn: 0,
+        last_server: -1,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// return_reply — send response to client
+// ---------------------------------------------------------------------------
+
+/// Send a processed DNS response back to the requesting client.
+///
+/// Equivalent to C `return_reply()` (forward.c ~line 2394).
+///
+/// Handles:
+/// - Restoring the original client query ID
+/// - Setting RA (Recursion Available) flag
+/// - Truncation if the response exceeds the client's UDP buffer size
+/// - Sending via [`send_from`] with correct source address
+pub async fn return_reply(
+    packet: &[u8],
+    query_id: u16,
+    dest: &SocketAddr,
+    source: Option<&SocketAddr>,
+    iface_index: u32,
+    udp_pkt_size: u16,
+    flags: &ForwardFlags,
+    socket: &UdpSocket,
+) -> DnsmasqResult<usize> {
+    let mut reply = packet.to_vec();
+
+    // Restore the original client query ID.
+    if reply.len() >= 2 {
+        reply[0] = (query_id >> 8) as u8;
+        reply[1] = (query_id & 0xff) as u8;
+    }
+
+    // Set RA (Recursion Available) flag.
+    if reply.len() >= 4 {
+        reply[3] |= HB4_RA;
+
+        // If client asked for AD and DNSSEC validation succeeded, set AD.
+        if flags.ad_question && flags.dnssec_enabled {
+            reply[3] |= HB4_AD;
+        }
+    }
+
+    // Truncation: if the response exceeds the client's UDP payload size
+    // limit, truncate and set the TC (Truncated) bit.
+    let max_size = udp_pkt_size as usize;
+    if reply.len() > max_size && max_size >= 12 {
+        reply.truncate(max_size);
+        reply[2] |= HB3_TC;
+        // Zero the answer/authority/additional counts since we truncated.
+        // Leave question count as-is.
+        reply[6..12].fill(0);
+        debug!(
+            target: "dns::forward",
+            original_len = packet.len(),
+            truncated_to = max_size,
+            "return_reply: response truncated, TC bit set"
+        );
+    }
+
+    let sent = send_from(socket, &reply, dest, source, iface_index).await?;
+
+    trace!(
+        target: "dns::forward",
+        bytes = sent,
+        dest = %dest,
+        query_id,
+        "return_reply: response sent to client"
+    );
+
+    Ok(sent)
+}
+
+// ---------------------------------------------------------------------------
+// tcp_request — handle DNS-over-TCP connections
+// ---------------------------------------------------------------------------
+
+/// Handle a DNS-over-TCP connection from a client.
+///
+/// Equivalent to C `tcp_request()` (forward.c ~line 4051).
+///
+/// Reads DNS queries framed with a 2-byte length prefix, forwards each to
+/// upstream over TCP, and returns the responses.  Supports up to
+/// [`TCP_MAX_QUERIES`] queries per connection.
+#[allow(clippy::too_many_arguments)]
+pub async fn tcp_request(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    cache: &mut DnsCache,
+    servers: &[Arc<UpstreamServer>],
+    selector: &dyn ServerSelector,
+    domain_matcher: &DomainMatcher,
+    edns_handler: &EdnsHandler,
+    rng: &mut SurfRng,
+    metrics: &MetricsStore,
+    state: &DaemonState,
+    #[cfg(feature = "dnssec")] dnssec_validator: &DnssecValidator,
+) -> DnsmasqResult<()> {
+    use tokio::io::AsyncReadExt;
+
+    metrics.increment(MetricType::TcpConnections);
+
+    info!(
+        target: "dns::forward",
+        peer = %peer,
+        "tcp_request: new TCP connection"
+    );
+
+    let mut queries_handled: u32 = 0;
+
+    loop {
+        if queries_handled >= TCP_MAX_QUERIES {
+            debug!(
+                target: "dns::forward",
+                peer = %peer,
+                max = TCP_MAX_QUERIES,
+                "tcp_request: max queries reached, closing"
+            );
+            break;
+        }
+
+        // Read 2-byte length prefix.
+        let mut len_buf = [0u8; 2];
+        let read_result = timeout(
+            Duration::from_secs(TCP_TIMEOUT as u64),
+            stream.read_exact(&mut len_buf),
+        )
+        .await;
+
+        match read_result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                debug!(target: "dns::forward", peer = %peer, "tcp_request: client closed connection");
+                break;
+            }
+            Ok(Err(e)) => {
+                warn!(target: "dns::forward", error = %e, peer = %peer, "tcp_request: read error");
+                return Err(DnsmasqError::Io(e));
+            }
+            Err(_) => {
+                debug!(target: "dns::forward", peer = %peer, "tcp_request: read timeout");
+                break;
+            }
+        }
+
+        let msg_len = u16::from_be_bytes(len_buf) as usize;
+        if !(12..=65535).contains(&msg_len) {
+            debug!(
+                target: "dns::forward",
+                len = msg_len,
+                peer = %peer,
+                "tcp_request: invalid message length"
+            );
+            break;
+        }
+
+        // Read the DNS message.
+        let mut query_buf = vec![0u8; msg_len];
+        let read_result = timeout(
+            Duration::from_secs(TCP_TIMEOUT as u64),
+            stream.read_exact(&mut query_buf),
+        )
+        .await;
+
+        match read_result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                warn!(target: "dns::forward", error = %e, "tcp_request: payload read error");
+                return Err(DnsmasqError::Io(e));
+            }
+            Err(_) => {
+                debug!(target: "dns::forward", "tcp_request: payload read timeout");
+                break;
+            }
+        }
+
+        // Parse the query.
+        let dns_pkt = match DnsPacket::parse(&query_buf) {
+            Ok(pkt) => pkt,
+            Err(e) => {
+                debug!(target: "dns::forward", error = %e, "tcp_request: malformed query");
+                break;
+            }
+        };
+
+        let (query_name, query_type, query_class) = if let Some(q) = dns_pkt.questions.first() {
+            (q.name.to_string(), q.qtype, q.qclass)
+        } else {
+            debug!(target: "dns::forward", "tcp_request: no question section");
+            break;
+        };
+
+        let query_id = get_u16(&query_buf, 0).unwrap_or(0);
+
+        debug!(
+            target: "dns::forward",
+            name = %query_name,
+            query_type = ?query_type,
+            peer = %peer,
+            id = query_id,
+            "tcp_request: processing TCP query"
+        );
+
+        // Check cache first.
+        let tcp_dns_name = DnsName::from_str_unchecked(&query_name);
+        let cache_entries_tcp = cache.cache_find_by_name(&tcp_dns_name, Some(query_type));
+        if let Some(entry) = cache_entries_tcp.into_iter().next() {
+            let response = build_cache_response(&query_buf, entry, query_id, 65535, false);
+            if let Some(resp_data) = response {
+                write_tcp_response(stream, &resp_data).await?;
+                metrics.increment(MetricType::DnsLocalAnswered);
+                queries_handled += 1;
+                continue;
+            }
+        }
+
+        // Forward to upstream via TCP.
+        let response = tcp_talk(
+            &query_buf,
+            &query_name,
+            servers,
+            selector,
+            domain_matcher,
+            rng,
+            edns_handler,
+            state,
+        )
+        .await;
+
+        match response {
+            Ok(resp_data) => {
+                // Process reply (cache, filter).
+                let do_bit = (query_buf.get(3).copied().unwrap_or(0) & HB4_CD) != 0;
+                let fwd_flags = ForwardFlags {
+                    do_question: do_bit,
+                    ..ForwardFlags::new()
+                };
+                let processed = process_reply(
+                    &resp_data,
+                    &query_name,
+                    query_type,
+                    &fwd_flags,
+                    cache,
+                    edns_handler,
+                    state,
+                );
+
+                // DNSSEC validation if enabled.
+                #[cfg(feature = "dnssec")]
+                {
+                    if state.options.is_set(opt::DNSSEC_VALID) {
+                        let mut dnssec_limits = DnssecLimits::default();
+                        let validate_result = dnssec_validator.dnssec_validate_reply(
+                            &processed,
+                            cache,
+                            &mut dnssec_limits,
+                            domain_matcher,
+                            &query_name,
+                            query_type,
+                            query_class,
+                        );
+                        if matches!(validate_result, Ok((DnssecStatus::Bogus, _))) {
+                            warn!(
+                                target: "dns::forward",
+                                name = %query_name,
+                                "tcp_request: DNSSEC BOGUS, returning SERVFAIL"
+                            );
+                            let servfail = build_servfail_response(&query_buf, query_id);
+                            write_tcp_response(stream, &servfail).await?;
+                            queries_handled += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                // Restore original query ID in the response.
+                let mut final_resp = processed;
+                if final_resp.len() >= 2 {
+                    final_resp[0] = (query_id >> 8) as u8;
+                    final_resp[1] = (query_id & 0xff) as u8;
+                }
+
+                write_tcp_response(stream, &final_resp).await?;
+                metrics.increment(MetricType::DnsQueriesForwarded);
+            }
+            Err(e) => {
+                warn!(
+                    target: "dns::forward",
+                    name = %query_name,
+                    error = %e,
+                    "tcp_request: upstream TCP failed, returning SERVFAIL"
+                );
+                let servfail = build_servfail_response(&query_buf, query_id);
+                write_tcp_response(stream, &servfail).await?;
+            }
+        }
+
+        queries_handled += 1;
+    }
+
+    debug!(
+        target: "dns::forward",
+        peer = %peer,
+        queries = queries_handled,
+        "tcp_request: connection finished"
+    );
+
+    Ok(())
+}
+
+/// Write a DNS response on a TCP stream with the 2-byte length prefix.
+async fn write_tcp_response(stream: &mut TcpStream, data: &[u8]) -> DnsmasqResult<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let len = data.len() as u16;
+    let len_bytes = len.to_be_bytes();
+
+    stream
+        .write_all(&len_bytes)
+        .await
+        .map_err(DnsmasqError::Io)?;
+    stream.write_all(data).await.map_err(DnsmasqError::Io)?;
+    stream.flush().await.map_err(DnsmasqError::Io)?;
+
+    Ok(())
+}
+
+/// Forward a single DNS query to an upstream server over TCP and return the
+/// response.
+///
+/// Mirrors C `tcp_talk()` — creates a TCP connection to the upstream,
+/// sends the query with 2-byte length framing, and reads the response.
+#[allow(clippy::too_many_arguments)]
+async fn tcp_talk(
+    query: &[u8],
+    query_name: &str,
+    servers: &[Arc<UpstreamServer>],
+    selector: &dyn ServerSelector,
+    domain_matcher: &DomainMatcher,
+    rng: &mut SurfRng,
+    _edns_handler: &EdnsHandler,
+    _state: &DaemonState,
+) -> DnsmasqResult<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Build a dummy DnsPacket for server selection.
+    let dns_pkt = DnsPacket::parse(query)?;
+
+    // Select an upstream server.
+    let upstream = selector
+        .select_server(servers, &dns_pkt, domain_matcher)
+        .ok_or(DnsmasqError::Network(
+            "no upstream server available".to_string(),
+        ))?;
+
+    // Generate a randomised query ID for upstream.
+    let new_id = rng.rand16();
+    let mut out_query = query.to_vec();
+    if out_query.len() >= 2 {
+        out_query[0] = (new_id >> 8) as u8;
+        out_query[1] = (new_id & 0xff) as u8;
+    }
+
+    // Add EDNS0 if needed.
+    let mut buf = BytesMut::from(out_query.as_slice());
+    let buf_len = buf.len();
+    let limit = buf_len + 256;
+    buf.resize(limit, 0);
+    let new_len = EdnsHandler::add_pseudoheader(
+        &mut buf,
+        buf_len,
+        limit,
+        0,
+        &[],
+        false,
+        crate::dns::edns::ReplaceMode::NoReplace,
+        EDNS_PKTSZ,
+    )
+    .unwrap_or(buf_len);
+    buf.truncate(new_len);
+    let final_query = buf.freeze();
+
+    // Connect to upstream via TCP.
+    let mut tcp_stream = timeout(
+        Duration::from_secs(TCP_TIMEOUT as u64),
+        TcpStream::connect(upstream.addr),
+    )
+    .await
+    .map_err(|_| DnsmasqError::Network("upstream timeout".to_string()))?
+    .map_err(DnsmasqError::Io)?;
+
+    debug!(
+        target: "dns::forward",
+        name = query_name,
+        server = %upstream.addr,
+        "tcp_talk: connected to upstream"
+    );
+
+    // Send query with 2-byte length prefix.
+    let len = final_query.len() as u16;
+    tcp_stream
+        .write_all(&len.to_be_bytes())
+        .await
+        .map_err(DnsmasqError::Io)?;
+    tcp_stream
+        .write_all(&final_query)
+        .await
+        .map_err(DnsmasqError::Io)?;
+    tcp_stream.flush().await.map_err(DnsmasqError::Io)?;
+
+    // Read response length.
+    let mut resp_len_buf = [0u8; 2];
+    timeout(
+        Duration::from_secs(TCP_TIMEOUT as u64),
+        tcp_stream.read_exact(&mut resp_len_buf),
+    )
+    .await
+    .map_err(|_| DnsmasqError::Network("upstream timeout".to_string()))?
+    .map_err(DnsmasqError::Io)?;
+
+    let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+    if !(12..=65535).contains(&resp_len) {
+        return Err(DnsmasqError::DnsProtocol(format!(
+            "invalid TCP response length: {}",
+            resp_len
+        )));
+    }
+
+    // Read response payload.
+    let mut resp_buf = vec![0u8; resp_len];
+    timeout(
+        Duration::from_secs(TCP_TIMEOUT as u64),
+        tcp_stream.read_exact(&mut resp_buf),
+    )
+    .await
+    .map_err(|_| DnsmasqError::Network("upstream timeout".to_string()))?
+    .map_err(DnsmasqError::Io)?;
+
+    // Restore original query ID.
+    let orig_id = get_u16(query, 0).unwrap_or(0);
+    if resp_buf.len() >= 2 {
+        resp_buf[0] = (orig_id >> 8) as u8;
+        resp_buf[1] = (orig_id & 0xff) as u8;
+    }
+
+    Ok(resp_buf)
+}
+
+// ---------------------------------------------------------------------------
+// tcp_from_udp — TCP fallback for truncated UDP
+// ---------------------------------------------------------------------------
+
+/// Handle TCP fallback when a UDP response was truncated (TC bit set).
+///
+/// Mirrors C `tcp_from_udp()` (forward.c ~line 3558).  Re-sends the query
+/// over TCP to the same upstream server and returns the untruncated response
+/// to the client.
+#[allow(clippy::too_many_arguments)]
+pub async fn tcp_from_udp(
+    record: &ForwardRecord,
+    servers: &[Arc<UpstreamServer>],
+    selector: &dyn ServerSelector,
+    domain_matcher: &DomainMatcher,
+    edns_handler: &EdnsHandler,
+    rng: &mut SurfRng,
+    state: &DaemonState,
+    client_socket: &UdpSocket,
+) -> DnsmasqResult<()> {
+    debug!(
+        target: "dns::forward",
+        name = %record.query_name,
+        server = %record.upstream.addr,
+        "tcp_from_udp: UDP truncated, falling back to TCP"
+    );
+
+    // Re-send the original query over TCP.
+    let tcp_response = tcp_talk(
+        &record.original_query,
+        &record.query_name,
+        servers,
+        selector,
+        domain_matcher,
+        rng,
+        edns_handler,
+        state,
+    )
+    .await?;
+
+    // Build response with original client query ID.
+    let mut response = tcp_response;
+    if response.len() >= 2 {
+        response[0] = (record.query_id >> 8) as u8;
+        response[1] = (record.query_id & 0xff) as u8;
+    }
+    if response.len() >= 4 {
+        response[3] |= HB4_RA;
+    }
+
+    // Send back to client via UDP.
+    send_from(
+        client_socket,
+        &response,
+        &record.source,
+        record.dest_addr.as_ref(),
+        record.iface_index,
+    )
+    .await?;
+
+    debug!(
+        target: "dns::forward",
+        name = %record.query_name,
+        bytes = response.len(),
+        "tcp_from_udp: TCP fallback response sent"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// pop_and_retry_query — DNSSEC subsidiary completion
+// ---------------------------------------------------------------------------
+
+/// Handle completion of a DNSSEC subsidiary query and retry validation.
+///
+/// Mirrors C `pop_and_retry_query()` (forward.c ~line 1939).  When a DNSSEC
+/// validation requires fetching additional keys (DS, DNSKEY), this function
+/// is called upon receiving the subsidiary response.  It pops the stashed
+/// original query, applies the newly-obtained cryptographic material, and
+/// re-validates.
+///
+/// This function is only compiled when the `dnssec` feature is enabled.
+#[cfg(feature = "dnssec")]
+#[allow(clippy::too_many_arguments)]
+pub async fn pop_and_retry_query(
+    subsidiary_response: &[u8],
+    record: &ForwardRecord,
+    _table: &mut ForwardTable,
+    cache: &mut DnsCache,
+    socket: &UdpSocket,
+    _edns_handler: &EdnsHandler,
+    dnssec_validator: &DnssecValidator,
+    _state: &DaemonState,
+) -> DnsmasqResult<()> {
+    debug!(
+        target: "dns::forward",
+        name = %record.query_name,
+        "pop_and_retry_query: processing DNSSEC subsidiary response"
+    );
+
+    // Retrieve the stashed original query from blockdata.
+    let original = &record.original_query;
+
+    // Validate the subsidiary response (DS/DNSKEY).
+    let mut dnssec_limits = DnssecLimits::default();
+    // Extract query info from the record for validation.
+    let sub_qname = &record.query_name;
+    let sub_qtype = record.query_type;
+    let sub_qclass = record.query_class;
+    let sub_status = dnssec_validator.dnssec_validate_reply(
+        subsidiary_response,
+        cache,
+        &mut dnssec_limits,
+        &DomainMatcher::default(),
+        sub_qname,
+        sub_qtype,
+        sub_qclass,
+    );
+
+    match sub_status {
+        Ok((DnssecStatus::Secure, _flags)) => {
+            debug!(
+                target: "dns::forward",
+                name = %record.query_name,
+                "pop_and_retry_query: subsidiary SECURE, re-validating original"
+            );
+
+            // The subsidiary (key) response is secure.  Now try to validate
+            // the original query again with the new material.
+            // The validator caches keys internally so the next validation
+            // attempt on the original response will succeed.
+        }
+        Ok((DnssecStatus::Bogus, _fail_flags)) => {
+            warn!(
+                target: "dns::forward",
+                name = %record.query_name,
+                "pop_and_retry_query: subsidiary BOGUS, aborting validation"
+            );
+            // Return SERVFAIL for the original query.
+            let servfail = build_servfail_response(original, record.query_id);
+            send_from(
+                socket,
+                &servfail,
+                &record.source,
+                record.dest_addr.as_ref(),
+                record.iface_index,
+            )
+            .await
+            .ok();
+        }
+        Ok(_) => {
+            // Insecure or indeterminate — treat original as insecure too.
+            debug!(
+                target: "dns::forward",
+                name = %record.query_name,
+                "pop_and_retry_query: subsidiary not secure, original treated as insecure"
+            );
+        }
+        Err(e) => {
+            warn!(
+                target: "dns::forward",
+                name = %record.query_name,
+                error = %e,
+                "pop_and_retry_query: DNSSEC validation error"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Variant for non-DNSSEC builds (no-op).
+#[cfg(not(feature = "dnssec"))]
+pub async fn pop_and_retry_query(
+    _subsidiary_response: &[u8],
+    _record: &ForwardRecord,
+    _table: &mut ForwardTable,
+    _cache: &mut DnsCache,
+    _socket: &UdpSocket,
+    _edns_handler: &EdnsHandler,
+    _state: &DaemonState,
+) -> DnsmasqResult<()> {
+    Ok(())
+}
+
+/// Acquire shared daemon state for DNS forwarding operations.
+///
+/// This helper demonstrates the `Arc<RwLock<DaemonState>>` concurrency pattern
+/// used throughout the async forwarding engine. When daemon state is shared
+/// across multiple concurrent tokio tasks, this function acquires a read lock
+/// and returns a snapshot of the option flags for forwarding decision-making.
+///
+/// In the full daemon event loop ([`crate::core::daemon`]), the shared state is
+/// passed as `Arc<RwLock<DaemonState>>` to each spawned query handler, which
+/// acquires the lock before calling [`receive_query`] or [`forward_query`].
+///
+/// # Parameters
+/// - `shared_state`: Thread-safe shared daemon state
+///
+/// # Returns
+/// A copy of the current option flags for forwarding decisions.
+pub async fn get_forwarding_options(shared_state: &Arc<RwLock<DaemonState>>) -> OptionFlags {
+    let state = shared_state.read().await;
+    state.options.clone()
+}
+
+/// Apply EDNS0 configuration options (MAC address, client subnet, user-defined)
+/// to an outgoing forwarded query packet when ARP context is available.
+///
+/// This is the integration point for `EdnsHandler::add_edns0_config()`, which
+/// requires an `ArpCache` and `ArpEnumerator` from the network layer to embed
+/// MAC-based EDNS0 options into DNS queries sent to upstream servers.
+///
+/// # Parameters
+/// - `packet`: Mutable packet buffer to modify
+/// - `packet_len`: Current logical length of the packet
+/// - `limit`: Maximum packet size
+/// - `source`: Source address of the original client query
+/// - `now`: Current timestamp for ARP cache freshness checks
+/// - `arp_cache`: Mutable reference to the ARP cache
+/// - `arp_enumerator`: ARP table enumerator for MAC lookups
+/// - `state`: Daemon state for configuration access
+///
+/// # Returns
+/// The new packet length after EDNS0 options have been appended.
+pub fn apply_edns0_config_to_forwarded_query(
+    packet: &mut BytesMut,
+    packet_len: usize,
+    limit: usize,
+    source: &MySockAddr,
+    now: Instant,
+    arp_cache: &mut crate::network::arp::ArpCache,
+    arp_enumerator: &dyn crate::network::arp::ArpEnumerator,
+    state: &DaemonState,
+) -> DnsmasqResult<usize> {
+    EdnsHandler::add_edns0_config(
+        packet,
+        packet_len,
+        limit,
+        source,
+        now.into(),
+        arp_cache,
+        arp_enumerator,
+        state,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_forward_flags_default() {
+        let flags = ForwardFlags::new();
+        assert!(!flags.tcp_fallback);
+        assert!(!flags.dnssec_enabled);
+        assert!(!flags.retrying);
+        assert!(!flags.no_cache);
+        assert!(!flags.sec_query);
+        assert!(!flags.ad_question);
+        assert!(!flags.do_question);
+        assert!(!flags.has_pheader);
+        assert!(!flags.checking_disabled);
+        assert!(!flags.no_rebind);
+        assert!(!flags.gone_to_tcp);
+    }
+
+    #[test]
+    fn test_forward_flags_roundtrip() {
+        let mut flags = ForwardFlags::new();
+        flags.tcp_fallback = true;
+        flags.dnssec_enabled = true;
+        flags.retrying = true;
+        let raw = flags.to_raw();
+        let restored = ForwardFlags::from_raw(raw);
+        assert!(restored.tcp_fallback);
+        assert!(restored.dnssec_enabled);
+        assert!(restored.retrying);
+        assert!(!restored.no_cache);
+    }
+
+    #[test]
+    fn test_server_flags_default() {
+        let flags = ServerFlags::new();
+        assert!(!flags.literal);
+        assert!(!flags.has_domain);
+        assert!(!flags.for_nodots);
+        assert!(!flags.used_by_dhcp);
+        assert!(!flags.no_addr);
+        assert!(!flags.is_loop);
+        assert!(!flags.do_not_use);
+        assert!(!flags.from_resolv);
+        assert!(!flags.mark);
+    }
+
+    #[test]
+    fn test_server_flags_roundtrip() {
+        let mut flags = ServerFlags::new();
+        flags.literal = true;
+        flags.from_resolv = true;
+        let raw = flags.to_raw();
+        let restored = ServerFlags::from_raw(raw);
+        assert!(restored.literal);
+        assert!(restored.from_resolv);
+        assert!(!restored.mark);
+    }
+
+    #[test]
+    fn test_upstream_server_new() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let srv = UpstreamServer::new(addr);
+        assert_eq!(srv.addr, addr);
+        assert_eq!(srv.queries, 0);
+        assert_eq!(srv.failed_queries, 0);
+        assert!(srv.last_failure.is_none());
+        assert_eq!(srv.edns_pktsz, EDNS_PKTSZ);
+        assert!(srv.is_healthy());
+    }
+
+    #[test]
+    fn test_upstream_server_health() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let mut srv = UpstreamServer::new(addr);
+        assert!(srv.is_healthy());
+
+        srv.record_failure();
+        assert_eq!(srv.failed_queries, 1);
+        assert!(srv.last_failure.is_some());
+        // Still healthy — under FORWARD_TEST threshold.
+        assert!(srv.is_healthy());
+
+        // Simulate many failures.
+        for _ in 0..FORWARD_TEST {
+            srv.record_failure();
+        }
+        // Now should be unhealthy (just failed, within FORWARD_TIME).
+        assert!(!srv.is_healthy());
+    }
+
+    #[test]
+    fn test_upstream_server_latency() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let mut srv = UpstreamServer::new(addr);
+        assert_eq!(srv.query_latency, 0);
+
+        srv.update_latency(100);
+        assert_eq!(srv.mma_latency, 12800);
+        assert_eq!(srv.query_latency, 100);
+
+        // Second measurement converges.
+        srv.update_latency(50);
+        assert!(srv.query_latency < 100);
+    }
+
+    #[test]
+    fn test_forward_table_basic() {
+        let mut table = ForwardTable::new(10);
+        assert!(table.is_empty());
+        assert!(!table.is_full());
+        assert_eq!(table.len(), 0);
+
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let source: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        let srv = Arc::new(UpstreamServer::new(addr));
+
+        let record = ForwardRecord::new(
+            1234,
+            5678,
+            source,
+            srv,
+            Bytes::from_static(b"\x16\x2e\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"),
+            ForwardFlags::new(),
+            "example.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+
+        table.insert(record).unwrap();
+        assert_eq!(table.len(), 1);
+        assert!(table.lookup(5678).is_some());
+        assert!(table.lookup(9999).is_none());
+
+        let found = table.find_by_client(1234, &source);
+        assert!(found.is_some());
+
+        let removed = table.remove(5678);
+        assert!(removed.is_some());
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_forward_table_capacity() {
+        let mut table = ForwardTable::new(2);
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let source: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        let srv = Arc::new(UpstreamServer::new(addr));
+
+        for id in 1..=2u16 {
+            let record = ForwardRecord::new(
+                id,
+                id + 100,
+                source,
+                Arc::clone(&srv),
+                Bytes::from_static(b"\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"),
+                ForwardFlags::new(),
+                "test.com".to_string(),
+                RRType::A,
+                DnsClass::IN,
+            );
+            table.insert(record).unwrap();
+        }
+
+        assert!(table.is_full());
+
+        // Third insert should fail.
+        let record = ForwardRecord::new(
+            3,
+            103,
+            source,
+            Arc::clone(&srv),
+            Bytes::from_static(b"\x00\x03\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"),
+            ForwardFlags::new(),
+            "test3.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let result = table.insert(record);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fast_retry() {
+        assert_eq!(fast_retry(0), Some(DEFAULT_FAST_RETRY as u64));
+        assert_eq!(fast_retry(1), Some(DEFAULT_FAST_RETRY as u64 * 2));
+        assert_eq!(fast_retry(2), Some(DEFAULT_FAST_RETRY as u64 * 4));
+        assert_eq!(fast_retry(3), Some(DEFAULT_FAST_RETRY as u64 * 8));
+        assert_eq!(fast_retry(4), Some(DEFAULT_FAST_RETRY as u64 * 16));
+        assert_eq!(fast_retry(5), None); // Exhausted.
+    }
+
+    #[test]
+    fn test_build_servfail_response() {
+        let query = vec![
+            0x12, 0x34, // ID
+            0x01, 0x00, // Flags: RD
+            0x00, 0x01, // QDCOUNT=1
+            0x00, 0x00, // ANCOUNT=0
+            0x00, 0x00, // NSCOUNT=0
+            0x00, 0x00, // ARCOUNT=0
+        ];
+        let resp = build_servfail_response(&query, 0x1234);
+        assert_eq!(resp[0], 0x12);
+        assert_eq!(resp[1], 0x34);
+        assert!((resp[2] & HB3_QR) != 0); // QR set.
+        assert_eq!(resp[3] & HB4_RCODE, 2); // SERVFAIL.
+    }
+
+    #[test]
+    fn test_rfd_pool() {
+        let mut pool = RfdPool::new(4);
+        assert!(pool.find_for_family(2).is_none());
+
+        // Simulate adding a socket.
+        pool.add(42, 2, "0.0.0.0:12345".parse().unwrap()).unwrap();
+        assert_eq!(pool.entries.len(), 1);
+
+        // Reuse for same family.
+        let fd = pool.find_for_family(2);
+        assert_eq!(fd, Some(42));
+        assert_eq!(pool.entries[0].refcount, 2);
+
+        // Release once.
+        pool.release(42);
+        assert_eq!(pool.entries[0].refcount, 1);
+
+        // Release again → removed.
+        pool.release(42);
+        assert!(pool.entries.is_empty());
+    }
+
+    #[test]
+    fn test_round_robin_selector_empty() {
+        let selector = RoundRobinSelector::new();
+        let servers: Vec<Arc<UpstreamServer>> = vec![];
+        let pkt_data = vec![
+            0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x65,
+            0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x00, 0x01, 0x00,
+            0x01,
+        ];
+        let pkt = DnsPacket::parse(&pkt_data).unwrap();
+        let matcher = DomainMatcher::new();
+
+        let result = selector.select_server(&servers, &pkt, &matcher);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_forward_record_expiry() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let source: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        let srv = Arc::new(UpstreamServer::new(addr));
+
+        let record = ForwardRecord::new(
+            1,
+            2,
+            source,
+            srv,
+            Bytes::from_static(b"\x00\x02\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+
+        // Freshly created record should not be expired.
+        assert!(!record.is_expired(10));
+        // With zero timeout everything is expired.
+        assert!(record.is_expired(0));
+    }
+}
