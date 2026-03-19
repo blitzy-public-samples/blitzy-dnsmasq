@@ -22,13 +22,19 @@
 //! matching the C `HAVE_*` preprocessor macro pattern from `config.h`.
 //!
 //! ## Sub-modules:
+//! - [`dbus`] — D-Bus interface for NetworkManager (from `dbus.c`, `cfg(feature = "dbus")`)
 //! - [`ubus`] — OpenWrt UBus interface (from `ubus.c`, `cfg(feature = "ubus")`)
+//! - [`helper`] — Script execution for lease events (from `helper.c`, `cfg(feature = "script")`)
+//! - [`conntrack`] — Linux conntrack marks (from `conntrack.c`, `cfg(feature = "conntrack")`)
+//! - [`ipset`] — Linux ipset via netlink (from `ipset.c`, `cfg(feature = "ipset")`)
+//! - [`nftset`] — nftables sets (from `nftset.c`, `cfg(feature = "nftset")`)
+//! - [`tables`] — BSD PF tables (from `tables.c`, `cfg(target_os = "freebsd")`)
 //!
 //! ## Feature Flag Mapping (C `HAVE_*` → Cargo features):
 //! - `HAVE_DBUS`      → `cfg(feature = "dbus")`       (disabled by default)
 //! - `HAVE_UBUS`      → `cfg(feature = "ubus")`       (disabled by default)
 //! - `HAVE_SCRIPT`    → `cfg(feature = "script")`      (enabled by default)
-//! - `HAVE_CONNTRACK`  → `cfg(feature = "conntrack")`   (disabled by default)
+//! - `HAVE_CONNTRACK` → `cfg(feature = "conntrack")`   (disabled by default)
 //! - `HAVE_IPSET`     → `cfg(feature = "ipset")`       (enabled by default)
 //! - `HAVE_NFTSET`    → `cfg(feature = "nftset")`      (disabled by default)
 //! - BSD PF tables    → `cfg(target_os = "freebsd")`   (auto-detected)
@@ -55,42 +61,37 @@ pub mod dbus;
 
 /// OpenWrt UBus message bus integration.
 ///
-/// Provides `UbusController` for OpenWrt embedded system integration,
-/// including metrics export, cache management, and DHCP event broadcasting.
+/// Provides [`UbusController`] for OpenWrt embedded system integration,
+/// including metrics export, cache management, and DHCP event broadcasting
+/// via [`UbusController::event_bcast`].
 ///
 /// Migrated from `src/ubus.c` (968 lines).
 #[cfg(feature = "ubus")]
 pub mod ubus;
 
-/// BSD PF table integration for DNS-based firewall rule population.
+/// Script execution helper for DHCP/TFTP/ARP event callbacks.
 ///
-/// Provides `PfTableController` for creating PF tables and adding/removing
-/// IP addresses via ioctl on `/dev/pf`. Platform-gated to FreeBSD/OpenBSD/NetBSD.
+/// Provides [`ScriptHelper`] for async process spawning of user-configured
+/// lease-change scripts, [`EventAction`] enum for event types, [`ScriptEvent`]
+/// data structure, and convenience wrappers [`queue_script`] and [`queue_arp`].
+/// Supports optional Lua scripting via the `luascript` feature.
 ///
-/// Migrated from `src/tables.c` (386 lines).
-#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
-pub mod tables;
-
-/// nftables set integration for DNS-based firewall rule population.
-///
-/// Provides [`NftsetController`] for adding/removing IP addresses in nftables
-/// sets, enabling domain-based firewall policies on modern Linux systems.
-///
-/// Migrated from `src/nftset.c` (392 lines).
-#[cfg(feature = "nftset")]
-pub mod nftset;
+/// Migrated from `src/helper.c` (1,528 lines).
+#[cfg(feature = "script")]
+pub mod helper;
 
 /// Linux netfilter conntrack mark retrieval for DNS policy routing.
 ///
 /// Provides [`get_incoming_mark`] for querying the Linux kernel's conntrack
 /// table to retrieve connection marks associated with incoming DNS queries,
 /// enabling VPN split-horizon and per-connection DNS policies.
+/// Error conditions are reported via [`ConntrackError`].
 ///
 /// Migrated from `src/conntrack.c` (324 lines).
 #[cfg(all(feature = "conntrack", target_os = "linux"))]
 pub mod conntrack;
 
-/// Linux ipset integration for DNS-based firewall rule population.
+/// Linux ipset integration via netlink for DNS-based firewall rules.
 ///
 /// Provides [`IpsetController`] for dynamically populating named ipset
 /// collections with IP addresses resolved from DNS queries, enabling
@@ -100,33 +101,85 @@ pub mod conntrack;
 #[cfg(all(feature = "ipset", target_os = "linux"))]
 pub mod ipset;
 
-/// Script execution helper for DHCP/TFTP/ARP event callbacks.
+/// nftables set manipulation for modern Linux firewall integration.
 ///
-/// Provides [`ScriptHelper`] for async process spawning of user-configured
-/// lease-change scripts, with optional Lua scripting support via `mlua`.
+/// Provides [`NftsetController`] for adding/removing IP addresses in nftables
+/// sets, enabling domain-based firewall policies on modern Linux systems.
+/// Error conditions are reported via [`NftsetError`].
 ///
-/// Migrated from `src/helper.c` (1,528 lines).
-#[cfg(feature = "script")]
-pub mod helper;
+/// Migrated from `src/nftset.c` (392 lines).
+#[cfg(all(feature = "nftset", target_os = "linux"))]
+pub mod nftset;
 
-// Re-export key types when features are enabled
+/// BSD PF table integration for DNS-based firewall rule population.
+///
+/// Provides [`PfTableController`] for creating PF tables and adding/removing
+/// IP addresses via ioctl on `/dev/pf`. Platform-gated to FreeBSD/OpenBSD/NetBSD.
+///
+/// Migrated from `src/tables.c` (386 lines).
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+pub mod tables;
+
+// ---------------------------------------------------------------------------
+// Public re-exports for ergonomic access
+// ---------------------------------------------------------------------------
+// Re-export commonly-used types when features are enabled, allowing callers
+// to use `crate::integration::DbusController` instead of
+// `crate::integration::dbus::DbusController`.
+
+/// D-Bus controller, error type, service constants, and signal emission.
 #[cfg(feature = "dbus")]
-pub use dbus::{DbusController, DbusError, DBUS_OBJECT_PATH, DBUS_SERVICE_NAME};
+pub use dbus::{emit_signal, DbusController, DbusError, DBUS_OBJECT_PATH, DBUS_SERVICE_NAME};
 
+/// OpenWrt UBus controller (event broadcasting via [`UbusController::event_bcast`]).
 #[cfg(feature = "ubus")]
 pub use ubus::UbusController;
 
-#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
-pub use tables::PfTableController;
+/// Script helper, event types, and convenience queue functions.
+#[cfg(feature = "script")]
+pub use helper::{EventAction, ScriptEvent, ScriptHelper};
 
-#[cfg(feature = "nftset")]
-pub use nftset::NftsetController;
+/// Convenience re-export of [`queue_script`] for DHCP lease events.
+/// Only available when both `script` and `dhcp` features are enabled,
+/// since the function signature references [`DhcpLease`].
+#[cfg(all(feature = "script", feature = "dhcp"))]
+pub use helper::queue_script;
 
+/// Convenience re-export of [`queue_arp`] for ARP table change events.
+#[cfg(feature = "script")]
+pub use helper::queue_arp;
+
+/// Conntrack mark retrieval function and error type.
 #[cfg(all(feature = "conntrack", target_os = "linux"))]
 pub use conntrack::{get_incoming_mark, ConntrackError};
 
+/// Linux ipset controller for DNS-based firewall rule population.
 #[cfg(all(feature = "ipset", target_os = "linux"))]
 pub use ipset::IpsetController;
 
-#[cfg(feature = "script")]
-pub use helper::{EventAction, ScriptEvent, ScriptHelper};
+/// nftables set controller and error type.
+#[cfg(all(feature = "nftset", target_os = "linux"))]
+pub use nftset::{NftsetController, NftsetError};
+
+/// BSD PF table controller for DNS-based firewall rules.
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+pub use tables::PfTableController;
+
+// ---------------------------------------------------------------------------
+// Feature flag mapping from C HAVE_* macros to Cargo features:
+//
+// HAVE_DBUS      → cfg(feature = "dbus")       (disabled by default)
+// HAVE_UBUS      → cfg(feature = "ubus")       (disabled by default)
+// HAVE_SCRIPT    → cfg(feature = "script")      (enabled by default)
+// HAVE_CONNTRACK → cfg(feature = "conntrack")   (disabled by default)
+// HAVE_IPSET     → cfg(feature = "ipset")       (enabled by default)
+// HAVE_NFTSET    → cfg(feature = "nftset")      (disabled by default)
+// HAVE_BSD_IPSET → cfg(target_os = "freebsd")   (auto-detected)
+//
+// Platform-specific modules use target_os gates replacing the C
+// #ifdef HAVE_LINUX_NETWORK / HAVE_BSD_NETWORK preprocessor guards:
+//   - conntrack, ipset, nftset → cfg(target_os = "linux")
+//   - tables                   → cfg(any(target_os = "freebsd",
+//                                        target_os = "openbsd",
+//                                        target_os = "netbsd"))
+// ---------------------------------------------------------------------------
