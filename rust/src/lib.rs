@@ -10,4 +10,5 @@ pub mod network;
 pub mod dhcp;
 
 pub mod integration;
+#[cfg(feature = "tftp")]
 pub mod services;
