@@ -1,3 +1,8 @@
+// SAFETY: This module contains unsafe blocks for platform-specific FFI operations.
+// The crate-level #![deny(unsafe_code)] is overridden here because this module
+// requires direct system call interactions that cannot be expressed in safe Rust.
+#![allow(unsafe_code)]
+
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // Copyright (C) 2024 dnsmasq contributors
