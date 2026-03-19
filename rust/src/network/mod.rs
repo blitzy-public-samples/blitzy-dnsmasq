@@ -39,8 +39,10 @@ pub mod bpf;
 /// Migrated from `network.c` — the platform-independent network management core.
 pub mod interface;
 
-// NOTE: The following sub-module is planned but created by a separate agent:
-// - pub mod arp;        (from arp.c — ARP cache management)
+/// ARP/neighbor cache management for DHCP address conflict detection.
+/// Migrated from `arp.c` — maintains internal ARP cache with periodic
+/// kernel synchronization, MAC lookup API, and script notifications.
+pub mod arp;
 
 // ---------------------------------------------------------------------------
 // Conditional re-exports
@@ -57,3 +59,7 @@ pub use netlink::{IFACE_DEPRECATED, IFACE_PERMANENT, IFACE_TENTATIVE};
 
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
 pub use bpf::{init_bpf, route_init, route_sock, send_via_bpf, BpfNetwork};
+
+pub use arp::{
+    do_arp_script_run, find_mac, ArpCache, ArpEnumerator, ArpRecord, ArpStatus, DHCP_CHADDR_MAX,
+};
