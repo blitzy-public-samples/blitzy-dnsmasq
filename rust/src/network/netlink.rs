@@ -526,6 +526,7 @@ impl NetlinkNetwork {
                     iov_base: self.recv_buf.as_mut_ptr() as *mut libc::c_void,
                     iov_len: self.recv_buf.len(),
                 };
+                // SAFETY: msghdr is a plain C struct with no validity invariants beyond zeroing.
                 let mut msg: libc::msghdr = unsafe { mem::zeroed() };
                 msg.msg_name = &mut nladdr as *mut _ as *mut libc::c_void;
                 msg.msg_namelen = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
@@ -567,6 +568,7 @@ impl NetlinkNetwork {
                     iov_base: self.recv_buf.as_mut_ptr() as *mut libc::c_void,
                     iov_len: self.recv_buf.len(),
                 };
+                // SAFETY: msghdr is a plain C struct with no validity invariants beyond zeroing.
                 let mut msg: libc::msghdr = unsafe { mem::zeroed() };
                 msg.msg_name = &mut nladdr as *mut _ as *mut libc::c_void;
                 msg.msg_namelen = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
@@ -1553,6 +1555,8 @@ mod tests {
             nlmsg_seq: 0,
             nlmsg_pid: 0,
         };
+        // SAFETY: nlh is a valid, fully-initialized nlmsghdr on the stack; reading
+        // size_of::<nlmsghdr>() bytes from its address is well-defined for a POD struct.
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 &nlh as *const _ as *const u8,
@@ -1611,6 +1615,8 @@ mod tests {
     fn build_rtattr(buf: &mut Vec<u8>, rta_type: u16, data: &[u8]) {
         let rta_len = (mem::size_of::<RtAttr>() + data.len()) as u16;
         let rta = RtAttr { rta_len, rta_type };
+        // SAFETY: rta is a valid, fully-initialized RtAttr on the stack; reading
+        // size_of::<RtAttr>() bytes from its address is well-defined for a POD struct.
         let hdr_bytes = unsafe {
             std::slice::from_raw_parts(&rta as *const _ as *const u8, mem::size_of::<RtAttr>())
         };
@@ -1678,6 +1684,8 @@ mod tests {
         };
 
         let mut msg_data = vec![0u8; msg_len];
+        // SAFETY: nlh is a valid nlmsghdr on the stack and msg_data is allocated with
+        // msg_len >= hdr_size bytes; the copy does not overlap and stays within bounds.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 &nlh as *const _ as *const u8,
@@ -1708,6 +1716,8 @@ mod tests {
             nlmsg_pid: 0,
         };
 
+        // SAFETY: nlh is a valid, fully-initialized nlmsghdr on the stack; reading
+        // size_of::<nlmsghdr>() bytes from its address is well-defined for a POD struct.
         let msg_data = unsafe {
             std::slice::from_raw_parts(
                 &nlh as *const _ as *const u8,
@@ -1736,6 +1746,8 @@ mod tests {
             nlmsg_pid: 0,
         };
 
+        // SAFETY: nlh is a valid, fully-initialized nlmsghdr on the stack; reading
+        // size_of::<nlmsghdr>() bytes from its address is well-defined for a POD struct.
         let msg_data = unsafe {
             std::slice::from_raw_parts(
                 &nlh as *const _ as *const u8,
@@ -1777,6 +1789,9 @@ mod tests {
         };
 
         let mut msg_data = vec![0u8; msg_len];
+        // SAFETY: nlh and rtm are valid POD structs on the stack; msg_data is allocated
+        // with msg_len = hdr_size + rtm_size so both copies stay within bounds and
+        // do not overlap (destination offsets are disjoint: 0..hdr_size, nlmsg_hdrlen()..+rtm_size).
         unsafe {
             std::ptr::copy_nonoverlapping(
                 &nlh as *const _ as *const u8,
@@ -1828,6 +1843,9 @@ mod tests {
         };
 
         let mut msg_data = vec![0u8; msg_len];
+        // SAFETY: nlh and rtm are valid POD structs on the stack; msg_data is allocated
+        // with msg_len = hdr_size + rtm_size so both copies stay within bounds and
+        // do not overlap (destination offsets are disjoint).
         unsafe {
             std::ptr::copy_nonoverlapping(
                 &nlh as *const _ as *const u8,
@@ -1978,6 +1996,8 @@ mod tests {
         // Build a valid nlmsghdr with unknown type 99
         let nlh_size = std::mem::size_of::<libc::nlmsghdr>();
         let mut buf = vec![0u8; nlh_size + 16];
+        // SAFETY: buf is at least nlh_size bytes; casting to *mut nlmsghdr and writing
+        // fields is valid because nlmsghdr is a POD C struct with no alignment beyond u32.
         let nlh = unsafe { &mut *(buf.as_mut_ptr() as *mut libc::nlmsghdr) };
         nlh.nlmsg_len = buf.len() as u32;
         nlh.nlmsg_type = 99;
@@ -1997,6 +2017,8 @@ mod tests {
         let total_size = nlh_size + ifa_size;
 
         let mut buf = vec![0u8; total_size + 32];
+        // SAFETY: buf is at least total_size bytes (>= nlh_size); casting to *mut nlmsghdr
+        // and writing fields is valid because nlmsghdr is a POD C struct.
         let nlh = unsafe { &mut *(buf.as_mut_ptr() as *mut libc::nlmsghdr) };
         nlh.nlmsg_len = total_size as u32;
         nlh.nlmsg_type = libc::RTM_DELADDR;
@@ -2016,6 +2038,8 @@ mod tests {
         let total_size = nlh_size + ifa_size;
 
         let mut buf = vec![0u8; total_size + 32];
+        // SAFETY: buf is at least total_size bytes (>= nlh_size); casting to *mut nlmsghdr
+        // and writing fields is valid because nlmsghdr is a POD C struct.
         let nlh = unsafe { &mut *(buf.as_mut_ptr() as *mut libc::nlmsghdr) };
         nlh.nlmsg_len = total_size as u32;
         nlh.nlmsg_type = libc::RTM_DELADDR;
@@ -2040,6 +2064,8 @@ mod tests {
         let total_size = nlh_size + err_size;
 
         let mut buf = vec![0u8; total_size + 32];
+        // SAFETY: buf is at least total_size bytes (>= nlh_size); casting to *mut nlmsghdr
+        // and writing fields is valid because nlmsghdr is a POD C struct.
         let nlh = unsafe { &mut *(buf.as_mut_ptr() as *mut libc::nlmsghdr) };
         nlh.nlmsg_len = total_size as u32;
         nlh.nlmsg_type = libc::NLMSG_ERROR as u16;
@@ -2176,6 +2202,8 @@ mod tests {
         // nlmsghdr with length larger than buffer
         let nlh_size = std::mem::size_of::<libc::nlmsghdr>();
         let mut buf = vec![0u8; nlh_size];
+        // SAFETY: buf is exactly nlh_size bytes; casting to *mut nlmsghdr and writing
+        // fields is valid because nlmsghdr is a POD C struct with no alignment beyond u32.
         let nlh = unsafe { &mut *(buf.as_mut_ptr() as *mut libc::nlmsghdr) };
         nlh.nlmsg_len = (nlh_size + 100) as u32; // Lies about length
         nlh.nlmsg_type = libc::RTM_NEWADDR;

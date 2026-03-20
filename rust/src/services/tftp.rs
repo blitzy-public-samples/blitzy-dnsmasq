@@ -1530,7 +1530,10 @@ impl TftpServer {
             // Check retransmit timer (C lines 878–919).
             if now >= transfer.retransmit {
                 // Need mutable access — remove, modify, re-insert.
-                let mut transfer = self.active_transfers.remove(peer).unwrap();
+                let mut transfer = self
+                    .active_transfers
+                    .remove(peer)
+                    .expect("invariant: peer must exist in active_transfers after iteration");
 
                 // Increment retransmit deadline with exponential backoff.
                 let backoff_secs = transfer.timeout + (1u32 << (transfer.backoff / 2));

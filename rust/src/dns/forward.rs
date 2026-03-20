@@ -856,6 +856,8 @@ fn send_from_with_cmsg(
     let mut cmsg_buf = vec![0u8; cmsg_buf_size];
 
     // Build sockaddr on the stack so it lives through the sendmsg call.
+    // SAFETY: sockaddr_in and sockaddr_in6 are plain-old-data C structs with no validity
+    // invariants beyond zeroing; mem::zeroed() produces a valid empty state for both.
     let mut dest_sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     let mut dest_sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
 
