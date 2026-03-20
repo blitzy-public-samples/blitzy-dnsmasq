@@ -19,7 +19,7 @@
 
 ## Overview
 
-This document describes the complete Rust module architecture for the dnsmasq implementation — a memory-safe rewrite of the dnsmasq v2.92 C codebase (50 source files, 92,894 lines) in Rust 1.91.0 stable. The Rust implementation is a single-binary daemon that uses the `tokio` async runtime, replacing the original C `poll()`-based event loop with Rust's `async`/`await` paradigm while preserving the single-process, event-driven architecture.
+This document describes the complete Rust module architecture for the dnsmasq implementation — a memory-safe rewrite of the dnsmasq v2.92 C codebase (50 source files, 92,894 lines) in Rust 1.91.0 stable. The Rust implementation is a single-binary daemon that uses the `tokio` async runtime (multi-threaded by default), replacing the original C `poll()`-based event loop with Rust's `async`/`await` paradigm while preserving the single-process, event-driven architecture.
 
 The Rust binary is a **drop-in replacement** for the C `dnsmasq` binary: it accepts identical configuration files (`dnsmasq.conf` with 350+ directives), command-line flags, signal semantics (SIGHUP, SIGUSR1, SIGUSR2, SIGTERM), and produces identical network behavior (DNS forwarding/caching, DHCPv4/v6 server, Router Advertisement, TFTP/PXE boot, DNSSEC validation, authoritative DNS).
 
@@ -58,7 +58,7 @@ RAII (Resource Acquisition Is Initialization) replaces all manual memory managem
 
 ### 3. Async I/O via Tokio
 
-The C `poll()`-based event loop (`src/poll.c`, `src/dnsmasq.c`) is replaced by a single-threaded `tokio` runtime using `epoll` (Linux) or `kqueue` (BSD/macOS) backends via `mio`. The `tokio::select!` macro multiplexes all event sources — DNS sockets, DHCP sockets, signal handlers, timers, and inotify watchers — in a single async event loop.
+The C `poll()`-based event loop (`src/poll.c`, `src/dnsmasq.c`) is replaced by `tokio`'s multi-threaded runtime using `epoll` (Linux) or `kqueue` (BSD/macOS) backends via `mio`. The `#[tokio::main]` attribute (without an explicit `flavor` parameter) defaults to the multi-threaded scheduler. The `tokio::select!` macro multiplexes all event sources — DNS sockets, DHCP sockets, signal handlers, timers, and inotify watchers — within the async event loop.
 
 ### 4. Type-State Pattern
 
@@ -156,10 +156,10 @@ rust/src/
 │   ├── dbus.rs                 (D-Bus interface via dbus crate — cfg(feature = "dbus"))
 │   ├── ubus.rs                 (OpenWrt ubus — cfg(feature = "ubus"))
 │   ├── helper.rs               (script execution via tokio::process::Command, lease-change callbacks)
-│   ├── conntrack.rs            (conntrack marks via nix/netlink — cfg(feature = "conntrack"))
-│   ├── ipset.rs                (ipset integration via netlink — cfg(feature = "ipset"))
-│   ├── nftset.rs               (nftables set integration — cfg(feature = "nftset"))
-│   └── tables.rs               (routing table interaction — cfg(target_os = "freebsd"))
+│   ├── conntrack.rs            (conntrack marks via nix/netlink — cfg(all(target_os = "linux", feature = "conntrack")))
+│   ├── ipset.rs                (ipset integration via netlink — cfg(all(target_os = "linux", feature = "ipset")))
+│   ├── nftset.rs               (nftables set integration — cfg(all(target_os = "linux", feature = "nftset")))
+│   └── tables.rs               (routing table interaction — cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")))
 │
 ├── services/                   [Network Services]
 │   ├── mod.rs                  (services module root)
@@ -220,10 +220,10 @@ Every Rust module traces back to one or more C source files. This mapping is the
 | `integration/dbus.rs` | `src/dbus.c` | 2,175 | `cfg(feature = "dbus")` |
 | `integration/ubus.rs` | `src/ubus.c` | 968 | `cfg(feature = "ubus")` |
 | `integration/helper.rs` | `src/helper.c` | 1,528 | `fork`/`exec` → `tokio::process` |
-| `integration/conntrack.rs` | `src/conntrack.c` | 324 | `cfg(feature = "conntrack")` |
-| `integration/ipset.rs` | `src/ipset.c` | 532 | `cfg(feature = "ipset")` |
-| `integration/nftset.rs` | `src/nftset.c` | 392 | `cfg(feature = "nftset")` |
-| `integration/tables.rs` | `src/tables.c` | 386 | `cfg(target_os = "freebsd")` |
+| `integration/conntrack.rs` | `src/conntrack.c` | 324 | `cfg(all(target_os = "linux", feature = "conntrack"))` |
+| `integration/ipset.rs` | `src/ipset.c` | 532 | `cfg(all(target_os = "linux", feature = "ipset"))` |
+| `integration/nftset.rs` | `src/nftset.c` | 392 | `cfg(all(target_os = "linux", feature = "nftset"))` |
+| `integration/tables.rs` | `src/tables.c` | 386 | `cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))` |
 | `services/tftp.rs` | `src/tftp.c` | 1,647 | `cfg(feature = "tftp")` |
 | `diagnostics/dump.rs` | `src/dump.c` | 815 | `cfg(feature = "dumpfile")` |
 | `diagnostics/inotify.rs` | `src/inotify.c` | 687 | `cfg(feature = "inotify")` |
@@ -346,7 +346,7 @@ pub struct DaemonState {
 
 1. **Safe shared access** — Multiple async tasks can hold references to the state without data races, enforced at compile time.
 2. **Read-write semantics** — `RwLock` allows concurrent readers with exclusive writers, matching the C access pattern where most operations read state and only specific events (config reload, lease update, cache insert) modify it.
-3. **Future-proofing** — Although the current implementation uses a single-threaded tokio runtime (matching the C single-process model), the `Arc<RwLock<>>` wrapper enables future migration to a multi-threaded runtime if needed, with zero code changes to state access patterns.
+3. **Multi-threaded readiness** — The `Arc<RwLock<>>` wrapper is required because the default `#[tokio::main]` multi-threaded runtime may schedule tasks across multiple worker threads. This enables safe concurrent access without data races.
 4. **Explicit dependency** — Passing state as a function parameter makes module dependencies visible in function signatures, unlike the C implicit global access.
 
 ---
@@ -355,17 +355,17 @@ pub struct DaemonState {
 
 ### Tokio Configuration
 
-The Rust implementation uses a **single-threaded tokio runtime**, preserving the C implementation's single-process, event-driven model:
+The Rust implementation uses `tokio`'s **multi-threaded runtime** (the default scheduler), preserving the C implementation's single-process, event-driven model while enabling concurrent task execution across worker threads:
 
 ```rust
 // main.rs
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize daemon, bind sockets, drop privileges, enter event loop
 }
 ```
 
-The `current_thread` flavor runs all async tasks on a single OS thread, matching the C `poll()` loop behavior. Under the hood, tokio uses `epoll` on Linux and `kqueue` on BSD/macOS (via the `mio` crate) for efficient kernel-level I/O event notification.
+The `#[tokio::main]` attribute without an explicit `flavor` parameter defaults to `flavor = "multi_thread"`, which spawns a thread pool of worker threads (one per CPU core by default). Under the hood, tokio uses `epoll` on Linux and `kqueue` on BSD/macOS (via the `mio` crate) for efficient kernel-level I/O event notification.
 
 ### Event Sources
 
@@ -473,6 +473,7 @@ The C `HAVE_*` preprocessor macro system maps to Cargo feature flags. The defaul
 | `HAVE_CONNTRACK` | `conntrack` | disabled | `integration/conntrack.rs` | (libnetfilter_conntrack) |
 | `HAVE_NFTSET` | `nftset` | disabled | `integration/nftset.rs` | `nftables` crate (libnftables) |
 | `HAVE_LUASCRIPT` | `luascript` | disabled | Lua scripting support | `mlua` crate (liblua) |
+| `HAVE_BROKEN_RTC` | `broken-rtc` | disabled | Embedded systems without hardware real-time clock — uses lease length instead of expiry time | None |
 
 ### Auto-Detected Platform Features
 
@@ -515,13 +516,13 @@ pub mod dbus;
 pub mod ubus;
 #[cfg(feature = "script")]
 pub mod helper;
-#[cfg(feature = "conntrack")]
+#[cfg(all(target_os = "linux", feature = "conntrack"))]
 pub mod conntrack;
-#[cfg(feature = "ipset")]
+#[cfg(all(target_os = "linux", feature = "ipset"))]
 pub mod ipset;
-#[cfg(feature = "nftset")]
+#[cfg(all(target_os = "linux", feature = "nftset"))]
 pub mod nftset;
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
 pub mod tables;
 ```
 
@@ -598,7 +599,7 @@ The binary entry point (`main.rs`) uses `anyhow::Result` for top-level error rep
 
 ```rust
 // main.rs
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = config::cli::parse_args()?;
     let state = core::daemon::initialize(config).await?;
@@ -629,7 +630,7 @@ All platform-specific code is isolated behind `#[cfg(target_os = "...")]` attrib
 |-----------|-------------|----------|-----------|
 | Raw packet capture | `network/bpf.rs` | `src/bpf.c` | BPF device via `nix` crate |
 | Interface monitoring | `network/bpf.rs` | `src/bpf.c` | Routing sockets |
-| Routing table interaction | `integration/tables.rs` | `src/tables.c` | `cfg(target_os = "freebsd")` |
+| Routing table interaction | `integration/tables.rs` | `src/tables.c` | `cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))` |
 
 ### macOS
 
@@ -662,7 +663,7 @@ fn main() {
 
 ### Unsafe Code Policy
 
-Zero `unsafe` blocks are permitted in core logic modules (`dns/`, `dhcp/`, `config/`, `core/` excluding platform FFI). `unsafe` FFI blocks are allowed only in platform-specific modules (`network/netlink.rs`, `network/bpf.rs`, `network/arp.rs`, `core/daemon.rs` for privilege management) and must include `// SAFETY:` comments explaining the invariant maintained. See [SAFETY.md](SAFETY.md) for the complete inventory.
+The crate root enforces `#![deny(unsafe_code)]`, and 15 modules carry the targeted `#![allow(unsafe_code)]` override for platform FFI and low-level packet/buffer operations. These include platform modules (`network/interface.rs`, `network/netlink.rs`, `network/bpf.rs`), privilege management (`core/daemon.rs`), raw socket I/O (`dns/forward.rs`, `dhcp/v4/server.rs`, `dhcp/v6/server.rs`, `dhcp/common.rs`, `dhcp/radv.rs`), service sockets (`services/tftp.rs`), logging (`core/log.rs`), and integration FFI (`integration/ubus.rs`, `integration/helper.rs`, `integration/ipset.rs`, `integration/tables.rs`). All `unsafe` blocks must include `// SAFETY:` comments explaining the invariant maintained. See [SAFETY.md](SAFETY.md) for the complete inventory.
 
 ---
 

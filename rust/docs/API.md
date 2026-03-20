@@ -5,7 +5,7 @@
 This document provides comprehensive internal API documentation for the dnsmasq Rust
 implementation. It covers the public Rust API surface of every module, with function
 signatures, type definitions, and purpose descriptions derived from the original C source
-code inline comments across all 50 source files (44 `.c` + 6 `.h`).
+code inline comments across all 50 source files (42 `.c` + 8 `.h`).
 
 For the module hierarchy and dependency graph, see [ARCHITECTURE.md](ARCHITECTURE.md).
 For the C-to-Rust pattern mapping, see [MIGRATION.md](MIGRATION.md). For full
@@ -44,54 +44,22 @@ initialization and teardown.
 
 ```rust
 /// Top-level daemon runner managing the async event loop and all subsystem lifecycles.
-pub struct Daemon { /* ... */ }
+/// Replaces C's main() orchestration in src/dnsmasq.c.
+pub struct DaemonRunner { /* ... */ }
 ```
 
 #### Public Functions
 
 ```rust
-/// Main async entry point — initialises all subsystems, binds sockets, drops
-/// privileges, and enters the tokio::select! event loop.
-/// Replaces C main() in src/dnsmasq.c.
-pub async fn run(config: DaemonConfig) -> Result<(), DnsmasqError>;
+impl DaemonRunner {
+    /// Construct a new `DaemonRunner` from the fully-parsed daemon state.
+    /// Initialises all subsystems — DNS cache, DHCP context, listeners, etc.
+    pub fn new(state: DaemonState) -> DnsmasqResult<Self>;
 
-/// Process a queued asynchronous event (signal, child exit, timer).
-/// Replaces C async_event() from src/dnsmasq.c.
-pub async fn async_event(state: &mut DaemonState, event: Event) -> Result<(), DnsmasqError>;
-
-/// Flush the DNS cache and reload configuration files (/etc/hosts, /etc/resolv.conf).
-/// Triggered by SIGHUP. Replaces C clear_cache_and_reload().
-pub fn clear_cache_and_reload(state: &mut DaemonState, now: Instant) -> Result<(), DnsmasqError>;
-
-/// Queue an event for processing in the next event loop iteration.
-/// Replaces C queue_event() from src/dnsmasq.c.
-pub fn queue_event(event: Event);
-
-/// Send a time-based alarm event. Schedules a timer for the given instant.
-/// Replaces C send_alarm() from src/dnsmasq.c.
-pub fn send_alarm(event_time: Instant, now: Instant);
-
-/// Send an event with associated data and optional message.
-/// Replaces C send_event() from src/dnsmasq.c.
-pub fn send_event(fd: RawFd, event: i32, data: i32, msg: Option<&str>);
-
-/// Check DNS listener sockets for incoming queries and dispatch processing.
-/// Replaces C check_dns_listeners() from src/dnsmasq.c.
-pub async fn check_dns_listeners(state: &mut DaemonState, now: Instant) -> Result<(), DnsmasqError>;
-
-/// Register DNS listener file descriptors with the async I/O reactor.
-/// Replaces C set_dns_listeners() from src/dnsmasq.c.
-pub fn set_dns_listeners(state: &DaemonState);
-
-/// Create an ICMP socket for DHCP ping-before-offer functionality.
-/// Replaces C make_icmp_sock() from src/dnsmasq.c.
-#[cfg(feature = "dhcp")]
-pub fn make_icmp_sock() -> Result<RawFd, DnsmasqError>;
-
-/// Perform an ICMP ping to check address availability before DHCP offer.
-/// Replaces C icmp_ping() from src/dnsmasq.c.
-#[cfg(feature = "dhcp")]
-pub fn icmp_ping(addr: Ipv4Addr) -> Result<bool, DnsmasqError>;
+    /// Main async entry point — binds sockets, drops privileges, and enters
+    /// the tokio::select! event loop. Replaces C main() in src/dnsmasq.c.
+    pub async fn run(&mut self) -> DnsmasqResult<()>;
+}
 ```
 
 ---
@@ -112,8 +80,8 @@ pub struct DaemonState {
     pub dns_cache: DnsCache,
     pub lease_db: LeaseDatabase,
     pub listeners: Vec<Listener>,
-    pub servers: Vec<ServerStruct>,
-    pub metrics: MetricsCounters,
+    pub servers: Vec<ServerEntry>,
+    pub metrics: MetricsStore,
     // ... additional fields corresponding to struct daemon members
 }
 
@@ -139,7 +107,7 @@ pub enum MySockAddr {
 
 /// Upstream DNS server descriptor.
 /// Replaces C `struct server` from src/dnsmasq.h.
-pub struct ServerStruct {
+pub struct ServerEntry {
     pub addr: MySockAddr,
     pub source_addr: MySockAddr,
     pub interface: Option<String>,
@@ -153,7 +121,7 @@ pub struct ServerStruct {
 
 /// Network interface record.
 /// Replaces C `struct irec` from src/dnsmasq.h.
-pub struct Irec {
+pub struct InterfaceRecord {
     pub addr: MySockAddr,
     pub netmask: Ipv4Addr,
     pub tftp_ok: bool,
@@ -226,22 +194,38 @@ by `tokio::select!` in the Rust implementation.
 #### Public Functions
 
 ```rust
-/// Reset the poll state, clearing all registered file descriptors.
-/// Replaces C poll_reset() from src/poll.c.
-pub fn poll_reset();
+/// Timer event types for the event loop scheduler.
+/// Replaces C's ad-hoc timer tracking in the poll loop.
+pub enum TimerEvent { /* DhcpLease, RouterAdvert, DnsCacheEvict, etc. */ }
 
-/// Check whether a file descriptor has a pending event of the given type.
-/// Replaces C poll_check() from src/poll.c.
-pub fn poll_check(fd: RawFd, event: PollEvent) -> bool;
+/// Async event loop abstraction built on tokio::select!.
+/// Replaces C's poll_reset()/poll_listen()/poll_check()/do_poll() from src/poll.c.
+pub struct EventLoop { /* ... */ }
 
-/// Register a file descriptor for monitoring with the specified event type.
-/// Replaces C poll_listen() from src/poll.c.
-pub fn poll_listen(fd: RawFd, event: PollEvent);
+impl EventLoop {
+    /// Create a new event loop with default timer set.
+    pub fn new() -> Self;
 
-/// Execute the poll wait, blocking until at least one event fires or timeout expires.
-/// In the Rust implementation, this is replaced by tokio::select! in the main event loop.
-/// Replaces C do_poll() from src/poll.c.
-pub fn do_poll(timeout_ms: i32) -> Result<i32, DnsmasqError>;
+    /// Schedule (or reschedule) a timer for the given event type.
+    pub fn schedule_timer(&mut self, event: TimerEvent, when: Instant);
+
+    /// Return the next timeout duration until the earliest pending timer fires.
+    pub fn next_timeout(&self) -> Option<Duration>;
+
+    /// Fire all timers whose deadline has passed and return their event types.
+    pub fn fire_expired_timers(&mut self) -> Vec<TimerEvent>;
+
+    /// Take ownership of the timer receiver channel for integration with
+    /// tokio::select! in the main daemon loop.
+    pub fn take_timer_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<TimerEvent>>;
+}
+
+/// Bind a UDP socket to the specified address with SO_REUSEADDR.
+/// Replaces C's socket + bind pattern in src/poll.c / src/network.c.
+pub fn bind_udp(addr: SocketAddr) -> DnsmasqResult<tokio::net::UdpSocket>;
+
+/// Bind a TCP listener to the specified address with SO_REUSEADDR.
+pub fn bind_tcp(addr: SocketAddr) -> DnsmasqResult<tokio::net::TcpListener>;
 ```
 
 ---
@@ -254,34 +238,62 @@ async-safe logging subsystem.
 #### Public Functions
 
 ```rust
-/// Terminate the daemon with a fatal error message and exit code.
-/// Replaces C die() from src/log.c.
-pub fn die(message: &str, arg: Option<&str>, exit_code: i32) -> !;
+/// Log facility/subsystem identifiers for categorised logging.
+pub enum LogFacility { /* DnsMasq, Dhcp, Tftp, Script, Debug, ... */ }
 
-/// Initialise the logging subsystem, opening the syslog connection.
-/// Returns Ok on success. Replaces C log_start() from src/log.c.
-pub fn log_start(ent_pw: Option<&Passwd>, errfd: RawFd) -> Result<i32, DnsmasqError>;
+/// Configuration for the logging subsystem.
+pub struct LogConfig { /* ... */ }
 
-/// Reopen the log file (for log rotation). Returns Ok on success.
-/// Replaces C log_reopen() from src/log.c.
-pub fn log_reopen(log_file: &str) -> Result<i32, DnsmasqError>;
-
-/// Log a message via syslog with the given priority level.
-/// Supports MS_TFTP, MS_DHCP, MS_SCRIPT, MS_DEBUG facility flags.
-/// Replaces C my_syslog() from src/log.c.
-pub fn my_syslog(priority: i32, message: &str);
-
-/// Register the log writer file descriptor with the I/O reactor.
-/// Replaces C set_log_writer() from src/log.c.
-pub fn set_log_writer();
-
-/// Check and flush pending log messages. If `force` is true, flush unconditionally.
-/// Replaces C check_log_writer() from src/log.c.
-pub fn check_log_writer(force: bool);
+/// Initialise the logging subsystem, opening the syslog connection and
+/// configuring structured output. Replaces C log_start() from src/log.c.
+pub fn init_logging(config: &LogConfig) -> DnsmasqResult<()>;
 
 /// Flush all pending log messages to the output destination.
 /// Replaces C flush_log() from src/log.c.
-pub fn flush_log();
+pub fn flush_logging();
+
+/// Reopen the log file (for log rotation). Replaces C log_reopen().
+pub fn reopen_log(state: &mut DaemonState) -> DnsmasqResult<()>;
+
+/// Log a DNS query with structured fields (name, type, source).
+/// Replaces C log_query() from src/log.c with structured logging.
+pub fn log_dns_query(flags: u32, name: &str, source: &str, qtype: &str);
+
+/// Log a DHCP event (lease grant, release, NAK, etc.) with structured fields.
+pub fn log_dhcp_event(event_type: &str, mac: &str, ip: &str, hostname: Option<&str>);
+
+/// Log a privilege-drop event for the security audit trail.
+pub fn log_privilege_drop(user: &str, group: &str);
+
+/// Log a configuration reload event (SIGHUP handling).
+pub fn log_config_reload();
+
+/// Log a DNSSEC validation failure with chain-of-trust details.
+pub fn log_dnssec_failure(domain: &str, reason: &str);
+
+/// Log a DNS cache poisoning attempt detection.
+pub fn log_cache_poisoning_attempt(domain: &str, source: &str);
+
+/// Log a TFTP transfer event (start, complete, error).
+pub fn log_tftp_event(event_type: &str, file: &str, client: &str);
+
+/// Log a script execution event (lease-change callback).
+pub fn log_script_event(action: &str, script: &str, result: i32);
+
+/// Log a debug-level message (only when debug logging enabled).
+pub fn log_debug_message(message: &str);
+
+/// Open the system syslog connection (low-level wrapper).
+pub fn open_system_syslog(ident: &str, facility: i32);
+
+/// Write a message to the system syslog (low-level wrapper).
+pub fn write_system_syslog(priority: i32, message: &str);
+
+/// Close the system syslog connection.
+pub fn close_system_syslog();
+
+/// Convert a tracing log level to a syslog priority constant.
+pub fn tracing_level_to_syslog_priority(level: &tracing::Level) -> i32;
 ```
 
 ---
@@ -299,9 +311,19 @@ and standard collections replace explicit heap management.
 /// Replaces C canonicalise() from src/util.c.
 pub fn canonicalise(input: &str) -> Result<String, DnsmasqError>;
 
+/// Validate a DNS name for correctness (label length, total length, characters).
+/// Replaces C check_dns_name() from src/util.c.
+pub fn check_dns_name(name: &str) -> bool;
+
 /// Case-insensitive domain name equality comparison (RFC 1035 §2.3.3).
 /// Replaces C hostname_isequal() from src/util.c.
-pub fn hostname_isequal(a: &str, b: &str) -> bool;
+pub fn hostname_eq(a: &str, b: &str) -> bool;
+
+/// Case-insensitive domain name comparison returning Ordering.
+pub fn hostname_cmp(a: &str, b: &str) -> std::cmp::Ordering;
+
+/// Check whether `sub` is a subdomain of `parent`.
+pub fn is_subdomain(sub: &str, parent: &str) -> bool;
 
 /// Validate that a hostname conforms to RFC 952/1123 rules.
 /// Replaces C legal_hostname() from src/util.c.
@@ -309,11 +331,45 @@ pub fn legal_hostname(name: &str) -> bool;
 
 /// Format a duration in seconds into a human-readable string (e.g., "2h30m").
 /// Replaces C prettyprint_time() from src/util.c.
-pub fn prettyprint_time(seconds: u64) -> String;
+pub fn format_duration(seconds: u64) -> String;
 
 /// Parse a hexadecimal string into a byte vector.
 /// Replaces C parse_hex() from src/util.c.
 pub fn parse_hex(hex: &str) -> Result<Vec<u8>, DnsmasqError>;
+
+/// Format a MAC address as a colon-separated hex string.
+pub fn format_mac(mac: &[u8]) -> String;
+
+/// Format an IP address (v4 or v6) for display.
+pub fn format_addr(addr: &AllAddr) -> String;
+
+/// Compare two socket addresses for equality.
+pub fn sockaddr_eq(a: &MySockAddr, b: &MySockAddr) -> bool;
+
+/// Compute the prefix length from a network mask.
+pub fn netmask_length(mask: Ipv4Addr) -> u32;
+
+/// Check whether two IPv4 addresses are on the same network.
+pub fn is_same_net(a: Ipv4Addr, b: Ipv4Addr, mask: Ipv4Addr) -> bool;
+
+/// Check whether two IPv6 addresses are on the same /prefix network.
+pub fn is_same_net6(a: &Ipv6Addr, b: &Ipv6Addr, prefix_len: u32) -> bool;
+
+/// Return the current time as seconds since epoch (monotonic for relative durations).
+pub fn dnsmasq_time() -> i64;
+
+/// Return the current time in milliseconds (for timeout calculations).
+pub fn dnsmasq_millis() -> u64;
+
+/// Create a non-blocking pipe pair. Replaces C safe_pipe() from src/util.c.
+pub fn safe_pipe() -> DnsmasqResult<(RawFd, RawFd)>;
+
+/// Close all file descriptors above a given threshold (for privilege separation).
+pub fn close_fds(max_fd: i32);
+
+/// Encode a domain name to IDNA/punycode form (if `idn` feature enabled).
+#[cfg(feature = "idn")]
+pub fn idn_encode(name: &str) -> DnsmasqResult<String>;
 
 /// Check whether a Linux kernel version meets the minimum requirement.
 /// Replaces C kernel_version() from src/util.c.
@@ -336,32 +392,21 @@ names and hostnames.
 #### Public Functions
 
 ```rust
-/// Match a string against a wildcard pattern (supports `*` and `?` globs).
+/// Match a string against a wildcard/glob pattern (supports `*` and `?`).
 /// Replaces C wildcard_match() from src/pattern.c.
-pub fn wildcard_match(wildcard: &str, candidate: &str) -> bool;
-
-/// Match with a maximum character count limit.
-/// Replaces C wildcard_matchn() from src/pattern.c.
-pub fn wildcard_matchn(wildcard: &str, candidate: &str, max_chars: usize) -> bool;
-
-/// Check whether a hostname is a subdomain of a given domain.
-/// Replaces C hostname_issubdomain() from src/pattern.c.
-pub fn hostname_issubdomain(name: &str, domain: &str) -> bool;
+pub fn glob_match(pattern: &str, candidate: &str) -> bool;
 
 /// Validate whether a value is a well-formed DNS name.
 /// Replaces C is_valid_dns_name() from src/pattern.c.
-#[cfg(feature = "conntrack")]
 pub fn is_valid_dns_name(value: &str) -> bool;
 
 /// Validate whether a value is a valid DNS name pattern (with wildcards).
 /// Replaces C is_valid_dns_name_pattern() from src/pattern.c.
-#[cfg(feature = "conntrack")]
 pub fn is_valid_dns_name_pattern(value: &str) -> bool;
 
 /// Check whether a DNS name matches a pattern (including wildcards).
-/// Replaces C is_dns_name_matching_pattern() from src/pattern.c.
-#[cfg(feature = "conntrack")]
-pub fn is_dns_name_matching_pattern(name: &str, pattern: &str) -> bool;
+/// Replaces C dns_name_matches_pattern() from src/pattern.c.
+pub fn dns_name_matches_pattern(name: &str, pattern: &str) -> bool;
 ```
 
 ---
@@ -506,10 +551,22 @@ attributes.
 | `conntrack` | `HAVE_CONNTRACK` | Disabled | Linux conntrack mark support |
 | `nftset` | `HAVE_NFTSET` | Disabled | nftables set integration |
 | `luascript` | `HAVE_LUASCRIPT` | Disabled | Lua scripting support |
+| `broken-rtc` | `HAVE_BROKEN_RTC` | Disabled | Embedded systems without a hardware real-time clock |
 
 Platform-specific features are auto-detected via `#[cfg(target_os = "...")]`:
 - `#[cfg(target_os = "linux")]` replaces `HAVE_LINUX_NETWORK`
 - `#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]` replaces `HAVE_BSD_NETWORK`
+
+#### Public Functions
+
+```rust
+/// Return a human-readable string listing all enabled compile-time features.
+/// Replaces C compile_opts logic from src/option.c.
+pub fn compile_options_string() -> String;
+
+/// Validate that feature flag dependencies are satisfied (e.g., dhcp6 implies dhcp).
+pub fn validate_feature_dependencies() -> DnsmasqResult<()>;
+```
 
 ---
 
@@ -521,38 +578,35 @@ processor.
 #### Public Functions
 
 ```rust
-/// Parse configuration from command-line arguments and config files.
-/// Processes /etc/dnsmasq.conf (or --conf-file path) and all --conf-dir includes.
-/// Replaces C read_opts() from src/option.c.
-pub fn read_opts(args: &[String], compile_opts: &str) -> Result<DaemonConfig, DnsmasqError>;
+/// Top-level config loading entry point — parse CLI args, then load and merge
+/// the config file(s). Replaces C read_opts() from src/option.c.
+pub fn load(cli: &CliArgs) -> DnsmasqResult<DaemonState>;
+
+/// Parse a single config file at the given path.
+/// Processes all directives, expanding conf-dir and conf-file includes.
+pub fn from_file(path: &Path) -> DnsmasqResult<Vec<ConfigDirective>>;
+
+/// Apply default values to any unset configuration fields.
+pub fn apply_defaults(state: &mut DaemonState);
+
+/// Parse a configuration file, processing each directive line.
+/// Replaces C read_opts() file-reading loop.
+pub fn parse_config_file(path: &Path, state: &mut DaemonState) -> DnsmasqResult<()>;
 
 /// Process a single configuration directive (name=value pair).
 /// Handles all 350+ dnsmasq.conf directives via pattern matching.
 /// Replaces C one_opt() from src/option.c.
-pub fn one_opt(option: u32, arg: &str, config: &mut DaemonConfig) -> Result<(), DnsmasqError>;
+pub fn process_directive(key: &str, value: &str, state: &mut DaemonState) -> DnsmasqResult<()>;
 
-/// Parse a DHCP option directive (--dhcp-option).
-/// Handles vendor classes, option numbers, and typed value encoding.
-/// Replaces C parse_dhcp_opt() from src/option.c.
-#[cfg(feature = "dhcp")]
-pub fn parse_dhcp_opt(arg: &str, config: &mut DaemonConfig) -> Result<(), DnsmasqError>;
-
-/// Render a DHCP option value as a human-readable string.
-/// Replaces C option_string() from src/option.c.
-pub fn option_string(protocol: i32, opt: u32, val: &[u8], buf: &mut String) -> Result<(), DnsmasqError>;
-
-/// Reread DHCP configuration (hosts file, ethers file).
-/// Replaces C reread_dhcp() from src/option.c.
-#[cfg(feature = "dhcp")]
-pub fn reread_dhcp();
-
-/// Reload the upstream servers configuration file.
-/// Replaces C read_servers_file() from src/option.c.
-pub fn read_servers_file();
-
-/// Parse a server= directive argument into server details.
+/// Parse a server= directive argument into server configuration.
 /// Replaces C parse_server() from src/option.c.
-pub fn parse_server(arg: &str, details: &mut ServerDetails) -> Result<(), DnsmasqError>;
+pub fn parse_server(arg: &str) -> DnsmasqResult<ServerConfig>;
+
+/// Merge CLI-specified overrides into the loaded configuration state.
+pub fn merge_cli_args(cli: &CliArgs, state: &mut DaemonState);
+
+/// Validate the fully-merged configuration for consistency.
+pub fn validate(state: &DaemonState) -> DnsmasqResult<()>;
 ```
 
 ---
@@ -595,6 +649,38 @@ pub struct CliArgs {
 
     // ... additional flags matching every dnsmasq CLI option
 }
+
+impl CliArgs {
+    /// Validate CLI arguments for consistency and conflicts.
+    pub fn validate(&self) -> DnsmasqResult<()>;
+
+    /// Resolve cache-size with default fallback.
+    pub fn effective_cache_size(&self) -> usize;
+
+    /// Resolve dns-forward-max with default fallback.
+    pub fn effective_dns_forward_max(&self) -> usize;
+
+    /// Resolve EDNS packet max size with default fallback.
+    pub fn effective_edns_packet_max(&self) -> usize;
+
+    /// Resolve the effective unprivileged user name.
+    pub fn effective_user(&self) -> String;
+
+    /// Resolve the effective unprivileged group name.
+    pub fn effective_group(&self) -> String;
+
+    /// Resolve the effective DNS listening port.
+    pub fn effective_port(&self) -> u16;
+
+    /// Resolve the effective DHCP lease max.
+    pub fn effective_dhcp_lease_max(&self) -> usize;
+
+    /// Resolve the effective maximum TCP connections.
+    pub fn effective_max_tcp_connections(&self) -> usize;
+
+    /// Resolve the effective TFTP connection max.
+    pub fn effective_tftp_max(&self) -> usize;
+}
 ```
 
 ---
@@ -612,23 +698,47 @@ server selection, retry/timeout logic, and TCP fallback.
 #### Public Functions
 
 ```rust
+/// Flags controlling forwarding behaviour.
+pub struct ForwardFlags { /* ... */ }
+
+/// Flags describing server properties.
+pub struct ServerFlags { /* ... */ }
+
+/// Upstream DNS server configuration and status.
+pub struct UpstreamServer { /* ... */ }
+
+/// Tracking record for an outstanding forwarded DNS query.
+pub struct ForwardRecord { /* ... */ }
+
+/// Table of outstanding forwarded queries (bounded by FTABSIZ).
+pub struct ForwardTable { /* ... */ }
+
+/// Random file descriptor entry for source port randomisation.
+pub struct RfdEntry { /* ... */ }
+
+/// Pool of random file descriptors for upstream queries.
+pub struct RfdPool { /* ... */ }
+
 /// Receive and dispatch an incoming DNS query from a client.
 /// Initiates cache lookup and, on cache miss, forwards to upstream servers.
 /// Replaces C receive_query() from src/forward.c.
-pub async fn receive_query(listener: &Listener, state: &mut DaemonState, now: Instant) -> Result<(), DnsmasqError>;
+pub async fn receive_query(listener: &Listener, state: &mut DaemonState, now: Instant) -> DnsmasqResult<()>;
 
 /// Forward a DNS query to the selected upstream server(s).
 /// Handles server selection, retry logic, and source port randomisation.
 /// Replaces C forward_query() from src/forward.c.
-pub async fn forward_query(state: &mut DaemonState, header: &DnsHeader, plen: usize, now: Instant) -> Result<(), DnsmasqError>;
+pub async fn forward_query(state: &mut DaemonState, header: &DnsHeader, plen: usize, now: Instant) -> DnsmasqResult<()>;
 
 /// Process a reply from an upstream DNS server and deliver to the waiting client.
 /// Replaces C reply_query() from src/forward.c.
-pub async fn reply_query(fd: RawFd, state: &mut DaemonState, now: Instant) -> Result<(), DnsmasqError>;
+pub async fn reply_query(fd: RawFd, state: &mut DaemonState, now: Instant) -> DnsmasqResult<()>;
 
 /// Return a processed reply to the originating client.
 /// Replaces C return_reply() from src/forward.c.
 pub fn return_reply(now: Instant, forward: &mut ForwardRecord, header: &DnsHeader, n: usize, status: i32);
+
+/// Build a DNS response using the `DnsPacketBuilder` and return it.
+pub fn build_response_with_builder(header: &DnsHeader, name: &str, qtype: u16) -> Vec<u8>;
 
 /// Perform fast retry of queries to servers that have not yet responded.
 /// Returns true if any retries were sent.
@@ -641,46 +751,36 @@ pub fn fast_retry(now: Instant) -> bool;
 pub fn send_from(
     fd: RawFd, nowild: bool, packet: &[u8],
     to: &MySockAddr, source: &AllAddr, iface: u32,
-) -> Result<(), DnsmasqError>;
+) -> DnsmasqResult<()>;
 
-/// Allocate a new forward record for tracking an outstanding DNS query.
-/// Replaces C get_new_frec() from src/forward.c.
-pub fn get_new_frec(now: Instant) -> Result<&mut ForwardRecord, DnsmasqError>;
+/// Allocate a random file descriptor for upstream query source port.
+/// Replaces C allocate_rfd() from src/forward.c.
+pub fn allocate_rfd(server: &UpstreamServer) -> DnsmasqResult<RawFd>;
 
-/// Find an existing forward record by query ID and sender address.
-/// Replaces C lookup_frec() from src/forward.c.
-pub fn lookup_frec(id: u16, source: &MySockAddr) -> Option<&mut ForwardRecord>;
+/// Free all random file descriptors in the given pool.
+pub fn free_rfds(pool: &mut RfdPool);
 
-/// Release a forward record back to the free pool.
-/// Replaces C free_frec() from src/forward.c.
-pub fn free_frec(forward: &mut ForwardRecord);
+/// Clean up state when an upstream server is removed from configuration.
+/// Replaces C server_gone() from src/forward.c.
+pub fn server_gone(server: &ServerEntry);
+
+/// Resend all pending queries (after upstream server list change).
+/// Replaces C resend_query() from src/forward.c.
+pub fn resend_query();
+
+/// Mark query servers with connection status flags.
+pub fn mark_query_servers(forward: &mut ForwardRecord, flags: u32);
 
 /// Handle a TCP DNS request on an accepted connection.
 /// Replaces C tcp_request() from src/forward.c.
 pub async fn tcp_request(
     conn_fd: RawFd, now: Instant,
     local_addr: &MySockAddr, netmask: Ipv4Addr, auth_dns: bool,
-) -> Result<(), DnsmasqError>;
+) -> DnsmasqResult<()>;
 
-/// Clean up state when an upstream server is removed from configuration.
-/// Replaces C server_gone() from src/forward.c.
-pub fn server_gone(server: &ServerStruct);
-
-/// Allocate a random file descriptor for upstream query source port.
-/// Replaces C allocate_rfd() from src/forward.c.
-pub fn allocate_rfd(server: &ServerStruct) -> Result<RawFd, DnsmasqError>;
-
-/// Resend all pending queries (after upstream server list change).
-/// Replaces C resend_query() from src/forward.c.
-pub fn resend_query();
-
-/// Initiate DNSSEC TCP key recursion for validation chain.
-/// Replaces C tcp_key_recurse() / swap_to_tcp() from src/forward.c.
-#[cfg(feature = "dnssec")]
-pub async fn tcp_key_recurse(
-    state: &mut DaemonState, now: Instant, status: i32,
-    header: &mut DnsHeader, name: &str, server: &ServerStruct,
-) -> Result<(), DnsmasqError>;
+/// Promote a UDP query to TCP when the response is truncated.
+/// Replaces C tcp_from_udp() from src/forward.c.
+pub async fn tcp_from_udp(forward: &ForwardRecord, state: &mut DaemonState) -> DnsmasqResult<()>;
 ```
 
 ---
@@ -694,13 +794,22 @@ expiry and LRU eviction. Rust implementation replaces the manual hash table with
 #### Public Types
 
 ```rust
+/// Flags associated with cache entries.
+pub struct CacheFlags { /* ... */ }
+
+/// Statistics counters for cache operations.
+pub struct CacheStats { /* ... */ }
+
+/// Union-like enum for cache record data (address, CNAME target, DNSSEC key, etc.).
+pub enum CacheData { /* ... */ }
+
 /// DNS cache record. Replaces C `struct crec` from src/dnsmasq.h.
-pub struct CacheRecord {
+pub struct CacheEntry {
     pub addr: AllAddr,
     pub ttd: Instant,        // Time-to-die (expiry)
     pub uid: u32,            // Source identifier (SRC_CONFIG, SRC_HOSTS, SRC_AH)
-    pub flags: u32,          // Cache flags (F_IMMORTAL, F_IPV4, F_IPV6, F_CNAME, ...)
-    pub name: CacheName,     // Domain name (small inline or heap-allocated)
+    pub flags: CacheFlags,   // Cache flags (F_IMMORTAL, F_IPV4, F_IPV6, F_CNAME, ...)
+    pub name: String,        // Domain name
 }
 
 /// DNS cache container with hash-based lookup and LRU eviction.
@@ -717,35 +826,44 @@ pub fn cache_init(size: usize) -> DnsCache;
 /// Look up a cache record by domain name and record type.
 /// Returns None if not found or expired.
 /// Replaces C cache_find_by_name() from src/cache.c.
-pub fn cache_find_by_name(cache: &DnsCache, name: &str, now: Instant, flags: u32) -> Option<&CacheRecord>;
+pub fn cache_find_by_name(cache: &DnsCache, name: &str, now: Instant, flags: u32) -> Option<&CacheEntry>;
 
 /// Look up a cache record by address (for reverse DNS / PTR queries).
 /// Replaces C cache_find_by_addr() from src/cache.c.
-pub fn cache_find_by_addr(cache: &DnsCache, addr: &AllAddr, now: Instant, flags: u32) -> Option<&CacheRecord>;
+pub fn cache_find_by_addr(cache: &DnsCache, addr: &AllAddr, now: Instant, flags: u32) -> Option<&CacheEntry>;
 
-/// Begin an insert transaction (for batching multiple record insertions).
-/// Replaces C cache_start_insert() from src/cache.c.
-pub fn cache_start_insert(cache: &mut DnsCache);
-
-/// Insert a record into the cache. Must be called between start_insert/end_insert.
+/// Insert a record into the cache, evicting expired or LRU entries as needed.
 /// Replaces C cache_insert() from src/cache.c.
-pub fn cache_insert(cache: &mut DnsCache, name: &str, addr: &AllAddr, class: u16, now: Instant, ttl: u64, flags: u32) -> Option<&mut CacheRecord>;
+pub fn cache_insert(cache: &mut DnsCache, name: &str, addr: &AllAddr, class: u16, now: Instant, ttl: u64, flags: u32) -> Option<&mut CacheEntry>;
 
-/// Commit the current insert transaction.
-/// Replaces C cache_end_insert() from src/cache.c.
-pub fn cache_end_insert(cache: &mut DnsCache);
+/// Evict all expired entries from the cache.
+/// Replaces C cache_scan_free() from src/cache.c.
+pub fn cache_evict_expired(cache: &mut DnsCache, now: Instant);
 
-/// Prune expired entries and rebuild the hash table if load factor exceeded.
-/// Replaces C cache_scan_free() / rehash() from src/cache.c.
-pub fn rehash(cache: &mut DnsCache, size: usize);
+/// Read a hosts-format file and add all entries to the cache.
+/// Replaces C read_hostsfile() from src/cache.c.
+pub fn read_hostsfile(path: &str, cache: &mut DnsCache, state: &mut DaemonState) -> DnsmasqResult<()>;
 
-/// Generate a new unique identifier for cache records.
-/// Replaces C next_uid() from src/cache.c.
-pub fn next_uid() -> u32;
+/// Add (or update) a DHCP-derived entry in the DNS cache.
+/// Replaces C cache_add_dhcp_entry() from src/cache.c.
+#[cfg(feature = "dhcp")]
+pub fn cache_add_dhcp_entry(cache: &mut DnsCache, hostname: &str, addr: &AllAddr, flags: u32);
 
-/// Return the string name for a DNS resource record type code.
-/// Replaces C rrtype() from src/cache.c.
-pub fn rrtype(rr_type: u16) -> &'static str;
+/// Reload all hosts files and clear non-static entries.
+/// Replaces C cache_reload() triggered by SIGHUP.
+pub fn cache_reload(cache: &mut DnsCache, state: &mut DaemonState);
+
+/// Dump all cache entries to the log (triggered by SIGUSR1).
+/// Replaces C dump_cache() from src/cache.c.
+pub fn dump_cache(cache: &DnsCache, state: &DaemonState);
+
+/// Log a DNS query with its flags and source information.
+/// Replaces C log_query() from src/cache.c.
+pub fn log_query(flags: u32, name: &str, source: &str, qtype: &str);
+
+/// Generate a cache statistics summary for SIGUSR1 output.
+/// Replaces C cache_make_stat() from src/cache.c.
+pub fn cache_make_stat(cache: &DnsCache) -> CacheStats;
 ```
 
 ---
@@ -796,61 +914,99 @@ pub const C_ANY: u16 = 255;    // Wildcard (query only)
 #### Public Types
 
 ```rust
+/// DNS response code enum. Replaces C RCODE constants.
+pub enum ResponseCode { NoError, FormErr, ServFail, NxDomain, NotImp, Refused, /* ... */ }
+
+/// DNS class codes.
+pub enum DnsClass { IN, Chaos, Hesiod, Any }
+
+/// DNS resource record type enum (comprehensive, maps all T_* constants).
+pub enum RRType { A, NS, CNAME, SOA, PTR, MX, TXT, AAAA, SRV, OPT, DS, RRSIG, NSEC, DNSKEY, /* ... */ }
+
+/// DNS header flags (QR, opcode, AA, TC, RD, RA, AD, CD, rcode).
+pub struct DnsHeaderFlags { /* ... */ }
+
 /// DNS message header (12 bytes, wire format per RFC 1035 §4.1.1).
 /// Replaces C `struct dns_header` from src/dns-protocol.h.
 pub struct DnsHeader {
     pub id: u16,
-    pub flags: DnsFlags,
+    pub flags: DnsHeaderFlags,
     pub qdcount: u16,   // Question count
     pub ancount: u16,   // Answer count
     pub nscount: u16,   // Authority count
     pub arcount: u16,   // Additional count
 }
+
+/// A parsed DNS domain name with encoding/decoding and compression support.
+pub struct DnsName { /* ... */ }
+
+/// A DNS question entry (QNAME + QTYPE + QCLASS).
+pub struct DnsQuestion { /* ... */ }
+
+/// A DNS resource record (name, type, class, TTL, rdata).
+pub struct DnsResourceRecord { /* ... */ }
+
+/// A fully parsed DNS packet containing header, questions, and RR sections.
+pub struct DnsPacket { /* ... */ }
+
+/// Builder for constructing DNS response packets with type-safe API.
+/// Replaces C's manual packet buffer manipulation in rfc1035.c.
+pub struct DnsPacketBuilder { /* ... */ }
+
+/// A set of resource records sharing the same name/type/class.
+pub struct RRSet { /* ... */ }
 ```
 
 #### Public Functions
 
+DNS protocol operations use builder/struct methods rather than C-style free functions:
+
 ```rust
-/// Extract a domain name from a DNS packet at the given offset, handling
-/// name compression pointers (RFC 1035 §4.1.4).
-/// Replaces C extract_name() from src/rfc1035.c.
-pub fn extract_name(header: &DnsHeader, packet: &[u8], offset: &mut usize) -> Result<String, DnsmasqError>;
+impl DnsName {
+    /// Parse a compressed DNS name from a packet at the given offset.
+    /// Replaces C extract_name() from src/rfc1035.c.
+    pub fn from_wire(packet: &[u8], offset: &mut usize) -> DnsmasqResult<Self>;
 
-/// Skip over a compressed domain name in a DNS packet.
-/// Replaces C skip_name() from src/rfc1035.c.
-pub fn skip_name(packet: &[u8], offset: &mut usize) -> Result<(), DnsmasqError>;
+    /// Encode the name to wire format (with label length prefixes).
+    pub fn to_wire(&self) -> Vec<u8>;
+}
 
-/// Skip the question section of a DNS message.
-/// Replaces C skip_questions() from src/rfc1035.c.
-pub fn skip_questions(header: &DnsHeader, packet: &[u8], offset: &mut usize) -> Result<(), DnsmasqError>;
+impl DnsPacket {
+    /// Parse a complete DNS packet from raw bytes.
+    pub fn from_bytes(data: &[u8]) -> DnsmasqResult<Self>;
 
-/// Skip a resource record section (answer, authority, or additional).
-/// Replaces C skip_section() from src/rfc1035.c.
-pub fn skip_section(packet: &[u8], offset: &mut usize, count: u16) -> Result<(), DnsmasqError>;
+    /// Serialise the packet to wire format.
+    pub fn to_bytes(&self) -> Vec<u8>;
+}
 
-/// Resize a DNS packet buffer, adjusting internal pointers.
-/// Replaces C resize_packet() from src/rfc1035.c.
-pub fn resize_packet(header: &mut DnsHeader, packet: &mut Vec<u8>, new_size: usize);
+impl DnsPacketBuilder {
+    /// Create a new builder for a DNS response.
+    pub fn new_response(request: &DnsHeader) -> Self;
 
-/// Parse an in-addr.arpa or ip6.arpa name into an IP address (reverse DNS).
-/// Replaces C in_arpa_name_2_addr() from src/rfc1035.c.
-pub fn in_arpa_name_2_addr(name: &str) -> Result<AllAddr, DnsmasqError>;
+    /// Add an answer resource record.
+    pub fn add_answer(&mut self, rr: DnsResourceRecord) -> &mut Self;
 
-/// Apply DNS doctor rules to rewrite addresses in responses.
-/// Replaces C do_doctor() from src/rfc1035.c.
-pub fn do_doctor(header: &mut DnsHeader, packet: &mut [u8], now: Instant) -> bool;
+    /// Add an authority (NS) resource record.
+    pub fn add_authority(&mut self, rr: DnsResourceRecord) -> &mut Self;
 
-/// Find the SOA record for a name in the DNS packet.
-/// Replaces C find_soa() from src/rfc1035.c.
-pub fn find_soa(header: &DnsHeader, packet: &[u8]) -> Option<SoaData>;
+    /// Add an additional resource record.
+    pub fn add_additional(&mut self, rr: DnsResourceRecord) -> &mut Self;
 
-/// Check whether an IPv4 address is in a private (RFC 1918) range.
-/// Replaces C private_net() from src/rfc1035.c.
-pub fn private_net(addr: Ipv4Addr, ban_localhost: bool) -> bool;
+    /// Build the final wire-format packet.
+    pub fn build(self) -> Vec<u8>;
+}
 
-/// Check whether an IPv6 address is in a private/link-local range.
-/// Replaces C private_net6() from src/rfc1035.c.
-pub fn private_net6(addr: &Ipv6Addr) -> bool;
+/// Read a big-endian u16 from a byte slice at the given offset.
+pub fn get_u16(data: &[u8], offset: usize) -> u16;
+
+/// Read a big-endian u32 from a byte slice at the given offset.
+pub fn get_u32(data: &[u8], offset: usize) -> u32;
+
+/// Write a big-endian u16 into a byte slice at the given offset.
+pub fn put_u16(data: &mut [u8], offset: usize, val: u16);
+
+/// Write a big-endian u32 into a byte slice at the given offset.
+pub fn put_u32(data: &mut [u8], offset: usize, val: u32);
 ```
 
 ---
@@ -865,29 +1021,59 @@ of trust verification, signature validation, and denial-of-existence proofs.
 #### Public Functions
 
 ```rust
-/// Validate a DNS reply for DNSSEC authenticity.
-/// Walks the chain of trust from the response back to a configured trust anchor.
-/// Replaces C dnssec_validate_reply() from src/dnssec.c.
-#[cfg(feature = "dnssec")]
-pub fn dnssec_validate_reply(
-    header: &DnsHeader, packet: &[u8], name: &str, keyname: &str,
-    class: u16, now: Instant,
-) -> Result<DnssecStatus, DnsmasqError>;
+/// DNSSEC validation result status.
+pub enum DnssecStatus { Secure, Insecure, Bogus, Indeterminate, NxDomain, /* ... */ }
 
-/// Validate an individual resource record set (RRset) against its RRSIG signature.
-/// Replaces C validate_rrset() from src/dnssec.c.
-#[cfg(feature = "dnssec")]
-pub fn validate_rrset(
-    now: Instant, header: &DnsHeader, packet: &[u8],
-    class: u16, rrtype: u16, name: &str,
-) -> Result<DnssecStatus, DnsmasqError>;
+/// Flags indicating DNSSEC failure reasons (bitfield).
+pub struct DnssecFailFlags { /* ... */ }
 
-/// Prove non-existence of a domain name or RR type using NSEC/NSEC3 records.
-/// Replaces C prove_non_existence() from src/dnssec.c.
+/// DNSSEC trust anchor configuration.
+pub struct TrustAnchor { /* ... */ }
+
+/// Limits for DNSSEC validation recursion and work factor.
+pub struct DnssecLimits { /* ... */ }
+
+/// Stateful DNSSEC validator managing trust anchors and validation chains.
+/// Replaces C's dnssec_* function family from src/dnssec.c.
+pub struct DnssecValidator { /* ... */ }
+
 #[cfg(feature = "dnssec")]
-pub fn prove_non_existence(
-    header: &DnsHeader, packet: &[u8], name: &str, qtype: u16,
-) -> Result<DnssecStatus, DnsmasqError>;
+impl DnssecValidator {
+    /// Validate a DNS reply for DNSSEC authenticity.
+    /// Walks the chain of trust from the response back to a configured trust anchor.
+    /// Replaces C dnssec_validate_reply() from src/dnssec.c.
+    pub fn dnssec_validate_reply(
+        &self, header: &DnsHeader, packet: &[u8], name: &str, keyname: &str,
+        class: u16, now: Instant,
+    ) -> DnsmasqResult<DnssecStatus>;
+
+    /// Validate using a DS record chain (delegation signer).
+    /// Replaces C dnssec_validate_by_ds() from src/dnssec.c.
+    pub fn dnssec_validate_by_ds(
+        &self, header: &DnsHeader, packet: &[u8], name: &str, class: u16, now: Instant,
+    ) -> DnsmasqResult<DnssecStatus>;
+
+    /// Validate an individual resource record set (RRset) against its RRSIG.
+    /// Replaces C validate_rrset() from src/dnssec.c.
+    pub fn validate_rrset(
+        &self, now: Instant, header: &DnsHeader, packet: &[u8],
+        class: u16, rrtype: u16, name: &str,
+    ) -> DnsmasqResult<DnssecStatus>;
+
+    /// Prove non-existence of a domain name or RR type using NSEC/NSEC3 records.
+    /// Replaces C prove_non_existence() from src/dnssec.c.
+    pub fn prove_non_existence(
+        &self, header: &DnsHeader, packet: &[u8], name: &str, qtype: u16,
+    ) -> DnsmasqResult<DnssecStatus>;
+}
+
+/// Compute the key tag for a DNSKEY record (RFC 4034 Appendix B).
+#[cfg(feature = "dnssec")]
+pub fn dnskey_keytag(key_data: &[u8], algo: u8) -> u16;
+
+/// Convert DNSSEC failure flags to an Extended DNS Error (EDE) code.
+#[cfg(feature = "dnssec")]
+pub fn errflags_to_ede(flags: &DnssecFailFlags) -> u16;
 ```
 
 Supported DNSSEC algorithms: RSA/SHA-1, RSA/SHA-256, RSA/SHA-512, ECDSA P-256,
@@ -905,20 +1091,41 @@ verification and digest computation.
 #### Public Functions
 
 ```rust
-/// Verify an RSA signature against a DNSKEY public key.
-/// Replaces C dnsmasq_rsa_verify() from src/crypto.c.
-#[cfg(feature = "dnssec")]
-pub fn rsa_verify(key: &[u8], sig: &[u8], digest: &[u8], algo: u8) -> Result<bool, DnsmasqError>;
+/// Supported DNSSEC cryptographic algorithms.
+pub enum DnssecAlgorithm { RsaSha1, RsaSha256, RsaSha512, EcdsaP256, EcdsaP384, Ed25519, Ed448, /* ... */ }
 
-/// Verify an ECDSA (P-256 or P-384) signature.
-/// Replaces C dnsmasq_ecdsa_verify() from src/crypto.c.
-#[cfg(feature = "dnssec")]
-pub fn ecdsa_verify(key: &[u8], sig: &[u8], digest: &[u8], algo: u8) -> Result<bool, DnsmasqError>;
+/// Hash/digest algorithms for DS and NSEC3 records.
+pub enum DigestAlgorithm { Sha1, Sha256, Sha384, /* ... */ }
 
-/// Verify an EdDSA (Ed25519 or Ed448) signature.
-/// Replaces C dnsmasq_eddsa_verify() from src/crypto.c.
+/// NSEC3 hash algorithm identifiers.
+pub enum Nsec3HashAlgorithm { Sha1 }
+
+/// Trait for pluggable hash function implementations.
+pub trait HashFunction: Send + Sync { /* ... */ }
+
+/// Unified DNSSEC cryptographic verifier.
+/// Replaces C dnsmasq_rsa_verify(), dnsmasq_ecdsa_verify(), dnsmasq_eddsa_verify().
 #[cfg(feature = "dnssec")]
-pub fn eddsa_verify(key: &[u8], sig: &[u8], digest: &[u8], algo: u8) -> Result<bool, DnsmasqError>;
+pub struct CryptoVerifier { /* ... */ }
+
+#[cfg(feature = "dnssec")]
+impl CryptoVerifier {
+    /// Verify a DNSSEC signature against the provided key data and digest.
+    /// Dispatches to the appropriate algorithm (RSA, ECDSA, EdDSA).
+    pub fn verify(&self, algo: DnssecAlgorithm, key: &[u8], sig: &[u8], data: &[u8]) -> DnsmasqResult<bool>;
+
+    /// Return the digest algorithm name for a given DNSSEC algorithm.
+    pub fn algo_digest_name(algo: DnssecAlgorithm) -> &'static str;
+
+    /// Return the DS digest algorithm name.
+    pub fn ds_digest_name(algo: DigestAlgorithm) -> &'static str;
+
+    /// Return the NSEC3 hash algorithm name.
+    pub fn nsec3_digest_name(algo: Nsec3HashAlgorithm) -> &'static str;
+
+    /// Look up a hash function implementation by algorithm.
+    pub fn hash_find(name: &str) -> Option<Box<dyn HashFunction>>;
+}
 ```
 
 ---
@@ -931,31 +1138,60 @@ option processing, including client subnet and DNS cookie support.
 #### Public Functions
 
 ```rust
-/// Locate the EDNS0 OPT pseudo-header in a DNS packet.
-/// Replaces C find_pseudoheader() from src/edns0.c.
-pub fn find_pseudoheader(header: &DnsHeader, packet: &[u8]) -> Option<EdnsInfo>;
+/// EDNS0 flags for tracking OPT record state.
+pub struct EdnsFlags { /* ... */ }
 
-/// Add or replace an EDNS0 OPT pseudo-header in a DNS packet.
-/// Replaces C add_pseudoheader() from src/edns0.c.
-pub fn add_pseudoheader(
-    header: &mut DnsHeader, packet: &mut Vec<u8>,
-    optno: u16, opt_data: &[u8], set_do: bool, replace: bool,
-) -> usize;
+/// A single EDNS0 option (code + data).
+pub struct EdnsOption { /* ... */ }
 
-/// Set the DNSSEC OK (DO) bit in the EDNS0 OPT record.
-/// Replaces C add_do_bit() from src/edns0.c.
-pub fn add_do_bit(header: &mut DnsHeader, packet: &mut Vec<u8>) -> usize;
+/// Parsed EDNS0 data from a DNS packet's OPT pseudo-header.
+pub struct EdnsData { /* ... */ }
 
-/// Add EDNS0 client subnet and other configured options to a query.
-/// Replaces C add_edns0_config() from src/edns0.c.
-pub fn add_edns0_config(
-    header: &mut DnsHeader, packet: &mut Vec<u8>,
-    source: &MySockAddr, now: Instant,
-) -> (usize, bool);
+/// EDNS0 option replacement mode.
+pub enum ReplaceMode { Add, Replace }
 
-/// Check whether the source address in an EDNS0 client subnet option matches.
-/// Replaces C check_source() from src/edns0.c.
-pub fn check_source(header: &DnsHeader, packet: &[u8], pseudoheader: &[u8], peer: &MySockAddr) -> bool;
+/// Stateful EDNS0 handler for manipulating OPT pseudo-headers.
+pub struct EdnsHandler { /* ... */ }
+
+impl EdnsHandler {
+    /// Locate the EDNS0 OPT pseudo-header in a DNS packet.
+    /// Replaces C find_pseudoheader() from src/edns0.c.
+    pub fn find_pseudoheader(&self, header: &DnsHeader, packet: &[u8]) -> Option<EdnsData>;
+
+    /// Add or replace an EDNS0 OPT pseudo-header in a DNS packet.
+    /// Replaces C add_pseudoheader() from src/edns0.c.
+    pub fn add_pseudoheader(
+        &self, header: &mut DnsHeader, packet: &mut Vec<u8>,
+        optno: u16, opt_data: &[u8], set_do: bool, replace: bool,
+    ) -> usize;
+
+    /// Set the DNSSEC OK (DO) bit in the EDNS0 OPT record.
+    /// Replaces C add_do_bit() from src/edns0.c.
+    pub fn add_do_bit(&self, header: &mut DnsHeader, packet: &mut Vec<u8>) -> usize;
+
+    /// Add EDNS0 client subnet option to an outgoing query.
+    pub fn add_source_addr(&self, header: &mut DnsHeader, packet: &mut Vec<u8>, source: &MySockAddr) -> usize;
+
+    /// Add MAC address EDNS0 option (for DHCP-linked DNS queries).
+    pub fn add_mac(&self, header: &mut DnsHeader, packet: &mut Vec<u8>, mac: &[u8]) -> usize;
+
+    /// Add the DNS client identifier option.
+    pub fn add_dns_client(&self, header: &mut DnsHeader, packet: &mut Vec<u8>) -> usize;
+
+    /// Add Cisco Umbrella EDNS0 option.
+    pub fn add_umbrella_opt(&self, header: &mut DnsHeader, packet: &mut Vec<u8>) -> usize;
+
+    /// Add EDNS0 client subnet and other configured options to a query.
+    /// Replaces C add_edns0_config() from src/edns0.c.
+    pub fn add_edns0_config(
+        &self, header: &mut DnsHeader, packet: &mut Vec<u8>,
+        source: &MySockAddr, now: Instant,
+    ) -> (usize, bool);
+
+    /// Check whether the source address in an EDNS0 client subnet option matches.
+    /// Replaces C check_source() from src/edns0.c.
+    pub fn check_source(&self, header: &DnsHeader, packet: &[u8], pseudoheader: &[u8], peer: &MySockAddr) -> bool;
+}
 ```
 
 ---
@@ -968,14 +1204,34 @@ response manipulation.
 #### Public Functions
 
 ```rust
-/// Filter resource records from a DNS response based on mode.
-/// Modes: RRFILTER_EDNS0 (0), RRFILTER_DNSSEC (1), RRFILTER_CONF (2).
-/// Replaces C rrfilter() from src/rrfilter.c.
-pub fn rrfilter(header: &mut DnsHeader, packet: &mut Vec<u8>, mode: i32) -> usize;
+/// Filter mode for resource record filtering.
+pub enum RRFilterMode { Edns0, Dnssec, Conf }
 
-/// Get the descriptor for a specific RR type (for filtering decisions).
-/// Replaces C rrfilter_desc() from src/rrfilter.c.
-pub fn rrfilter_desc(rr_type: u16) -> Option<Vec<i16>>;
+/// Descriptor for RR type rdata field layout.
+pub enum RdataField { /* ... */ }
+
+/// Get the field descriptor for a specific RR type (for filtering decisions).
+/// Replaces C rrfilter_desc() / rr_type_descriptor() from src/rrfilter.c.
+pub fn rr_type_descriptor(rr_type: u16) -> Option<Vec<RdataField>>;
+
+/// Validate a domain name in a DNS packet for correctness.
+/// Replaces C check_name() from src/rrfilter.c.
+pub fn check_name(packet: &[u8], offset: usize) -> bool;
+
+/// Validate all resource records in a DNS response for well-formedness.
+/// Replaces C check_rrs() from src/rrfilter.c.
+pub fn check_rrs(header: &DnsHeader, packet: &[u8]) -> bool;
+
+/// Filter resource records from a DNS response based on mode.
+/// Replaces C rrfilter() from src/rrfilter.c.
+pub fn rrfilter(header: &mut DnsHeader, packet: &mut Vec<u8>, mode: RRFilterMode) -> usize;
+
+/// Filter and write resource records directly to an output packet.
+/// Replaces C rrfilter_to_packet() from src/rrfilter.c.
+pub fn rrfilter_to_packet(header: &DnsHeader, packet: &[u8], output: &mut Vec<u8>, mode: RRFilterMode) -> usize;
+
+/// Extract the question name from a DNS packet.
+pub fn extract_question_name(header: &DnsHeader, packet: &[u8]) -> Option<String>;
 
 /// Convert a domain name to wire format (length-prefixed labels).
 /// Replaces C to_wire() from src/rrfilter.c.
@@ -998,6 +1254,26 @@ record generation.
 #### Public Functions
 
 ```rust
+/// Subnet record for authoritative zone access control.
+pub struct AuthSubnet { /* ... */ }
+
+/// Types of authoritative DNS records.
+pub enum AuthRecord { /* ... */ }
+
+/// Name entry within an authoritative zone.
+pub struct AuthNameEntry { /* ... */ }
+
+/// Authoritative DNS zone configuration.
+pub struct AuthZone { /* ... */ }
+
+/// Result of an authoritative query lookup.
+pub enum AuthResult { /* ... */ }
+
+/// Check whether a query name falls within a configured authoritative zone.
+/// Replaces part of C answer_auth() zone matching from src/auth.c.
+#[cfg(feature = "auth")]
+pub fn in_zone(zone: &AuthZone, name: &str) -> bool;
+
 /// Answer a DNS query from a locally configured authoritative zone.
 /// Generates SOA, NS, A, AAAA, and other records from zone configuration.
 /// Replaces C answer_auth() from src/auth.c.
@@ -1006,6 +1282,10 @@ pub fn answer_auth(
     header: &mut DnsHeader, packet: &mut Vec<u8>,
     now: Instant, peer: &MySockAddr, local: bool,
 ) -> Result<usize, DnsmasqError>;
+
+/// Convert an authoritative record to a DNS resource record for response construction.
+#[cfg(feature = "auth")]
+pub fn record_to_rr(record: &AuthRecord, packet: &mut Vec<u8>) -> DnsmasqResult<usize>;
 ```
 
 ---
@@ -1018,48 +1298,68 @@ server selection and local answer generation.
 #### Public Functions
 
 ```rust
-/// Build the sorted server array for efficient domain-based lookup.
-/// Replaces C build_server_array() from src/domain-match.c.
-pub fn build_server_array(state: &mut DaemonState);
+/// Flags controlling server match behaviour.
+pub struct ServerMatchFlags { /* bitflags */ }
 
-/// Look up which upstream servers should handle a query for the given domain.
-/// Returns index range into the server array.
-/// Replaces C lookup_domain() from src/domain-match.c.
-pub fn lookup_domain(domain: &str, flags: i32) -> Option<(usize, usize)>;
+/// Server configuration entry for upstream DNS server selection.
+pub struct ServerConfig { /* ... */ }
 
-/// Filter the server list based on flags and domain match.
-/// Replaces C filter_servers() from src/domain-match.c.
-pub fn filter_servers(seed: usize, flags: i32) -> Option<(usize, usize)>;
+/// Domain matcher for upstream server selection and local answer generation.
+/// Maintains a sorted server array for efficient domain-based lookup.
+pub struct DomainMatcher { /* ... */ }
 
-/// Check if a query can be answered locally (from /etc/hosts, config, etc.).
-/// Replaces C is_local_answer() from src/domain-match.c.
-pub fn is_local_answer(now: Instant, first: i32, name: &str) -> bool;
+impl DomainMatcher {
+    /// Create a new domain matcher.
+    pub fn new() -> Self;
 
-/// Generate a local answer response packet.
-/// Replaces C make_local_answer() from src/domain-match.c.
-pub fn make_local_answer(
-    flags: i32, got_name: bool, header: &mut DnsHeader,
-    name: &str, first: i32, last: i32, ede: i32,
-) -> usize;
+    /// Build the sorted server array for efficient domain-based lookup.
+    /// Replaces C build_server_array() from src/domain-match.c.
+    pub fn build_server_array(&mut self, state: &mut DaemonState);
 
-/// Check if two servers belong to the same group (for round-robin selection).
-/// Replaces C server_samegroup() from src/domain-match.c.
-pub fn server_samegroup(a: &ServerStruct, b: &ServerStruct) -> bool;
+    /// Look up which upstream servers should handle a query for the given domain.
+    /// Returns index range into the server array.
+    /// Replaces C lookup_domain() from src/domain-match.c.
+    pub fn lookup_domain(&self, domain: &str, flags: ServerMatchFlags) -> Option<(usize, usize)>;
 
-/// Mark servers with the specified flag.
-/// Replaces C mark_servers() from src/domain-match.c.
-pub fn mark_servers(flag: i32);
+    /// Filter the server list based on flags and domain match.
+    /// Replaces C filter_servers() from src/domain-match.c.
+    pub fn filter_servers(&self, seed: usize, flags: ServerMatchFlags) -> Option<(usize, usize)>;
 
-/// Remove servers marked for deletion.
-/// Replaces C cleanup_servers() from src/domain-match.c.
-pub fn cleanup_servers();
+    /// Check if two servers belong to the same group (for round-robin selection).
+    /// Replaces C server_samegroup() from src/domain-match.c.
+    pub fn server_samegroup(&self, a: &ServerEntry, b: &ServerEntry) -> bool;
 
-/// Add or update a server entry in the server list.
-/// Replaces C add_update_server() from src/domain-match.c.
-pub fn add_update_server(
-    flags: i32, addr: &MySockAddr, source_addr: &MySockAddr,
-    interface: Option<&str>, domain: Option<&str>, local_addr: Option<&AllAddr>,
-) -> Result<(), DnsmasqError>;
+    /// Mark servers with the specified flag.
+    /// Replaces C mark_servers() from src/domain-match.c.
+    pub fn mark_servers(&mut self, flag: ServerMatchFlags);
+
+    /// Remove servers marked for deletion.
+    /// Replaces C cleanup_servers() from src/domain-match.c.
+    pub fn cleanup_servers(&mut self);
+
+    /// Check if a query can be answered locally (from /etc/hosts, config, etc.).
+    /// Replaces C is_local_answer() from src/domain-match.c.
+    pub fn is_local_answer(&self, now: Instant, first: i32, name: &str) -> bool;
+
+    /// Generate a local answer response packet.
+    /// Replaces C make_local_answer() from src/domain-match.c.
+    pub fn make_local_answer(
+        &self, flags: ServerMatchFlags, got_name: bool,
+        header: &mut DnsHeader, name: &str, first: i32, last: i32, ede: i32,
+    ) -> usize;
+
+    /// Add or update a server entry in the server list.
+    /// Replaces C add_update_server() from src/domain-match.c.
+    pub fn add_update_server(
+        &mut self, flags: ServerMatchFlags, addr: &MySockAddr,
+        source_addr: &MySockAddr, interface: Option<&str>,
+        domain: Option<&str>, local_addr: Option<&AllAddr>,
+    ) -> Result<(), DnsmasqError>;
+
+    /// Check if a server supports DNSSEC for a given domain.
+    /// Replaces C dnssec_server() from src/domain-match.c.
+    pub fn dnssec_server(&self, domain: &str) -> bool;
+}
 ```
 
 ---
@@ -1072,9 +1372,24 @@ generation from address ranges.
 #### Public Functions
 
 ```rust
-/// Synthesise a reverse DNS domain name from an IP address and configured ranges.
-/// Replaces the domain synthesis logic from src/domain.c.
+/// Conditional domain configuration entry.
+pub struct ConditionalDomain { /* ... */ }
+
+/// Check if a domain name is a synthetic reverse DNS name.
+/// Replaces C is_name_synthetic() from src/domain.c.
+pub fn is_name_synthetic(flags: i32, name: &str, addr: &AllAddr) -> bool;
+
+/// Check if a reverse PTR name is synthetic and extract the forward address.
+/// Replaces C is_rev_synth() from src/domain.c.
+pub fn is_rev_synth(flags: i32, addr: &AllAddr, name: &mut String) -> bool;
+
+/// Synthesise a reverse DNS domain name from an IPv4 address and configured ranges.
+/// Replaces C get_domain() from src/domain.c.
 pub fn get_domain(addr: &AllAddr) -> Option<String>;
+
+/// Synthesise a reverse DNS domain name from an IPv6 address and configured ranges.
+/// Replaces C get_domain6() from src/domain.c.
+pub fn get_domain6(addr: &Ipv6Addr) -> Option<String>;
 ```
 
 ---
@@ -1088,14 +1403,30 @@ allocator.
 #### Public Functions
 
 ```rust
-/// Store variable-length data (DNSSEC keys, signatures) in block storage.
-/// In Rust, uses Vec<u8> instead of the C linked-block allocator.
-/// Replaces C blockdata_alloc() from src/blockdata.c.
-pub fn blockdata_alloc(data: &[u8]) -> Vec<u8>;
+/// Block-allocated storage for variable-length DNSSEC record data.
+/// In Rust, uses Vec<u8>/Box<[u8]> instead of the C linked-block allocator.
+pub struct BlockData { /* ... */ }
 
-/// Retrieve data from block storage into a contiguous buffer.
-/// Replaces C blockdata_retrieve() from src/blockdata.c.
-pub fn blockdata_retrieve(blocks: &[u8], len: usize) -> Vec<u8>;
+/// Pool manager for block-allocated data storage.
+pub struct BlockDataPool { /* ... */ }
+
+impl BlockData {
+    /// Allocate and store variable-length data (DNSSEC keys, signatures).
+    /// Replaces C blockdata_alloc() from src/blockdata.c.
+    pub fn new(data: &[u8]) -> Self;
+
+    /// Retrieve the stored data as a contiguous byte slice.
+    /// Replaces C blockdata_retrieve() from src/blockdata.c.
+    pub fn retrieve(&self) -> &[u8];
+}
+
+impl BlockDataPool {
+    /// Create a new block data pool for managing DNSSEC record storage.
+    pub fn new() -> Self;
+
+    /// Free all allocated blocks, resetting the pool.
+    pub fn free_all(&mut self);
+}
 ```
 
 ---
@@ -1110,16 +1441,35 @@ query cycles.
 #### Public Functions
 
 ```rust
-/// Send loop detection probe queries to all configured upstream servers.
-/// Replaces C loop_send_probes() from src/loop.c.
-#[cfg(feature = "loop-detect")]
-pub fn loop_send_probes();
+/// DNS forwarding loop detector.
+/// Maintains daemon UID and probe state for detecting query cycles.
+pub struct LoopDetector { /* ... */ }
 
-/// Check if an incoming query matches a loop detection probe (indicating a loop).
-/// Returns true if a forwarding loop is detected.
-/// Replaces C detect_loop() from src/loop.c.
-#[cfg(feature = "loop-detect")]
-pub fn detect_loop(query: &str, qtype: u16) -> bool;
+impl LoopDetector {
+    /// Create a new loop detector instance.
+    #[cfg(feature = "loop-detect")]
+    pub fn new() -> Self;
+
+    /// Get the daemon's unique identifier used in loop detection probes.
+    #[cfg(feature = "loop-detect")]
+    pub fn daemon_uid(&self) -> u32;
+
+    /// Send loop detection probe queries to all configured upstream servers.
+    /// Replaces C loop_send_probes() from src/loop.c.
+    #[cfg(feature = "loop-detect")]
+    pub fn loop_send_probes(&self);
+
+    /// Construct a loop detection probe query packet.
+    /// Replaces C loop_make_probe() from src/loop.c.
+    #[cfg(feature = "loop-detect")]
+    pub fn loop_make_probe(&self, server_index: usize) -> Vec<u8>;
+
+    /// Check if an incoming query matches a loop detection probe (indicating a loop).
+    /// Returns true if a forwarding loop is detected.
+    /// Replaces C detect_loop() from src/loop.c.
+    #[cfg(feature = "loop-detect")]
+    pub fn detect_loop(&self, query: &str, qtype: u16) -> bool;
+}
 ```
 
 ---
@@ -1139,21 +1489,22 @@ and packet dispatch.
 #### Public Functions
 
 ```rust
+/// Parameters for interface matching during DHCP context narrowing.
+pub struct IfaceParam { /* ... */ }
+
+/// Parameters for client matching during DHCP configuration lookup.
+pub struct MatchParam { /* ... */ }
+
 /// Initialise the DHCPv4 server: create raw sockets, set BPF filters.
 /// Replaces C dhcp_init() from src/dhcp.c.
 #[cfg(feature = "dhcp")]
-pub fn dhcp_init() -> Result<(), DnsmasqError>;
+pub async fn dhcp_init() -> Result<(), DnsmasqError>;
 
 /// Process an incoming DHCPv4 packet from the raw socket.
 /// Dispatches to the protocol state machine (rfc2131 handler).
 /// Replaces C dhcp_packet() from src/dhcp.c.
 #[cfg(feature = "dhcp")]
 pub async fn dhcp_packet(state: &mut DaemonState, now: Instant, pxe_fd: Option<RawFd>) -> Result<(), DnsmasqError>;
-
-/// Check whether a DHCP context contains available addresses for allocation.
-/// Replaces C address_available() from src/dhcp.c.
-#[cfg(feature = "dhcp")]
-pub fn address_available(context: &DhcpContext, addr: Ipv4Addr, netids: &[DhcpNetId]) -> Option<&DhcpContext>;
 
 /// Allocate an IP address from the DHCP pool.
 /// Replaces C address_allocate() from src/dhcp.c.
@@ -1162,10 +1513,65 @@ pub fn address_allocate(
     context: &DhcpContext, hwaddr: &[u8], netids: &[DhcpNetId], now: Instant, loopback: bool,
 ) -> Result<Ipv4Addr, DnsmasqError>;
 
+/// Look up a client lease by address, hardware address, or client ID.
+/// Replaces C lookup_client_lease() from src/dhcp.c.
+#[cfg(feature = "dhcp")]
+pub fn lookup_client_lease(hwaddr: &[u8], clid: Option<&[u8]>, addr: Ipv4Addr) -> Option<&DhcpLease>;
+
+/// Look up a client configuration by MAC address or client identity.
+/// Replaces C lookup_client_config() from src/dhcp.c.
+#[cfg(feature = "dhcp")]
+pub fn lookup_client_config(configs: &[DhcpConfig], hwaddr: &[u8], clid: Option<&[u8]>) -> Option<&DhcpConfig>;
+
+/// Check if bind-interfaces mode is active (affects socket binding strategy).
+/// Replaces C is_bind_interfaces_mode() from src/dhcp.c.
+#[cfg(feature = "dhcp")]
+pub fn is_bind_interfaces_mode() -> bool;
+
+/// Complete DHCP context narrowing by populating interface-specific fields.
+/// Replaces C complete_context() from src/dhcp.c.
+#[cfg(feature = "dhcp")]
+pub fn complete_context(contexts: &mut [DhcpContext], iface: &IfaceParam);
+
+/// Guess the netmask for a DHCP range from the interface configuration.
+/// Replaces C guess_range_netmask() from src/dhcp.c.
+#[cfg(feature = "dhcp")]
+pub fn guess_range_netmask(addr: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr;
+
+/// Narrow DHCP contexts to those matching the arrival interface.
+/// Replaces C narrow_context() / narrow_context3() from src/dhcp.c.
+#[cfg(feature = "dhcp")]
+pub fn narrow_context(contexts: &[DhcpContext], iface_addr: Ipv4Addr) -> Vec<&DhcpContext>;
+
+/// Check if the given address is accepted by local listen configuration.
+/// Replaces C check_listen_addrs() from src/dhcp.c.
+#[cfg(feature = "dhcp")]
+pub fn check_listen_addrs(addr: Ipv4Addr, iface_index: i32) -> bool;
+
+/// Send an ICMP ping to check if an address is already in use before offering.
+/// Replaces C do_icmp_ping() from src/dhcp.c.
+#[cfg(feature = "dhcp")]
+pub async fn do_icmp_ping(addr: Ipv4Addr) -> bool;
+
 /// Find a DHCP static configuration by IP address.
 /// Replaces C config_find_by_address() from src/dhcp.c.
 #[cfg(feature = "dhcp")]
 pub fn config_find_by_address(configs: &[DhcpConfig], addr: Ipv4Addr) -> Option<&DhcpConfig>;
+
+/// Resolve a hostname via DNS for DHCP client identification.
+/// Replaces C host_from_dns() from src/dhcp.c.
+#[cfg(feature = "dhcp")]
+pub fn host_from_dns(addr: Ipv4Addr) -> Option<String>;
+
+/// Read static DHCP assignments from /etc/ethers file.
+/// Replaces C dhcp_read_ethers() from src/dhcp.c.
+#[cfg(feature = "dhcp")]
+pub fn dhcp_read_ethers() -> DnsmasqResult<()>;
+
+/// Process a relayed DHCPv4 reply message.
+/// Replaces C relay_reply4() from src/dhcp.c.
+#[cfg(feature = "dhcp")]
+pub fn relay_reply4(mess: &DhcpPacket, sz: usize, arrival_interface: &str) -> u32;
 ```
 
 ---
@@ -1216,6 +1622,62 @@ pub const BOOTREQUEST: u8 = 1;
 pub const BOOTREPLY: u8 = 2;
 ```
 
+#### Public Types
+
+```rust
+/// DHCPv4 protocol state machine states.
+pub enum DhcpV4State {
+    Discover,
+    Offer,
+    Request,
+    Decline,
+    Ack,
+    Nak,
+    Release,
+    Inform,
+}
+
+/// Parsed DHCPv4 packet with accessor methods for all fields.
+/// Replaces C's raw `struct dhcp_packet` buffer manipulation.
+pub struct DhcpPacket { /* ... */ }
+
+impl DhcpPacket {
+    /// Parse a DHCPv4 packet from raw bytes.
+    pub fn from_bytes(data: &[u8]) -> DnsmasqResult<Self>;
+    /// Create a reply packet from a request.
+    pub fn new_reply(request: &DhcpPacket) -> Self;
+    /// Serialize the packet to wire format.
+    pub fn as_bytes(&self) -> &[u8];
+    pub fn as_bytes_mut(&mut self) -> &mut [u8];
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    /// Field accessors (op, htype, hlen, hops, xid, secs, flags, chaddr, sname, file, options)
+    pub fn op(&self) -> u8;
+    pub fn htype(&self) -> u8;
+    pub fn hlen(&self) -> u8;
+    pub fn hops(&self) -> u8;
+    pub fn xid(&self) -> u32;
+    pub fn secs(&self) -> u16;
+    pub fn flags(&self) -> u16;
+    pub fn chaddr(&self) -> &[u8];
+    pub fn sname(&self) -> &[u8];
+    pub fn file(&self) -> &[u8];
+    pub fn options(&self) -> &[u8];
+    /// Address field accessors
+    pub fn ciaddr_addr(&self) -> Ipv4Addr;
+    pub fn yiaddr_addr(&self) -> Ipv4Addr;
+    pub fn siaddr_addr(&self) -> Ipv4Addr;
+    pub fn giaddr_addr(&self) -> Ipv4Addr;
+    /// Address field setters
+    pub fn set_op(&mut self, op: u8);
+    pub fn set_hops(&mut self, hops: u8);
+    pub fn set_ciaddr(&mut self, addr: Ipv4Addr);
+    pub fn set_yiaddr(&mut self, addr: Ipv4Addr);
+    pub fn set_siaddr(&mut self, addr: Ipv4Addr);
+    pub fn set_giaddr(&mut self, addr: Ipv4Addr);
+}
+```
+
 #### Public Functions
 
 ```rust
@@ -1255,29 +1717,70 @@ encoding and decoding utilities.
 #### Public Functions
 
 ```rust
-/// Receive a DHCP packet from a raw or UDP socket with ancillary data.
-/// Replaces C recv_dhcp_packet() from src/dhcp-common.c.
+/// Return the length of a DHCP option payload.
+/// Replaces C option_len() from src/dhcp-common.c.
 #[cfg(feature = "dhcp")]
-pub fn recv_dhcp_packet(fd: RawFd) -> Result<(Vec<u8>, MsgHdr), DnsmasqError>;
+pub fn option_len(opt: &[u8]) -> usize;
 
-/// Process tag-if matching rules for DHCP network tags.
-/// Replaces C run_tag_if() from src/dhcp-common.c.
+/// Return the data portion of a DHCP option.
+/// Replaces C option_data() from src/dhcp-common.c.
 #[cfg(feature = "dhcp")]
-pub fn run_tag_if(tags: &[DhcpNetId]) -> Vec<DhcpNetId>;
+pub fn option_data(opt: &[u8]) -> &[u8];
 
-/// Match network tags against a tag pool.
-/// Replaces C match_netid() from src/dhcp-common.c.
+/// Find the first occurrence of an option code in the primary option area.
+/// Replaces C option_find1() from src/dhcp-common.c.
 #[cfg(feature = "dhcp")]
-pub fn match_netid(check: &[DhcpNetId], pool: &[DhcpNetId], tag_not_needed: bool) -> bool;
+pub fn option_find1(options: &[u8], code: u8) -> Option<&[u8]>;
 
-/// Find a DHCP configuration record by client identity (MAC, client-id, hostname).
-/// Replaces C find_config() from src/dhcp-common.c.
+/// Find an option with overload handling (sname/file field overload).
+/// Replaces C option_find() from src/dhcp-common.c.
 #[cfg(feature = "dhcp")]
-pub fn find_config(
-    configs: &[DhcpConfig], context: &DhcpContext,
-    clid: Option<&[u8]>, hwaddr: &[u8], hostname: Option<&str>,
-    filter: &[DhcpNetId],
-) -> Option<&DhcpConfig>;
+pub fn option_find(packet: &DhcpPacket, code: u8) -> Option<&[u8]>;
+
+/// Extract an IPv4 address from a DHCP option.
+/// Replaces C option_addr() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn option_addr(opt: &[u8]) -> Option<Ipv4Addr>;
+
+/// Extract an unsigned integer (1/2/4 bytes) from a DHCP option.
+/// Replaces C option_uint() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn option_uint(opt: &[u8], size: usize) -> u32;
+
+/// Sanitise a hostname extracted from DHCP options.
+/// Replaces C sanitise() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn sanitise(name: &[u8]) -> Option<String>;
+
+/// Check whether a DHCP option code is in a request list.
+/// Replaces C in_list() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn in_list(list: &[u8], code: u8) -> bool;
+
+/// Find free space in the option buffer for inserting a new option.
+/// Replaces C free_space() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn free_space(options: &mut [u8], end: usize, code: u8, len: usize) -> Option<usize>;
+
+/// Put a DHCP option (code + length + data) into the option buffer.
+/// Replaces C option_put() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn option_put(options: &mut [u8], end: usize, code: u8, len: usize, val: u32) -> usize;
+
+/// Put a string-valued DHCP option into the option buffer.
+/// Replaces C option_put_string() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn option_put_string(options: &mut [u8], end: usize, code: u8, val: &str) -> usize;
+
+/// Clear all options from the option buffer.
+/// Replaces C clear_options() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn clear_options(options: &mut [u8], end: usize);
+
+/// Calculate the maximum DHCP packet size the client can accept.
+/// Replaces C dhcp_packet_size() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn dhcp_packet_size(packet: &DhcpPacket, netmask: Ipv4Addr) -> usize;
 ```
 
 ---
@@ -1295,12 +1798,26 @@ delegation initialisation.
 /// Initialise the DHCPv6 server: create sockets, join multicast groups.
 /// Replaces C dhcp6_init() from src/dhcp6.c.
 #[cfg(feature = "dhcp6")]
-pub fn dhcp6_init() -> Result<(), DnsmasqError>;
+pub async fn dhcp6_init() -> Result<(), DnsmasqError>;
 
 /// Process an incoming DHCPv6 packet.
 /// Replaces C dhcp6_packet() from src/dhcp6.c.
 #[cfg(feature = "dhcp6")]
 pub async fn dhcp6_packet(state: &mut DaemonState, now: Instant) -> Result<(), DnsmasqError>;
+
+/// Retrieve the MAC address from a DHCPv6 client request.
+/// Replaces C get_client_mac() from src/dhcp6.c.
+#[cfg(feature = "dhcp6")]
+pub async fn get_client_mac(
+    client: &Ipv6Addr, iface_index: i32,
+) -> Option<[u8; 6]>;
+
+/// Find a DHCPv6 static configuration by IPv6 address.
+/// Replaces C config_find_by_address6() from src/dhcp6.c.
+#[cfg(feature = "dhcp6")]
+pub fn config_find_by_address6(
+    configs: &[DhcpConfig], addr: &Ipv6Addr, prefix: u8, plain_range: bool,
+) -> Option<&DhcpConfig>;
 
 /// Allocate a DHCPv6 address from the configured context pools.
 /// Replaces C address6_allocate() from src/dhcp6.c.
@@ -1310,15 +1827,30 @@ pub fn address6_allocate(
     netids: &[DhcpNetId], plain_range: bool,
 ) -> Result<Ipv6Addr, DnsmasqError>;
 
-/// Construct DHCP contexts from the current network interface configuration.
-/// Replaces C dhcp_construct_contexts() from src/dhcp6.c.
+/// Check whether an IPv6 address is available in the pool (not leased).
+/// Replaces C address6_available() from src/dhcp6.c.
 #[cfg(feature = "dhcp6")]
-pub fn dhcp_construct_contexts(now: Instant);
+pub fn address6_available(
+    context: &DhcpContext, addr: &Ipv6Addr, netids: &[DhcpNetId],
+) -> bool;
+
+/// Validate that an existing DHCPv6 address is still valid in the current context.
+/// Replaces C address6_valid() from src/dhcp6.c.
+#[cfg(feature = "dhcp6")]
+pub fn address6_valid(
+    context: &DhcpContext, addr: &Ipv6Addr, netids: &[DhcpNetId],
+    plain_range: bool,
+) -> bool;
 
 /// Generate a DUID (DHCP Unique Identifier) for this server instance.
 /// Replaces C make_duid() from src/dhcp6.c.
 #[cfg(feature = "dhcp6")]
 pub fn make_duid(now: Instant);
+
+/// Construct DHCP contexts from the current network interface configuration.
+/// Replaces C dhcp_construct_contexts() from src/dhcp6.c.
+#[cfg(feature = "dhcp6")]
+pub fn dhcp_construct_contexts(now: Instant);
 ```
 
 ---
@@ -1330,9 +1862,55 @@ protocol state machine implementing SOLICIT → ADVERTISE → REQUEST → REPLY 
 
 **Feature gate:** `#[cfg(feature = "dhcp6")]`
 
+#### Public Types
+
+```rust
+/// DHCPv6 protocol state machine states.
+pub enum DhcpV6State {
+    Solicit,
+    Advertise,
+    Request,
+    Confirm,
+    Renew,
+    Rebind,
+    Reply,
+    Release,
+    Decline,
+    Reconfigure,
+    InformationRequest,
+    RelayForw,
+    RelayRepl,
+}
+
+/// Identity Association type (address vs prefix delegation).
+pub enum IaType {
+    Na,  // Non-temporary addresses (IA_NA)
+    Ta,  // Temporary addresses (IA_TA)
+    Pd,  // Prefix delegation (IA_PD)
+}
+
+/// State accumulated during DHCPv6 request processing.
+pub struct Dhcp6RequestState { /* ... */ }
+```
+
 #### Public Functions
 
 ```rust
+/// Find a DHCPv6 option by code within an option buffer.
+/// Replaces C opt6_find() from src/rfc3315.c.
+#[cfg(feature = "dhcp6")]
+pub fn opt6_find(opts: &[u8], code: u16) -> Option<&[u8]>;
+
+/// Iterate to the next DHCPv6 option in a buffer.
+/// Replaces C opt6_next() from src/rfc3315.c.
+#[cfg(feature = "dhcp6")]
+pub fn opt6_next(current: &[u8], remaining: &[u8]) -> Option<&[u8]>;
+
+/// Extract an unsigned integer value from a DHCPv6 option.
+/// Replaces C opt6_uint() from src/rfc3315.c.
+#[cfg(feature = "dhcp6")]
+pub fn opt6_uint(opt: &[u8], offset: usize, size: usize) -> u32;
+
 /// Process a DHCPv6 message and generate the appropriate response.
 /// Implements the full state machine: SOLICIT→ADVERTISE, REQUEST→REPLY, etc.
 /// Replaces C dhcp6_reply() from src/rfc3315.c.
@@ -1367,48 +1945,49 @@ management. In Rust, `Vec<u8>` replaces the manual buffer allocator.
 
 **Feature gate:** `#[cfg(feature = "dhcp6")]`
 
-#### Public Functions
+#### Public Types
 
 ```rust
-/// Start a new DHCPv6 option in the output packet.
-/// Replaces C new_opt6() from src/outpacket.c.
-#[cfg(feature = "dhcp6")]
-pub fn new_opt6(opt: u16) -> i32;
+/// DHCPv6 outgoing packet construction buffer.
+/// In Rust, wraps a `Vec<u8>` with helper methods for building
+/// nested DHCPv6 options in wire format.
+/// Replaces C's manual buffer management in src/outpacket.c.
+pub struct OutPacket { /* ... */ }
 
-/// Close an open DHCPv6 option container, writing the final length.
-/// Replaces C end_opt6() from src/outpacket.c.
-#[cfg(feature = "dhcp6")]
-pub fn end_opt6(container: i32);
-
-/// Write raw data into the DHCPv6 output packet.
-/// Replaces C put_opt6() from src/outpacket.c.
-#[cfg(feature = "dhcp6")]
-pub fn put_opt6(data: &[u8]);
-
-/// Write a 32-bit value into the DHCPv6 output packet (network byte order).
-/// Replaces C put_opt6_long() from src/outpacket.c.
-#[cfg(feature = "dhcp6")]
-pub fn put_opt6_long(val: u32);
-
-/// Write a 16-bit value into the DHCPv6 output packet (network byte order).
-/// Replaces C put_opt6_short() from src/outpacket.c.
-#[cfg(feature = "dhcp6")]
-pub fn put_opt6_short(val: u16);
-
-/// Write a single byte into the DHCPv6 output packet.
-/// Replaces C put_opt6_char() from src/outpacket.c.
-#[cfg(feature = "dhcp6")]
-pub fn put_opt6_char(val: u8);
-
-/// Write a null-terminated string into the DHCPv6 output packet.
-/// Replaces C put_opt6_string() from src/outpacket.c.
-#[cfg(feature = "dhcp6")]
-pub fn put_opt6_string(s: &str);
-
-/// Reset the output buffer write counter.
-/// Replaces C reset_counter() from src/outpacket.c.
-#[cfg(feature = "dhcp6")]
-pub fn reset_counter();
+impl OutPacket {
+    /// Create a new empty output packet.
+    pub fn new() -> Self;
+    /// Create with pre-allocated capacity.
+    pub fn with_capacity(capacity: usize) -> Self;
+    /// Reset the buffer and write counter.
+    pub fn reset(&mut self);
+    /// Save the current write position for later backpatching.
+    pub fn save_counter(&mut self) -> usize;
+    /// Current packet length.
+    pub fn len(&self) -> usize;
+    /// Whether the packet buffer is empty.
+    pub fn is_empty(&self) -> bool;
+    /// Start a new DHCPv6 option container; returns a handle for end_opt6().
+    pub fn new_opt6(&mut self, opt: u16) -> i32;
+    /// Write raw data into the packet.
+    pub fn put_opt6(&mut self, data: &[u8]);
+    /// Write raw bytes into an option.
+    pub fn put_opt6_raw(&mut self, data: &[u8]);
+    /// Write a 32-bit value (network byte order).
+    pub fn put_opt6_long(&mut self, val: u32);
+    /// Write a 16-bit value (network byte order).
+    pub fn put_opt6_short(&mut self, val: u16);
+    /// Write a single byte.
+    pub fn put_opt6_char(&mut self, val: u8);
+    /// Write a string.
+    pub fn put_opt6_string(&mut self, s: &str);
+    /// Close an open option container, writing the final length.
+    pub fn end_opt6(&mut self, container: i32);
+    /// Get a read-only reference to the packet bytes.
+    pub fn as_bytes(&self) -> &[u8];
+    /// Get a mutable reference to the packet bytes.
+    pub fn as_mut_bytes(&mut self) -> &mut [u8];
+}
 ```
 
 ---
@@ -1420,6 +1999,49 @@ used by both DHCPv4 and DHCPv6, including vendor class matching and option displ
 
 **Feature gate:** `#[cfg(feature = "dhcp")]`
 
+#### Public Types
+
+```rust
+/// Network identity tag for DHCP option matching.
+pub struct NetId { /* ... */ }
+
+/// DHCP option definition (code + value + flags).
+pub struct DhcpOpt { /* ... */ }
+
+/// Hardware address configuration for a DHCP host record.
+pub struct HwAddrConfig { /* ... */ }
+
+/// DHCP static host configuration record.
+pub struct DhcpConfig { /* ... */ }
+
+/// DHCP address pool context (network range, options, timing).
+pub struct DhcpContext { /* ... */ }
+
+/// DHCP relay configuration.
+pub struct DhcpRelay { /* ... */ }
+
+/// Tag-if conditional rule for DHCP option matching.
+pub struct TagIfRule { /* ... */ }
+
+/// Known DHCP option code definition with name, length, and type.
+pub struct DhcpOptDef { /* ... */ }
+
+/// Extra data variants for DHCP option encoding.
+pub enum DhcpOptExtra { /* ... */ }
+
+/// Protocol discriminator (DHCPv4 vs DHCPv6).
+pub enum DhcpProtocol {
+    V4,
+    V6,
+}
+
+/// Address family discriminator.
+pub enum AddressFamily {
+    Inet,
+    Inet6,
+}
+```
+
 #### Public Functions
 
 ```rust
@@ -1428,30 +2050,89 @@ used by both DHCPv4 and DHCPv6, including vendor class matching and option displ
 #[cfg(feature = "dhcp")]
 pub fn dhcp_common_init();
 
+/// Receive a DHCP packet from a raw or UDP socket with ancillary data.
+/// Replaces C recv_dhcp_packet() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub async fn recv_dhcp_packet(fd: RawFd) -> Result<(Vec<u8>, MsgHdr), DnsmasqError>;
+
+/// Match network tags against a tag pool.
+/// Replaces C match_netid() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn match_netid(check: &[NetId], pool: &[NetId], tag_not_needed: bool) -> bool;
+
+/// Match network tags with wildcard support.
+/// Replaces C match_netid_wild() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn match_netid_wild(check: &[NetId], pool: &[NetId]) -> bool;
+
+/// Process tag-if matching rules for DHCP network tags.
+/// Replaces C run_tag_if() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn run_tag_if(tags: &[NetId]) -> Vec<NetId>;
+
+/// Filter DHCP options based on tag matching.
+/// Replaces C option_filter() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn option_filter(tags: &[NetId], opts: &[DhcpOpt]) -> Vec<&DhcpOpt>;
+
+/// Check if PXE options are valid for the current client.
+/// Replaces C pxe_ok() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn pxe_ok(tags: &[NetId], options: &[DhcpOpt]) -> bool;
+
 /// Strip invalid characters from a hostname received from a DHCP client.
 /// Replaces C strip_hostname() from src/dhcp-common.c.
 #[cfg(feature = "dhcp")]
 pub fn strip_hostname(hostname: &str) -> String;
 
-/// Display all configured DHCP options (for debugging/logging).
-/// Replaces C display_opts() from src/dhcp-common.c.
+/// Match raw bytes against a configuration pattern.
+/// Replaces C match_bytes() from src/dhcp-common.c.
 #[cfg(feature = "dhcp")]
-pub fn display_opts();
+pub fn match_bytes(opt: &DhcpOpt, data: &[u8]) -> bool;
 
-/// Look up a DHCP option code by name.
-/// Replaces C lookup_dhcp_opt() from src/dhcp-common.c.
+/// Check whether a DHCP config entry matches by MAC address.
+/// Replaces C config_has_mac() from src/dhcp-common.c.
 #[cfg(feature = "dhcp")]
-pub fn lookup_dhcp_opt(protocol: i32, name: &str) -> Option<u32>;
+pub fn config_has_mac(config: &DhcpConfig, hwaddr: &[u8], hw_type: i32) -> bool;
+
+/// Find a DHCP configuration record by client identity.
+/// Replaces C find_config() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn find_config(
+    configs: &[DhcpConfig], context: &DhcpContext,
+    clid: Option<&[u8]>, hwaddr: &[u8], hostname: Option<&str>,
+    filter: &[NetId],
+) -> Option<&DhcpConfig>;
 
 /// Update DHCP static host configurations from external sources.
 /// Replaces C dhcp_update_configs() from src/dhcp-common.c.
 #[cfg(feature = "dhcp")]
 pub fn dhcp_update_configs(configs: &mut Vec<DhcpConfig>);
 
-/// Log DHCP context details for a given address family.
-/// Replaces C log_context() from src/dhcp-common.c.
+/// Determine which network interface a DHCP packet arrived on.
+/// Replaces C which_device() from src/dhcp-common.c.
 #[cfg(feature = "dhcp")]
-pub fn log_context(family: i32, context: &DhcpContext);
+pub fn which_device(dest: &std::net::SocketAddr) -> Option<String>;
+
+/// Bind DHCP sockets to specific interfaces.
+/// Replaces C bind_dhcp_devices() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn bind_dhcp_devices(interfaces: &[String]) -> DnsmasqResult<()>;
+
+/// Look up a DHCP option code by name.
+/// Replaces C lookup_dhcp_opt() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn lookup_dhcp_opt(protocol: i32, name: &str) -> Option<u32>;
+
+/// Look up the expected length for a DHCP option code.
+/// Replaces C lookup_dhcp_len() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn lookup_dhcp_len(protocol: i32, code: u32) -> Option<usize>;
+
+/// Format a DHCP option value as a human-readable string.
+/// Replaces C option_string() from src/dhcp-common.c.
+#[cfg(feature = "dhcp")]
+pub fn option_string(protocol: i32, code: u32, data: &[u8]) -> String;
 ```
 
 ---
@@ -1463,23 +2144,44 @@ the lease file, lease lookup, allocation, pruning, and DNS update integration.
 
 **Feature gate:** `#[cfg(feature = "dhcp")]`
 
+#### Public Types
+
+```rust
+/// Discriminator for DHCPv4 vs DHCPv6 lease types.
+pub enum LeaseType {
+    V4,
+    Na,  // DHCPv6 non-temporary address
+    Ta,  // DHCPv6 temporary address
+    Pd,  // DHCPv6 prefix delegation
+}
+
+/// Flags on a lease entry (state tracking).
+pub struct LeaseFlags { /* ... */ }
+
+/// A DHCP lease entry.
+pub struct DhcpLease { /* ... */ }
+
+/// Lease database container with lookup indexes.
+pub struct LeaseDatabase { /* ... */ }
+
+impl LeaseDatabase {
+    /// Create a new empty lease database.
+    pub fn new() -> Self;
+}
+```
+
 #### Public Functions
 
 ```rust
-/// Initialise the lease database, reading persisted leases from the lease file.
-/// Replaces C lease_init() from src/lease.c.
-#[cfg(feature = "dhcp")]
-pub fn lease_init(now: Instant) -> Result<(), DnsmasqError>;
-
 /// Write current lease database state to the lease file.
 /// Replaces C lease_update_file() from src/lease.c.
 #[cfg(feature = "dhcp")]
 pub fn lease_update_file(now: Instant) -> Result<(), DnsmasqError>;
 
-/// Update DNS records based on current lease database state.
-/// Replaces C lease_update_dns() from src/lease.c.
+/// Initialise the lease database, reading persisted leases from the lease file.
+/// Replaces C lease_init() from src/lease.c.
 #[cfg(feature = "dhcp")]
-pub fn lease_update_dns(force: bool);
+pub fn lease_init(now: Instant) -> Result<(), DnsmasqError>;
 
 /// Allocate a new DHCPv4 lease for the given IP address.
 /// Replaces C lease4_allocate() from src/lease.c.
@@ -1489,22 +2191,67 @@ pub fn lease4_allocate(addr: Ipv4Addr) -> Result<DhcpLease, DnsmasqError>;
 /// Allocate a new DHCPv6 lease for the given IPv6 address.
 /// Replaces C lease6_allocate() from src/lease.c.
 #[cfg(feature = "dhcp6")]
-pub fn lease6_allocate(addr: &Ipv6Addr, lease_type: i32) -> Result<DhcpLease, DnsmasqError>;
+pub fn lease6_allocate(addr: &Ipv6Addr, lease_type: LeaseType) -> Result<DhcpLease, DnsmasqError>;
+
+/// Add a lease to the database.
+/// Replaces C lease_db_add() from src/lease.c.
+#[cfg(feature = "dhcp")]
+pub fn lease_db_add(db: &mut LeaseDatabase, lease: DhcpLease);
+
+/// Find a DHCPv4 lease by IPv4 address.
+/// Replaces C lease_find_by_addr() from src/lease.c.
+#[cfg(feature = "dhcp")]
+pub fn lease_find_by_addr(addr: Ipv4Addr) -> Option<&DhcpLease>;
+
+/// Find a DHCPv4 lease by IPv4 address (mutable).
+/// Replaces C lease_find_by_addr() from src/lease.c.
+#[cfg(feature = "dhcp")]
+pub fn lease_find_by_addr_mut(addr: Ipv4Addr) -> Option<&mut DhcpLease>;
 
 /// Find a lease by client hardware address or client identifier.
 /// Replaces C lease_find_by_client() from src/lease.c.
 #[cfg(feature = "dhcp")]
 pub fn lease_find_by_client(hwaddr: &[u8], hw_type: i32, clid: Option<&[u8]>) -> Option<&DhcpLease>;
 
-/// Find a lease by IPv4 address.
-/// Replaces C lease_find_by_addr() from src/lease.c.
-#[cfg(feature = "dhcp")]
-pub fn lease_find_by_addr(addr: Ipv4Addr) -> Option<&DhcpLease>;
+/// Find a DHCPv6 lease by type and IAID.
+/// Replaces C lease6_find() from src/lease.c.
+#[cfg(feature = "dhcp6")]
+pub fn lease6_find(lease_type: LeaseType, iaid: u32) -> Option<&DhcpLease>;
 
-/// Prune expired leases from the database.
-/// Replaces C lease_prune() from src/lease.c.
+/// Find a DHCPv6 lease by client DUID.
+/// Replaces C lease6_find_by_client() from src/lease.c.
+#[cfg(feature = "dhcp6")]
+pub fn lease6_find_by_client(clid: &[u8], iaid: u32) -> Option<&DhcpLease>;
+
+/// Find a DHCPv6 lease by IPv6 address.
+/// Replaces C lease6_find_by_addr() from src/lease.c.
+#[cfg(feature = "dhcp6")]
+pub fn lease6_find_by_addr(addr: &Ipv6Addr, prefix: u8) -> Option<&DhcpLease>;
+
+/// Find a DHCPv6 lease by plain IPv6 address (no prefix consideration).
+/// Replaces C lease6_find_by_plain_addr() from src/lease.c.
+#[cfg(feature = "dhcp6")]
+pub fn lease6_find_by_plain_addr(addr: &Ipv6Addr) -> Option<&DhcpLease>;
+
+/// Reset DHCPv6 lease state for re-enumeration.
+/// Replaces C lease6_reset() from src/lease.c.
+#[cfg(feature = "dhcp6")]
+pub fn lease6_reset();
+
+/// Set the lease expiry time.
+/// Replaces C lease_set_expires() from src/lease.c.
 #[cfg(feature = "dhcp")]
-pub fn lease_prune(target: Option<&DhcpLease>, now: Instant);
+pub fn lease_set_expires(lease: &mut DhcpLease, duration: u32, now: Instant);
+
+/// Set the lease expiry time from the database context.
+/// Replaces C lease_set_expires() (database variant) from src/lease.c.
+#[cfg(feature = "dhcp")]
+pub fn lease_set_expires_db(lease: &mut DhcpLease, expires: u64);
+
+/// Set the IAID on a DHCPv6 lease.
+/// Replaces C lease_set_iaid() from src/lease.c.
+#[cfg(feature = "dhcp6")]
+pub fn lease_set_iaid(lease: &mut DhcpLease, iaid: u32);
 
 /// Set the hardware address and client identifier on a lease.
 /// Replaces C lease_set_hwaddr() from src/lease.c.
@@ -1516,10 +2263,20 @@ pub fn lease_set_hwaddr(lease: &mut DhcpLease, hwaddr: &[u8], clid: Option<&[u8]
 #[cfg(feature = "dhcp")]
 pub fn lease_set_hostname(lease: &mut DhcpLease, name: &str, auth: bool, domain: Option<&str>, config_domain: Option<&str>);
 
-/// Set the lease expiry time.
-/// Replaces C lease_set_expires() from src/lease.c.
+/// Set the interface name on a lease.
+/// Replaces C lease_set_interface() from src/lease.c.
 #[cfg(feature = "dhcp")]
-pub fn lease_set_expires(lease: &mut DhcpLease, duration: u32, now: Instant);
+pub fn lease_set_interface(lease: &mut DhcpLease, iface: &str, now: Instant);
+
+/// Set the relay agent information (option 82) on a lease.
+/// Replaces C lease_set_agent_id() from src/lease.c.
+#[cfg(feature = "dhcp")]
+pub fn lease_set_agent_id(lease: &mut DhcpLease, agent_id: &[u8]);
+
+/// Set the vendor class identifier on a lease.
+/// Replaces C lease_set_vendorclass() from src/lease.c.
+#[cfg(feature = "dhcp")]
+pub fn lease_set_vendorclass(lease: &mut DhcpLease, vendorclass: &str);
 ```
 
 ---
@@ -1530,6 +2287,28 @@ pub fn lease_set_expires(lease: &mut DhcpLease, duration: u32, now: Instant);
 Advertisement construction and dispatch per RFC 4861.
 
 **Feature gate:** `#[cfg(feature = "dhcp6")]`
+
+#### Public Types
+
+```rust
+/// ICMPv6 Router Advertisement packet structure.
+pub struct RaPacket { /* ... */ }
+
+/// ICMPv6 Prefix Information Option (RFC 4861 §4.6.2).
+pub struct PrefixOpt { /* ... */ }
+
+/// ICMPv6 Echo Request/Reply for neighbor probing.
+pub struct PingPacket { /* ... */ }
+
+/// ICMPv6 Neighbor Solicitation/Advertisement.
+pub struct NeighPacket { /* ... */ }
+
+/// Per-interface Router Advertisement configuration.
+pub struct RaInterface { /* ... */ }
+
+/// Parameters accumulated during RA construction.
+pub struct RaParam { /* ... */ }
+```
 
 #### Public Functions
 
@@ -1543,6 +2322,11 @@ pub fn ra_init(now: Instant) -> Result<(), DnsmasqError>;
 /// Replaces C icmp6_packet() from src/radv.c.
 #[cfg(feature = "dhcp6")]
 pub async fn icmp6_packet(state: &mut DaemonState, now: Instant) -> Result<(), DnsmasqError>;
+
+/// Construct and send a Router Advertisement on the specified interface.
+/// Replaces C send_ra() from src/radv.c.
+#[cfg(feature = "dhcp6")]
+pub fn send_ra(now: Instant, iface_index: i32, iface_name: &str, dest: &Ipv6Addr) -> DnsmasqResult<()>;
 
 /// Send periodic unsolicited Router Advertisements.
 /// Returns the next scheduled RA time.
@@ -1565,9 +2349,30 @@ address tracking and ping checks.
 
 **Feature gate:** `#[cfg(feature = "dhcp6")]`
 
+#### Public Types
+
+```rust
+/// A SLAAC-derived IPv6 address record associated with a lease.
+pub struct SlaacAddress { /* ... */ }
+
+/// SLAAC lease information for tracking purposes.
+pub struct SlaacLeaseInfo { /* ... */ }
+
+/// A pending SLAAC ping (DAD probe) record.
+pub struct PendingPing { /* ... */ }
+
+/// Result of periodic SLAAC maintenance.
+pub struct PeriodicSlaacResult { /* ... */ }
+```
+
 #### Public Functions
 
 ```rust
+/// Convert a MAC address to an EUI-64 identifier for SLAAC.
+/// Replaces C mac_to_eui64() from src/slaac.c.
+#[cfg(feature = "dhcp6")]
+pub fn mac_to_eui64(mac: &[u8]) -> [u8; 8];
+
 /// Add SLAAC-derived addresses to a DHCP lease for tracking.
 /// Replaces C slaac_add_addrs() from src/slaac.c.
 #[cfg(feature = "dhcp6")]
@@ -1578,6 +2383,11 @@ pub fn slaac_add_addrs(lease: &mut DhcpLease, now: Instant, force: bool);
 /// Replaces C periodic_slaac() from src/slaac.c.
 #[cfg(feature = "dhcp6")]
 pub fn periodic_slaac(now: Instant, leases: &mut [DhcpLease]) -> Instant;
+
+/// Handle an error from a SLAAC ping send attempt.
+/// Replaces C handle_ping_send_error() from src/slaac.c.
+#[cfg(feature = "dhcp6")]
+pub fn handle_ping_send_error(addr: &Ipv6Addr, err: std::io::Error);
 
 /// Handle a SLAAC ping reply confirming address reachability.
 /// Replaces C slaac_ping_reply() from src/slaac.c.
@@ -1595,17 +2405,17 @@ functions.
 #### Public Functions
 
 ```rust
-/// Check whether an IPv6 address falls within a given prefix.
-/// Replaces C is_same_net6() macro from src/ip6addr.h.
-pub fn is_same_net6(addr: &Ipv6Addr, net: &Ipv6Addr, prefix_len: u32) -> bool;
+/// Check whether an IPv6 address is a Unique Local Address (ULA, fc00::/7).
+/// Replaces C is_ula() macro from src/ip6addr.h.
+pub fn is_ula(addr: &Ipv6Addr) -> bool;
 
-/// Set the host portion of an IPv6 address from a u64 value.
-/// Replaces C addr6part() / setaddr6part() macros from src/ip6addr.h.
-pub fn set_addr6_part(addr: &mut Ipv6Addr, host: u64);
+/// Check whether an IPv6 address is a ULA with a zero interface ID.
+/// Replaces C is_ula_zero() macro from src/ip6addr.h.
+pub fn is_ula_zero(addr: &Ipv6Addr) -> bool;
 
-/// Extract the host portion (lower 64 bits) of an IPv6 address.
-/// Replaces C addr6part() macro from src/ip6addr.h.
-pub fn addr6_part(addr: &Ipv6Addr) -> u64;
+/// Check whether an IPv6 address is a link-local address with a zero interface ID.
+/// Replaces C is_link_local_zero() macro from src/ip6addr.h.
+pub fn is_link_local_zero(addr: &Ipv6Addr) -> bool;
 ```
 
 ---
@@ -1620,12 +2430,64 @@ binding, and low-level network monitoring.
 **Source:** `src/network.c` (6,331 lines) — interface enumeration, socket creation, bind
 operations, and listener management.
 
+#### Public Types
+
+```rust
+/// Platform-abstracted socket address (IPv4 or IPv6 with scope).
+/// Replaces C `union mysockaddr` from src/dnsmasq.h.
+pub struct MySockAddr { /* ... */ }
+
+impl MySockAddr {
+    /// Construct from an IPv4 address and port.
+    pub fn v4(addr: Ipv4Addr, port: u16) -> Self;
+    /// Construct from an IPv6 address, port, and scope ID.
+    pub fn v6(addr: Ipv6Addr, port: u16, scope_id: u32) -> Self;
+    /// Get the port number.
+    pub fn port(&self) -> u16;
+    /// Set the port number.
+    pub fn set_port(&mut self, port: u16);
+    /// Get the IP address.
+    pub fn ip(&self) -> std::net::IpAddr;
+}
+
+/// Extract the IP address from a MySockAddr.
+pub fn mysockaddr_ip(addr: &MySockAddr) -> std::net::IpAddr;
+```
+
 #### Public Functions
 
 ```rust
+/// Translate a network interface index to its name.
+/// Replaces C indextoname() from src/network.c.
+pub fn index_to_name(fd: RawFd, index: i32) -> Result<String, DnsmasqError>;
+
+/// Check whether an address on a named interface should be used.
+/// Replaces C iface_check() from src/network.c.
+pub fn iface_check(family: i32, addr: &AllAddr, name: &str) -> (bool, bool);
+
+/// Check for loopback exceptions in interface binding.
+/// Replaces C loopback_exception() from src/network.c.
+pub fn loopback_exception(fd: RawFd, family: i32, addr: &AllAddr, name: &str) -> bool;
+
+/// Check for label exceptions in interface binding.
+/// Replaces C label_exception() from src/network.c.
+pub fn label_exception(index: i32, family: i32, addr: &AllAddr) -> bool;
+
 /// Enumerate all network interfaces and their addresses.
 /// Replaces C enumerate_interfaces() from src/network.c.
 pub fn enumerate_interfaces(reset: bool) -> Result<bool, DnsmasqError>;
+
+/// Set FD_CLOEXEC and O_NONBLOCK on a file descriptor.
+/// Replaces C fix_fd() from src/network.c.
+pub fn fix_fd(fd: RawFd) -> Result<(), DnsmasqError>;
+
+/// Set IPV6_RECVPKTINFO on a socket for destination address retrieval.
+/// Replaces C set_ipv6pktinfo() from src/network.c.
+pub fn set_ipv6pktinfo(fd: RawFd) -> Result<(), DnsmasqError>;
+
+/// Determine the TCP interface for a connected socket.
+/// Replaces C tcp_interface() from src/network.c.
+pub fn tcp_interface(fd: RawFd, af: i32) -> Result<i32, DnsmasqError>;
 
 /// Create wildcard listeners (bind to INADDR_ANY/in6addr_any).
 /// Replaces C create_wildcard_listeners() from src/network.c.
@@ -1635,6 +2497,27 @@ pub fn create_wildcard_listeners() -> Result<(), DnsmasqError>;
 /// Replaces C create_bound_listeners() from src/network.c.
 pub fn create_bound_listeners(die_now: bool) -> Result<(), DnsmasqError>;
 
+/// Log warnings about interfaces that could not bind.
+/// Replaces C warn_bound_listeners() from src/network.c.
+pub fn warn_bound_listeners();
+
+/// Log warnings about wildcard-mode interface labels.
+/// Replaces C warn_wild_labels() from src/network.c.
+pub fn warn_wild_labels();
+
+/// Log warnings about --interface-name entries.
+/// Replaces C warn_int_names() from src/network.c.
+pub fn warn_int_names();
+
+/// Check if Duplicate Address Detection listeners are needed.
+/// Replaces C is_dad_listeners() from src/network.c.
+pub fn is_dad_listeners() -> bool;
+
+/// Join DHCPv6 multicast groups on all interfaces.
+/// Replaces C join_multicast() from src/network.c.
+#[cfg(feature = "dhcp6")]
+pub fn join_multicast(die_now: bool);
+
 /// Bind a socket to a local address, optionally to a specific interface.
 /// Replaces C local_bind() from src/network.c.
 pub fn local_bind(fd: RawFd, addr: &MySockAddr, intname: Option<&str>, ifindex: u32, is_tcp: bool) -> Result<(), DnsmasqError>;
@@ -1643,30 +2526,17 @@ pub fn local_bind(fd: RawFd, addr: &MySockAddr, intname: Option<&str>, ifindex: 
 /// Replaces C pre_allocate_sfds() from src/network.c.
 pub fn pre_allocate_sfds();
 
-/// Reload upstream server list from resolv.conf or equivalent.
-/// Replaces C reload_servers() from src/network.c.
-pub fn reload_servers(fname: &str) -> Result<bool, DnsmasqError>;
-
 /// Validate configured upstream servers, removing unreachable ones.
 /// Replaces C check_servers() from src/network.c.
 pub fn check_servers(no_loop_call: bool);
 
-/// Check whether an address on a named interface should be used.
-/// Replaces C iface_check() from src/network.c.
-pub fn iface_check(family: i32, addr: &AllAddr, name: &str) -> (bool, bool);
+/// Reload upstream server list from resolv.conf or equivalent.
+/// Replaces C reload_servers() from src/network.c.
+pub fn reload_servers(fname: &str) -> Result<bool, DnsmasqError>;
 
-/// Translate a network interface index to its name.
-/// Replaces C indextoname() from src/network.c.
-pub fn indextoname(fd: RawFd, index: i32) -> Result<String, DnsmasqError>;
-
-/// Set IPV6_RECVPKTINFO on a socket for destination address retrieval.
-/// Replaces C set_ipv6pktinfo() from src/network.c.
-pub fn set_ipv6pktinfo(fd: RawFd) -> Result<(), DnsmasqError>;
-
-/// Join DHCPv6 multicast groups on all interfaces.
-/// Replaces C join_multicast() from src/network.c.
-#[cfg(feature = "dhcp6")]
-pub fn join_multicast(die_now: bool);
+/// Handle a new address event (interface address added or removed).
+/// Replaces C newaddress() from src/network.c.
+pub fn newaddress(now: Instant);
 ```
 
 ---
@@ -1678,7 +2548,33 @@ address and route change monitoring.
 
 **Platform gate:** `#[cfg(target_os = "linux")]`
 
-#### Public Functions
+#### Public Types
+
+```rust
+/// Callback discriminator for netlink interface enumeration results.
+pub enum IfaceCallback { /* ... */ }
+
+/// Netlink-based network interface enumerator.
+/// Wraps a NETLINK_ROUTE socket for address/route monitoring.
+pub struct NetlinkNetwork { /* ... */ }
+
+impl NetlinkNetwork {
+    /// Create a new netlink network interface.
+    pub fn new() -> DnsmasqResult<Self>;
+    /// Enumerate all interfaces and their addresses.
+    pub fn enumerate_interfaces(&self) -> DnsmasqResult<Vec<IfaceCallback>>;
+    /// Enumerate IPv4 addresses only.
+    pub fn enumerate_interfaces_v4(&self) -> DnsmasqResult<Vec<IfaceCallback>>;
+    /// Enumerate IPv6 addresses only.
+    pub fn enumerate_interfaces_v6(&self) -> DnsmasqResult<Vec<IfaceCallback>>;
+    /// Process pending multicast netlink messages.
+    pub fn process_multicast(&self) -> DnsmasqResult<bool>;
+    /// Initialise monitoring for address/route changes.
+    pub fn init_monitoring(&self) -> DnsmasqResult<()>;
+}
+```
+
+#### Free Functions
 
 ```rust
 /// Initialise the netlink socket for monitoring address/route changes.
@@ -1690,6 +2586,11 @@ pub fn netlink_init() -> Result<(), DnsmasqError>;
 /// Replaces C netlink_multicast() from src/netlink.c.
 #[cfg(target_os = "linux")]
 pub fn netlink_multicast();
+
+/// Async netlink event processing.
+/// Replaces C nl_async() from src/netlink.c.
+#[cfg(target_os = "linux")]
+pub fn nl_async() -> DnsmasqResult<bool>;
 ```
 
 ---
@@ -1701,9 +2602,32 @@ raw DHCP packet capture on BSD and macOS systems.
 
 **Platform gate:** `#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]`
 
-#### Public Functions
+#### Public Types
 
 ```rust
+/// BPF-based network interface enumerator for BSD systems.
+pub struct BpfNetwork { /* ... */ }
+
+impl BpfNetwork {
+    /// Create a new BPF network interface.
+    pub fn new() -> DnsmasqResult<Self>;
+    /// Enumerate IPv4 addresses via getifaddrs.
+    pub fn enumerate_interfaces_v4(&self) -> DnsmasqResult<Vec<IfaceCallback>>;
+    /// Enumerate IPv6 addresses via getifaddrs.
+    pub fn enumerate_interfaces_v6(&self) -> DnsmasqResult<Vec<IfaceCallback>>;
+    /// Initialise routing socket monitoring.
+    pub fn init_monitoring(&self) -> DnsmasqResult<()>;
+}
+```
+
+#### Free Functions
+
+```rust
+/// Enumerate ARP entries on BSD (via sysctl/route socket).
+/// Replaces C arp_enumerate_bsd() from src/bpf.c.
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
+pub fn arp_enumerate_bsd() -> DnsmasqResult<Vec<ArpRecord>>;
+
 /// Initialise BPF device for raw DHCP packet capture.
 /// Replaces C init_bpf() from src/bpf.c.
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
@@ -1732,11 +2656,48 @@ pub fn route_sock();
 **Source:** `src/arp.c` (475 lines) — ARP (Address Resolution Protocol) cache reading for
 DHCP address conflict detection.
 
-#### Public Functions
+#### Public Types
+
+```rust
+/// ARP lookup result status.
+pub enum ArpStatus {
+    Found,
+    NotFound,
+    Pending,
+}
+
+/// ARP cache entry record.
+pub struct ArpRecord {
+    pub ip: std::net::IpAddr,
+    pub mac: [u8; 6],
+    pub iface: String,
+}
+
+/// Trait for ARP enumeration (platform-specific implementations).
+pub trait ArpEnumerator {
+    fn enumerate(&self) -> DnsmasqResult<Vec<ArpRecord>>;
+}
+
+/// Null ARP enumerator (no-op for unsupported platforms).
+pub struct NullArpEnumerator;
+
+/// ARP cache with lookup and event tracking.
+pub struct ArpCache { /* ... */ }
+
+impl ArpCache {
+    /// Create a new ARP cache.
+    pub fn new() -> Self;
+    /// Look up a MAC address by IP from the ARP cache.
+    pub fn find_mac(&self, addr: &MySockAddr, lazy: bool, now: Instant) -> Option<Vec<u8>>;
+    /// Execute ARP event scripts (for lease-change notifications).
+    pub fn do_arp_script_run(&mut self) -> bool;
+}
+```
+
+#### Free Functions
 
 ```rust
 /// Look up a MAC address in the system ARP cache for a given IP address.
-/// Returns true if a MAC address was found and written to the output buffer.
 /// Replaces C find_mac() from src/arp.c.
 pub fn find_mac(addr: &MySockAddr, lazy: bool, now: Instant) -> Option<Vec<u8>>;
 
@@ -1759,28 +2720,25 @@ and remote management.
 
 **Feature gate:** `#[cfg(feature = "dbus")]`
 
-#### Public Functions
+#### Public Types
 
 ```rust
-/// Initialise the D-Bus connection and register the dnsmasq service.
-/// Replaces C dbus_init() from src/dbus.c.
-#[cfg(feature = "dbus")]
-pub fn dbus_init() -> Result<(), DnsmasqError>;
+/// D-Bus integration error type.
+pub enum DbusError { /* ... */ }
 
-/// Check D-Bus listener for incoming method calls and signals.
-/// Replaces C check_dbus_listeners() from src/dbus.c.
-#[cfg(feature = "dbus")]
-pub fn check_dbus_listeners();
+/// D-Bus controller managing the dnsmasq service bus connection.
+pub struct DbusController { /* ... */ }
 
-/// Register D-Bus file descriptors with the I/O reactor.
-/// Replaces C set_dbus_listeners() from src/dbus.c.
-#[cfg(feature = "dbus")]
-pub fn set_dbus_listeners();
-
-/// Emit a D-Bus signal when a DHCP lease changes.
-/// Replaces C emit_dbus_signal() from src/dbus.c.
-#[cfg(all(feature = "dbus", feature = "dhcp"))]
-pub fn emit_dbus_signal(action: i32, lease: &DhcpLease, hostname: Option<&str>);
+impl DbusController {
+    /// Create a new D-Bus controller and register the service on the system bus.
+    pub fn new() -> Result<Self, DbusError>;
+    /// Get file descriptors for D-Bus watches (for I/O reactor integration).
+    pub fn get_fds(&self) -> Vec<RawFd>;
+    /// Check for incoming D-Bus method calls and signals.
+    pub fn check_listeners(&self);
+    /// Emit a D-Bus signal (e.g., DHCP lease change).
+    pub fn emit_signal(&self, action: i32, lease: &DhcpLease, hostname: Option<&str>);
+}
 ```
 
 ---
@@ -1791,28 +2749,26 @@ pub fn emit_dbus_signal(action: i32, lease: &DhcpLease, hostname: Option<&str>);
 
 **Feature gate:** `#[cfg(feature = "ubus")]`
 
-#### Public Functions
+#### Public Types
 
 ```rust
-/// Initialise the ubus connection.
-/// Replaces C ubus_init() from src/ubus.c.
-#[cfg(feature = "ubus")]
-pub fn ubus_init() -> Result<(), DnsmasqError>;
+/// OpenWrt ubus controller managing the bus connection.
+pub struct UbusController { /* ... */ }
 
-/// Register ubus file descriptors with the I/O reactor.
-/// Replaces C set_ubus_listeners() from src/ubus.c.
-#[cfg(feature = "ubus")]
-pub fn set_ubus_listeners();
-
-/// Check ubus for incoming messages.
-/// Replaces C check_ubus_listeners() from src/ubus.c.
-#[cfg(feature = "ubus")]
-pub fn check_ubus_listeners();
-
-/// Broadcast a ubus event for DHCP lease changes.
-/// Replaces C ubus_event_bcast() from src/ubus.c.
-#[cfg(feature = "ubus")]
-pub fn ubus_event_bcast(event_type: &str, mac: &str, ip: &str, name: &str, interface: &str);
+impl UbusController {
+    /// Create a new ubus controller and connect to the system bus.
+    pub fn new() -> Result<Self, DnsmasqError>;
+    /// Get the ubus file descriptor for I/O reactor integration.
+    pub fn get_fd(&self) -> RawFd;
+    /// Check for incoming ubus messages and dispatch handlers.
+    pub fn check_listeners(&self);
+    /// Broadcast a ubus event for DHCP lease changes.
+    pub fn event_bcast(&self, event_type: &str, mac: &str, ip: &str, name: &str, interface: &str);
+    /// Broadcast a connmark allowlist refused event.
+    pub fn event_bcast_connmark_allowlist_refused(&self, addr: &str, mac: &str);
+    /// Broadcast a connmark allowlist resolved event.
+    pub fn event_bcast_connmark_allowlist_resolved(&self, addr: &str, name: &str);
+}
 ```
 
 ---
@@ -1824,38 +2780,61 @@ callbacks using `tokio::process::Command`.
 
 **Feature gate:** `#[cfg(feature = "script")]`
 
-#### Public Functions
+#### Public Types
 
 ```rust
-/// Create the script helper process and communication pipe.
-/// Replaces C create_helper() from src/helper.c.
-#[cfg(feature = "script")]
-pub fn create_helper(event_fd: RawFd, err_fd: RawFd, uid: u32, gid: u32, max_fd: i64) -> Result<i32, DnsmasqError>;
+/// Script event action type.
+pub enum EventAction {
+    Add,
+    Del,
+    Old,
+    Arp,
+    ArpDel,
+    Tftp,
+    RelaySnoopV4,
+    RelaySnoopV6,
+}
 
-/// Flush pending script execution data to the helper process.
-/// Replaces C helper_write() from src/helper.c.
-#[cfg(feature = "script")]
-pub fn helper_write();
+/// A queued script execution event.
+pub struct ScriptEvent { /* ... */ }
 
-/// Queue a lease-change script execution.
+/// Script helper managing the event queue and subprocess execution.
+pub struct ScriptHelper { /* ... */ }
+
+impl ScriptHelper {
+    /// Create a new script helper.
+    pub fn new() -> Self;
+    /// Create from DaemonState credentials.
+    pub fn from_daemon_state(uid: u32, gid: u32) -> Self;
+    /// Resolve default credentials (uid/gid) for the helper process.
+    pub fn resolve_default_credentials(&mut self);
+    /// Queue a lease-change script execution.
+    pub fn queue_script(&mut self, action: EventAction, lease: &DhcpLease, hostname: Option<&str>, now: Instant);
+    /// Queue a TFTP event for script notification.
+    pub fn queue_tftp(&mut self, file_len: u64, filename: &str, peer: &MySockAddr);
+    /// Queue an ARP event for script notification.
+    pub fn queue_arp(&mut self, action: EventAction, mac: &[u8], family: i32, addr: &AllAddr);
+    /// Queue a relay snoop event.
+    pub fn queue_relay_snoop(&mut self, action: EventAction, lease: &DhcpLease);
+    /// Check if the event queue is empty.
+    pub fn is_empty(&self) -> bool;
+    /// Process all pending events by executing scripts.
+    pub fn process_events(&mut self) -> DnsmasqResult<()>;
+}
+```
+
+#### Free Functions
+
+```rust
+/// Queue a lease-change script execution (convenience wrapper).
 /// Replaces C queue_script() from src/helper.c.
 #[cfg(feature = "script")]
 pub fn queue_script(action: i32, lease: &DhcpLease, hostname: Option<&str>, now: Instant);
 
-/// Queue a TFTP event for script notification.
-/// Replaces C queue_tftp() from src/helper.c.
-#[cfg(all(feature = "script", feature = "tftp"))]
-pub fn queue_tftp(file_len: u64, filename: &str, peer: &MySockAddr);
-
-/// Queue an ARP event for script notification.
+/// Queue an ARP event for script notification (convenience wrapper).
 /// Replaces C queue_arp() from src/helper.c.
 #[cfg(feature = "script")]
 pub fn queue_arp(action: i32, mac: &[u8], family: i32, addr: &AllAddr);
-
-/// Check if the helper output buffer is empty (all events flushed).
-/// Replaces C helper_buf_empty() from src/helper.c.
-#[cfg(feature = "script")]
-pub fn helper_buf_empty() -> bool;
 ```
 
 ---
@@ -1865,7 +2844,18 @@ pub fn helper_buf_empty() -> bool;
 **Source:** `src/conntrack.c` (324 lines) — Linux conntrack mark preservation for
 firewall integration.
 
-**Feature gate:** `#[cfg(feature = "conntrack")]`
+**Feature gate:** `#[cfg(all(target_os = "linux", feature = "conntrack"))]`
+
+#### Public Types
+
+```rust
+/// Errors from conntrack mark operations.
+pub enum ConntrackError {
+    SocketCreate(io::Error),
+    Query(io::Error),
+    NotFound,
+}
+```
 
 #### Public Functions
 
@@ -1873,7 +2863,7 @@ firewall integration.
 /// Retrieve the conntrack mark for an incoming connection.
 /// Used to preserve firewall marks across DNS forwarding.
 /// Replaces C get_incoming_mark() from src/conntrack.c.
-#[cfg(feature = "conntrack")]
+#[cfg(all(target_os = "linux", feature = "conntrack"))]
 pub fn get_incoming_mark(peer: &MySockAddr, local: &AllAddr, is_tcp: bool) -> Result<u32, DnsmasqError>;
 ```
 
@@ -1884,20 +2874,20 @@ pub fn get_incoming_mark(peer: &MySockAddr, local: &AllAddr, is_tcp: bool) -> Re
 **Source:** `src/ipset.c` (532 lines) — Linux ipset integration for adding resolved
 addresses to firewall sets.
 
-**Feature gate:** `#[cfg(feature = "ipset")]`
+**Feature gate:** `#[cfg(all(target_os = "linux", feature = "ipset"))]`
 
-#### Public Functions
+#### Public Types
 
 ```rust
-/// Initialise the ipset netlink socket.
-/// Replaces C ipset_init() from src/ipset.c.
-#[cfg(feature = "ipset")]
-pub fn ipset_init() -> Result<(), DnsmasqError>;
+/// Controller for ipset netlink operations.
+pub struct IpsetController { /* ... */ }
 
-/// Add or remove an IP address from a named ipset.
-/// Replaces C add_to_ipset() from src/ipset.c.
-#[cfg(feature = "ipset")]
-pub fn add_to_ipset(setname: &str, addr: &AllAddr, flags: i32, remove: bool) -> Result<(), DnsmasqError>;
+impl IpsetController {
+    /// Create a new ipset controller and initialise the netlink socket.
+    pub fn new() -> Result<Self, DnsmasqError>;
+    /// Add or remove an IP address from a named ipset.
+    pub fn add_to_ipset(&self, setname: &str, addr: &AllAddr, flags: i32, remove: bool) -> Result<(), DnsmasqError>;
+}
 ```
 
 ---
@@ -1907,37 +2897,48 @@ pub fn add_to_ipset(setname: &str, addr: &AllAddr, flags: i32, remove: bool) -> 
 **Source:** `src/nftset.c` (392 lines) — nftables set integration for adding resolved
 addresses to nftables firewall sets.
 
-**Feature gate:** `#[cfg(feature = "nftset")]`
+**Feature gate:** `#[cfg(all(target_os = "linux", feature = "nftset"))]`
 
-#### Public Functions
+#### Public Types
 
 ```rust
-/// Initialise the nftables set interface.
-/// Replaces C nftset_init() from src/nftset.c.
-#[cfg(feature = "nftset")]
-pub fn nftset_init() -> Result<(), DnsmasqError>;
+/// Errors from nftables set operations.
+pub enum NftsetError {
+    InitFailed(String),
+    AddFailed(String),
+}
 
-/// Add or remove an IP address from a named nftables set.
-/// Replaces C add_to_nftset() from src/nftset.c.
-#[cfg(feature = "nftset")]
-pub fn add_to_nftset(setpath: &str, addr: &AllAddr, flags: i32, remove: bool) -> Result<(), DnsmasqError>;
+/// Controller for nftables set operations.
+pub struct NftsetController { /* ... */ }
+
+impl NftsetController {
+    /// Create a new nftset controller and initialise the interface.
+    pub fn new() -> Result<Self, DnsmasqError>;
+    /// Add or remove an IP address from a named nftables set.
+    pub fn add_to_nftset(&self, setpath: &str, addr: &AllAddr, flags: i32, remove: bool) -> Result<(), DnsmasqError>;
+}
 ```
 
 ---
 
 ### 6.7 `integration::tables`
 
-**Source:** `src/tables.c` (386 lines) — routing table interaction for FreeBSD.
+**Source:** `src/tables.c` (386 lines) — routing table interaction for BSD platforms.
 
-**Platform gate:** `#[cfg(target_os = "freebsd")]`
+**Platform gate:** `#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]`
 
-#### Public Functions
+#### Public Types
 
 ```rust
-/// Platform-specific routing table interaction for FreeBSD.
-/// Replaces the routing table functions from src/tables.c.
-#[cfg(target_os = "freebsd")]
-pub fn tables_init() -> Result<(), DnsmasqError>;
+/// Controller for PF table operations on BSD platforms.
+pub struct PfTableController { /* ... */ }
+
+impl PfTableController {
+    /// Create a new PF table controller.
+    pub fn new() -> Result<Self, DnsmasqError>;
+    /// Add an address to a PF table.
+    pub fn add_to_table(&self, table: &str, addr: &AllAddr) -> Result<(), DnsmasqError>;
+}
 ```
 
 ---
@@ -1951,18 +2952,53 @@ with PXE (Preboot Execution Environment) network boot support.
 
 **Feature gate:** `#[cfg(feature = "tftp")]`
 
-#### Public Functions
+#### Public Types
 
 ```rust
-/// Check TFTP listener sockets for incoming requests and handle file transfers.
-/// Replaces C check_tftp_listeners() from src/tftp.c.
-#[cfg(feature = "tftp")]
-pub async fn check_tftp_listeners(state: &mut DaemonState, now: Instant) -> Result<(), DnsmasqError>;
+/// TFTP error codes (RFC 1350).
+pub enum TftpError {
+    FileNotFound,
+    AccessViolation,
+    DiskFull,
+    IllegalOperation,
+    UnknownTransferId,
+    FileAlreadyExists,
+    PermissionDenied,
+    OptionNegotiation,
+}
 
-/// Execute pending TFTP event scripts.
-/// Replaces C do_tftp_script_run() from src/tftp.c.
-#[cfg(feature = "tftp")]
-pub fn do_tftp_script_run() -> bool;
+/// TFTP transfer modes.
+pub enum TransferMode {
+    Octet,
+    Netascii,
+}
+
+/// Represents an open file for a TFTP transfer.
+pub struct TftpFile { /* ... */ }
+
+/// Active TFTP transfer state machine.
+pub struct TftpTransfer { /* ... */ }
+
+/// TFTP directory prefix configuration.
+pub struct TftpPrefix { /* ... */ }
+
+/// TFTP server managing all active transfers and listener sockets.
+pub struct TftpServer { /* ... */ }
+
+impl TftpServer {
+    /// Create a new TFTP server instance.
+    pub fn new() -> Self;
+    /// Handle an incoming TFTP request (RRQ/WRQ).
+    pub async fn handle_request(&mut self, listener: &TokioUdpSocket, now: Instant) -> Result<(), DnsmasqError>;
+    /// Process pending TFTP data transfers (send DATA/receive ACK).
+    pub async fn process_transfers(&mut self, now: Instant) -> Result<(), DnsmasqError>;
+    /// Check TFTP listener sockets for incoming requests.
+    pub async fn check_listeners(&mut self, state: &mut DaemonState, now: Instant) -> Result<(), DnsmasqError>;
+    /// Clean up completed transfers and run notification scripts.
+    pub fn process_done_transfers(&mut self) -> bool;
+    /// Collect file descriptors for active transfers (for poll integration).
+    pub fn get_transfer_fds(&self) -> Vec<RawFd>;
+}
 ```
 
 ---
@@ -1979,23 +3015,23 @@ analysis.
 
 **Feature gate:** `#[cfg(feature = "dumpfile")]`
 
-#### Public Functions
+#### Public Types
 
 ```rust
-/// Initialise the packet dump file.
-/// Replaces C dump_init() from src/dump.c.
-#[cfg(feature = "dumpfile")]
-pub fn dump_init() -> Result<(), DnsmasqError>;
+/// Packet dumper managing the pcap output file.
+pub struct PacketDumper { /* ... */ }
 
-/// Dump a UDP packet to the pcap file.
-/// Replaces C dump_packet_udp() from src/dump.c.
-#[cfg(feature = "dumpfile")]
-pub fn dump_packet_udp(mask: i32, packet: &[u8], src: &MySockAddr, dst: &MySockAddr, fd: RawFd);
-
-/// Dump an ICMPv6 packet to the pcap file.
-/// Replaces C dump_packet_icmp() from src/dump.c.
-#[cfg(feature = "dumpfile")]
-pub fn dump_packet_icmp(mask: i32, packet: &[u8], src: &MySockAddr, dst: &MySockAddr);
+impl PacketDumper {
+    /// Create and initialise a new packet dumper with the given file path.
+    /// Replaces C dump_init() from src/dump.c.
+    pub fn new(path: &str) -> Result<Self, DnsmasqError>;
+    /// Dump a UDP packet to the pcap file.
+    /// Replaces C dump_packet_udp() from src/dump.c.
+    pub fn dump_packet_udp(&mut self, mask: i32, packet: &[u8], src: &MySockAddr, dst: &MySockAddr, fd: RawFd);
+    /// Dump an ICMPv6 packet to the pcap file.
+    /// Replaces C dump_packet_icmp() from src/dump.c.
+    pub fn dump_packet_icmp(&mut self, mask: i32, packet: &[u8], src: &MySockAddr, dst: &MySockAddr);
+}
 ```
 
 ---
@@ -2007,24 +3043,30 @@ inotify for `/etc/hosts` and `/etc/resolv.conf` changes.
 
 **Feature gate:** `#[cfg(feature = "inotify")]`
 
-#### Public Functions
+#### Public Types
 
 ```rust
-/// Initialise inotify watches for configuration files.
-/// Replaces C inotify_dnsmasq_init() from src/inotify.c.
-#[cfg(feature = "inotify")]
-pub fn inotify_dnsmasq_init() -> Result<(), DnsmasqError>;
+/// Callback trait for inotify file change events.
+pub trait InotifyCallbacks {
+    /// Called when a watched file is modified.
+    fn on_file_changed(&mut self, path: &str);
+}
 
-/// Check for inotify events and process file changes.
-/// Returns true if files were modified and configuration needs reloading.
-/// Replaces C inotify_check() from src/inotify.c.
-#[cfg(feature = "inotify")]
-pub fn inotify_check(now: Instant) -> Result<bool, DnsmasqError>;
+/// Asynchronous file change watcher using inotify.
+pub struct InotifyWatcher { /* ... */ }
 
-/// Set up dynamic inotify watches for runtime-added hosts directories.
-/// Replaces C set_dynamic_inotify() from src/inotify.c.
-#[cfg(feature = "inotify")]
-pub fn set_dynamic_inotify(flag: i32, total_size: i32);
+impl InotifyWatcher {
+    /// Create a new inotify watcher and initialise watches.
+    /// Replaces C inotify_dnsmasq_init() from src/inotify.c.
+    pub fn new() -> Result<Self, DnsmasqError>;
+    /// Set up dynamic inotify watches for runtime-added hosts directories.
+    /// Replaces C set_dynamic_inotify() from src/inotify.c.
+    pub fn setup_dynamic_dirs(&mut self, dirs: &[&str]) -> Result<(), DnsmasqError>;
+    /// Check for inotify events and process file changes.
+    /// Returns true if files were modified and configuration needs reloading.
+    /// Replaces C inotify_check() from src/inotify.c.
+    pub fn check_events(&mut self, now: Instant) -> Result<bool, DnsmasqError>;
+}
 ```
 
 ---
@@ -2038,7 +3080,7 @@ performance counters using `AtomicU64` for lock-free increment operations.
 
 ```rust
 /// Metric counter identifiers. In Rust, stored using AtomicU64 for safe concurrent access.
-pub enum Metric {
+pub enum MetricType {
     DnsCacheInserted,       // Cache record successfully inserted
     DnsCacheLiveFreed,      // Cache record evicted while still valid (LRU pressure)
     DnsQueriesForwarded,    // Queries forwarded to upstream servers (cache miss)
@@ -2072,17 +3114,31 @@ pub enum Metric {
 }
 ```
 
-#### Public Functions
+#### Public Types
 
 ```rust
-/// Retrieve the human-readable name for a metric identifier.
-/// Replaces C get_metric_name() from src/metrics.c.
-pub fn get_metric_name(metric: Metric) -> &'static str;
+/// Runtime metrics store backed by AtomicU64 counters.
+pub struct MetricsStore { /* ... */ }
 
-/// Reset all metric counters to zero.
-/// Typically called on daemon startup or SIGHUP configuration reload.
-/// Replaces C clear_metrics() from src/metrics.c.
-pub fn clear_metrics();
+impl MetricsStore {
+    /// Create a new metrics store with all counters at zero.
+    pub fn new() -> Self;
+    /// Increment a metric counter by one.
+    pub fn increment(&self, metric: MetricType);
+    /// Set a metric to the maximum of its current value and the given value.
+    pub fn set_max(&self, metric: MetricType, value: u64);
+    /// Read the current value of a metric counter.
+    pub fn get(&self, metric: MetricType) -> u64;
+    /// Retrieve the human-readable name for a metric identifier.
+    pub fn get_name(metric: MetricType) -> &'static str;
+    /// Reset all metric counters to zero.
+    pub fn clear(&self);
+    /// Iterate over all metrics (identifier, value) pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (MetricType, u64)>;
+}
+
+/// Per-server query statistics.
+pub struct ServerStats { /* ... */ }
 ```
 
 ---
@@ -2097,39 +3153,54 @@ unified error type hierarchy using `Result<T, DnsmasqError>` and the `?` operato
 ```rust
 /// Central error type for all dnsmasq operations.
 /// Derived using thiserror for ergonomic error handling.
+/// Defined in `core/types.rs`.
 #[derive(Debug, thiserror::Error)]
 pub enum DnsmasqError {
     /// Configuration file parse error.
     #[error("configuration error: {0}")]
     Config(String),
 
-    /// Network socket or I/O error.
+    /// Network-level error (socket bind failure, send/receive error, etc.).
     #[error("network error: {0}")]
-    Network(#[from] std::io::Error),
+    Network(String),
 
-    /// DNS protocol error (malformed packet, invalid name, etc.).
+    /// Standard I/O error (file operations, pipe I/O, etc.).
+    /// Automatically converted from `std::io::Error` via `#[from]`.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// DNS protocol error (malformed packet, invalid name, compression error, etc.).
     #[error("DNS protocol error: {0}")]
-    Dns(String),
+    DnsProtocol(String),
 
-    /// DHCP protocol error.
+    /// DHCP protocol error (invalid option, state machine violation, etc.).
     #[error("DHCP error: {0}")]
     Dhcp(String),
 
-    /// DNSSEC validation failure.
+    /// Privilege/permission error (failed to drop privileges, bind to port <1024, etc.).
+    #[error("privilege error: {0}")]
+    Privilege(String),
+
+    /// DNSSEC validation failure (bad signature, missing key, chain broken, etc.).
     #[error("DNSSEC validation failed: {0}")]
     Dnssec(String),
 
-    /// Platform-specific system call failure.
-    #[error("platform error: {0}")]
-    Platform(String),
+    /// Lease database error (file I/O, corrupt lease, allocation failure, etc.).
+    #[error("lease error: {0}")]
+    Lease(String),
 
-    /// Insufficient permissions for the requested operation.
-    #[error("permission denied: {0}")]
-    Permission(String),
+    /// Miscellaneous error that does not fit other categories.
+    #[error("error: {0}")]
+    Misc(String),
 
-    /// Resource exhaustion (too many connections, cache full, etc.).
-    #[error("resource limit reached: {0}")]
-    ResourceLimit(String),
+    /// Fatal error requiring immediate daemon termination.
+    #[error("fatal error (code {code}): {message}")]
+    Fatal {
+        /// Exit code to return to the operating system.
+        code: i32,
+        /// Human-readable description of the fatal condition.
+        message: String,
+    },
 }
 ```
 
@@ -2167,36 +3238,55 @@ fn process() -> Result<(), DnsmasqError> {
 
 ### `ServerSelector` — Upstream Server Selection Strategy
 
+Defined in `dns/forward.rs`. Used to implement pluggable upstream DNS server
+selection algorithms.
+
 ```rust
 /// Strategy trait for selecting upstream DNS servers.
 /// Enables pluggable selection algorithms (round-robin, weighted, failover).
 /// Used by dns::forward for server selection.
-pub trait ServerSelector {
-    /// Select the next upstream server to use for a query.
-    fn select(&mut self, servers: &[ServerStruct], domain: &str) -> Option<usize>;
-
-    /// Notify the selector that a server has failed.
-    fn report_failure(&mut self, server_index: usize);
-
-    /// Notify the selector that a server has responded successfully.
-    fn report_success(&mut self, server_index: usize);
+pub trait ServerSelector: Send + Sync {
+    /// Select the best upstream server for the given query and domain context.
+    fn select_server(
+        &self,
+        servers: &[Arc<UpstreamServer>],
+        query: &DnsPacket,
+        domain_matcher: &DomainMatcher,
+    ) -> Option<Arc<UpstreamServer>>;
 }
 ```
 
-### `InterfaceEnumerator` — Platform Callback Abstraction
+#### Built-in Implementations
 
 ```rust
-/// Callback trait for platform-specific network interface enumeration.
-/// Replaces C `callback_t` union from src/dnsmasq.h.
-pub trait InterfaceEnumerator {
-    /// Called for each IPv4 address discovered on an interface.
-    fn on_ipv4(&mut self, local: Ipv4Addr, if_index: i32, label: &str, netmask: Ipv4Addr, broadcast: Ipv4Addr);
+/// Round-robin server selector — cycles through available upstream servers.
+pub struct RoundRobinSelector { /* ... */ }
 
-    /// Called for each IPv6 address discovered on an interface.
-    fn on_ipv6(&mut self, local: &Ipv6Addr, prefix: i32, scope: i32, if_index: i32, flags: i32, preferred: u32, valid: u32);
+impl ServerSelector for RoundRobinSelector { /* ... */ }
+```
 
-    /// Called for each link-layer interface discovered.
-    fn on_link(&mut self, index: i32, hw_type: u32, mac: &[u8]);
+### `InotifyCallbacks` — File Change Event Callback
+
+Defined in `diagnostics/inotify.rs`. Used by the inotify watcher to notify
+the daemon of file changes.
+
+```rust
+/// Callback trait for inotify file change events.
+pub trait InotifyCallbacks {
+    /// Called when a watched file is modified.
+    fn on_file_changed(&mut self, path: &str);
+}
+```
+
+### `ArpEnumerator` — ARP Cache Iteration Callback
+
+Defined in `network/arp.rs`. Used for platform-specific ARP table enumeration.
+
+```rust
+/// Callback trait for ARP cache enumeration.
+pub trait ArpEnumerator {
+    /// Called for each ARP entry discovered.
+    fn on_arp_entry(&mut self, addr: &std::net::IpAddr, mac: &[u8; 6], iface: &str);
 }
 ```
 

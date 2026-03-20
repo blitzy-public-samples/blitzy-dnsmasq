@@ -13,7 +13,7 @@ checker, and lifetime annotations.
 
 | Metric | Value |
 |--------|-------|
-| C source files migrated | 50 (44 `.c` + 6 `.h`) |
+| C source files migrated | 50 (42 `.c` + 8 `.h`) |
 | Total C lines | 92,894 |
 | Rust modules produced | 60+ in mirrored hierarchy |
 | Target Rust version | 1.91.0 stable |
@@ -56,7 +56,7 @@ struct daemon *daemon;
 ```
 
 This `struct daemon` (defined in `src/dnsmasq.h`, 100+ members) is accessed directly by every
-module through an `extern` declaration. All 44 `.c` files include `dnsmasq.h`, which provides
+module through an `extern` declaration. All 42 `.c` files include `dnsmasq.h`, which provides
 universal access to every type, constant, and function prototype in the entire codebase.
 
 An incremental FFI approach would require either:
@@ -744,6 +744,7 @@ These features require explicit opt-in, matching the C commented-out macros:
 | `HAVE_CONNTRACK` | `conntrack` | Linux conntrack mark support |
 | `HAVE_NFTSET` | `nftset` | nftables set integration |
 | `HAVE_LUASCRIPT` | `luascript` | Lua scripting support |
+| `HAVE_BROKEN_RTC` | `broken-rtc` | Embedded systems without hardware real-time clock — stores lease length instead of expiry time |
 
 ### 5.3 Platform-Auto-Detected (No Feature Flag)
 

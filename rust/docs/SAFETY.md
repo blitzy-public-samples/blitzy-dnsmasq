@@ -1,8 +1,11 @@
 # Safety Documentation — Unsafe Block Inventory
 
-> **Core Safety Guarantee:** Zero `unsafe` blocks in core DNS, DHCP, TFTP, and configuration
-> parsing logic. All `unsafe` usage is confined exclusively to platform-specific FFI code at
-> the system boundary layer.
+> **Core Safety Guarantee:** The crate root enforces `#![deny(unsafe_code)]`, requiring
+> explicit `#![allow(unsafe_code)]` opt-in for any module that needs `unsafe`. A total of
+> 128 `unsafe` blocks exist across 15 opted-in modules — primarily for platform FFI (raw
+> sockets, netlink, BPF, privilege management) and low-level packet/buffer operations in
+> core, DNS, DHCP, and service modules. Every `unsafe` block carries a `// SAFETY:` comment
+> documenting its invariants.
 
 ## 1. Safety Philosophy
 
@@ -36,18 +39,29 @@ business logic:
 |--------|-------------------|--------|
 | `config/*` | **No** | Pure configuration parsing, no system calls |
 | `core/types.rs` | **No** | Type definitions only |
-| `core/log.rs` | **No** | Uses `tracing` crate safe API |
+| `core/log.rs` | **FFI only** | Low-level syslog fd operations and signal-safe writes |
 | `core/util.rs` | **No** | String utilities — no manual memory management |
 | `core/pattern.rs` | **No** | Pattern matching — pure logic |
-| `dns/*` | **No** | DNS forwarding, caching, DNSSEC — all safe Rust |
-| `dhcp/*` | **No** | DHCP v4/v6 state machines, lease management — all safe Rust |
-| `services/tftp.rs` | **No** | TFTP server — uses tokio safe async I/O |
+| `core/daemon.rs` | **FFI only** | Privilege dropping requires `libc` syscalls |
+| `core/poll.rs` | **FFI only** | Event loop fd management may use raw fd operations |
+| `dns/forward.rs` | **FFI only** | Raw socket send/recv for DNS packet forwarding |
+| `dns/*` (other) | **No** | DNS caching, DNSSEC, protocol parsing — all safe Rust |
+| `dhcp/v4/server.rs` | **FFI only** | Raw DHCP socket I/O, BPF filter installation |
+| `dhcp/v6/server.rs` | **FFI only** | Raw DHCPv6 socket I/O, multicast setup |
+| `dhcp/common.rs` | **FFI only** | Low-level DHCP packet receive via raw sockets |
+| `dhcp/radv.rs` | **FFI only** | ICMPv6 raw socket for Router Advertisement |
+| `dhcp/*` (other) | **No** | DHCP state machines, lease management — all safe Rust |
+| `services/tftp.rs` | **FFI only** | TFTP socket options and interface binding |
 | `diagnostics/metrics.rs` | **No** | Uses `AtomicU64` — safe concurrent counters |
 | `diagnostics/dump.rs` | **No** | Packet dump — writes to file via safe I/O |
-| `core/daemon.rs` | **FFI only** | Privilege dropping requires `libc` syscalls |
-| `core/poll.rs` | **No** | Uses `tokio::select!` safe API |
 | `network/*` | **FFI only** | Platform-specific socket/netlink/BPF operations |
-| `integration/*` | **FFI only** | Netfilter/conntrack require kernel FFI |
+| `integration/dbus.rs` | **FFI only** | D-Bus library FFI integration |
+| `integration/ubus.rs` | **FFI only** | OpenWrt ubus library FFI |
+| `integration/helper.rs` | **FFI only** | Script helper process fork/exec FFI |
+| `integration/ipset.rs` | **FFI only** | Netlink socket for ipset operations |
+| `integration/tables.rs` | **FFI only** | PF table ioctl operations (BSD) |
+| `integration/conntrack.rs` | **No** | Uses safe crate wrappers; no direct unsafe |
+| `integration/nftset.rs` | **No** | Uses safe `nftables` crate API; no direct unsafe |
 
 The crate root (`lib.rs`) enforces this with:
 
@@ -55,10 +69,10 @@ The crate root (`lib.rs`) enforces this with:
 #![deny(unsafe_code)]
 ```
 
-Only specific FFI modules carry the targeted override:
+The 15 modules that require `unsafe` carry the targeted override:
 
 ```rust
-#[allow(unsafe_code)]
+#![allow(unsafe_code)]
 ```
 
 ---
@@ -67,20 +81,19 @@ Only specific FFI modules carry the targeted override:
 
 | Category | Count | Location |
 |----------|-------|----------|
-| Total `unsafe` blocks in crate | **~15–20** | FFI boundary modules only |
-| `unsafe` in core logic (DNS/DHCP/TFTP/config) | **0** | Enforced by `#![deny(unsafe_code)]` |
-| `unsafe` in privilege management | ~2–4 | `core/daemon.rs` |
-| `unsafe` in raw socket operations | ~3–5 | `network/interface.rs` |
-| `unsafe` in Linux netlink | ~2–3 | `network/netlink.rs` |
-| `unsafe` in BSD BPF | ~2–3 | `network/bpf.rs` |
-| `unsafe` in conntrack/netfilter | ~2–3 | `integration/conntrack.rs`, `ipset.rs`, `nftset.rs` |
-| `unsafe` in ARP cache access | ~1–2 | `network/arp.rs` |
-| `unsafe` in PF table operations (BSD) | ~1–2 | `integration/tables.rs` |
+| Total `unsafe` blocks in crate | **128** | Across 15 modules with `#![allow(unsafe_code)]` |
+| `unsafe` in core modules | **6** | `core/daemon.rs`, `core/log.rs` |
+| `unsafe` in DNS modules | **4** | `dns/forward.rs` (raw socket forwarding) |
+| `unsafe` in DHCP modules | **26** | `dhcp/v4/server.rs` (5), `dhcp/v6/server.rs` (7), `dhcp/common.rs` (4), `dhcp/radv.rs` (10) |
+| `unsafe` in network modules | **~45** | `network/interface.rs`, `network/netlink.rs`, `network/bpf.rs` |
+| `unsafe` in integration modules | **~40** | `integration/ubus.rs`, `integration/helper.rs`, `integration/ipset.rs`, `integration/tables.rs` |
+| `unsafe` in services | **4** | `services/tftp.rs` (socket options, interface binding) |
 | `unsafe` in third-party crates | Encapsulated | `libc`, `nix`, `socket2`, `tokio` handle internally |
+| Modules with `#![allow(unsafe_code)]` | **15** | See full inventory in Section 3 |
 
-> **Note:** Exact block counts depend on how many platform operations the `nix` and `socket2`
-> crates cover with safe wrappers. The goal is to minimize raw `libc` calls by preferring
-> safe crate APIs wherever available.
+> **Note:** Exact per-module counts may vary as implementations evolve. The crate root
+> `#![deny(unsafe_code)]` ensures that any new `unsafe` usage requires explicit opt-in.
+> The goal is to minimize raw `libc` calls by preferring safe crate APIs wherever available.
 
 ---
 
@@ -289,36 +302,23 @@ unsafe { libc::ioctl(fd, BIOCSETIF as libc::c_ulong, &ifr) };
 
 ---
 
-### 3.5 Conntrack/Netfilter — `integration::conntrack`, `integration::ipset`, `integration::nftset`
+### 3.5 Linux ipset — `integration::ipset`
 
-**C source origins:**
+**C source origin:** `src/ipset.c` (532 lines) — manages Linux kernel ipset collections
+via netlink (`AF_NETLINK`, `NETLINK_NETFILTER`) for dynamic firewall rules.
 
-- `src/conntrack.c` (324 lines) — queries netfilter conntrack table via
-  `libnetfilter_conntrack` API for connection mark retrieval
-- `src/ipset.c` (532 lines) — manages Linux kernel ipset collections via netlink
-  (`AF_NETLINK`, `NETLINK_NETFILTER`) for dynamic firewall rules
-- `src/nftset.c` (392 lines) — manages nftables sets via `libnftables` API
+**Rust module:** `rust/src/integration/ipset.rs` — `#[cfg(all(target_os = "linux", feature = "ipset"))]`
 
-**Rust modules:**
-
-- `rust/src/integration/conntrack.rs` — `#[cfg(feature = "conntrack")]`
-- `rust/src/integration/ipset.rs` — `#[cfg(feature = "ipset")]`
-- `rust/src/integration/nftset.rs` — `#[cfg(feature = "nftset")]`
-
-**Justification:** These Linux kernel interfaces use netlink protocol messages with
-specific netfilter subsystem formats. The ipset module constructs raw netlink messages
-with `nlmsghdr` + `nfgenmsg` headers and netlink attributes. The conntrack module uses
-`libnetfilter_conntrack` C library FFI. The nftset module uses `libnftables` C library
-FFI. Where Rust crate wrappers exist (`nftables` crate v0.4), safe APIs are preferred;
-direct FFI is used only when crate coverage is incomplete.
+**Justification:** The ipset module constructs raw netlink messages with `nlmsghdr` +
+`nfgenmsg` headers and netlink attributes for adding/removing addresses from kernel ipset
+collections. Safe Rust crate wrappers do not fully cover the ipset netlink protocol.
 
 **Invariants:**
 
 1. Netlink messages are constructed with validated lengths and proper attribute nesting.
 2. Netlink socket file descriptors are validated after `socket()` creation.
-3. All `nfct_*` / `nft_*` library handles are checked for null before use.
-4. Response buffers are validated for minimum message size before parsing.
-5. All operations are feature-gated and only compiled when explicitly enabled.
+3. Response buffers are validated for minimum message size before parsing.
+4. All operations are feature-gated and only compiled when explicitly enabled.
 
 **`// SAFETY:` comment pattern:**
 
@@ -334,51 +334,15 @@ unsafe {
 };
 ```
 
-**Conditional compilation:**
+**Conditional compilation:** `#[cfg(all(target_os = "linux", feature = "ipset"))]`
 
-- `conntrack.rs`: `#[cfg(all(target_os = "linux", feature = "conntrack"))]`
-- `ipset.rs`: `#[cfg(all(target_os = "linux", feature = "ipset"))]`
-- `nftset.rs`: `#[cfg(all(target_os = "linux", feature = "nftset"))]`
-
----
-
-### 3.6 ARP Cache Reading — `network::arp`
-
-**C source origin:** `src/arp.c` (475 lines)
-
-The C implementation reads the kernel ARP/neighbor cache to map IP addresses to hardware
-MAC addresses. On Linux this uses the netlink-based `iface_enumerate()` callback; on BSD
-it uses `sysctl()` with `CTL_NET`/`PF_ROUTE`/`NET_RT_FLAGS`.
-
-**Rust module:** `rust/src/network/arp.rs`
-
-**Justification:** ARP cache access may require `ioctl(SIOCGARP)` on some platforms or
-parsing `sysctl()` results that contain `rt_msghdr`/`sockaddr_dl` structures requiring
-raw pointer casts.
-
-**Invariants:**
-
-1. `ioctl` argument structs (`arpreq`) are fully initialized before the syscall.
-2. `sysctl` result buffers are sized according to the kernel-reported length before
-   parsing.
-3. Pointer casts from `sysctl` result buffers validate alignment and minimum struct size.
-4. Procfs paths (e.g., `/proc/net/arp` on Linux) are hardcoded constants — no user-controlled
-   path construction.
-
-**`// SAFETY:` comment pattern:**
-
-```rust
-// SAFETY: arpreq struct is stack-allocated and fully initialized with
-// the target IP address. fd is a valid socket from socket(). The ioctl
-// reads the ARP table entry without modifying kernel state.
-unsafe { libc::ioctl(fd, libc::SIOCGARP as libc::c_ulong, &mut req) };
-```
-
-**Conditional compilation:** Platform-specific variants via `#[cfg(target_os = "...")]`.
+> **Note:** `integration/conntrack.rs` and `integration/nftset.rs` do **not** contain any
+> `unsafe` blocks. The `conntrack` module uses safe Rust wrappers, and the `nftset` module
+> uses the safe `nftables` crate (v0.4) API. Neither module carries `#![allow(unsafe_code)]`.
 
 ---
 
-### 3.7 BSD PF Table Operations — `integration::tables`
+### 3.6 BSD PF Table Operations — `integration::tables`
 
 **C source origin:** `src/tables.c` (386 lines), conditionally compiled under
 `HAVE_BSD_IPSET`.
@@ -415,6 +379,206 @@ unsafe { libc::ioctl(dev, DIOCRADDADDRS as libc::c_ulong, &mut io) };
 
 ---
 
+### 3.7 Logging — `core::log`
+
+**C source origin:** `src/log.c` (1,120 lines) — syslog integration, async-safe logging.
+
+**Rust module:** `rust/src/core/log.rs`
+
+**Justification:** The logging module requires direct writes to syslog file descriptors
+and signal-safe I/O operations that cannot use the standard `tracing` subscriber in
+all contexts (e.g., during signal handling or before the async runtime is initialized).
+
+**Invariants:**
+
+1. File descriptors passed to low-level write operations are valid (obtained from `socket()`
+   or `open()` with validated return values).
+2. Signal-safe logging paths use only async-signal-safe system calls.
+3. All buffer pointers are valid stack or heap allocations with verified lengths.
+
+**Conditional compilation:** Always compiled.
+
+---
+
+### 3.8 DNS Forwarding — `dns::forward`
+
+**C source origin:** `src/forward.c` (6,068 lines) — DNS query forwarding engine.
+
+**Rust module:** `rust/src/dns/forward.rs`
+
+**Justification:** The forwarding engine performs raw socket send/receive operations for
+DNS packets, including setting socket options for source address selection and interface
+binding that may not be fully covered by safe crate wrappers.
+
+**Invariants:**
+
+1. Socket file descriptors are obtained from safe socket creation APIs.
+2. Packet buffers are validated for minimum DNS header size before transmission.
+3. Socket option values are stack-allocated and fully initialized.
+4. Send/receive operations use validated buffer lengths.
+
+**Conditional compilation:** Always compiled (core DNS functionality).
+
+---
+
+### 3.9 DHCPv4 Server — `dhcp::v4::server`
+
+**C source origin:** `src/dhcp.c` (2,344 lines) — DHCPv4 server initialization and raw
+socket I/O.
+
+**Rust module:** `rust/src/dhcp/v4/server.rs` — `#[cfg(feature = "dhcp")]`
+
+**Justification:** DHCPv4 uses raw sockets (`AF_PACKET` on Linux, BPF on BSD) to send and
+receive DHCP packets at layer 2, bypassing the kernel's IP stack. This requires direct
+`libc` calls for raw socket creation, BPF filter installation, and packet injection.
+
+**Invariants:**
+
+1. Raw socket file descriptors are validated after creation.
+2. BPF filter programs are constructed from constant instruction arrays.
+3. Packet buffers are bounds-checked before sending.
+4. Interface index and hardware address lookups use validated ioctl results.
+5. All raw socket operations are feature-gated under `dhcp`.
+
+**Conditional compilation:** `#[cfg(feature = "dhcp")]`
+
+---
+
+### 3.10 DHCPv6 Server — `dhcp::v6::server`
+
+**C source origin:** `src/dhcp6.c` (1,487 lines) — DHCPv6 server, relay agent support.
+
+**Rust module:** `rust/src/dhcp/v6/server.rs` — `#[cfg(feature = "dhcp6")]`
+
+**Justification:** DHCPv6 requires IPv6 multicast socket setup (joining multicast groups,
+setting hop limits) and raw ICMPv6 packet handling for relay agent support, which use
+`setsockopt()` calls not fully covered by safe wrappers.
+
+**Invariants:**
+
+1. IPv6 socket options (IPV6_JOIN_GROUP, IPV6_MULTICAST_HOPS) use valid group addresses.
+2. Multicast socket membership operations are idempotent (joining an already-joined group
+   is a no-op).
+3. All sockaddr_in6 structures are fully initialized with valid scope IDs.
+
+**Conditional compilation:** `#[cfg(feature = "dhcp6")]`
+
+---
+
+### 3.11 DHCP Common Utilities — `dhcp::common`
+
+**C source origin:** `src/dhcp-common.c` (2,337 lines) — shared DHCPv4/v6 utilities.
+
+**Rust module:** `rust/src/dhcp/common.rs` — `#[cfg(any(feature = "dhcp", feature = "dhcp6"))]`
+
+**Justification:** The common DHCP module performs raw packet receive operations using
+`recvmsg()` with control message (`cmsg`) parsing to extract packet metadata (arrival
+interface, destination address). The `cmsg` API requires `unsafe` pointer traversal.
+
+**Invariants:**
+
+1. Control message buffers are sized according to `CMSG_SPACE()` calculations.
+2. `CMSG_FIRSTHDR()` / `CMSG_NXTHDR()` iteration validates message lengths.
+3. `cmsg_type` and `cmsg_level` are checked before casting data pointers.
+4. All `msghdr` structures are fully initialized before `recvmsg()`.
+
+**Conditional compilation:** `#[cfg(any(feature = "dhcp", feature = "dhcp6"))]`
+
+---
+
+### 3.12 Router Advertisement — `dhcp::radv`
+
+**C source origin:** `src/radv.c` (2,175 lines) — IPv6 Router Advertisement daemon.
+
+**Rust module:** `rust/src/dhcp/radv.rs` — `#[cfg(feature = "dhcp6")]`
+
+**Justification:** Router Advertisement construction and transmission uses raw ICMPv6
+sockets (`IPPROTO_ICMPV6`) with ancillary data (`IPV6_PKTINFO`) for source address
+selection and hop limit configuration. These operations require `setsockopt()` and
+`sendmsg()` calls with `cmsg` construction.
+
+**Invariants:**
+
+1. ICMPv6 socket is created with `IPPROTO_ICMPV6` and validated.
+2. Router Advertisement packets are constructed with valid ICMPv6 type/code fields.
+3. Prefix options include validated prefix lengths (0–128).
+4. `sendmsg()` control messages are properly constructed with `CMSG_SPACE()` sizing.
+5. Hop limit is set to 255 per RFC 4861 requirement.
+
+**Conditional compilation:** `#[cfg(feature = "dhcp6")]`
+
+---
+
+### 3.13 OpenWrt ubus — `integration::ubus`
+
+**C source origin:** `src/ubus.c` (968 lines) — OpenWrt ubus message bus integration.
+
+**Rust module:** `rust/src/integration/ubus.rs` — `#[cfg(feature = "ubus")]`
+
+**Justification:** The ubus integration requires FFI calls to the `libubus` C library
+for registering event handlers and broadcasting lease-change events.
+
+**Invariants:**
+
+1. ubus context handles are checked for null after initialization.
+2. Blob buffer construction validates attribute lengths.
+3. Event names are null-terminated C strings constructed via `CString`.
+
+**Conditional compilation:** `#[cfg(feature = "ubus")]`
+
+---
+
+### 3.14 Script Helper — `integration::helper`
+
+**C source origin:** `src/helper.c` (1,528 lines) — script execution helper process.
+
+**Rust module:** `rust/src/integration/helper.rs` — `#[cfg(feature = "script")]`
+
+**Justification:** The script helper may use direct `fork()`/`exec()` FFI for subprocess
+management in contexts where `tokio::process::Command` is not suitable (e.g., during
+privilege transitions).
+
+**Invariants:**
+
+1. Fork/exec operations are performed in single-threaded context when possible.
+2. File descriptors are closed in the child process after fork.
+3. Environment variables passed to scripts are validated strings.
+
+**Conditional compilation:** `#[cfg(feature = "script")]`
+
+---
+
+### 3.15 TFTP Server — `services::tftp`
+
+**C source origin:** `src/tftp.c` (1,647 lines) — TFTP server with PXE boot support.
+
+**Rust module:** `rust/src/services/tftp.rs` — `#[cfg(feature = "tftp")]`
+
+**Justification:** The TFTP server requires interface-specific socket binding via
+`SO_BINDTODEVICE` and IP_PKTINFO socket options for multi-interface operation, which
+may not be fully covered by safe crate wrappers on all platforms.
+
+**Invariants:**
+
+1. Socket file descriptors are obtained from safe socket creation.
+2. Interface names are validated `CString` values with length <= `IF_NAMESIZE`.
+3. Socket options are set before the socket is shared with async tasks.
+4. File paths for TFTP transfers are validated against the configured prefix directory.
+
+**Conditional compilation:** `#[cfg(feature = "tftp")]`
+
+> **Modules that do NOT require `#![allow(unsafe_code)]`:** The following modules use
+> only safe crate APIs and contain zero `unsafe` blocks:
+>
+> - `network/arp.rs` — ARP cache reading via safe procfs parsing (`/proc/net/arp`) on
+>   Linux and safe sysctl wrappers on BSD.
+> - `integration/dbus.rs` — D-Bus integration uses the safe `dbus` crate (v0.9) API.
+> - `integration/conntrack.rs` — conntrack mark queries via safe `nix` crate wrappers.
+> - `integration/nftset.rs` — nftables set operations via the safe `nftables` crate (v0.4).
+> - `core/poll.rs` — event loop abstraction built entirely on safe `tokio` async APIs.
+
+---
+
 ## 4. Eliminated Unsafe Patterns
 
 The following table documents every major class of memory-safety hazard present in the
@@ -425,7 +589,7 @@ C implementation that is **completely eliminated** by the Rust rewrite:
 | `malloc()` / `free()` / `realloc()` via `safe_malloc()`, `whine_malloc()` wrappers | `src/util.c` (lines 41–95) | `Vec<T>`, `Box<T>`, `String`, `Arc<T>`, `Rc<T>` | Compile-time ownership tracking; automatic `Drop` invocation; double-free impossible |
 | Manual buffer sizing for DNS packets | `src/rfc1035.c`, `src/forward.c` | `bytes::BytesMut`, `Vec<u8>` with bounds checking | Runtime bounds checks on every access; panic on out-of-bounds (no silent corruption) |
 | Manual buffer sizing for DHCP packets | `src/rfc2131.c`, `src/rfc3315.c`, `src/outpacket.c` | `bytes::BytesMut`, `Vec<u8>` with bounds checking | Runtime bounds checks; buffer auto-grows via `Vec::push()` / `BytesMut::put()` |
-| `goto` error cleanup patterns | All 44 `.c` files | `Result<T, E>` + `?` operator | Compiler-enforced error propagation; no forgotten cleanup paths |
+| `goto` error cleanup patterns | All 42 `.c` files | `Result<T, E>` + `?` operator | Compiler-enforced error propagation; no forgotten cleanup paths |
 | Dangling pointers from DNS cache eviction (`struct crec*`) | `src/cache.c` | Rust lifetime annotations, `Option<&T>`, index-based references | Compile-time lifetime verification; references cannot outlive the cache |
 | Union type punning (`union all_addr`, `union mysockaddr`) | `src/dnsmasq.h` (lines 540+) | Rust `enum AllAddr { V4(...), V6(...) }` with pattern matching | Exhaustive match enforced by compiler; no undefined behavior from mismatched access |
 | Format string vulnerabilities in logging | `src/log.c` | `format!()` macro, `tracing` crate structured logging | Format strings validated at compile time; no user-controlled format specifiers |
@@ -467,8 +631,8 @@ remain safe:
 - **Safety model:** All functions are `unsafe extern "C"`. Callers (our FFI modules)
   must uphold invariants manually and document them via `// SAFETY:` comments.
 - **Our usage:** Direct `libc` calls appear **only** in the modules documented in
-  Section 3 above (privilege management, raw sockets, netlink, BPF, conntrack, ARP,
-  PF tables).
+  Section 3 above (privilege management, raw sockets, netlink, BPF, ipset, PF tables,
+  DHCP raw I/O, logging, and service socket configuration).
 - **Audit status:** 540M+ downloads; maintained by the Rust project.
 
 ### 5.4 `tokio` (v1.48.0) — Async Runtime
@@ -525,14 +689,22 @@ grep -rc "unsafe {" rust/src/ --include="*.rs" | grep -v ":0$"
 # Find unsafe blocks NOT in allowed modules (should return empty)
 grep -rn "unsafe" rust/src/ --include="*.rs" \
     | grep -v "core/daemon.rs" \
+    | grep -v "core/log.rs" \
+    | grep -v "core/poll.rs" \
+    | grep -v "dns/forward.rs" \
+    | grep -v "dhcp/v4/server.rs" \
+    | grep -v "dhcp/v6/server.rs" \
+    | grep -v "dhcp/common.rs" \
+    | grep -v "dhcp/radv.rs" \
     | grep -v "network/interface.rs" \
     | grep -v "network/netlink.rs" \
     | grep -v "network/bpf.rs" \
-    | grep -v "network/arp.rs" \
-    | grep -v "integration/conntrack.rs" \
+    | grep -v "integration/dbus.rs" \
+    | grep -v "integration/ubus.rs" \
+    | grep -v "integration/helper.rs" \
     | grep -v "integration/ipset.rs" \
-    | grep -v "integration/nftset.rs" \
     | grep -v "integration/tables.rs" \
+    | grep -v "services/tftp.rs" \
     | grep -v "#\[deny(unsafe_code)\]" \
     | grep -v "#\[allow(unsafe_code)\]" \
     | grep -v "// SAFETY:"
@@ -550,8 +722,8 @@ The crate root (`rust/src/lib.rs`) contains:
 ```
 
 This causes a **compile error** if any module uses `unsafe` without an explicit
-`#[allow(unsafe_code)]` attribute. Only the FFI modules listed in Section 3 carry
-this attribute:
+`#[allow(unsafe_code)]` attribute. The 15 modules listed in Section 3 carry this
+attribute:
 
 ```rust
 // In network/netlink.rs:

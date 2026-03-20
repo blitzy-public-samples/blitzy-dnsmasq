@@ -327,6 +327,7 @@ enabled at build time via `--features` or `--all-features` flags.
 | `conntrack` | `HAVE_CONNTRACK` | Linux conntrack marks | — |
 | `nftset` | `HAVE_NFTSET` | nftables sets | `libnftables-dev` |
 | `luascript` | `HAVE_LUASCRIPT` | Lua scripting | `liblua5.4-dev` |
+| `broken-rtc` | `HAVE_BROKEN_RTC` | Embedded systems without hardware real-time clock | — |
 
 ### Platform Auto-Detection
 
