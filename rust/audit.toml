@@ -1,0 +1,81 @@
+# =============================================================================
+# cargo-audit Vulnerability Scanning Configuration — dnsmasq (Rust)
+# =============================================================================
+#
+# Configures cargo-audit (v0.22.1) for automated security vulnerability scanning
+# of the dnsmasq Rust implementation's dependency tree. This file is critical for
+# maintaining the memory-safety guarantees that motivate the C-to-Rust migration.
+#
+# The zero-vulnerability target requires that no known security advisories exist
+# in any direct or transitive dependency. Unmaintained crates are denied to
+# prevent future unpatched vulnerabilities from accumulating.
+#
+# Location  : rust/audit.toml (project root, auto-detected by cargo-audit)
+# Usage     : cd rust/ && cargo audit
+# CI/CD     : Integrated via .github/workflows/*.yml pipeline
+# Reference : https://github.com/rustsec/rustsec/tree/main/cargo-audit
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Advisory Configuration
+# -----------------------------------------------------------------------------
+[advisories]
+# No advisories are ignored by default. This enforces the zero-vulnerability
+# target: "Zero memory-safety vulnerabilities detected by the Rust compiler
+# and cargo-audit."
+#
+# If a specific advisory must be temporarily ignored (e.g., no upstream fix is
+# available and the affected API is not reachable from dnsmasq code paths), add
+# its RUSTSEC ID here with a justification comment and resolution timeline.
+# Example: ignore = ["RUSTSEC-2024-0001"]
+ignore = []
+
+# Warn when dependencies are flagged as unmaintained in the RustSec Advisory
+# Database. Unmaintained crates pose long-term security risk since discovered
+# vulnerabilities may never receive patches.
+informational_warnings = ["unmaintained"]
+
+# -----------------------------------------------------------------------------
+# Advisory Database Configuration
+# -----------------------------------------------------------------------------
+[database]
+# Fetch the latest advisory database from the RustSec repository before each
+# audit scan. Ensures newly published vulnerabilities are detected immediately
+# in CI/CD pipelines. Default: true.
+fetch = true
+
+# Do not allow a stale advisory database (no new commits for 90+ days).
+# Forces the CI pipeline to fail if the advisory DB cannot be refreshed,
+# preventing false "clean" audit results from outdated data. Default: false.
+stale = false
+
+# -----------------------------------------------------------------------------
+# Output Configuration
+# -----------------------------------------------------------------------------
+[output]
+# Deny (exit with non-zero status) when unmaintained dependencies are found.
+# This causes CI/CD pipelines to fail on unmaintained crate usage, prompting
+# immediate action to find maintained alternatives.
+deny = ["unmaintained"]
+
+# Human-readable terminal output format for developer and CI log consumption.
+# Set to "json" for machine-parseable output in automated reporting pipelines.
+format = "terminal"
+
+# Display inverse dependency trees alongside advisories so developers can trace
+# which direct dependency introduced a vulnerable transitive dependency.
+show_tree = true
+
+# -----------------------------------------------------------------------------
+# Yanked Crate Detection
+# -----------------------------------------------------------------------------
+[yanked]
+# Check for yanked crate versions in Cargo.lock. Yanked crates indicate the
+# publisher has retracted the release, often due to critical bugs or security
+# issues that require immediate remediation.
+enabled = true
+
+# Auto-update the crates.io index before checking for yanked crates. Ensures
+# detection of recently yanked versions without requiring a manual index refresh.
+update_index = true

@@ -1,0 +1,43 @@
+[package]
+name = "dnsmasq-migrate-config"
+version = "2.92.0"
+edition = "2021"
+rust-version = "1.91.0"
+authors = ["dnsmasq contributors"]
+description = "Configuration migration and validation tool for dnsmasq C-to-Rust transition"
+license = "GPL-2.0-or-later"
+publish = false
+
+[[bin]]
+name = "dnsmasq-migrate-config"
+path = "src/main.rs"
+
+[dependencies]
+# Main dnsmasq library — provides config::options::DnsmasqConfig and config parsing
+dnsmasq = { path = "../.." }
+
+# CLI argument parsing — same version as main crate (AAP Section 0.6.1)
+clap = { version = "4.5.60", features = ["derive"] }
+
+# Top-level error handling
+anyhow = "1"
+
+# Error type derivation
+thiserror = "2"
+
+# Serialization for migration reports
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Structured logging — consistent with main dnsmasq binary
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
