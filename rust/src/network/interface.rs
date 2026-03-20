@@ -454,7 +454,9 @@ fn is_loopback_interface(name: &str) -> bool {
                 ifr.ifr_name.as_mut_ptr() as *mut u8,
                 copy_len,
             );
-            let ret = libc::ioctl(sock, libc::SIOCGIFFLAGS as libc::c_ulong, &mut ifr);
+            // Cast via `as _` for portability: ioctl() request parameter is
+            // `c_ulong` on glibc but `c_int` on musl libc.
+            let ret = libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr);
             libc::close(sock);
             if ret < 0 {
                 return false;
@@ -974,15 +976,19 @@ pub fn tcp_interface(fd: RawFd, af: i32) -> u32 {
             return 0;
         }
 
-        let msg = libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: std::ptr::null_mut(),
-            msg_iovlen: 0,
-            msg_control: buf.as_mut_ptr() as *mut libc::c_void,
-            msg_controllen: len as usize,
-            msg_flags: 0,
-        };
+        // Use zeroed() + field assignment for portability: on musl libc,
+        // libc::msghdr has private padding fields (__pad1, __pad2) that
+        // prevent struct literal construction. This approach works on both
+        // glibc and musl.
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_name = std::ptr::null_mut();
+        msg.msg_namelen = 0;
+        msg.msg_iov = std::ptr::null_mut();
+        msg.msg_iovlen = 0;
+        msg.msg_control = buf.as_mut_ptr() as *mut libc::c_void;
+        // Cast via `as _`: msg_controllen is `usize` on glibc, `u32` on musl.
+        msg.msg_controllen = len as _;
+        msg.msg_flags = 0;
 
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {

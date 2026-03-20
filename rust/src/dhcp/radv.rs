@@ -556,7 +556,9 @@ pub fn icmp6_packet(state: &mut DaemonState) -> DnsmasqResult<()> {
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = cmsg_buf.len();
+        // Cast via `as _` for portability: msg_controllen is `usize` on
+        // glibc but `u32` (socklen_t) on musl libc.
+        msg.msg_controllen = cmsg_buf.len() as _;
 
         let ret = libc::recvmsg(fd, &mut msg, 0);
         if ret < 1 {

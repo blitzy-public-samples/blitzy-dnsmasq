@@ -81,6 +81,16 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 # Add cargo and rustc to PATH for all subsequent RUN instructions.
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+# Override the musl linker setting from .cargo/config.toml.
+# The config specifies linker = "musl-gcc" for x86_64-unknown-linux-musl,
+# which is correct on Ubuntu/Debian (provided by musl-tools package).
+# However, Alpine Linux uses musl libc natively — its standard GCC already
+# links against musl, so the separate musl-gcc wrapper does not exist.
+# This environment variable overrides the config setting within the Docker
+# build context only, using Alpine's native GCC which produces correct
+# musl-linked binaries.
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=gcc
+
 # Set working directory for the Rust project.
 # The Docker build context is the rust/ directory, so all COPY paths are
 # relative to that root.
@@ -97,16 +107,35 @@ COPY .cargo/ .cargo/
 # This creates a cached layer containing all compiled dependency crates.
 # The stub files satisfy Cargo's requirement for a valid crate structure
 # without including any actual project source code.
-RUN mkdir -p src && \
+# Note: benches/ stub is required because Cargo.toml declares [[bench]]
+# which Cargo validates at manifest parse time even for non-bench builds.
+# After compiling dependencies, we remove the stub source AND the project-
+# specific build artifacts (binary, library, fingerprints) while preserving
+# cached dependency crates. This forces Cargo to recompile only the dnsmasq
+# crate when the real source is copied in, while skipping expensive dependency
+# compilation.
+RUN mkdir -p src benches && \
     echo 'fn main() { println!("dependency-cache-stub"); }' > src/main.rs && \
     echo '// dependency cache stub' > src/lib.rs && \
+    echo 'fn main() {}' > benches/dns_cache_bench.rs && \
     cargo build --release --target x86_64-unknown-linux-musl ${FEATURES} 2>/dev/null || true && \
-    rm -rf src/
+    rm -rf src/ benches/ && \
+    rm -f target/x86_64-unknown-linux-musl/release/dnsmasq && \
+    rm -f target/x86_64-unknown-linux-musl/release/libdnsmasq* && \
+    rm -rf target/x86_64-unknown-linux-musl/release/.fingerprint/dnsmasq-* && \
+    rm -f target/x86_64-unknown-linux-musl/release/deps/dnsmasq-* && \
+    rm -f target/x86_64-unknown-linux-musl/release/deps/libdnsmasq-*
 
-# Copy the full Rust source tree.
+# Copy the full Rust source tree, benchmarks, and integration tests.
 # This invalidates the layer cache only when source files change,
 # not when dependencies change (those are cached above).
+# All three directories are required by Cargo.toml: src/ contains the
+# library and binary targets, benches/ contains the dns_cache_bench
+# benchmark (declared via [[bench]]), and tests/ contains integration
+# test files auto-discovered by Cargo.
 COPY src/ src/
+COPY benches/ benches/
+COPY tests/ tests/
 
 # Build the release binary targeting musl libc for static linking.
 # Default Cargo features enabled (from Cargo.toml [features].default):

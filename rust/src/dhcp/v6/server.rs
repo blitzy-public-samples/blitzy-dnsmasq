@@ -341,7 +341,9 @@ pub async fn dhcp6_packet(_now: i64, state: &mut DaemonState) -> DnsmasqResult<(
             msg.msg_iov = iov.as_mut_ptr() as *mut libc::iovec;
             msg.msg_iovlen = 1;
             msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = cmsg_buf.len();
+            // Cast to `as _` for portability: msg_controllen is `usize` on
+            // glibc but `u32` (socklen_t) on musl libc.
+            msg.msg_controllen = cmsg_buf.len() as _;
 
             let n = libc::recvmsg(fd, &mut msg, 0);
             if n < 0 {

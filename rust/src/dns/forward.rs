@@ -916,10 +916,12 @@ fn send_from_with_cmsg(
                         s_addr: u32::from_ne_bytes(v4.octets()),
                     };
                     (*p).ipi_addr = libc::in_addr { s_addr: 0 };
+                    // Cast via `as _` for portability: msg_controllen and cmsg_len
+                    // are `usize` on glibc but `u32` (socklen_t) on musl libc.
                     msg.msg_controllen =
-                        libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
+                        libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) as _;
                     (*cmptr).cmsg_len =
-                        libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
+                        libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as _;
                     (*cmptr).cmsg_level = libc::IPPROTO_IP;
                     (*cmptr).cmsg_type = libc::IP_PKTINFO;
                 }
@@ -935,9 +937,9 @@ fn send_from_with_cmsg(
                         std::mem::size_of::<libc::in_addr>(),
                     );
                     msg.msg_controllen =
-                        libc::CMSG_SPACE(std::mem::size_of::<libc::in_addr>() as u32) as usize;
+                        libc::CMSG_SPACE(std::mem::size_of::<libc::in_addr>() as u32) as _;
                     (*cmptr).cmsg_len =
-                        libc::CMSG_LEN(std::mem::size_of::<libc::in_addr>() as u32) as usize;
+                        libc::CMSG_LEN(std::mem::size_of::<libc::in_addr>() as u32) as _;
                     (*cmptr).cmsg_level = libc::IPPROTO_IP;
                     (*cmptr).cmsg_type = libc::IP_SENDSRCADDR;
                 }
@@ -950,9 +952,9 @@ fn send_from_with_cmsg(
                 };
                 (*p).ipi6_ifindex = iface_index as libc::c_uint;
                 msg.msg_controllen =
-                    libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize;
+                    libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as _;
                 (*cmptr).cmsg_len =
-                    libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize;
+                    libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as u32) as _;
                 (*cmptr).cmsg_level = libc::IPPROTO_IPV6;
                 (*cmptr).cmsg_type = libc::IPV6_PKTINFO;
             }
