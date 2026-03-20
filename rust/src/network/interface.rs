@@ -1890,3 +1890,586 @@ pub fn newaddress(_now: u64, state: &mut DaemonState) -> DnsmasqResult<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // ===== MySockAddr methods ==========================================
+
+    #[test]
+    fn mysockaddr_v4_family() {
+        let sa = MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53));
+        assert_eq!(sa.family(), libc::AF_INET);
+    }
+
+    #[test]
+    fn mysockaddr_v6_family() {
+        let sa = MySockAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 53, 0, 0));
+        assert_eq!(sa.family(), libc::AF_INET6);
+    }
+
+    #[test]
+    fn mysockaddr_v4_port() {
+        let sa = MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234));
+        assert_eq!(sa.port(), 1234);
+    }
+
+    #[test]
+    fn mysockaddr_v6_port() {
+        let sa = MySockAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5353, 0, 0));
+        assert_eq!(sa.port(), 5353);
+    }
+
+    #[test]
+    fn mysockaddr_set_port_v4() {
+        let mut sa = MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53));
+        sa.set_port(8053);
+        assert_eq!(sa.port(), 8053);
+    }
+
+    #[test]
+    fn mysockaddr_set_port_v6() {
+        let mut sa = MySockAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 53, 0, 0));
+        sa.set_port(8053);
+        assert_eq!(sa.port(), 8053);
+    }
+
+    #[test]
+    fn mysockaddr_is_equal_same_v4() {
+        let a = MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 53));
+        let b = MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 53));
+        assert!(a.is_equal(&b));
+    }
+
+    #[test]
+    fn mysockaddr_is_equal_different_port() {
+        let a = MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53));
+        let b = MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5353));
+        assert!(!a.is_equal(&b));
+    }
+
+    #[test]
+    fn mysockaddr_is_equal_different_family() {
+        let a = MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53));
+        let b = MySockAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 53, 0, 0));
+        assert!(!a.is_equal(&b));
+    }
+
+    #[test]
+    fn mysockaddr_is_wildcard_v4() {
+        let w = MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+        assert!(w.is_wildcard());
+        let nw = MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        assert!(!nw.is_wildcard());
+    }
+
+    #[test]
+    fn mysockaddr_is_wildcard_v6() {
+        let w = MySockAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
+        assert!(w.is_wildcard());
+        let nw = MySockAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0));
+        assert!(!nw.is_wildcard());
+    }
+
+    // ===== mysockaddr_ip ==============================================
+
+    #[test]
+    fn mysockaddr_ip_v4() {
+        let sa = MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 53));
+        assert_eq!(
+            mysockaddr_ip(&sa),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))
+        );
+    }
+
+    #[test]
+    fn mysockaddr_ip_v6() {
+        let sa = MySockAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 53, 0, 0));
+        assert_eq!(mysockaddr_ip(&sa), IpAddr::V6(Ipv6Addr::LOCALHOST));
+    }
+
+    // ===== ip_to_mysockaddr ===========================================
+
+    #[test]
+    fn ip_to_mysockaddr_v4() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let sa = ip_to_mysockaddr(&ip, 53);
+        assert_eq!(sa.port(), 53);
+        assert_eq!(mysockaddr_ip(&sa), ip);
+        assert_eq!(sa.family(), libc::AF_INET);
+    }
+
+    #[test]
+    fn ip_to_mysockaddr_v6() {
+        let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let sa = ip_to_mysockaddr(&ip, 5353);
+        assert_eq!(sa.port(), 5353);
+        assert_eq!(mysockaddr_ip(&sa), ip);
+        assert_eq!(sa.family(), libc::AF_INET6);
+    }
+
+    // ===== irec flag helpers ==========================================
+
+    fn make_irec(flags: u32) -> InterfaceRecord {
+        InterfaceRecord {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            name: "lo".to_string(),
+            index: 1,
+            flags,
+            netmask: Some(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0))),
+            label: 0,
+        }
+    }
+
+    #[test]
+    fn irec_has_flag_set() {
+        let irec = make_irec(IREC_FOUND | IREC_DONE);
+        assert!(irec_has_flag(&irec, IREC_FOUND));
+        assert!(irec_has_flag(&irec, IREC_DONE));
+        assert!(!irec_has_flag(&irec, IREC_WARNED));
+    }
+
+    #[test]
+    fn irec_set_flag_works() {
+        let mut irec = make_irec(0);
+        assert!(!irec_has_flag(&irec, IREC_DAD));
+        irec_set_flag(&mut irec, IREC_DAD);
+        assert!(irec_has_flag(&irec, IREC_DAD));
+    }
+
+    #[test]
+    fn irec_clear_flag_works() {
+        let mut irec = make_irec(IREC_FOUND | IREC_DAD);
+        assert!(irec_has_flag(&irec, IREC_DAD));
+        irec_clear_flag(&mut irec, IREC_DAD);
+        assert!(!irec_has_flag(&irec, IREC_DAD));
+        assert!(irec_has_flag(&irec, IREC_FOUND)); // other flags preserved
+    }
+
+    #[test]
+    fn irec_set_clear_idempotent() {
+        let mut irec = make_irec(0);
+        irec_set_flag(&mut irec, IREC_WARNED);
+        irec_set_flag(&mut irec, IREC_WARNED);
+        assert!(irec_has_flag(&irec, IREC_WARNED));
+        irec_clear_flag(&mut irec, IREC_WARNED);
+        irec_clear_flag(&mut irec, IREC_WARNED);
+        assert!(!irec_has_flag(&irec, IREC_WARNED));
+    }
+
+    // ===== irec_to_mysockaddr =========================================
+
+    #[test]
+    fn irec_to_mysockaddr_v4() {
+        let irec = InterfaceRecord {
+            addr: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            name: "eth0".to_string(),
+            index: 2,
+            flags: 0,
+            netmask: Some(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0))),
+            label: 0,
+        };
+        let sa = irec_to_mysockaddr(&irec, 53);
+        assert_eq!(
+            mysockaddr_ip(&sa),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))
+        );
+        assert_eq!(sa.port(), 53);
+    }
+
+    #[test]
+    fn irec_to_mysockaddr_v6() {
+        let irec = InterfaceRecord {
+            addr: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            name: "eth0".to_string(),
+            index: 2,
+            flags: 0,
+            netmask: None,
+            label: 0,
+        };
+        let sa = irec_to_mysockaddr(&irec, 5353);
+        assert_eq!(sa.port(), 5353);
+        assert_eq!(sa.family(), libc::AF_INET6);
+    }
+
+    // ===== netmask_to_prefix_v4 =======================================
+
+    #[test]
+    fn netmask_prefix_class_c() {
+        assert_eq!(netmask_to_prefix_v4(&Ipv4Addr::new(255, 255, 255, 0)), 24);
+    }
+
+    #[test]
+    fn netmask_prefix_class_b() {
+        assert_eq!(netmask_to_prefix_v4(&Ipv4Addr::new(255, 255, 0, 0)), 16);
+    }
+
+    #[test]
+    fn netmask_prefix_class_a() {
+        assert_eq!(netmask_to_prefix_v4(&Ipv4Addr::new(255, 0, 0, 0)), 8);
+    }
+
+    #[test]
+    fn netmask_prefix_slash32() {
+        assert_eq!(netmask_to_prefix_v4(&Ipv4Addr::new(255, 255, 255, 255)), 32);
+    }
+
+    #[test]
+    fn netmask_prefix_slash0() {
+        assert_eq!(netmask_to_prefix_v4(&Ipv4Addr::new(0, 0, 0, 0)), 0);
+    }
+
+    #[test]
+    fn netmask_prefix_slash28() {
+        assert_eq!(netmask_to_prefix_v4(&Ipv4Addr::new(255, 255, 255, 240)), 28);
+    }
+
+    #[test]
+    fn netmask_prefix_slash20() {
+        assert_eq!(netmask_to_prefix_v4(&Ipv4Addr::new(255, 255, 240, 0)), 20);
+    }
+
+    // ===== is_private_ipv4 ============================================
+
+    #[test]
+    fn is_private_10_x() {
+        assert!(is_private_ipv4(&Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(is_private_ipv4(&Ipv4Addr::new(10, 255, 255, 255)));
+    }
+
+    #[test]
+    fn is_private_172_16() {
+        assert!(is_private_ipv4(&Ipv4Addr::new(172, 16, 0, 0)));
+        assert!(is_private_ipv4(&Ipv4Addr::new(172, 31, 255, 255)));
+        assert!(!is_private_ipv4(&Ipv4Addr::new(172, 32, 0, 0)));
+    }
+
+    #[test]
+    fn is_private_192_168() {
+        assert!(is_private_ipv4(&Ipv4Addr::new(192, 168, 0, 1)));
+        assert!(is_private_ipv4(&Ipv4Addr::new(192, 168, 255, 255)));
+    }
+
+    #[test]
+    fn is_private_loopback() {
+        assert!(is_private_ipv4(&Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(is_private_ipv4(&Ipv4Addr::new(127, 255, 255, 255)));
+    }
+
+    #[test]
+    fn is_private_link_local() {
+        assert!(is_private_ipv4(&Ipv4Addr::new(169, 254, 0, 1)));
+        assert!(is_private_ipv4(&Ipv4Addr::new(169, 254, 255, 255)));
+    }
+
+    #[test]
+    fn is_not_private_public_ips() {
+        assert!(!is_private_ipv4(&Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!is_private_ipv4(&Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(!is_private_ipv4(&Ipv4Addr::new(203, 0, 113, 1)));
+    }
+
+    // ===== SERV_* flag constants ======================================
+
+    #[test]
+    fn serv_flags_unique_bits() {
+        let flags = [
+            SERV_USE_RESOLV,
+            SERV_LITERAL_ADDRESS,
+            SERV_NO_ADDR,
+            SERV_4ADDR,
+            SERV_6ADDR,
+            SERV_COUNTED,
+            SERV_FOR_NODOTS,
+            SERV_WARNED_RECURSIVE,
+            SERV_FROM_DBUS,
+            SERV_MARK,
+            SERV_WILDCARD,
+            SERV_FROM_RESOLV,
+            SERV_FROM_FILE,
+            SERV_LOOP,
+            SERV_DO_DNSSEC,
+            SERV_GOT_TCP,
+            SERV_HAS_DOMAIN,
+            SERV_NO_REBIND,
+        ];
+        for &f in &flags {
+            assert!(f.is_power_of_two(), "SERV flag 0x{:x} not a power of 2", f);
+        }
+    }
+
+    #[test]
+    fn serv_type_composite() {
+        let expected = SERV_LITERAL_ADDRESS | SERV_NO_ADDR | SERV_FOR_NODOTS | SERV_USE_RESOLV;
+        assert_eq!(SERV_TYPE, expected);
+    }
+
+    // ===== IREC_* flag constants ======================================
+
+    #[test]
+    fn irec_flags_unique_bits() {
+        let flags = [
+            IREC_FOUND,
+            IREC_DONE,
+            IREC_WARNED,
+            IREC_DAD,
+            IREC_DNS_AUTH,
+            IREC_MULTICAST_DONE,
+            IREC_TFTP_OK,
+            IREC_DHCP4_OK,
+            IREC_DHCP6_OK,
+        ];
+        for &f in &flags {
+            assert!(f.is_power_of_two(), "IREC flag 0x{:x} not a power of 2", f);
+        }
+    }
+
+    // ===== INAME_* constants ==========================================
+
+    #[test]
+    fn iname_constants() {
+        assert_eq!(INAME_USED, 1);
+        assert_eq!(INAME_4, 2);
+        assert_eq!(INAME_6, 4);
+    }
+
+    // ===== loopback_exception =========================================
+
+    #[test]
+    fn loopback_exception_non_loopback_returns_false() {
+        let addr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let ifaces = vec![make_irec(0)];
+        assert!(!loopback_exception("eth0", libc::AF_INET, &addr, &ifaces));
+    }
+
+    #[test]
+    fn loopback_exception_lo_with_matching_addr() {
+        let addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let irec = InterfaceRecord {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            name: "lo".to_string(),
+            index: 1,
+            flags: 0,
+            netmask: Some(IpAddr::V4(Ipv4Addr::new(255, 0, 0, 0))),
+            label: 0,
+        };
+        assert!(loopback_exception("lo", libc::AF_INET, &addr, &[irec]));
+    }
+
+    #[test]
+    fn loopback_exception_lo_no_matching_addr() {
+        let addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let irec = InterfaceRecord {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            name: "lo".to_string(),
+            index: 1,
+            flags: 0,
+            netmask: Some(IpAddr::V4(Ipv4Addr::new(255, 0, 0, 0))),
+            label: 0,
+        };
+        assert!(!loopback_exception("lo", libc::AF_INET, &addr, &[irec]));
+    }
+
+    // ===== label_exception ============================================
+
+    #[test]
+    fn label_exception_ipv6_returns_false() {
+        let addr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert!(!label_exception(1, libc::AF_INET6, &addr, &[]));
+    }
+
+    #[test]
+    fn label_exception_matching() {
+        let addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let irec = InterfaceRecord {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            name: "eth0".to_string(),
+            index: 2,
+            flags: 0,
+            netmask: Some(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0))),
+            label: 0,
+        };
+        assert!(label_exception(2, libc::AF_INET, &addr, &[irec]));
+    }
+
+    #[test]
+    fn label_exception_different_index() {
+        let addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let irec = InterfaceRecord {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            name: "eth0".to_string(),
+            index: 2,
+            flags: 0,
+            netmask: Some(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0))),
+            label: 0,
+        };
+        assert!(!label_exception(3, libc::AF_INET, &addr, &[irec]));
+    }
+
+    #[test]
+    fn label_exception_empty_interfaces() {
+        let addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        assert!(!label_exception(1, libc::AF_INET, &addr, &[]));
+    }
+
+    // ===== index_to_name ==============================================
+
+    #[test]
+    fn index_to_name_zero_returns_none() {
+        assert!(index_to_name(0).is_none());
+    }
+
+    #[test]
+    fn index_to_name_lo() {
+        let result = index_to_name(1);
+        assert!(result.is_some());
+        let name = result.unwrap();
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn index_to_name_invalid_index() {
+        assert!(index_to_name(99999).is_none());
+    }
+
+    // ===== iface_check ================================================
+
+    #[test]
+    fn iface_check_no_filters_allows_all() {
+        let state = DaemonState::default();
+        let (allowed, _is_auth) = iface_check(
+            libc::AF_INET,
+            Some(&IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "eth0",
+            &state,
+        );
+        assert!(allowed, "no filters configured should allow all");
+    }
+
+    // ===== fix_fd =====================================================
+
+    #[test]
+    fn fix_fd_invalid_fd_returns_error() {
+        let result = fix_fd(-1);
+        assert!(result.is_err());
+    }
+
+    // ===== clean_interfaces ===========================================
+
+    #[test]
+    fn clean_interfaces_removes_unfound() {
+        let found = InterfaceRecord {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            name: "lo".to_string(),
+            index: 1,
+            flags: IREC_FOUND,
+            netmask: Some(IpAddr::V4(Ipv4Addr::new(255, 0, 0, 0))),
+            label: 0,
+        };
+        let not_found = InterfaceRecord {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            name: "eth0".to_string(),
+            index: 2,
+            flags: 0,
+            netmask: Some(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0))),
+            label: 0,
+        };
+        let mut ifaces = vec![found.clone(), not_found];
+        clean_interfaces(&mut ifaces);
+        assert_eq!(ifaces.len(), 1);
+        assert_eq!(ifaces[0].name, "lo");
+    }
+
+    #[test]
+    fn clean_interfaces_empty() {
+        let mut ifaces: Vec<InterfaceRecord> = vec![];
+        clean_interfaces(&mut ifaces);
+        assert!(ifaces.is_empty());
+    }
+
+    // ===== find_listener_by_addr ======================================
+
+    #[test]
+    fn find_listener_by_addr_found_v4() {
+        let listeners = vec![
+            Listener {
+                fd: -1,
+                tcpfd: -1,
+                tftpfd: -1,
+                family: libc::AF_INET,
+                iface: Some(0),
+            },
+            Listener {
+                fd: -1,
+                tcpfd: -1,
+                tftpfd: -1,
+                family: libc::AF_INET6,
+                iface: Some(1),
+            },
+        ];
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let idx = find_listener_by_addr(&ip, &listeners);
+        assert_eq!(idx, Some(0)); // first AF_INET match
+    }
+
+    #[test]
+    fn find_listener_by_addr_found_v6() {
+        let listeners = vec![
+            Listener {
+                fd: -1,
+                tcpfd: -1,
+                tftpfd: -1,
+                family: libc::AF_INET,
+                iface: Some(0),
+            },
+            Listener {
+                fd: -1,
+                tcpfd: -1,
+                tftpfd: -1,
+                family: libc::AF_INET6,
+                iface: Some(1),
+            },
+        ];
+        let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let idx = find_listener_by_addr(&ip, &listeners);
+        assert_eq!(idx, Some(1)); // second element is AF_INET6
+    }
+
+    #[test]
+    fn find_listener_by_addr_not_found() {
+        let listeners = vec![Listener {
+            fd: -1,
+            tcpfd: -1,
+            tftpfd: -1,
+            family: libc::AF_INET,
+            iface: Some(0),
+        }];
+        // Looking for v6 but only v4 listener exists
+        let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert_eq!(find_listener_by_addr(&ip, &listeners), None);
+    }
+
+    #[test]
+    fn find_listener_by_addr_empty() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(find_listener_by_addr(&ip, &[]), None);
+    }
+
+    // ===== Constants checks ==========================================
+
+    #[test]
+    fn tftp_port_constant() {
+        assert_eq!(TFTP_PORT, 69);
+    }
+
+    #[test]
+    fn locals_logged_constant() {
+        assert_eq!(LOCALS_LOGGED, 8);
+    }
+}

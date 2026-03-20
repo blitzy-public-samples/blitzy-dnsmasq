@@ -1723,6 +1723,7 @@ fn collect_interface_v6_addrs(state: &DaemonState) -> Vec<(Ipv6Addr, u8, i32, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dhcp::common::CONTEXT_V6;
     use std::net::Ipv4Addr;
 
     /// Helper: create a test DhcpContext with IPv6 range.
@@ -1972,5 +1973,783 @@ mod tests {
         // Use Default implementation if available, otherwise construct manually.
         // DaemonState has many fields; we initialize the ones relevant to our tests.
         DaemonState::default()
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional sdbm_hash tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sdbm_hash_empty_clid() {
+        let h = sdbm_hash(b"", 0);
+        // Even empty input + 0 IAID should produce a hash
+        let _ = h; // just ensure no panic
+    }
+
+    #[test]
+    fn test_sdbm_hash_single_byte() {
+        let h1 = sdbm_hash(&[0x00], 0);
+        let h2 = sdbm_hash(&[0x01], 0);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_sdbm_hash_iaid_zero_vs_one() {
+        let h1 = sdbm_hash(b"client", 0);
+        let h2 = sdbm_hash(b"client", 1);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_sdbm_hash_long_clid() {
+        let clid = vec![0xAA; 128];
+        let h = sdbm_hash(&clid, 42);
+        assert_ne!(h, 0);
+    }
+
+    #[test]
+    fn test_sdbm_hash_max_iaid() {
+        let h = sdbm_hash(b"x", u32::MAX);
+        assert_ne!(h, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional config_find_by_address6 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_find_by_address6_empty_configs() {
+        let target = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x100);
+        let result = config_find_by_address6(&[], None, 64, &target);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_config_find_by_address6_multiple_configs() {
+        let target = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x200);
+        let configs = vec![
+            make_test_config(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x100)),
+            make_test_config(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x200)),
+            make_test_config(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x300)),
+        ];
+        let result = config_find_by_address6(&configs, None, 64, &target);
+        assert!(result.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional address6_available tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_address6_available_boundary_start() {
+        let start6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x100);
+        let end6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1FF);
+        let ctx = make_test_context(start6, end6, 64, 0);
+        let contexts = vec![ctx];
+
+        // Exactly at start
+        let result = address6_available(&contexts, &start6, &[], true);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_address6_available_boundary_end() {
+        let start6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x100);
+        let end6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1FF);
+        let ctx = make_test_context(start6, end6, 64, 0);
+        let contexts = vec![ctx];
+
+        // Exactly at end
+        let result = address6_available(&contexts, &end6, &[], true);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_address6_available_just_below_start() {
+        let start6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x100);
+        let end6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1FF);
+        let ctx = make_test_context(start6, end6, 64, 0);
+        let contexts = vec![ctx];
+
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xFF);
+        let result = address6_available(&contexts, &addr, &[], true);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_address6_available_multiple_contexts() {
+        let ctx1 = make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x100),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1FF),
+            64,
+            0,
+        );
+        let ctx2 = make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x200),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x2FF),
+            64,
+            0,
+        );
+        let contexts = vec![ctx1, ctx2];
+
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x250);
+        let result = address6_available(&contexts, &addr, &[], true);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 1); // Second context
+    }
+
+    #[test]
+    fn test_address6_available_empty_contexts() {
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x100);
+        let result = address6_available(&[], &addr, &[], true);
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional address6_valid tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_address6_valid_empty_contexts() {
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x100);
+        let result = address6_valid(&[], &addr, &[], true);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_address6_valid_multiple_contexts_second_matches() {
+        let ctx1 = make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 0x100),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 0x1FF),
+            64,
+            0,
+        );
+        let ctx2 = make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 0x100),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 0x1FF),
+            64,
+            0,
+        );
+        let contexts = vec![ctx1, ctx2];
+
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 0x500);
+        let result = address6_valid(&contexts, &addr, &[], true);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional parse_mac_string tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_mac_string_all_zeros() {
+        let mac = parse_mac_string("00:00:00:00:00:00");
+        assert_eq!(mac, Some(vec![0, 0, 0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn test_parse_mac_string_uppercase() {
+        let mac = parse_mac_string("AA:BB:CC:DD:EE:FF");
+        assert_eq!(mac, Some(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
+    }
+
+    #[test]
+    fn test_parse_mac_string_empty() {
+        assert!(parse_mac_string("").is_none());
+    }
+
+    #[test]
+    fn test_parse_mac_string_too_many() {
+        assert!(parse_mac_string("aa:bb:cc:dd:ee:ff:00").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // IfaceParam tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_iface_param_modified() {
+        let mut param = IfaceParam::default();
+        param.addr_match = true;
+        param.ind = 5;
+        param.fallback = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        assert!(param.addr_match);
+        assert_eq!(param.ind, 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // make_duid tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_make_duid_ll_fallback() {
+        let mut state = create_test_daemon_state();
+        // No enterprise config, no existing DUID → should generate DUID-LL or DUID-LLT
+        make_duid(1000, &mut state);
+        // DUID should be generated (may be empty if no interface found, but no panic)
+        let _ = state.duid;
+    }
+
+    // -----------------------------------------------------------------------
+    // DhcpContext helper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_make_test_context_fields() {
+        let start = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let end = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xFF);
+        let ctx = make_test_context(start, end, 64, CONTEXT_STATIC);
+
+        assert_eq!(ctx.start6, start);
+        assert_eq!(ctx.end6, end);
+        assert_eq!(ctx.prefix, 64);
+        assert_ne!(ctx.flags & CONTEXT_STATIC, 0);
+    }
+
+    #[test]
+    fn test_make_test_config_fields() {
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x42);
+        let config = make_test_config(addr);
+        assert_eq!(config.addr6, vec![addr]);
+        assert_ne!(config.flags & CONFIG_ADDR6, 0);
+    }
+
+    // ---- find_wildcard_contexts tests ----
+
+    #[test]
+    fn test_find_wildcard_contexts_empty_state() {
+        let state = DaemonState::default();
+        let wcs = find_wildcard_contexts(&state);
+        assert!(wcs.is_empty());
+    }
+
+    #[test]
+    fn test_find_wildcard_contexts_with_wildcard() {
+        let mut state = DaemonState::default();
+        state
+            .dhcp6_contexts
+            .push(crate::core::types::DhcpContextEntry {
+                start: std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                end: std::net::IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0xff)),
+                netmask: None,
+                lease_time: 3600,
+                flags: CONTEXT_V6,
+                netid: Some("wildcard".to_string()),
+            });
+        let wcs = find_wildcard_contexts(&state);
+        assert_eq!(wcs.len(), 1);
+        assert_eq!(wcs[0].lease_time, 3600);
+        assert_eq!(wcs[0].netid.net, "wildcard");
+    }
+
+    #[test]
+    fn test_find_wildcard_contexts_skips_non_wildcard() {
+        let mut state = DaemonState::default();
+        state
+            .dhcp6_contexts
+            .push(crate::core::types::DhcpContextEntry {
+                start: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                end: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff)),
+                netmask: None,
+                lease_time: 7200,
+                flags: CONTEXT_V6,
+                netid: None,
+            });
+        let wcs = find_wildcard_contexts(&state);
+        assert!(wcs.is_empty());
+    }
+
+    #[test]
+    fn test_find_wildcard_contexts_skips_v4() {
+        let mut state = DaemonState::default();
+        state
+            .dhcp6_contexts
+            .push(crate::core::types::DhcpContextEntry {
+                start: std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),
+                end: std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200)),
+                netmask: None,
+                lease_time: 3600,
+                flags: 0,
+                netid: None,
+            });
+        let wcs = find_wildcard_contexts(&state);
+        assert!(wcs.is_empty());
+    }
+
+    #[test]
+    fn test_find_wildcard_contexts_multiple_mixed() {
+        let mut state = DaemonState::default();
+        // Wildcard context
+        state
+            .dhcp6_contexts
+            .push(crate::core::types::DhcpContextEntry {
+                start: std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                end: std::net::IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0xff)),
+                netmask: None,
+                lease_time: 3600,
+                flags: CONTEXT_V6,
+                netid: None,
+            });
+        // Non-wildcard
+        state
+            .dhcp6_contexts
+            .push(crate::core::types::DhcpContextEntry {
+                start: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                end: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff)),
+                netmask: None,
+                lease_time: 7200,
+                flags: CONTEXT_V6,
+                netid: None,
+            });
+        // Another wildcard
+        state
+            .dhcp6_contexts
+            .push(crate::core::types::DhcpContextEntry {
+                start: std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                end: std::net::IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0x1ff)),
+                netmask: None,
+                lease_time: 1800,
+                flags: CONTEXT_V6,
+                netid: Some("pool2".to_string()),
+            });
+        let wcs = find_wildcard_contexts(&state);
+        assert_eq!(wcs.len(), 2);
+    }
+
+    // ---- address6_allocate tests ----
+
+    #[test]
+    fn test_address6_allocate_basic() {
+        let contexts = vec![make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            CONTEXT_V6,
+        )];
+        let state = DaemonState::default();
+        let result = address6_allocate(
+            &contexts,
+            &[1, 2, 3, 4],
+            false,
+            1,
+            0,
+            &[],
+            true,
+            &[],
+            &state,
+            &[],
+        );
+        assert!(result.is_some());
+        let (ctx_idx, addr) = result.unwrap();
+        assert_eq!(ctx_idx, 0);
+        // Address should be within range
+        let host = crate::core::util::addr6_host_part(&addr);
+        assert!(host >= 1 && host <= 0xff);
+    }
+
+    #[test]
+    fn test_address6_allocate_no_contexts() {
+        let state = DaemonState::default();
+        let result = address6_allocate(&[], &[1, 2, 3], false, 1, 0, &[], true, &[], &state, &[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_address6_allocate_static_only_skipped() {
+        let contexts = vec![make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            CONTEXT_V6 | CONTEXT_STATIC,
+        )];
+        let state = DaemonState::default();
+        let result = address6_allocate(
+            &contexts,
+            &[1, 2, 3],
+            false,
+            1,
+            0,
+            &[],
+            true,
+            &[],
+            &state,
+            &[],
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_address6_allocate_deterministic() {
+        let contexts = vec![make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            CONTEXT_V6,
+        )];
+        let state = DaemonState::default();
+        let r1 = address6_allocate(
+            &contexts,
+            &[1, 2, 3, 4],
+            false,
+            1,
+            0,
+            &[],
+            true,
+            &[],
+            &state,
+            &[],
+        );
+        let r2 = address6_allocate(
+            &contexts,
+            &[1, 2, 3, 4],
+            false,
+            1,
+            0,
+            &[],
+            true,
+            &[],
+            &state,
+            &[],
+        );
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_address6_allocate_different_clid() {
+        let contexts = vec![make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            CONTEXT_V6,
+        )];
+        let state = DaemonState::default();
+        let r1 = address6_allocate(
+            &contexts,
+            &[1, 2, 3, 4],
+            false,
+            1,
+            0,
+            &[],
+            true,
+            &[],
+            &state,
+            &[],
+        );
+        let r2 = address6_allocate(
+            &contexts,
+            &[5, 6, 7, 8],
+            false,
+            1,
+            0,
+            &[],
+            true,
+            &[],
+            &state,
+            &[],
+        );
+        // Different CLIDs should typically produce different addresses
+        assert!(r1.is_some());
+        assert!(r2.is_some());
+    }
+
+    #[test]
+    fn test_address6_allocate_avoids_local6() {
+        let local6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let mut ctx = make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2),
+            64,
+            CONTEXT_V6,
+        );
+        ctx.local6 = local6;
+        let contexts = vec![ctx];
+        let state = DaemonState::default();
+        let result = address6_allocate(&contexts, &[0], false, 0, 0, &[], true, &[], &state, &[]);
+        // Should allocate addr 2 (avoiding local6 = 1)
+        if let Some((_, addr)) = result {
+            assert_ne!(addr, local6);
+        }
+    }
+
+    #[test]
+    fn test_address6_allocate_inverted_range() {
+        // end < start
+        let contexts = vec![make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            64,
+            CONTEXT_V6,
+        )];
+        let state = DaemonState::default();
+        let result = address6_allocate(
+            &contexts,
+            &[1, 2, 3],
+            false,
+            1,
+            0,
+            &[],
+            true,
+            &[],
+            &state,
+            &[],
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_address6_allocate_ra_stateless_skipped() {
+        let contexts = vec![make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            CONTEXT_V6 | CONTEXT_RA_STATELESS,
+        )];
+        let state = DaemonState::default();
+        let result = address6_allocate(
+            &contexts,
+            &[1, 2, 3],
+            false,
+            1,
+            0,
+            &[],
+            true,
+            &[],
+            &state,
+            &[],
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_address6_allocate_with_filter_pass0() {
+        let mut ctx = make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            CONTEXT_V6,
+        );
+        ctx.filter = vec![NetId {
+            net: "office".into(),
+        }];
+        let contexts = vec![ctx];
+        let state = DaemonState::default();
+        // netids match
+        let result = address6_allocate(
+            &contexts,
+            &[1, 2, 3],
+            false,
+            1,
+            0,
+            &[NetId {
+                net: "office".into(),
+            }],
+            true,
+            &[],
+            &state,
+            &[],
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_address6_allocate_with_filter_pass1_fallback() {
+        let mut ctx = make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            CONTEXT_V6,
+        );
+        ctx.filter = vec![NetId {
+            net: "office".into(),
+        }];
+        let contexts = vec![ctx];
+        let state = DaemonState::default();
+        // netids don't match, but pass 1 (relaxed) should still allocate
+        let result = address6_allocate(
+            &contexts,
+            &[1, 2, 3],
+            false,
+            1,
+            0,
+            &[NetId {
+                net: "guest".into(),
+            }],
+            true,
+            &[],
+            &state,
+            &[],
+        );
+        assert!(result.is_some());
+    }
+
+    // ---- collect_interface_v6_addrs tests ----
+
+    #[test]
+    fn test_collect_interface_v6_addrs_empty() {
+        let state = DaemonState::default();
+        let addrs = collect_interface_v6_addrs(&state);
+        assert!(addrs.is_empty());
+    }
+
+    fn make_iface_rec(
+        name: &str,
+        addr: std::net::IpAddr,
+        index: u32,
+    ) -> crate::core::types::InterfaceRecord {
+        crate::core::types::InterfaceRecord {
+            name: name.to_string(),
+            addr,
+            index,
+            netmask: None,
+            label: 0,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn test_collect_interface_v6_addrs_with_v6() {
+        let mut state = DaemonState::default();
+        state.interfaces.push(make_iface_rec(
+            "eth0",
+            std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            2,
+        ));
+        let addrs = collect_interface_v6_addrs(&state);
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].0, Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        assert_eq!(addrs[0].3, "eth0");
+    }
+
+    #[test]
+    fn test_collect_interface_v6_addrs_skips_v4() {
+        let mut state = DaemonState::default();
+        state.interfaces.push(make_iface_rec(
+            "eth0",
+            std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            2,
+        ));
+        let addrs = collect_interface_v6_addrs(&state);
+        assert!(addrs.is_empty());
+    }
+
+    // ---- collect_template_contexts ----
+
+    #[test]
+    fn test_collect_template_contexts_returns_empty() {
+        let state = DaemonState::default();
+        let tmps = collect_template_contexts(&state);
+        assert!(tmps.is_empty());
+    }
+
+    // ---- dhcp_construct_contexts tests ----
+
+    #[test]
+    fn test_dhcp_construct_contexts_empty_state() {
+        let mut state = DaemonState::default();
+        dhcp_construct_contexts(1000, &mut state);
+        // Should not panic with empty state
+    }
+
+    #[test]
+    fn test_dhcp_construct_contexts_with_interfaces() {
+        let mut state = DaemonState::default();
+        state.interfaces.push(make_iface_rec(
+            "eth0",
+            std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            2,
+        ));
+        dhcp_construct_contexts(1000, &mut state);
+    }
+
+    // ---- complete_context6_for_interface tests ----
+
+    #[test]
+    fn test_complete_context6_for_interface_no_match() {
+        let state = DaemonState::default();
+        let mut param = IfaceParam::default();
+        param.ind = 2;
+        complete_context6_for_interface(&state, &mut param);
+        assert!(param.current.is_empty());
+    }
+
+    // ---- make_duid tests (extra) ----
+
+    #[test]
+    fn test_make_duid_already_generated() {
+        let mut state = DaemonState::default();
+        state.duid = vec![1, 2, 3, 4];
+        make_duid(1000, &mut state);
+        assert_eq!(state.duid, vec![1, 2, 3, 4]); // Unchanged
+    }
+
+    #[test]
+    fn test_make_duid_enterprise_config() {
+        let mut state = DaemonState::default();
+        state.duid_config = vec![0xAA, 0xBB];
+        state.duid_enterprise = 12345;
+        make_duid(1000, &mut state);
+        assert!(!state.duid.is_empty());
+        // First 2 bytes should be DUID-EN type (0x0002)
+        assert_eq!(state.duid[0], 0);
+        assert_eq!(state.duid[1], 2);
+        // Bytes 2-5: enterprise number 12345 in big-endian
+        let ent = u32::from_be_bytes([state.duid[2], state.duid[3], state.duid[4], state.duid[5]]);
+        assert_eq!(ent, 12345);
+    }
+
+    #[test]
+    fn test_make_duid_empty_config_no_enterprise() {
+        let mut state = DaemonState::default();
+        state.duid_config = vec![0xAA];
+        state.duid_enterprise = 0; // zero enterprise → not DUID-EN
+        make_duid(1000, &mut state);
+        // Should still generate a DUID (fallback to LL)
+        assert!(!state.duid.is_empty());
+    }
+
+    // ---- IfaceParam tests ----
+
+    #[test]
+    fn test_iface_param_link_local() {
+        let mut param = IfaceParam::default();
+        param.ll_addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        assert!(!param.ll_addr.is_unspecified());
+        assert!(param.ula_addr.is_unspecified());
+        assert!(param.fallback.is_unspecified());
+    }
+
+    #[test]
+    fn test_iface_param_with_current() {
+        let mut param = IfaceParam::default();
+        let ctx = make_test_context(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            CONTEXT_V6,
+        );
+        param.current.push(ctx);
+        assert_eq!(param.current.len(), 1);
+    }
+
+    // ---- find_interface_mac tests ----
+
+    #[test]
+    fn test_find_interface_mac_empty_interfaces() {
+        let state = DaemonState::default();
+        let result = find_interface_mac(&state);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_interface_mac_skips_loopback() {
+        let mut state = DaemonState::default();
+        state.interfaces.push(make_iface_rec(
+            "lo",
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            1,
+        ));
+        let result = find_interface_mac(&state);
+        assert!(result.is_none());
     }
 }

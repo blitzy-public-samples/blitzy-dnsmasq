@@ -2570,4 +2570,2266 @@ mod tests {
         assert_eq!(status, DnssecStatus::Bogus);
         assert!(returned_flags.contains(DnssecFailFlags::NOSIG));
     }
+
+    // -----------------------------------------------------------------------
+    // DnssecFailFlags exhaustive tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fail_flags_all_variants() {
+        let all_flags = [
+            DnssecFailFlags::NOSIG,
+            DnssecFailFlags::NYV,
+            DnssecFailFlags::EXP,
+            DnssecFailFlags::NOKEYSUP,
+            DnssecFailFlags::NOZONE,
+            DnssecFailFlags::NOKEY,
+            DnssecFailFlags::NODSSUP,
+            DnssecFailFlags::NSEC3_ITERS,
+            DnssecFailFlags::NONSEC,
+            DnssecFailFlags::INDET,
+        ];
+        let mut flags = DnssecFailFlags::empty();
+        for &flag in &all_flags {
+            assert!(!flags.contains(flag));
+            flags.insert(flag);
+            assert!(flags.contains(flag));
+        }
+        // All flags now set
+        assert!(!flags.is_empty());
+        for &flag in &all_flags {
+            assert!(flags.contains(flag));
+        }
+    }
+
+    #[test]
+    fn test_fail_flags_from_bits() {
+        let flags = DnssecFailFlags::from_bits(0x0003);
+        assert!(flags.contains(DnssecFailFlags::NOSIG));
+        assert!(flags.contains(DnssecFailFlags::NYV));
+        assert!(!flags.contains(DnssecFailFlags::EXP));
+        assert_eq!(flags.bits(), 0x0003);
+    }
+
+    #[test]
+    fn test_fail_flags_from_bits_zero() {
+        let flags = DnssecFailFlags::from_bits(0);
+        assert!(flags.is_empty());
+    }
+
+    #[test]
+    fn test_fail_flags_insert_idempotent() {
+        let mut flags = DnssecFailFlags::empty();
+        flags.insert(DnssecFailFlags::EXP);
+        let bits1 = flags.bits();
+        flags.insert(DnssecFailFlags::EXP);
+        assert_eq!(flags.bits(), bits1);
+    }
+
+    // -----------------------------------------------------------------------
+    // errflags_to_ede comprehensive tests (all single-flag combinations)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_errflags_to_ede_nozone() {
+        let mut flags = DnssecFailFlags::empty();
+        flags.insert(DnssecFailFlags::NOZONE);
+        assert_eq!(errflags_to_ede(&flags), ede::NO_ZONE_KEY as i16);
+    }
+
+    #[test]
+    fn test_errflags_to_ede_nokey() {
+        let mut flags = DnssecFailFlags::empty();
+        flags.insert(DnssecFailFlags::NOKEY);
+        assert_eq!(errflags_to_ede(&flags), ede::DNSKEY_MISSING as i16);
+    }
+
+    #[test]
+    fn test_errflags_to_ede_all_flags_priority() {
+        // All flags set: NYV should win (highest priority)
+        let mut flags = DnssecFailFlags::empty();
+        flags.insert(DnssecFailFlags::NOSIG);
+        flags.insert(DnssecFailFlags::NYV);
+        flags.insert(DnssecFailFlags::EXP);
+        flags.insert(DnssecFailFlags::NOKEYSUP);
+        flags.insert(DnssecFailFlags::NOZONE);
+        flags.insert(DnssecFailFlags::NOKEY);
+        flags.insert(DnssecFailFlags::NODSSUP);
+        flags.insert(DnssecFailFlags::NSEC3_ITERS);
+        flags.insert(DnssecFailFlags::NONSEC);
+        flags.insert(DnssecFailFlags::INDET);
+        assert_eq!(errflags_to_ede(&flags), ede::SIG_NOT_YET_VALID as i16);
+    }
+
+    #[test]
+    fn test_errflags_to_ede_exp_and_nokeysup() {
+        let mut flags = DnssecFailFlags::empty();
+        flags.insert(DnssecFailFlags::EXP);
+        flags.insert(DnssecFailFlags::NOKEYSUP);
+        assert_eq!(errflags_to_ede(&flags), ede::SIG_EXPIRED as i16);
+    }
+
+    // -----------------------------------------------------------------------
+    // DnssecStatus comprehensive tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_status_needs_additional_query_all_variants() {
+        assert!(!DnssecStatus::Secure.needs_additional_query());
+        assert!(!DnssecStatus::Insecure.needs_additional_query());
+        assert!(!DnssecStatus::Bogus.needs_additional_query());
+        assert!(DnssecStatus::NeedDsDigest.needs_additional_query());
+        assert!(DnssecStatus::NeedKey.needs_additional_query());
+        assert!(DnssecStatus::NeedDs.needs_additional_query());
+        assert!(DnssecStatus::Truncated.needs_additional_query());
+        assert!(!DnssecStatus::Abandoned.needs_additional_query());
+    }
+
+    #[test]
+    fn test_status_is_secure_exhaustive() {
+        assert!(DnssecStatus::Secure.is_secure());
+        assert!(!DnssecStatus::Insecure.is_secure());
+        assert!(!DnssecStatus::Bogus.is_secure());
+        assert!(!DnssecStatus::NeedDsDigest.is_secure());
+        assert!(!DnssecStatus::NeedKey.is_secure());
+        assert!(!DnssecStatus::NeedDs.is_secure());
+        assert!(!DnssecStatus::Truncated.is_secure());
+        assert!(!DnssecStatus::Abandoned.is_secure());
+    }
+
+    #[test]
+    fn test_status_is_bogus_exhaustive() {
+        assert!(!DnssecStatus::Secure.is_bogus());
+        assert!(!DnssecStatus::Insecure.is_bogus());
+        assert!(DnssecStatus::Bogus.is_bogus());
+        assert!(!DnssecStatus::NeedDsDigest.is_bogus());
+        assert!(!DnssecStatus::NeedKey.is_bogus());
+    }
+
+    #[test]
+    fn test_status_is_insecure_exhaustive() {
+        assert!(!DnssecStatus::Secure.is_insecure());
+        assert!(DnssecStatus::Insecure.is_insecure());
+        assert!(!DnssecStatus::Bogus.is_insecure());
+        assert!(!DnssecStatus::NeedKey.is_insecure());
+        assert!(!DnssecStatus::Abandoned.is_insecure());
+    }
+
+    // -----------------------------------------------------------------------
+    // serial_compare_32 additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_serial_compare_boundary() {
+        // One past half-space: 0 is "ahead" of 0x80000001 in serial space
+        assert_eq!(serial_compare_32(0, 0x80000001), SERIAL_GT);
+        assert_eq!(serial_compare_32(0x80000001, 0), SERIAL_LT);
+    }
+
+    #[test]
+    fn test_serial_compare_large_values() {
+        assert_eq!(serial_compare_32(0xFFFFFFFE, 0xFFFFFFFF), SERIAL_LT);
+        assert_eq!(serial_compare_32(0xFFFFFFFF, 0xFFFFFFFE), SERIAL_GT);
+    }
+
+    #[test]
+    fn test_serial_compare_wraparound_small() {
+        // 5 is "greater" than 0xFFFFFFF0 in serial arithmetic (wraps around)
+        assert_eq!(serial_compare_32(5, 0xFFFFFFF0), SERIAL_GT);
+        assert_eq!(serial_compare_32(0xFFFFFFF0, 5), SERIAL_LT);
+    }
+
+    // -----------------------------------------------------------------------
+    // count_labels additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_count_labels_trailing_dot_variants() {
+        assert_eq!(count_labels("com."), 1);
+        assert_eq!(count_labels("a.b.c."), 3);
+    }
+
+    #[test]
+    fn test_count_labels_single_char_labels() {
+        assert_eq!(count_labels("a.b.c.d.e.f"), 6);
+    }
+
+    // -----------------------------------------------------------------------
+    // canonical_dns_name_cmp comprehensive tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_canonical_cmp_equal() {
+        assert_eq!(
+            canonical_dns_name_cmp("example.com", "example.com"),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_canonical_cmp_case_insensitive() {
+        assert_eq!(
+            canonical_dns_name_cmp("Example.COM", "example.com"),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_canonical_cmp_different_tld() {
+        // "com" < "org" → example.com < example.org
+        assert_eq!(
+            canonical_dns_name_cmp("example.com", "example.org"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_canonical_cmp_parent_child() {
+        // Shorter name (suffix) sorts before longer name
+        assert_eq!(
+            canonical_dns_name_cmp("example.com", "www.example.com"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_canonical_cmp_sibling_subdomains() {
+        // Compare leftmost labels after right labels match
+        assert_eq!(
+            canonical_dns_name_cmp("a.example.com", "b.example.com"),
+            Ordering::Less
+        );
+        assert_eq!(
+            canonical_dns_name_cmp("z.example.com", "a.example.com"),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_canonical_cmp_root() {
+        assert_eq!(canonical_dns_name_cmp(".", "."), Ordering::Equal);
+        assert_eq!(canonical_dns_name_cmp("", ""), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_canonical_cmp_root_vs_name() {
+        // Root sorts before everything
+        assert_eq!(canonical_dns_name_cmp(".", "com"), Ordering::Less);
+        assert_eq!(canonical_dns_name_cmp("com", "."), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_canonical_cmp_trailing_dots() {
+        assert_eq!(
+            canonical_dns_name_cmp("example.com.", "example.com"),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_canonical_cmp_different_label_lengths() {
+        // "abc.com" vs "ab.com" — compare "abc" vs "ab": "ab" < "abc"
+        assert_eq!(
+            canonical_dns_name_cmp("abc.com", "ab.com"),
+            Ordering::Greater
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // name_to_wire comprehensive tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_name_to_wire_root() {
+        assert_eq!(name_to_wire(""), vec![0]);
+        assert_eq!(name_to_wire("."), vec![0]);
+    }
+
+    #[test]
+    fn test_name_to_wire_single_label() {
+        let wire = name_to_wire("com");
+        assert_eq!(wire, vec![3, b'c', b'o', b'm', 0]);
+    }
+
+    #[test]
+    fn test_name_to_wire_multi_label() {
+        let wire = name_to_wire("www.example.com");
+        assert_eq!(
+            wire,
+            vec![
+                3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o',
+                b'm', 0
+            ]
+        );
+    }
+
+    #[test]
+    fn test_name_to_wire_lowercase() {
+        let wire = name_to_wire("WWW.EXAMPLE.COM");
+        assert_eq!(
+            wire,
+            vec![
+                3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o',
+                b'm', 0
+            ]
+        );
+    }
+
+    #[test]
+    fn test_name_to_wire_trailing_dot() {
+        let wire = name_to_wire("example.com.");
+        // Trailing dot results in empty label filtered out
+        assert_eq!(
+            wire,
+            vec![7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // dnskey_keytag additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_keytag_empty_key() {
+        let tag = dnskey_keytag(8, 0x0101, &[]);
+        // Should not panic with empty key
+        // Base: flags(0x0101) + 0x300 + algo(8) = 0x0101 + 0x300 + 8 = 0x0409
+        // ac += ac >> 16 → 0x0409 + 0 = 0x0409
+        // tag = 0x0409 & 0xffff = 0x0409 = 1033
+        assert_eq!(tag, 1033);
+    }
+
+    #[test]
+    fn test_keytag_algo1_short_key() {
+        // Algorithm 1 with key shorter than 4 bytes
+        let tag = dnskey_keytag(1, 0x0100, &[0xAA, 0xBB]);
+        assert_eq!(tag, 0);
+    }
+
+    #[test]
+    fn test_keytag_algo1_exact_4_bytes() {
+        let key = vec![0x00, 0x01, 0x02, 0x03];
+        let tag = dnskey_keytag(1, 0x0100, &key);
+        assert_eq!(tag, (0x00 as u16) * 256 + 0x01);
+    }
+
+    #[test]
+    fn test_keytag_deterministic() {
+        let key = vec![0x03, 0x08, 0xAA, 0xBB, 0xCC, 0xDD];
+        let tag1 = dnskey_keytag(8, 0x0101, &key);
+        let tag2 = dnskey_keytag(8, 0x0101, &key);
+        assert_eq!(tag1, tag2);
+    }
+
+    #[test]
+    fn test_keytag_different_flags() {
+        let key = vec![0x01, 0x02, 0x03, 0x04];
+        let tag1 = dnskey_keytag(8, 0x0100, &key);
+        let tag2 = dnskey_keytag(8, 0x0101, &key);
+        assert_ne!(tag1, tag2); // Different flags → different tags
+    }
+
+    // -----------------------------------------------------------------------
+    // base32_decode comprehensive tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_base32_decode_empty() {
+        assert_eq!(base32_decode(""), Some(vec![]));
+    }
+
+    #[test]
+    fn test_base32_decode_valid_hex_chars() {
+        // '0' through '9' = values 0-9
+        let result = base32_decode("01234567890").unwrap();
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_base32_decode_valid_alpha_chars() {
+        // 'a' through 'v' = values 10-31
+        let result = base32_decode("abcdefghijklmnopqrstuv").unwrap();
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_base32_decode_case_insensitive() {
+        let lower = base32_decode("abc");
+        let upper = base32_decode("ABC");
+        assert_eq!(lower, upper);
+    }
+
+    #[test]
+    fn test_base32_decode_stops_at_dot() {
+        let result1 = base32_decode("abc.example.com");
+        let result2 = base32_decode("abc");
+        assert_eq!(result1, result2);
+    }
+
+    #[test]
+    fn test_base32_decode_invalid_char() {
+        assert!(base32_decode("abc!").is_none());
+        assert!(base32_decode("xyz").is_none()); // 'x', 'y', 'z' are > 'v'
+    }
+
+    #[test]
+    fn test_base32_decode_w_is_invalid() {
+        // 'w' is beyond 'v' in the extended hex alphabet
+        assert!(base32_decode("w").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // check_type_bitmap comprehensive tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_type_bitmap_empty() {
+        assert!(!check_type_bitmap(&[], RRType::A));
+        assert!(!check_type_bitmap(&[], RRType::AAAA));
+        assert!(!check_type_bitmap(&[], RRType::MX));
+    }
+
+    #[test]
+    fn test_type_bitmap_a_only() {
+        // A = type 1: window 0, byte 0, bit 6 (7-1=6)
+        let bitmap = vec![0u8, 1, 0x40]; // Window 0, len 1, byte 0 = 0x40
+        assert!(check_type_bitmap(&bitmap, RRType::A));
+        assert!(!check_type_bitmap(&bitmap, RRType::AAAA));
+        assert!(!check_type_bitmap(&bitmap, RRType::NS));
+    }
+
+    #[test]
+    fn test_type_bitmap_ns_and_soa() {
+        // NS = type 2: window 0, byte 0, bit 5 (7-2=5) → 0x20
+        // SOA = type 6: window 0, byte 0, bit 1 (7-6=1) → 0x02
+        let bitmap = vec![0u8, 1, 0x22]; // 0x20 | 0x02
+        assert!(check_type_bitmap(&bitmap, RRType::NS));
+        assert!(check_type_bitmap(&bitmap, RRType::from_u16(6))); // SOA
+        assert!(!check_type_bitmap(&bitmap, RRType::A));
+    }
+
+    #[test]
+    fn test_type_bitmap_wrong_window() {
+        // Window 1 bitmap won't match window 0 types
+        let bitmap = vec![1u8, 1, 0xFF]; // Window 1
+        assert!(!check_type_bitmap(&bitmap, RRType::A)); // type 1 is window 0
+    }
+
+    #[test]
+    fn test_type_bitmap_truncated() {
+        // Block length exceeds remaining data
+        let bitmap = vec![0u8, 10, 0xFF]; // Claims length 10 but only 1 byte follows
+        assert!(!check_type_bitmap(&bitmap, RRType::A));
+    }
+
+    #[test]
+    fn test_type_bitmap_multiple_windows() {
+        // Window 0 with A type, then Window 1 (unused types 256+)
+        let bitmap = vec![
+            0u8, 1, 0x40, // Window 0, len 1, A set
+            1, 1, 0x80, // Window 1, len 1, type 256 set
+        ];
+        assert!(check_type_bitmap(&bitmap, RRType::A));
+        assert!(check_type_bitmap(&bitmap, RRType::from_u16(256)));
+        assert!(!check_type_bitmap(&bitmap, RRType::AAAA));
+    }
+
+    // -----------------------------------------------------------------------
+    // DnssecLimits additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_limits_dec_sig_fail() {
+        let mut limits = DnssecLimits::new(10, 3, 100, 50);
+        assert!(!limits.dec_sig_fail());
+        assert!(!limits.dec_sig_fail());
+        assert!(!limits.dec_sig_fail());
+        assert!(limits.dec_sig_fail()); // exhausted
+        assert!(limits.is_exhausted());
+    }
+
+    #[test]
+    fn test_limits_dec_crypto() {
+        let mut limits = DnssecLimits::new(10, 10, 2, 50);
+        assert!(!limits.dec_crypto());
+        assert!(!limits.dec_crypto());
+        assert!(limits.dec_crypto()); // exhausted
+    }
+
+    #[test]
+    fn test_limits_is_exhausted_checks_all() {
+        // Not exhausted when all > 0
+        let limits = DnssecLimits::new(1, 1, 1, 1);
+        assert!(!limits.is_exhausted());
+
+        // Exhausted when work = 0
+        let limits = DnssecLimits::new(0, 1, 1, 1);
+        assert!(limits.is_exhausted());
+
+        // Exhausted when sig_fail = 0
+        let limits = DnssecLimits::new(1, 0, 1, 1);
+        assert!(limits.is_exhausted());
+
+        // Exhausted when crypto = 0
+        let limits = DnssecLimits::new(1, 1, 0, 1);
+        assert!(limits.is_exhausted());
+    }
+
+    // -----------------------------------------------------------------------
+    // TrustAnchor additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_trust_anchor_fields() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("example.com"),
+            12345,
+            13,
+            2,
+            vec![0x01, 0x02, 0x03],
+        );
+        assert_eq!(ta.key_tag, 12345);
+        assert_eq!(ta.algorithm, 13);
+        assert_eq!(ta.digest_type, 2);
+        assert_eq!(ta.digest, vec![0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn test_trust_anchor_matches_partial() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("."),
+            20326,
+            8,
+            2,
+            vec![0xAA, 0xBB],
+        );
+        // Wrong key_tag
+        assert!(!ta.matches_ds(65535, 8, 2, &[0xAA, 0xBB]));
+        // Wrong algorithm
+        assert!(!ta.matches_ds(20326, 99, 2, &[0xAA, 0xBB]));
+        // Wrong digest_type
+        assert!(!ta.matches_ds(20326, 8, 99, &[0xAA, 0xBB]));
+        // Wrong digest
+        assert!(!ta.matches_ds(20326, 8, 2, &[0xFF, 0xFF]));
+        // Correct
+        assert!(ta.matches_ds(20326, 8, 2, &[0xAA, 0xBB]));
+    }
+
+    // -----------------------------------------------------------------------
+    // DnssecValidator construction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validator_new_empty() {
+        let validator = DnssecValidator::new(vec![], true);
+        assert!(validator.trust_anchors.is_empty());
+        assert!(validator.check_date);
+    }
+
+    #[test]
+    fn test_validator_new_with_anchors() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("."),
+            20326,
+            8,
+            2,
+            vec![0xE0, 0x6D],
+        );
+        let validator = DnssecValidator::new(vec![ta], false);
+        assert_eq!(validator.trust_anchors.len(), 1);
+        assert!(!validator.check_date);
+    }
+
+    // -----------------------------------------------------------------------
+    // with_fail_flags additional combinations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_with_fail_flags_empty() {
+        let flags = DnssecFailFlags::empty();
+        let (status, returned_flags) = DnssecStatus::Bogus.with_fail_flags(flags);
+        assert_eq!(status, DnssecStatus::Bogus);
+        assert!(returned_flags.is_empty());
+    }
+
+    #[test]
+    fn test_with_fail_flags_multiple() {
+        let mut flags = DnssecFailFlags::empty();
+        flags.insert(DnssecFailFlags::NOSIG);
+        flags.insert(DnssecFailFlags::EXP);
+        let (_, returned_flags) = DnssecStatus::Bogus.with_fail_flags(flags);
+        assert!(returned_flags.contains(DnssecFailFlags::NOSIG));
+        assert!(returned_flags.contains(DnssecFailFlags::EXP));
+    }
+
+    #[test]
+    fn test_with_fail_flags_secure_status() {
+        let flags = DnssecFailFlags::empty();
+        let (status, _) = DnssecStatus::Secure.with_fail_flags(flags);
+        assert_eq!(status, DnssecStatus::Secure);
+    }
+
+    // =========================================================================
+    // Additional comprehensive tests for coverage
+    // =========================================================================
+
+    use crate::dns::protocol::{DnsHeaderFlags, DnsPacketBuilder};
+
+    // --- canonical_dns_name_cmp edge cases ---
+
+    #[test]
+    fn test_canonical_cmp_empty_vs_empty() {
+        assert_eq!(canonical_dns_name_cmp("", ""), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_canonical_cmp_empty_vs_name() {
+        assert_eq!(canonical_dns_name_cmp("", "a.com"), Ordering::Less);
+        assert_eq!(canonical_dns_name_cmp("a.com", ""), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_canonical_cmp_deep_subdomain() {
+        let r = canonical_dns_name_cmp("a.b.c.example.com", "d.e.f.example.com");
+        assert_eq!(r, Ordering::Less);
+    }
+
+    #[test]
+    fn test_canonical_cmp_numeric_labels() {
+        assert_eq!(canonical_dns_name_cmp("1.com", "2.com"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_canonical_cmp_mixed_case_deep() {
+        assert_eq!(
+            canonical_dns_name_cmp("A.B.Example.COM", "a.b.example.com"),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_canonical_cmp_prefix_label() {
+        assert_eq!(canonical_dns_name_cmp("ab.com", "a.com"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_canonical_cmp_single_labels() {
+        assert_eq!(canonical_dns_name_cmp("abc", "def"), Ordering::Less);
+        assert_eq!(canonical_dns_name_cmp("xyz", "abc"), Ordering::Greater);
+    }
+
+    // --- name_to_wire edge cases ---
+
+    #[test]
+    fn test_name_to_wire_empty_string() {
+        let wire = name_to_wire("");
+        assert_eq!(wire, vec![0]);
+    }
+
+    #[test]
+    fn test_name_to_wire_only_dots() {
+        let wire = name_to_wire("...");
+        assert_eq!(wire, vec![0]);
+    }
+
+    #[test]
+    fn test_name_to_wire_long_label() {
+        let wire = name_to_wire("abcdefghij.com");
+        assert_eq!(wire[0], 10);
+        assert_eq!(&wire[1..11], b"abcdefghij");
+        assert_eq!(wire[11], 3);
+        assert_eq!(&wire[12..15], b"com");
+        assert_eq!(wire[15], 0);
+    }
+
+    #[test]
+    fn test_name_to_wire_uppercase_converted() {
+        let wire = name_to_wire("ABC.DEF");
+        assert_eq!(wire[0], 3);
+        assert_eq!(&wire[1..4], b"abc");
+        assert_eq!(wire[4], 3);
+        assert_eq!(&wire[5..8], b"def");
+        assert_eq!(wire[8], 0);
+    }
+
+    // --- serial_compare_32 additional edge cases ---
+
+    #[test]
+    fn test_serial_compare_zero_vs_max() {
+        assert_eq!(serial_compare_32(0, u32::MAX), SERIAL_GT);
+    }
+
+    #[test]
+    fn test_serial_compare_max_vs_zero() {
+        assert_eq!(serial_compare_32(u32::MAX, 0), SERIAL_LT);
+    }
+
+    #[test]
+    fn test_serial_compare_identical_large() {
+        assert_eq!(serial_compare_32(0xFFFFFFFF, 0xFFFFFFFF), SERIAL_EQ);
+    }
+
+    #[test]
+    fn test_serial_compare_half_space_exactly() {
+        assert_eq!(serial_compare_32(0, 0x80000000), SERIAL_UNDEF);
+        assert_eq!(serial_compare_32(0x80000000, 0), SERIAL_UNDEF);
+    }
+
+    #[test]
+    fn test_serial_compare_just_below_half() {
+        assert_eq!(serial_compare_32(0x7FFFFFFF, 0), SERIAL_GT);
+    }
+
+    #[test]
+    fn test_serial_compare_just_above_half() {
+        assert_eq!(serial_compare_32(0x80000001, 0), SERIAL_LT);
+    }
+
+    // --- count_labels edge cases ---
+
+    #[test]
+    fn test_count_labels_deeply_nested() {
+        assert_eq!(count_labels("a.b.c.d.e.f.g.h"), 8);
+    }
+
+    #[test]
+    fn test_count_labels_dots_only() {
+        assert_eq!(count_labels("..."), 0);
+    }
+
+    #[test]
+    fn test_count_labels_single_trailing_dot() {
+        assert_eq!(count_labels("example.com."), 2);
+    }
+
+    #[test]
+    fn test_count_labels_multiple_trailing_dots() {
+        assert_eq!(count_labels("example.com.."), 2);
+    }
+
+    // --- dnskey_keytag edge cases ---
+
+    #[test]
+    fn test_keytag_algo1_large_key() {
+        let key = vec![0x00, 0x01, 0x02, 0x03, 0xAB, 0xCD, 0xEF, 0x12];
+        let tag = dnskey_keytag(1, 0x0100, &key);
+        assert_eq!(tag, 0xAB * 256 + 0xCD);
+    }
+
+    #[test]
+    fn test_keytag_algo1_exactly_3_bytes() {
+        let key = vec![0x01, 0x02, 0x03];
+        assert_eq!(dnskey_keytag(1, 0x0100, &key), 0);
+    }
+
+    #[test]
+    fn test_keytag_normal_algo_odd_length_key() {
+        let key = vec![0x01, 0x02, 0x03];
+        let tag1 = dnskey_keytag(8, 0x0100, &key);
+        let tag2 = dnskey_keytag(8, 0x0100, &key);
+        assert_eq!(tag1, tag2);
+    }
+
+    #[test]
+    fn test_keytag_normal_algo_even_length_key() {
+        let key = vec![0x01, 0x02, 0x03, 0x04];
+        let tag = dnskey_keytag(8, 0x0100, &key);
+        assert_eq!(tag, 2062);
+    }
+
+    // --- base32_decode edge cases ---
+
+    #[test]
+    fn test_base32_decode_single_char() {
+        let result = base32_decode("0").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_base32_decode_two_chars() {
+        let result = base32_decode("00").unwrap();
+        assert_eq!(result, vec![0]);
+    }
+
+    #[test]
+    fn test_base32_decode_max_value_chars() {
+        let result = base32_decode("vv");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_base32_decode_mixed_case() {
+        let lower = base32_decode("abc").unwrap();
+        let upper = base32_decode("ABC").unwrap();
+        assert_eq!(lower, upper);
+    }
+
+    #[test]
+    fn test_base32_decode_stops_at_first_dot() {
+        let r1 = base32_decode("00.11").unwrap();
+        let r2 = base32_decode("00").unwrap();
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_base32_decode_invalid_chars() {
+        assert!(base32_decode("xyz").is_none());
+        assert!(base32_decode("!@#").is_none());
+        assert!(base32_decode(" ").is_none());
+    }
+
+    // --- check_type_bitmap edge cases ---
+
+    #[test]
+    fn test_type_bitmap_high_type_number() {
+        let bitmap = vec![1, 1, 0x80];
+        assert!(check_type_bitmap(&bitmap, RRType::from_u16(256)));
+        assert!(!check_type_bitmap(&bitmap, RRType::A));
+    }
+
+    #[test]
+    fn test_type_bitmap_byte_offset_in_block() {
+        let bitmap = vec![0, 2, 0x00, 0x01];
+        assert!(check_type_bitmap(&bitmap, RRType::MX));
+    }
+
+    #[test]
+    fn test_type_bitmap_block_len_too_short() {
+        let bitmap = vec![0, 0];
+        assert!(!check_type_bitmap(&bitmap, RRType::A));
+    }
+
+    #[test]
+    fn test_type_bitmap_truncated_block() {
+        let bitmap = vec![0, 5, 0xFF, 0xFF];
+        assert!(!check_type_bitmap(&bitmap, RRType::A));
+    }
+
+    #[test]
+    fn test_type_bitmap_all_types_in_window0() {
+        let bitmap = vec![0, 4, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(check_type_bitmap(&bitmap, RRType::A));
+        assert!(check_type_bitmap(&bitmap, RRType::NS));
+        assert!(check_type_bitmap(&bitmap, RRType::CNAME));
+        assert!(check_type_bitmap(&bitmap, RRType::SOA));
+        assert!(check_type_bitmap(&bitmap, RRType::MX));
+        assert!(check_type_bitmap(&bitmap, RRType::AAAA));
+    }
+
+    // --- DnssecStatus exhaustive tests ---
+
+    #[test]
+    fn test_status_all_variants_is_secure() {
+        assert!(DnssecStatus::Secure.is_secure());
+        assert!(!DnssecStatus::Insecure.is_secure());
+        assert!(!DnssecStatus::Bogus.is_secure());
+        assert!(!DnssecStatus::NeedDsDigest.is_secure());
+        assert!(!DnssecStatus::NeedKey.is_secure());
+        assert!(!DnssecStatus::NeedDs.is_secure());
+        assert!(!DnssecStatus::Truncated.is_secure());
+        assert!(!DnssecStatus::Abandoned.is_secure());
+    }
+
+    #[test]
+    fn test_status_all_variants_is_bogus() {
+        assert!(!DnssecStatus::Secure.is_bogus());
+        assert!(!DnssecStatus::Insecure.is_bogus());
+        assert!(DnssecStatus::Bogus.is_bogus());
+        assert!(!DnssecStatus::NeedDsDigest.is_bogus());
+        assert!(!DnssecStatus::NeedKey.is_bogus());
+        assert!(!DnssecStatus::NeedDs.is_bogus());
+        assert!(!DnssecStatus::Truncated.is_bogus());
+        assert!(!DnssecStatus::Abandoned.is_bogus());
+    }
+
+    #[test]
+    fn test_status_all_variants_is_insecure() {
+        assert!(!DnssecStatus::Secure.is_insecure());
+        assert!(DnssecStatus::Insecure.is_insecure());
+        assert!(!DnssecStatus::Bogus.is_insecure());
+        assert!(!DnssecStatus::NeedDsDigest.is_insecure());
+        assert!(!DnssecStatus::NeedKey.is_insecure());
+        assert!(!DnssecStatus::NeedDs.is_insecure());
+        assert!(!DnssecStatus::Truncated.is_insecure());
+        assert!(!DnssecStatus::Abandoned.is_insecure());
+    }
+
+    #[test]
+    fn test_status_all_variants_needs_additional() {
+        assert!(!DnssecStatus::Secure.needs_additional_query());
+        assert!(!DnssecStatus::Insecure.needs_additional_query());
+        assert!(!DnssecStatus::Bogus.needs_additional_query());
+        assert!(DnssecStatus::NeedDsDigest.needs_additional_query());
+        assert!(DnssecStatus::NeedKey.needs_additional_query());
+        assert!(DnssecStatus::NeedDs.needs_additional_query());
+        assert!(DnssecStatus::Truncated.needs_additional_query());
+        assert!(!DnssecStatus::Abandoned.needs_additional_query());
+    }
+
+    // --- DnssecFailFlags comprehensive tests ---
+
+    #[test]
+    fn test_fail_flags_all_individual_flags() {
+        let all_flags: &[u32] = &[
+            DnssecFailFlags::NOSIG,
+            DnssecFailFlags::NYV,
+            DnssecFailFlags::EXP,
+            DnssecFailFlags::NOKEYSUP,
+            DnssecFailFlags::NOZONE,
+            DnssecFailFlags::NOKEY,
+            DnssecFailFlags::NODSSUP,
+            DnssecFailFlags::NSEC3_ITERS,
+            DnssecFailFlags::NONSEC,
+            DnssecFailFlags::INDET,
+        ];
+        for flag in all_flags {
+            let mut flags = DnssecFailFlags::empty();
+            assert!(!flags.contains(*flag));
+            flags.insert(*flag);
+            assert!(flags.contains(*flag));
+            assert!(!flags.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_fail_flags_combine_all() {
+        let mut flags = DnssecFailFlags::empty();
+        flags.insert(DnssecFailFlags::NOSIG);
+        flags.insert(DnssecFailFlags::NYV);
+        flags.insert(DnssecFailFlags::EXP);
+        flags.insert(DnssecFailFlags::NOKEYSUP);
+        flags.insert(DnssecFailFlags::NOZONE);
+        flags.insert(DnssecFailFlags::NOKEY);
+        flags.insert(DnssecFailFlags::NODSSUP);
+        flags.insert(DnssecFailFlags::NSEC3_ITERS);
+        flags.insert(DnssecFailFlags::NONSEC);
+        flags.insert(DnssecFailFlags::INDET);
+        let expected_bits =
+            0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0020 | 0x0040 | 0x0080 | 0x0100 | 0x0200;
+        assert_eq!(flags.bits(), expected_bits);
+    }
+
+    #[test]
+    fn test_fail_flags_from_bits_roundtrip() {
+        let bits: u32 = 0x0135;
+        let flags = DnssecFailFlags::from_bits(bits);
+        assert_eq!(flags.bits(), bits);
+        assert!(flags.contains(DnssecFailFlags::NOSIG));
+        assert!(!flags.contains(DnssecFailFlags::NYV));
+        assert!(flags.contains(DnssecFailFlags::EXP));
+        assert!(flags.contains(DnssecFailFlags::NOZONE));
+        assert!(flags.contains(DnssecFailFlags::NOKEY));
+        assert!(flags.contains(DnssecFailFlags::NONSEC));
+    }
+
+    // --- errflags_to_ede comprehensive priority tests ---
+
+    #[test]
+    fn test_errflags_to_ede_each_individual_flag() {
+        let cases: Vec<(u32, i16)> = vec![
+            (DnssecFailFlags::NOSIG, ede::RRSIG_MISSING as i16),
+            (DnssecFailFlags::NYV, ede::SIG_NOT_YET_VALID as i16),
+            (DnssecFailFlags::EXP, ede::SIG_EXPIRED as i16),
+            (DnssecFailFlags::NOKEYSUP, ede::UNSUP_DNSKEY as i16),
+            (DnssecFailFlags::NOZONE, ede::NO_ZONE_KEY as i16),
+            (DnssecFailFlags::NOKEY, ede::DNSKEY_MISSING as i16),
+            (DnssecFailFlags::NODSSUP, ede::UNSUP_DS as i16),
+            (DnssecFailFlags::NSEC3_ITERS, ede::UNS_NS3_ITER as i16),
+            (DnssecFailFlags::NONSEC, ede::NSEC_MISSING as i16),
+            (DnssecFailFlags::INDET, ede::DNSSEC_INDETERMINATE as i16),
+        ];
+        for (flag, expected_ede) in &cases {
+            let mut f = DnssecFailFlags::empty();
+            f.insert(*flag);
+            assert_eq!(
+                errflags_to_ede(&f),
+                *expected_ede,
+                "flag {} should map to ede {}",
+                flag,
+                expected_ede
+            );
+        }
+    }
+
+    #[test]
+    fn test_errflags_to_ede_priority_nyv_over_all() {
+        let mut f = DnssecFailFlags::empty();
+        f.insert(DnssecFailFlags::NYV);
+        f.insert(DnssecFailFlags::NOSIG);
+        f.insert(DnssecFailFlags::EXP);
+        f.insert(DnssecFailFlags::NOKEY);
+        assert_eq!(errflags_to_ede(&f), ede::SIG_NOT_YET_VALID as i16);
+    }
+
+    #[test]
+    fn test_errflags_to_ede_priority_exp_over_nokeysup() {
+        let mut f = DnssecFailFlags::empty();
+        f.insert(DnssecFailFlags::EXP);
+        f.insert(DnssecFailFlags::NOKEYSUP);
+        assert_eq!(errflags_to_ede(&f), ede::SIG_EXPIRED as i16);
+    }
+
+    #[test]
+    fn test_errflags_to_ede_nodssup_over_nsec3() {
+        let mut f = DnssecFailFlags::empty();
+        f.insert(DnssecFailFlags::NODSSUP);
+        f.insert(DnssecFailFlags::NSEC3_ITERS);
+        assert_eq!(errflags_to_ede(&f), ede::UNSUP_DS as i16);
+    }
+
+    // --- DnssecLimits comprehensive tests ---
+
+    #[test]
+    fn test_limits_default_values() {
+        let limits = DnssecLimits::default();
+        assert_eq!(limits.max_work, DNSSEC_LIMIT_WORK);
+        assert_eq!(limits.max_sig_fail, DNSSEC_LIMIT_SIG_FAIL);
+        assert_eq!(limits.max_crypto, DNSSEC_LIMIT_CRYPTO);
+        assert_eq!(limits.max_nsec3_iters, DNSSEC_LIMIT_NSEC3_ITERS);
+    }
+
+    #[test]
+    fn test_limits_custom_values() {
+        let limits = DnssecLimits::new(10, 5, 50, 100);
+        assert_eq!(limits.max_work, 10);
+        assert_eq!(limits.max_sig_fail, 5);
+        assert_eq!(limits.max_crypto, 50);
+        assert_eq!(limits.max_nsec3_iters, 100);
+    }
+
+    #[test]
+    fn test_limits_dec_work_to_exhaustion() {
+        let mut limits = DnssecLimits::new(3, 10, 10, 10);
+        assert!(!limits.dec_work());
+        assert_eq!(limits.max_work, 2);
+        assert!(!limits.dec_work());
+        assert_eq!(limits.max_work, 1);
+        assert!(!limits.dec_work());
+        assert_eq!(limits.max_work, 0);
+        assert!(limits.dec_work());
+    }
+
+    #[test]
+    fn test_limits_dec_sig_fail_to_exhaustion() {
+        let mut limits = DnssecLimits::new(10, 2, 10, 10);
+        assert!(!limits.dec_sig_fail());
+        assert!(!limits.dec_sig_fail());
+        assert!(limits.dec_sig_fail());
+    }
+
+    #[test]
+    fn test_limits_dec_crypto_to_exhaustion() {
+        let mut limits = DnssecLimits::new(10, 10, 1, 10);
+        assert!(!limits.dec_crypto());
+        assert!(limits.dec_crypto());
+    }
+
+    #[test]
+    fn test_limits_is_exhausted_work() {
+        let mut limits = DnssecLimits::new(1, 10, 10, 10);
+        assert!(!limits.is_exhausted());
+        limits.dec_work();
+        assert!(limits.is_exhausted());
+    }
+
+    #[test]
+    fn test_limits_is_exhausted_sig_fail() {
+        let mut limits = DnssecLimits::new(10, 1, 10, 10);
+        assert!(!limits.is_exhausted());
+        limits.dec_sig_fail();
+        assert!(limits.is_exhausted());
+    }
+
+    #[test]
+    fn test_limits_is_exhausted_crypto() {
+        let mut limits = DnssecLimits::new(10, 10, 1, 10);
+        assert!(!limits.is_exhausted());
+        limits.dec_crypto();
+        assert!(limits.is_exhausted());
+    }
+
+    #[test]
+    fn test_limits_is_exhausted_none() {
+        let limits = DnssecLimits::new(10, 10, 10, 10);
+        assert!(!limits.is_exhausted());
+    }
+
+    // --- TrustAnchor comprehensive tests ---
+
+    #[test]
+    fn test_trust_anchor_new_and_fields() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("."),
+            20326,
+            8,
+            2,
+            vec![0xE0, 0x6D, 0x44],
+        );
+        assert_eq!(ta.domain.to_string(), ".");
+        assert_eq!(ta.key_tag, 20326);
+        assert_eq!(ta.algorithm, 8);
+        assert_eq!(ta.digest_type, 2);
+        assert_eq!(ta.digest, vec![0xE0, 0x6D, 0x44]);
+    }
+
+    #[test]
+    fn test_trust_anchor_matches_ds_exact() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("."),
+            20326,
+            8,
+            2,
+            vec![0xAA, 0xBB],
+        );
+        assert!(ta.matches_ds(20326, 8, 2, &[0xAA, 0xBB]));
+    }
+
+    #[test]
+    fn test_trust_anchor_matches_ds_wrong_keytag() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("."),
+            20326,
+            8,
+            2,
+            vec![0xAA, 0xBB],
+        );
+        assert!(!ta.matches_ds(12345, 8, 2, &[0xAA, 0xBB]));
+    }
+
+    #[test]
+    fn test_trust_anchor_matches_ds_wrong_algo() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("."),
+            20326,
+            8,
+            2,
+            vec![0xAA, 0xBB],
+        );
+        assert!(!ta.matches_ds(20326, 13, 2, &[0xAA, 0xBB]));
+    }
+
+    #[test]
+    fn test_trust_anchor_matches_ds_wrong_digest_type() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("."),
+            20326,
+            8,
+            2,
+            vec![0xAA, 0xBB],
+        );
+        assert!(!ta.matches_ds(20326, 8, 1, &[0xAA, 0xBB]));
+    }
+
+    #[test]
+    fn test_trust_anchor_matches_ds_wrong_digest() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("."),
+            20326,
+            8,
+            2,
+            vec![0xAA, 0xBB],
+        );
+        assert!(!ta.matches_ds(20326, 8, 2, &[0xCC, 0xDD]));
+    }
+
+    #[test]
+    fn test_trust_anchor_matches_ds_empty_digest() {
+        let ta = TrustAnchor::new(DnsName::from_str_unchecked("."), 20326, 8, 2, vec![]);
+        assert!(ta.matches_ds(20326, 8, 2, &[]));
+        assert!(!ta.matches_ds(20326, 8, 2, &[0x00]));
+    }
+
+    // --- DnssecValidator construction and setup tests ---
+
+    #[test]
+    fn test_validator_empty_anchors() {
+        let v = DnssecValidator::new(vec![], true);
+        assert!(v.trust_anchors.is_empty());
+        assert!(v.check_date);
+        assert!(v.timestamp_file.is_none());
+    }
+
+    #[test]
+    fn test_validator_check_date_flag() {
+        let v = DnssecValidator::new(vec![], false);
+        assert!(!v.is_check_date());
+        let v2 = DnssecValidator::new(vec![], true);
+        assert!(v2.is_check_date());
+    }
+
+    #[test]
+    fn test_validator_with_multiple_anchors() {
+        let ta1 = TrustAnchor::new(DnsName::from_str_unchecked("."), 20326, 8, 2, vec![0xAA]);
+        let ta2 = TrustAnchor::new(
+            DnsName::from_str_unchecked("example.com"),
+            12345,
+            13,
+            2,
+            vec![0xBB],
+        );
+        let v = DnssecValidator::new(vec![ta1, ta2], true);
+        assert_eq!(v.trust_anchors.len(), 2);
+    }
+
+    // --- setup_timestamp tests ---
+
+    #[test]
+    fn test_setup_timestamp_nonexistent_file_creates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnssec_timestamp");
+        let path_str = path.to_str().unwrap();
+
+        let mut v = DnssecValidator::new(vec![], true);
+        let result = v.setup_timestamp(path_str).unwrap();
+
+        assert!(!result);
+        assert!(!v.check_date);
+        assert!(path.exists());
+        assert_eq!(v.timestamp_file, Some(path_str.to_string()));
+    }
+
+    #[test]
+    fn test_setup_timestamp_existing_file_past_mtime() {
+        use std::fs::FileTimes;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnssec_timestamp");
+        let file = std::fs::File::create(&path).unwrap();
+        // Set mtime to 1 hour in the past so elapsed.as_secs() > 0
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        file.set_times(FileTimes::new().set_modified(past)).unwrap();
+        drop(file);
+
+        let mut v = DnssecValidator::new(vec![], false);
+        let result = v.setup_timestamp(path.to_str().unwrap()).unwrap();
+        assert!(result);
+        assert!(v.check_date);
+    }
+
+    #[test]
+    fn test_setup_timestamp_permission_error() {
+        let mut v = DnssecValidator::new(vec![], true);
+        let result = v.setup_timestamp("/proc/nonexistent/timestamp");
+        assert!(result.is_ok());
+        assert!(!v.check_date);
+    }
+
+    // --- zone_status tests ---
+
+    #[test]
+    fn test_zone_status_exact_trust_anchor_match() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("example.com"),
+            20326,
+            8,
+            2,
+            vec![0xAA],
+        );
+        let v = DnssecValidator::new(vec![ta], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let status = v
+            .zone_status("example.com", &mut cache, &mut limits)
+            .unwrap();
+        assert_eq!(status, DnssecStatus::Secure);
+    }
+
+    #[test]
+    fn test_zone_status_root_anchor_no_ds() {
+        let ta = TrustAnchor::new(DnsName::from_str_unchecked("."), 20326, 8, 2, vec![0xAA]);
+        let v = DnssecValidator::new(vec![ta], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let status = v
+            .zone_status("www.example.com", &mut cache, &mut limits)
+            .unwrap();
+        assert_eq!(status, DnssecStatus::NeedDs);
+    }
+
+    #[test]
+    fn test_zone_status_no_trust_anchor() {
+        let v = DnssecValidator::new(vec![], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let status = v
+            .zone_status("example.com", &mut cache, &mut limits)
+            .unwrap();
+        assert_eq!(status, DnssecStatus::NeedDs);
+    }
+
+    #[test]
+    fn test_zone_status_work_limit_exhausted() {
+        let ta = TrustAnchor::new(DnsName::from_str_unchecked("."), 20326, 8, 2, vec![0xAA]);
+        let v = DnssecValidator::new(vec![ta], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::new(1, 10, 10, 10);
+        let status = v
+            .zone_status("a.b.c.d.e.f.example.com", &mut cache, &mut limits)
+            .unwrap();
+        assert!(status == DnssecStatus::Abandoned || status == DnssecStatus::NeedDs);
+    }
+
+    // --- Helper to build raw DNS response bytes ---
+
+    fn build_raw_response(
+        id: u16,
+        qname: &str,
+        qtype: RRType,
+        answers: &[(&str, RRType, u32, &[u8])],
+        authority: &[(&str, RRType, u32, &[u8])],
+        tc: bool,
+    ) -> Vec<u8> {
+        let name = DnsName::from_str_unchecked(qname);
+        let mut buf = BytesMut::with_capacity(512);
+        let hdr = DnsHeader {
+            id,
+            flags: DnsHeaderFlags {
+                qr: true,
+                tc,
+                ..DnsHeaderFlags::default()
+            },
+            qdcount: 1,
+            ancount: answers.len() as u16,
+            nscount: authority.len() as u16,
+            arcount: 0,
+        };
+        hdr.serialize(&mut buf);
+        name.to_wire(&mut buf);
+        buf.put_u16(qtype.to_u16());
+        buf.put_u16(DnsClass::IN.to_u16());
+        for (rr_name, rr_type, ttl, rdata) in answers {
+            let n = DnsName::from_str_unchecked(rr_name);
+            n.to_wire(&mut buf);
+            buf.put_u16(rr_type.to_u16());
+            buf.put_u16(DnsClass::IN.to_u16());
+            buf.put_u32(*ttl);
+            buf.put_u16(rdata.len() as u16);
+            buf.extend_from_slice(rdata);
+        }
+        for (rr_name, rr_type, ttl, rdata) in authority {
+            let n = DnsName::from_str_unchecked(rr_name);
+            n.to_wire(&mut buf);
+            buf.put_u16(rr_type.to_u16());
+            buf.put_u16(DnsClass::IN.to_u16());
+            buf.put_u32(*ttl);
+            buf.put_u16(rdata.len() as u16);
+            buf.extend_from_slice(rdata);
+        }
+        buf.to_vec()
+    }
+
+    fn build_header_only(id: u16, tc: bool) -> Vec<u8> {
+        let mut buf = BytesMut::with_capacity(12);
+        let hdr = DnsHeader {
+            id,
+            flags: DnsHeaderFlags {
+                qr: true,
+                tc,
+                ..DnsHeaderFlags::default()
+            },
+            qdcount: 0,
+            ancount: 0,
+            nscount: 0,
+            arcount: 0,
+        };
+        hdr.serialize(&mut buf);
+        buf.to_vec()
+    }
+
+    // --- DnssecValidator::dnssec_validate_reply tests ---
+
+    #[test]
+    fn test_validate_reply_truncated_response() {
+        let ta = TrustAnchor::new(DnsName::from_str_unchecked("."), 20326, 8, 2, vec![0xAA]);
+        let v = DnssecValidator::new(vec![ta], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let domain_matcher = DomainMatcher::new();
+
+        let packet = build_header_only(0x5678, true);
+        let result = v
+            .dnssec_validate_reply(
+                &packet,
+                &mut cache,
+                &mut limits,
+                &domain_matcher,
+                "example.com",
+                RRType::A,
+                DnsClass::IN,
+            )
+            .unwrap();
+        assert_eq!(result.0, DnssecStatus::Truncated);
+    }
+
+    #[test]
+    fn test_validate_reply_simple_response_no_anchor() {
+        let v = DnssecValidator::new(vec![], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let domain_matcher = DomainMatcher::new();
+
+        let packet = build_raw_response(
+            0x1234,
+            "example.com",
+            RRType::A,
+            &[("example.com", RRType::A, 300, &[1, 2, 3, 4])],
+            &[],
+            false,
+        );
+        let result = v
+            .dnssec_validate_reply(
+                &packet,
+                &mut cache,
+                &mut limits,
+                &domain_matcher,
+                "example.com",
+                RRType::A,
+                DnsClass::IN,
+            )
+            .unwrap();
+        assert!(
+            result.0 == DnssecStatus::NeedDs
+                || result.0 == DnssecStatus::Insecure
+                || result.0 == DnssecStatus::Secure
+        );
+    }
+
+    #[test]
+    fn test_validate_reply_with_root_anchor_no_rrsig() {
+        let ta = TrustAnchor::new(DnsName::from_str_unchecked("."), 20326, 8, 2, vec![0xAA]);
+        let v = DnssecValidator::new(vec![ta], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let domain_matcher = DomainMatcher::new();
+
+        let packet = build_raw_response(
+            0x1234,
+            "example.com",
+            RRType::A,
+            &[("example.com", RRType::A, 300, &[1, 2, 3, 4])],
+            &[],
+            false,
+        );
+        let result = v
+            .dnssec_validate_reply(
+                &packet,
+                &mut cache,
+                &mut limits,
+                &domain_matcher,
+                "example.com",
+                RRType::A,
+                DnsClass::IN,
+            )
+            .unwrap();
+        assert!(matches!(
+            result.0,
+            DnssecStatus::Bogus | DnssecStatus::NeedDs | DnssecStatus::NeedKey
+        ));
+    }
+
+    #[test]
+    fn test_validate_reply_empty_packet() {
+        let v = DnssecValidator::new(vec![], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let domain_matcher = DomainMatcher::new();
+
+        let result = v.dnssec_validate_reply(
+            &[],
+            &mut cache,
+            &mut limits,
+            &domain_matcher,
+            "example.com",
+            RRType::A,
+            DnsClass::IN,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_reply_header_only() {
+        let v = DnssecValidator::new(vec![], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let domain_matcher = DomainMatcher::new();
+
+        let packet = build_header_only(0x1234, false);
+        let result = v
+            .dnssec_validate_reply(
+                &packet,
+                &mut cache,
+                &mut limits,
+                &domain_matcher,
+                "example.com",
+                RRType::A,
+                DnsClass::IN,
+            )
+            .unwrap();
+        assert!(matches!(
+            result.0,
+            DnssecStatus::Secure | DnssecStatus::Insecure
+        ));
+    }
+
+    #[test]
+    fn test_validate_reply_answer_rrsig_only() {
+        let v = DnssecValidator::new(vec![], false);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let domain_matcher = DomainMatcher::new();
+
+        let mut rrsig_rdata = vec![0u8; 20];
+        rrsig_rdata[0] = 0;
+        rrsig_rdata[1] = 1; // covers type A
+
+        let packet = build_raw_response(
+            0x1234,
+            "example.com",
+            RRType::A,
+            &[("example.com", RRType::RRSIG, 300, &rrsig_rdata)],
+            &[],
+            false,
+        );
+        let result = v
+            .dnssec_validate_reply(
+                &packet,
+                &mut cache,
+                &mut limits,
+                &domain_matcher,
+                "example.com",
+                RRType::A,
+                DnsClass::IN,
+            )
+            .unwrap();
+        assert!(matches!(
+            result.0,
+            DnssecStatus::Secure | DnssecStatus::Insecure
+        ));
+    }
+
+    // --- validate_rrset tests ---
+
+    #[test]
+    fn test_validate_rrset_empty_rrsigs() {
+        let v = DnssecValidator::new(vec![], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+
+        let rrset = RRSet {
+            name: DnsName::from_str_unchecked("example.com"),
+            rr_type: RRType::A,
+            class: DnsClass::IN,
+            records: vec![],
+        };
+        let empty_rrsigs: Vec<&DnsResourceRecord> = vec![];
+        let mut fail_flags = DnssecFailFlags::empty();
+
+        let result = v
+            .validate_rrset(
+                &rrset,
+                &empty_rrsigs,
+                &mut cache,
+                &mut limits,
+                &mut fail_flags,
+            )
+            .unwrap();
+        assert_eq!(result, DnssecStatus::Bogus);
+        assert!(fail_flags.contains(DnssecFailFlags::NOSIG));
+    }
+
+    #[test]
+    fn test_validate_rrset_short_rrsig_rdata() {
+        let v = DnssecValidator::new(vec![], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+
+        let rrset = RRSet {
+            name: DnsName::from_str_unchecked("example.com"),
+            rr_type: RRType::A,
+            class: DnsClass::IN,
+            records: vec![],
+        };
+        let rrsig = DnsResourceRecord {
+            name: DnsName::from_str_unchecked("example.com"),
+            rr_type: RRType::RRSIG,
+            class: DnsClass::IN,
+            ttl: 300,
+            rdata: vec![0; 10].into(),
+        };
+        let rrsigs: Vec<&DnsResourceRecord> = vec![&rrsig];
+        let mut fail_flags = DnssecFailFlags::empty();
+
+        let result = v
+            .validate_rrset(&rrset, &rrsigs, &mut cache, &mut limits, &mut fail_flags)
+            .unwrap();
+        assert_eq!(result, DnssecStatus::Bogus);
+        assert!(fail_flags.contains(DnssecFailFlags::NOKEYSUP));
+    }
+
+    #[test]
+    fn test_validate_rrset_unsupported_algo() {
+        let v = DnssecValidator::new(vec![], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+
+        let rrset = RRSet {
+            name: DnsName::from_str_unchecked("example.com"),
+            rr_type: RRType::A,
+            class: DnsClass::IN,
+            records: vec![],
+        };
+        let mut rdata = vec![0u8; 18];
+        rdata[0] = 0;
+        rdata[1] = 1; // type covered: A
+        rdata[2] = 255; // unsupported algorithm
+        rdata[3] = 2; // labels
+
+        let rrsig = DnsResourceRecord {
+            name: DnsName::from_str_unchecked("example.com"),
+            rr_type: RRType::RRSIG,
+            class: DnsClass::IN,
+            ttl: 300,
+            rdata: rdata.into(),
+        };
+        let rrsigs: Vec<&DnsResourceRecord> = vec![&rrsig];
+        let mut fail_flags = DnssecFailFlags::empty();
+
+        let result = v
+            .validate_rrset(&rrset, &rrsigs, &mut cache, &mut limits, &mut fail_flags)
+            .unwrap();
+        assert_eq!(result, DnssecStatus::Bogus);
+        assert!(fail_flags.contains(DnssecFailFlags::NOKEYSUP));
+    }
+
+    // --- prove_non_existence tests ---
+
+    #[test]
+    fn test_prove_non_existence_no_nsec_records() {
+        let v = DnssecValidator::new(vec![], false);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+
+        let name = DnsName::from_str_unchecked("example.com");
+        let packet = DnsPacketBuilder::new(0x1234)
+            .set_response()
+            .add_question(&name, RRType::A, DnsClass::IN)
+            .build()
+            .unwrap();
+
+        let result = v
+            .prove_non_existence(
+                &[],
+                &packet,
+                "nonexistent.example.com",
+                RRType::A,
+                DnsClass::IN,
+                &mut cache,
+                &mut limits,
+            )
+            .unwrap();
+        assert_eq!(result, DnssecStatus::Bogus);
+    }
+
+    #[test]
+    fn test_prove_non_existence_mixed_nsec_nsec3() {
+        let v = DnssecValidator::new(vec![], false);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+
+        let name = DnsName::from_str_unchecked("example.com");
+        let nsec_name = DnsName::from_str_unchecked("a.example.com");
+
+        let mut nsec_rdata = BytesMut::new();
+        let next_name = DnsName::from_str_unchecked("b.example.com");
+        next_name.to_wire(&mut nsec_rdata);
+        nsec_rdata.extend_from_slice(&[0, 1, 0x40]);
+
+        let nsec3_rdata = vec![1, 0, 0, 1, 0];
+
+        let packet = DnsPacketBuilder::new(0x1234)
+            .set_response()
+            .add_question(&name, RRType::A, DnsClass::IN)
+            .add_authority(&nsec_name, RRType::NSEC, DnsClass::IN, 300, &nsec_rdata)
+            .add_authority(&nsec_name, RRType::NSEC3, DnsClass::IN, 300, &nsec3_rdata)
+            .build()
+            .unwrap();
+
+        let result = v
+            .prove_non_existence(
+                &[],
+                &packet,
+                "c.example.com",
+                RRType::A,
+                DnsClass::IN,
+                &mut cache,
+                &mut limits,
+            )
+            .unwrap();
+        assert_eq!(result, DnssecStatus::Bogus);
+    }
+
+    // --- prove_non_existence_nsec tests ---
+
+    fn make_nsec_rdata(next_name: &str, type_bitmap: &[u8]) -> Vec<u8> {
+        let mut rdata = BytesMut::new();
+        let next = DnsName::from_str_unchecked(next_name);
+        next.to_wire(&mut rdata);
+        rdata.extend_from_slice(type_bitmap);
+        rdata.to_vec()
+    }
+
+    #[test]
+    fn test_nsec_exact_match_nodata() {
+        let v = DnssecValidator::new(vec![], false);
+        let name = DnsName::from_str_unchecked("example.com");
+        let nsec_rdata = make_nsec_rdata("next.example.com", &[0, 1, 0x40]);
+
+        let nsec_rr = DnsResourceRecord {
+            name: name.clone(),
+            rr_type: RRType::NSEC,
+            class: DnsClass::IN,
+            ttl: 300,
+            rdata: nsec_rdata.into(),
+        };
+        let nsec_records: Vec<&DnsResourceRecord> = vec![&nsec_rr];
+        let packet = DnsPacketBuilder::new(1).set_response().build().unwrap();
+
+        let result = v
+            .prove_non_existence_nsec(&nsec_records, "example.com", RRType::MX, &packet)
+            .unwrap();
+        assert_eq!(result, DnssecStatus::Secure);
+    }
+
+    #[test]
+    fn test_nsec_exact_match_type_present() {
+        let v = DnssecValidator::new(vec![], false);
+        let name = DnsName::from_str_unchecked("example.com");
+        let nsec_rdata = make_nsec_rdata("next.example.com", &[0, 1, 0x40]);
+
+        let nsec_rr = DnsResourceRecord {
+            name: name.clone(),
+            rr_type: RRType::NSEC,
+            class: DnsClass::IN,
+            ttl: 300,
+            rdata: nsec_rdata.into(),
+        };
+        let nsec_records: Vec<&DnsResourceRecord> = vec![&nsec_rr];
+        let packet = DnsPacketBuilder::new(1).set_response().build().unwrap();
+
+        let result = v
+            .prove_non_existence_nsec(&nsec_records, "example.com", RRType::A, &packet)
+            .unwrap();
+        assert_eq!(result, DnssecStatus::Bogus);
+    }
+
+    #[test]
+    fn test_nsec_empty_rdata() {
+        let v = DnssecValidator::new(vec![], false);
+        let nsec_rr = DnsResourceRecord {
+            name: DnsName::from_str_unchecked("a.example.com"),
+            rr_type: RRType::NSEC,
+            class: DnsClass::IN,
+            ttl: 300,
+            rdata: vec![].into(),
+        };
+        let nsec_records: Vec<&DnsResourceRecord> = vec![&nsec_rr];
+        let packet = DnsPacketBuilder::new(1).set_response().build().unwrap();
+
+        let result = v
+            .prove_non_existence_nsec(&nsec_records, "b.example.com", RRType::A, &packet)
+            .unwrap();
+        assert_eq!(result, DnssecStatus::Bogus);
+    }
+
+    // --- prove_non_existence_nsec3 tests ---
+
+    #[test]
+    fn test_nsec3_empty_records() {
+        let v = DnssecValidator::new(vec![], false);
+        let empty: Vec<&DnsResourceRecord> = vec![];
+        let mut limits = DnssecLimits::default();
+        let result = v
+            .prove_non_existence_nsec3(&empty, "example.com", RRType::A, &mut limits)
+            .unwrap();
+        assert_eq!(result, DnssecStatus::Bogus);
+    }
+
+    #[test]
+    fn test_nsec3_short_rdata() {
+        let v = DnssecValidator::new(vec![], false);
+        let mut limits = DnssecLimits::default();
+        let rr = DnsResourceRecord {
+            name: DnsName::from_str_unchecked("hash.example.com"),
+            rr_type: RRType::NSEC3,
+            class: DnsClass::IN,
+            ttl: 300,
+            rdata: vec![1, 0, 0].into(),
+        };
+        let records: Vec<&DnsResourceRecord> = vec![&rr];
+        let result = v
+            .prove_non_existence_nsec3(&records, "example.com", RRType::A, &mut limits)
+            .unwrap();
+        assert_eq!(result, DnssecStatus::Bogus);
+    }
+
+    #[test]
+    fn test_nsec3_iterations_exceed_limit() {
+        let v = DnssecValidator::new(vec![], false);
+        let mut limits = DnssecLimits::new(40, 20, 200, 10);
+        let rdata = vec![1, 0, 1, 244, 0]; // iterations = 500
+        let rr = DnsResourceRecord {
+            name: DnsName::from_str_unchecked("hash.example.com"),
+            rr_type: RRType::NSEC3,
+            class: DnsClass::IN,
+            ttl: 300,
+            rdata: rdata.into(),
+        };
+        let records: Vec<&DnsResourceRecord> = vec![&rr];
+        let result = v
+            .prove_non_existence_nsec3(&records, "example.com", RRType::A, &mut limits)
+            .unwrap();
+        assert_eq!(result, DnssecStatus::Bogus);
+    }
+
+    #[test]
+    fn test_nsec3_unsupported_hash_algo() {
+        let v = DnssecValidator::new(vec![], false);
+        let mut limits = DnssecLimits::default();
+        let rdata = vec![255, 0, 0, 0, 0]; // unsupported hash algo
+        let rr = DnsResourceRecord {
+            name: DnsName::from_str_unchecked("hash.example.com"),
+            rr_type: RRType::NSEC3,
+            class: DnsClass::IN,
+            ttl: 300,
+            rdata: rdata.into(),
+        };
+        let records: Vec<&DnsResourceRecord> = vec![&rr];
+        let result = v
+            .prove_non_existence_nsec3(&records, "example.com", RRType::A, &mut limits)
+            .unwrap();
+        assert_eq!(result, DnssecStatus::Bogus);
+    }
+
+    #[test]
+    fn test_nsec3_salt_length_exceeds_rdata() {
+        let v = DnssecValidator::new(vec![], false);
+        let mut limits = DnssecLimits::default();
+        let rdata = vec![1, 0, 0, 0, 100]; // salt_len=100 exceeds
+        let rr = DnsResourceRecord {
+            name: DnsName::from_str_unchecked("hash.example.com"),
+            rr_type: RRType::NSEC3,
+            class: DnsClass::IN,
+            ttl: 300,
+            rdata: rdata.into(),
+        };
+        let records: Vec<&DnsResourceRecord> = vec![&rr];
+        let result = v
+            .prove_non_existence_nsec3(&records, "example.com", RRType::A, &mut limits)
+            .unwrap();
+        assert_eq!(result, DnssecStatus::Bogus);
+    }
+
+    // --- check_nsec3_coverage tests ---
+
+    #[test]
+    fn test_nsec3_coverage_empty_records() {
+        let v = DnssecValidator::new(vec![], false);
+        let empty: Vec<&DnsResourceRecord> = vec![];
+        let result = v.check_nsec3_coverage(&empty, &[0x50]).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_nsec3_coverage_short_rdata() {
+        let v = DnssecValidator::new(vec![], false);
+        let rr = DnsResourceRecord {
+            name: DnsName::from_str_unchecked("aaa.example.com"),
+            rr_type: RRType::NSEC3,
+            class: DnsClass::IN,
+            ttl: 300,
+            rdata: vec![1, 0, 0].into(),
+        };
+        let records: Vec<&DnsResourceRecord> = vec![&rr];
+        let result = v.check_nsec3_coverage(&records, &[0x50]).unwrap();
+        assert!(!result);
+    }
+
+    // --- dnssec_validate_by_ds tests ---
+
+    fn make_dnskey_raw_packet(
+        name: &str,
+        flags: u16,
+        protocol: u8,
+        algo: u8,
+        key: &[u8],
+    ) -> Vec<u8> {
+        let dns_name = DnsName::from_str_unchecked(name);
+        let mut rdata = BytesMut::new();
+        rdata.put_u16(flags);
+        rdata.put_u8(protocol);
+        rdata.put_u8(algo);
+        rdata.extend_from_slice(key);
+
+        let mut buf = BytesMut::with_capacity(512);
+        let hdr = DnsHeader {
+            id: 0xABCD,
+            flags: DnsHeaderFlags {
+                qr: true,
+                ..DnsHeaderFlags::default()
+            },
+            qdcount: 1,
+            ancount: 1,
+            nscount: 0,
+            arcount: 0,
+        };
+        hdr.serialize(&mut buf);
+        dns_name.to_wire(&mut buf);
+        buf.put_u16(RRType::DNSKEY.to_u16());
+        buf.put_u16(DnsClass::IN.to_u16());
+        dns_name.to_wire(&mut buf);
+        buf.put_u16(RRType::DNSKEY.to_u16());
+        buf.put_u16(DnsClass::IN.to_u16());
+        buf.put_u32(300);
+        buf.put_u16(rdata.len() as u16);
+        buf.extend_from_slice(&rdata);
+        buf.to_vec()
+    }
+
+    #[test]
+    fn test_validate_by_ds_no_dnskey_in_response() {
+        let v = DnssecValidator::new(vec![], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let domain_matcher = DomainMatcher::new();
+
+        let packet = build_header_only(0x1234, false);
+        let (status, flags) = v
+            .dnssec_validate_by_ds(
+                &packet,
+                "example.com",
+                &mut cache,
+                &mut limits,
+                &domain_matcher,
+            )
+            .unwrap();
+        assert_eq!(status, DnssecStatus::Bogus);
+        assert!(flags.contains(DnssecFailFlags::NOKEY));
+    }
+
+    #[test]
+    fn test_validate_by_ds_no_ds_no_anchor() {
+        let v = DnssecValidator::new(vec![], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let domain_matcher = DomainMatcher::new();
+
+        let packet = make_dnskey_raw_packet("example.com", 0x0100, 3, 8, &[1, 2, 3, 4]);
+        let (status, _flags) = v
+            .dnssec_validate_by_ds(
+                &packet,
+                "example.com",
+                &mut cache,
+                &mut limits,
+                &domain_matcher,
+            )
+            .unwrap();
+        assert_eq!(status, DnssecStatus::NeedDs);
+    }
+
+    #[test]
+    fn test_validate_by_ds_non_zone_key() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("example.com"),
+            12345,
+            8,
+            2,
+            vec![0xAA],
+        );
+        let v = DnssecValidator::new(vec![ta], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let domain_matcher = DomainMatcher::new();
+
+        let packet = make_dnskey_raw_packet("example.com", 0x0000, 3, 8, &[1, 2, 3, 4]);
+        let (status, flags) = v
+            .dnssec_validate_by_ds(
+                &packet,
+                "example.com",
+                &mut cache,
+                &mut limits,
+                &domain_matcher,
+            )
+            .unwrap();
+        assert_eq!(status, DnssecStatus::Bogus);
+        assert!(flags.contains(DnssecFailFlags::NOZONE));
+    }
+
+    #[test]
+    fn test_validate_by_ds_wrong_protocol() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("example.com"),
+            12345,
+            8,
+            2,
+            vec![0xAA],
+        );
+        let v = DnssecValidator::new(vec![ta], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let domain_matcher = DomainMatcher::new();
+
+        let packet = make_dnskey_raw_packet("example.com", 0x0100, 1, 8, &[1, 2, 3, 4]);
+        let (status, _flags) = v
+            .dnssec_validate_by_ds(
+                &packet,
+                "example.com",
+                &mut cache,
+                &mut limits,
+                &domain_matcher,
+            )
+            .unwrap();
+        assert_eq!(status, DnssecStatus::Bogus);
+    }
+
+    #[test]
+    fn test_validate_by_ds_unsupported_algorithm() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("example.com"),
+            12345,
+            255,
+            2,
+            vec![0xAA],
+        );
+        let v = DnssecValidator::new(vec![ta], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let domain_matcher = DomainMatcher::new();
+
+        let packet = make_dnskey_raw_packet("example.com", 0x0100, 3, 255, &[1, 2, 3, 4]);
+        let (status, flags) = v
+            .dnssec_validate_by_ds(
+                &packet,
+                "example.com",
+                &mut cache,
+                &mut limits,
+                &domain_matcher,
+            )
+            .unwrap();
+        assert_eq!(status, DnssecStatus::Bogus);
+        assert!(flags.contains(DnssecFailFlags::NOKEYSUP));
+    }
+
+    #[test]
+    fn test_validate_by_ds_crypto_limit_exhausted() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("example.com"),
+            12345,
+            8,
+            2,
+            vec![0xAA],
+        );
+        let v = DnssecValidator::new(vec![ta], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::new(40, 20, 0, 150);
+        let domain_matcher = DomainMatcher::new();
+
+        let packet = make_dnskey_raw_packet("example.com", 0x0100, 3, 8, &[1, 2, 3, 4]);
+        let (status, _flags) = v
+            .dnssec_validate_by_ds(
+                &packet,
+                "example.com",
+                &mut cache,
+                &mut limits,
+                &domain_matcher,
+            )
+            .unwrap();
+        assert_eq!(status, DnssecStatus::Abandoned);
+    }
+
+    #[test]
+    fn test_validate_by_ds_short_dnskey_rdata() {
+        let ta = TrustAnchor::new(
+            DnsName::from_str_unchecked("example.com"),
+            12345,
+            8,
+            2,
+            vec![0xAA],
+        );
+        let v = DnssecValidator::new(vec![ta], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+        let domain_matcher = DomainMatcher::new();
+
+        // 2-byte DNSKEY rdata (< 4 minimum)
+        let dns_name = DnsName::from_str_unchecked("example.com");
+        let rdata = vec![0x01, 0x00];
+        let mut buf = BytesMut::with_capacity(512);
+        let hdr = DnsHeader {
+            id: 0xABCD,
+            flags: DnsHeaderFlags {
+                qr: true,
+                ..DnsHeaderFlags::default()
+            },
+            qdcount: 1,
+            ancount: 1,
+            nscount: 0,
+            arcount: 0,
+        };
+        hdr.serialize(&mut buf);
+        dns_name.to_wire(&mut buf);
+        buf.put_u16(RRType::DNSKEY.to_u16());
+        buf.put_u16(DnsClass::IN.to_u16());
+        dns_name.to_wire(&mut buf);
+        buf.put_u16(RRType::DNSKEY.to_u16());
+        buf.put_u16(DnsClass::IN.to_u16());
+        buf.put_u32(300);
+        buf.put_u16(rdata.len() as u16);
+        buf.extend_from_slice(&rdata);
+        let packet = buf.to_vec();
+
+        let (status, _flags) = v
+            .dnssec_validate_by_ds(
+                &packet,
+                "example.com",
+                &mut cache,
+                &mut limits,
+                &domain_matcher,
+            )
+            .unwrap();
+        assert_eq!(status, DnssecStatus::Bogus);
+    }
+
+    // --- with_fail_flags additional combinations ---
+
+    #[test]
+    fn test_with_fail_flags_all_status_variants() {
+        let flags = DnssecFailFlags::from_bits(0xFFFF);
+        for status in [
+            DnssecStatus::Secure,
+            DnssecStatus::Insecure,
+            DnssecStatus::Bogus,
+            DnssecStatus::NeedDsDigest,
+            DnssecStatus::NeedKey,
+            DnssecStatus::NeedDs,
+            DnssecStatus::Truncated,
+            DnssecStatus::Abandoned,
+        ] {
+            let (returned_status, returned_flags) = status.with_fail_flags(flags);
+            assert_eq!(returned_status, status);
+            assert_eq!(returned_flags.bits(), 0xFFFF);
+        }
+    }
+
+    // --- zone_status DS in cache tests ---
+
+    #[test]
+    fn test_zone_status_with_ds_in_cache() {
+        let ta = TrustAnchor::new(DnsName::from_str_unchecked("."), 20326, 8, 2, vec![0xAA]);
+        let v = DnssecValidator::new(vec![ta], true);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let mut limits = DnssecLimits::default();
+
+        let ds_entry = CacheEntry {
+            name: DnsName::from_str_unchecked("com"),
+            rr_type: RRType::DS,
+            data: CacheData::Ds {
+                key_tag: 12345,
+                algorithm: 8,
+                digest_type: 2,
+                digest: vec![0xBB, 0xCC],
+            },
+            expires: std::time::Instant::now() + Duration::from_secs(300),
+            last_access: std::time::Instant::now(),
+            flags: CacheFlags::default(),
+            ttl: 300,
+        };
+        let _ = cache.cache_insert(ds_entry);
+
+        let status = v
+            .zone_status("example.com", &mut cache, &mut limits)
+            .unwrap();
+        assert!(status == DnssecStatus::Secure || status == DnssecStatus::NeedDs);
+    }
+
+    // --- Additional canonical name comparison deep tests ---
+
+    #[test]
+    fn test_canonical_cmp_same_labels_different_depths() {
+        assert_eq!(canonical_dns_name_cmp("a.com", "com"), Ordering::Greater);
+        assert_eq!(canonical_dns_name_cmp("com", "a.com"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_canonical_cmp_with_trailing_dots_mixed() {
+        assert_eq!(
+            canonical_dns_name_cmp("example.com.", "example.com"),
+            Ordering::Equal
+        );
+        assert_eq!(
+            canonical_dns_name_cmp("example.com..", "example.com"),
+            Ordering::Equal
+        );
+    }
+
+    // --- Base32 decode thorough tests ---
+
+    #[test]
+    fn test_base32_decode_all_digit_chars() {
+        for c in b'0'..=b'9' {
+            let s = String::from_utf8(vec![c, c]).unwrap();
+            assert!(
+                base32_decode(&s).is_some(),
+                "char {} should be valid",
+                c as char
+            );
+        }
+    }
+
+    #[test]
+    fn test_base32_decode_all_alpha_chars() {
+        for c in b'a'..=b'v' {
+            let s = String::from_utf8(vec![c, c]).unwrap();
+            assert!(
+                base32_decode(&s).is_some(),
+                "char {} should be valid",
+                c as char
+            );
+        }
+        for c in b'w'..=b'z' {
+            let s = String::from_utf8(vec![c, c]).unwrap();
+            assert!(
+                base32_decode(&s).is_none(),
+                "char {} should be invalid",
+                c as char
+            );
+        }
+    }
+
+    // --- keytag comprehensive tests ---
+
+    #[test]
+    fn test_keytag_known_value() {
+        let key = vec![0x03, 0x01, 0x00, 0x01];
+        let tag = dnskey_keytag(8, 0x0101, &key);
+        assert!(tag > 0);
+    }
+
+    #[test]
+    fn test_keytag_zero_key_data() {
+        let key = vec![0x00, 0x00, 0x00, 0x00];
+        let tag = dnskey_keytag(8, 0x0100, &key);
+        // algo=8, flags=0x0100 => accumulator includes flags and proto+algo contribution
+        assert_eq!(tag, 1032);
+    }
+
+    // --- name_to_wire roundtrip tests ---
+
+    #[test]
+    fn test_name_to_wire_matches_dns_name_to_wire() {
+        let name_str = "www.example.com";
+        let wire = name_to_wire(name_str);
+        let dns_name = DnsName::from_str_unchecked(name_str);
+        let mut buf = BytesMut::new();
+        dns_name.to_wire(&mut buf);
+        assert_eq!(wire.len(), buf.len());
+    }
 }

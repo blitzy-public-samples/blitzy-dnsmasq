@@ -4712,4 +4712,1308 @@ mod tests {
         assert_eq!(config.user.as_deref(), Some("dnsmasq"));
         assert_eq!(config.group.as_deref(), Some("nogroup"));
     }
+
+    // -----------------------------------------------------------------------
+    // split_on tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_split_on_comma_basic() {
+        let r = split_on("a,b,c", ',');
+        assert_eq!(r, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_split_on_empty() {
+        let r = split_on("", ',');
+        // Empty string produces empty vec (no non-empty segments)
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn test_split_on_no_delim() {
+        let r = split_on("hello", ',');
+        assert_eq!(r, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_split_on_trailing() {
+        let r = split_on("a,b,", ',');
+        assert_eq!(r.len(), 3);
+    }
+
+    #[test]
+    fn test_split_on_single_char() {
+        let r = split_on(",", ',');
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn test_split_on_consecutive_delims() {
+        let r = split_on("a,,b", ',');
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[1], "");
+    }
+
+    // -----------------------------------------------------------------------
+    // canonicalise tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_canonicalise_lowercase() {
+        let r = canonicalise("EXAMPLE.COM");
+        assert_eq!(r, "example.com");
+    }
+
+    #[test]
+    fn test_canonicalise_trailing_dot() {
+        let r = canonicalise("example.com.");
+        // Should strip trailing dot
+        assert!(r.ends_with("com") || r.ends_with("com."));
+    }
+
+    #[test]
+    fn test_canonicalise_already_lower() {
+        let r = canonicalise("foo.bar");
+        assert_eq!(r, "foo.bar");
+    }
+
+    #[test]
+    fn test_canonicalise_mixed_case() {
+        let r = canonicalise("FoO.BaR.CoM");
+        assert_eq!(r, "foo.bar.com");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_addr_port tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_parse_addr_port_ipv4() {
+        let (addr, port) = parse_addr_port("192.168.1.1").unwrap();
+        assert_eq!(addr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(port.is_none());
+    }
+
+    #[test]
+    fn test_parse_addr_port_ipv4_with_port() {
+        let (addr, port) = parse_addr_port("192.168.1.1#5353").unwrap();
+        assert_eq!(addr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(port, Some(5353));
+    }
+
+    #[test]
+    fn test_parse_addr_port_ipv6() {
+        let (addr, _) = parse_addr_port("::1").unwrap();
+        assert!(addr.is_ipv6());
+    }
+
+    #[test]
+    fn test_parse_addr_port_invalid() {
+        assert!(parse_addr_port("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn test_parse_addr_port_loopback() {
+        let (addr, port) = parse_addr_port("127.0.0.1").unwrap();
+        assert_eq!(addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert!(port.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_ip tests (renamed to avoid duplicates)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_parse_ip_v4_addr() {
+        let addr = parse_ip("10.0.0.1").unwrap();
+        assert_eq!(addr, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn test_parse_ip_v6_addr() {
+        let addr = parse_ip("::1").unwrap();
+        assert!(addr.is_ipv6());
+    }
+
+    #[test]
+    fn test_parse_ip_invalid_string() {
+        assert!(parse_ip("garbage").is_err());
+    }
+
+    #[test]
+    fn test_parse_ip_broadcast() {
+        let addr = parse_ip("255.255.255.255").unwrap();
+        assert_eq!(addr, IpAddr::V4(Ipv4Addr::BROADCAST));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_lease_time tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_parse_lease_time_seconds() {
+        let t = parse_lease_time("3600").unwrap();
+        assert_eq!(t, 3600);
+    }
+
+    #[test]
+    fn test_parse_lease_time_minutes() {
+        let t = parse_lease_time("60m").unwrap();
+        assert_eq!(t, 3600);
+    }
+
+    #[test]
+    fn test_parse_lease_time_hours() {
+        let t = parse_lease_time("1h").unwrap();
+        assert_eq!(t, 3600);
+    }
+
+    #[test]
+    fn test_parse_lease_time_days() {
+        let t = parse_lease_time("1d").unwrap();
+        assert_eq!(t, 86400);
+    }
+
+    #[test]
+    fn test_parse_lease_time_weeks() {
+        let t = parse_lease_time("1w").unwrap();
+        assert_eq!(t, 604800);
+    }
+
+    #[test]
+    fn test_parse_lease_time_infinite() {
+        let t = parse_lease_time("infinite").unwrap();
+        // dnsmasq convention: 0 = infinite lease
+        assert_eq!(t, 0);
+    }
+
+    #[test]
+    fn test_parse_lease_time_invalid() {
+        assert!(parse_lease_time("").is_err());
+    }
+
+    #[test]
+    fn test_parse_lease_time_zero() {
+        let t = parse_lease_time("0").unwrap();
+        assert_eq!(t, 0);
+    }
+
+    #[test]
+    fn test_parse_lease_time_large_minutes() {
+        let t = parse_lease_time("120m").unwrap();
+        assert_eq!(t, 7200);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_dhcp_option_value tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_parse_dhcp_option_value_string() {
+        let v = parse_dhcp_option_value("hello");
+        assert!(!v.is_empty());
+    }
+
+    #[test]
+    fn test_parse_dhcp_option_value_hex() {
+        let v = parse_dhcp_option_value("01:02:03");
+        assert_eq!(v, vec![0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn test_parse_dhcp_option_value_empty() {
+        let v = parse_dhcp_option_value("");
+        assert!(v.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // matches_glob_filter tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_glob_filter_star() {
+        assert!(matches_glob_filter("test.conf", "*.conf"));
+    }
+
+    #[test]
+    fn test_glob_filter_no_match() {
+        assert!(!matches_glob_filter("test.txt", "*.conf"));
+    }
+
+    #[test]
+    fn test_glob_filter_exact() {
+        assert!(matches_glob_filter("foo", "foo"));
+    }
+
+    #[test]
+    fn test_glob_filter_star_all() {
+        assert!(matches_glob_filter("anything.txt", "*"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_dhcp_range tests
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_range_basic() {
+        let r = parse_dhcp_range("192.168.1.100,192.168.1.200").unwrap();
+        assert_eq!(r.start, "192.168.1.100");
+        assert_eq!(r.end, "192.168.1.200");
+        assert!(r.netmask.is_none());
+        assert!(r.lease_time.is_none());
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_range_with_netmask() {
+        let r = parse_dhcp_range("192.168.1.100,192.168.1.200,255.255.255.0").unwrap();
+        assert_eq!(r.netmask.as_deref(), Some("255.255.255.0"));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_range_with_lease_time() {
+        let r = parse_dhcp_range("192.168.1.100,192.168.1.200,12h").unwrap();
+        assert!(r.lease_time.is_some());
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_range_with_tag() {
+        let r = parse_dhcp_range("tag:lan,192.168.1.100,192.168.1.200").unwrap();
+        assert_eq!(r.tag.as_deref(), Some("lan"));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_range_with_set_tag() {
+        let r = parse_dhcp_range("set:red,10.0.0.1,10.0.0.50").unwrap();
+        assert_eq!(r.set_tag.as_deref(), Some("red"));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_range_empty() {
+        assert!(parse_dhcp_range("").is_err());
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_range_single_addr() {
+        assert!(parse_dhcp_range("192.168.1.1").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_dhcp_host tests
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_host_mac_ip() {
+        let r = parse_dhcp_host("00:11:22:33:44:55,192.168.1.50").unwrap();
+        assert_eq!(r.mac.as_deref(), Some("00:11:22:33:44:55"));
+        assert_eq!(r.ip.as_deref(), Some("192.168.1.50"));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_host_hostname_ip() {
+        let r = parse_dhcp_host("myhost,192.168.1.50").unwrap();
+        assert!(r.hostname.is_some());
+        assert_eq!(r.ip.as_deref(), Some("192.168.1.50"));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_host_with_lease_time() {
+        let r = parse_dhcp_host("00:11:22:33:44:55,192.168.1.50,1h").unwrap();
+        assert!(r.lease_time.is_some());
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_host_with_tag() {
+        let r = parse_dhcp_host("set:known,00:11:22:33:44:55,192.168.1.50").unwrap();
+        assert_eq!(r.tag.as_deref(), Some("known"));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_host_empty() {
+        assert!(parse_dhcp_host("").is_err());
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_host_client_id() {
+        let r = parse_dhcp_host("id:01:02:03,192.168.1.50").unwrap();
+        assert!(r.ip.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_dhcp_option tests
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_option_numeric() {
+        let r = parse_dhcp_option("3,192.168.1.1", false).unwrap();
+        assert_eq!(r.option_num, 3);
+        assert!(!r.force);
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_option_force() {
+        let r = parse_dhcp_option("3,192.168.1.1", true).unwrap();
+        assert!(r.force);
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_option_with_tag() {
+        let r = parse_dhcp_option("tag:lan,3,192.168.1.1", false).unwrap();
+        assert_eq!(r.tag.as_deref(), Some("lan"));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_option_empty() {
+        assert!(parse_dhcp_option("", false).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_dhcp_boot tests
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_boot_basic() {
+        let r = parse_dhcp_boot("pxelinux.0").unwrap();
+        assert_eq!(r.filename, "pxelinux.0");
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_boot_with_server() {
+        let r = parse_dhcp_boot("pxelinux.0,bootserver").unwrap();
+        assert_eq!(r.filename, "pxelinux.0");
+        assert_eq!(r.servername.as_deref(), Some("bootserver"));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_boot_with_ip() {
+        let r = parse_dhcp_boot("pxelinux.0,bootserver,192.168.1.1").unwrap();
+        assert!(r.server_address.is_some());
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_boot_with_tag() {
+        let r = parse_dhcp_boot("tag:pxe,pxelinux.0").unwrap();
+        assert_eq!(r.tag.as_deref(), Some("pxe"));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_boot_empty() {
+        assert!(parse_dhcp_boot("").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_dhcp_match tests
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_match_basic() {
+        // dhcp-match expects set:tag,option-number[,value]
+        let r = parse_dhcp_match("set:tag,60,value").unwrap();
+        assert_eq!(r.set_tag, "tag");
+        assert_eq!(r.option_num, 60);
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_dhcp_match_empty() {
+        assert!(parse_dhcp_match("").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_tag_if tests
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_tag_if_basic() {
+        let r = parse_tag_if("set:foo,tag:bar").unwrap();
+        assert_eq!(r.set_tag, "foo");
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_parse_tag_if_empty() {
+        assert!(parse_tag_if("").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // DnsmasqConfig default tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_default_sets_dns_port() {
+        let cfg = DnsmasqConfig::default();
+        assert_eq!(cfg.dns_port, 53);
+    }
+
+    #[test]
+    fn test_default_sets_cache() {
+        let cfg = DnsmasqConfig::default();
+        assert_eq!(cfg.cache_size, crate::config::constants::CACHESIZ);
+    }
+
+    #[test]
+    fn test_default_sets_edns() {
+        let cfg = DnsmasqConfig::default();
+        assert_eq!(cfg.edns_packet_max, crate::config::constants::EDNS_PKTSZ);
+    }
+
+    #[test]
+    fn test_default_dns_forward_max() {
+        let cfg = DnsmasqConfig::default();
+        assert_eq!(cfg.dns_forward_max, crate::config::constants::FTABSIZ);
+    }
+
+    #[test]
+    fn test_default_booleans_false() {
+        let cfg = DnsmasqConfig::default();
+        assert!(!cfg.domain_needed);
+        assert!(!cfg.bogus_priv);
+        assert!(!cfg.no_resolv);
+        assert!(!cfg.no_poll);
+        assert!(!cfg.log_queries);
+        assert!(!cfg.no_negcache);
+        assert!(!cfg.strict_order);
+        assert!(!cfg.all_servers);
+        assert!(!cfg.expand_hosts);
+        assert!(!cfg.stop_dns_rebind);
+        assert!(!cfg.rebind_localhost_ok);
+        assert!(!cfg.proxy_dnssec);
+        assert!(!cfg.no_daemon);
+        assert!(!cfg.keep_in_foreground);
+        assert!(!cfg.filterwin2k);
+        assert!(!cfg.local_service);
+        assert!(!cfg.bind_interfaces);
+        assert!(!cfg.no_hosts);
+    }
+
+    #[test]
+    fn test_default_options_none() {
+        let cfg = DnsmasqConfig::default();
+        assert!(cfg.max_ttl.is_none());
+        assert!(cfg.neg_ttl.is_none());
+        assert!(cfg.min_cache_ttl.is_none());
+        assert!(cfg.max_cache_ttl.is_none());
+        assert!(cfg.local_ttl.is_none());
+        // user defaults to CHUSER, group defaults to CHGRP (dnsmasq convention)
+        assert!(cfg.user.is_some());
+        assert!(cfg.group.is_some());
+        assert!(cfg.pid_file.is_some()); // defaults to RUNFILE
+    }
+
+    #[test]
+    fn test_default_vectors_empty() {
+        let cfg = DnsmasqConfig::default();
+        assert!(cfg.listen_addresses.is_empty());
+        assert!(cfg.interfaces.is_empty());
+        assert!(cfg.except_interfaces.is_empty());
+        assert!(cfg.servers.is_empty());
+        assert!(cfg.addresses.is_empty());
+        assert!(cfg.bogus_nxdomain.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // DnsmasqConfig::validate tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_validate_default_config() {
+        let cfg = DnsmasqConfig::default();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_port_zero() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.dns_port = 0;
+        // Port 0 disables DNS, should still be valid
+        assert!(cfg.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // DnsmasqConfig::parse_server tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_parse_server_basic() {
+        let mut cfg = DnsmasqConfig::default();
+        let s = cfg.parse_server("8.8.8.8").unwrap();
+        assert!(s.address.ip().is_ipv4());
+        assert_eq!(s.address.port(), 53);
+    }
+
+    #[test]
+    fn test_parse_server_with_port() {
+        let mut cfg = DnsmasqConfig::default();
+        let s = cfg.parse_server("8.8.8.8#5353").unwrap();
+        assert_eq!(s.address.port(), 5353);
+    }
+
+    #[test]
+    fn test_parse_server_domain_specific() {
+        let mut cfg = DnsmasqConfig::default();
+        let s = cfg.parse_server("/example.com/8.8.8.8").unwrap();
+        assert!(s.domain.is_some());
+    }
+
+    #[test]
+    fn test_parse_server_with_source() {
+        let mut cfg = DnsmasqConfig::default();
+        let s = cfg.parse_server("8.8.8.8@10.0.0.1").unwrap();
+        assert!(s.source.is_some());
+    }
+
+    #[test]
+    fn test_parse_server_with_iface() {
+        let mut cfg = DnsmasqConfig::default();
+        let s = cfg.parse_server("8.8.8.8@eth0").unwrap();
+        assert!(s.interface.is_some());
+    }
+
+    #[test]
+    fn test_parse_server_invalid() {
+        let mut cfg = DnsmasqConfig::default();
+        assert!(cfg.parse_server("not-valid").is_err());
+    }
+
+    #[test]
+    fn test_parse_server_malformed_domain() {
+        let mut cfg = DnsmasqConfig::default();
+        // Missing closing slash for domain-specific
+        assert!(cfg.parse_server("/example.com").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // process_directive tests (additional)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_directive_domain_needed() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("domain-needed", None).unwrap();
+        assert!(cfg.domain_needed);
+    }
+
+    #[test]
+    fn test_directive_bogus_priv() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("bogus-priv", None).unwrap();
+        assert!(cfg.bogus_priv);
+    }
+
+    #[test]
+    fn test_directive_no_hosts() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("no-hosts", None).unwrap();
+        assert!(cfg.no_hosts);
+    }
+
+    #[test]
+    fn test_directive_keep_in_foreground() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("keep-in-foreground", None).unwrap();
+        assert!(cfg.keep_in_foreground);
+    }
+
+    #[test]
+    fn test_directive_no_resolv() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("no-resolv", None).unwrap();
+        assert!(cfg.no_resolv);
+    }
+
+    #[test]
+    fn test_directive_filterwin2k() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("filterwin2k", None).unwrap();
+        assert!(cfg.filterwin2k);
+    }
+
+    #[test]
+    fn test_directive_no_poll() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("no-poll", None).unwrap();
+        assert!(cfg.no_poll);
+    }
+
+    #[test]
+    fn test_directive_log_queries() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("log-queries", None).unwrap();
+        assert!(cfg.log_queries);
+    }
+
+    #[test]
+    fn test_directive_port() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("port", Some("5353")).unwrap();
+        assert_eq!(cfg.dns_port, 5353);
+    }
+
+    #[test]
+    fn test_directive_cache_size() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("cache-size", Some("1000")).unwrap();
+        assert_eq!(cfg.cache_size, 1000);
+    }
+
+    #[test]
+    fn test_directive_min_port() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("min-port", Some("4096")).unwrap();
+        assert_eq!(cfg.min_port, 4096);
+    }
+
+    #[test]
+    fn test_directive_max_port() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("max-port", Some("65535")).unwrap();
+        assert_eq!(cfg.max_port, 65535);
+    }
+
+    #[test]
+    fn test_directive_listen_address() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("listen-address", Some("127.0.0.1"))
+            .unwrap();
+        assert!(!cfg.listen_addresses.is_empty());
+    }
+
+    #[test]
+    fn test_directive_except_interface() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("except-interface", Some("docker0"))
+            .unwrap();
+        assert!(cfg.except_interfaces.contains(&"docker0".to_string()));
+    }
+
+    #[test]
+    fn test_directive_bind_interfaces() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("bind-interfaces", None).unwrap();
+        assert!(cfg.bind_interfaces);
+    }
+
+    #[test]
+    fn test_directive_no_negcache() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("no-negcache", None).unwrap();
+        assert!(cfg.no_negcache);
+    }
+
+    #[test]
+    fn test_directive_strict_order() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("strict-order", None).unwrap();
+        assert!(cfg.strict_order);
+    }
+
+    #[test]
+    fn test_directive_all_servers() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("all-servers", None).unwrap();
+        assert!(cfg.all_servers);
+    }
+
+    #[test]
+    fn test_directive_dns_forward_max() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("dns-forward-max", Some("1000"))
+            .unwrap();
+        assert_eq!(cfg.dns_forward_max, 1000);
+    }
+
+    #[test]
+    fn test_directive_local_ttl() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("local-ttl", Some("300")).unwrap();
+        assert_eq!(cfg.local_ttl, Some(300));
+    }
+
+    #[test]
+    fn test_directive_neg_ttl() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("neg-ttl", Some("60")).unwrap();
+        assert_eq!(cfg.neg_ttl, Some(60));
+    }
+
+    #[test]
+    fn test_directive_max_ttl() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("max-ttl", Some("3600")).unwrap();
+        assert_eq!(cfg.max_ttl, Some(3600));
+    }
+
+    #[test]
+    fn test_directive_max_cache_ttl() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("max-cache-ttl", Some("7200"))
+            .unwrap();
+        assert_eq!(cfg.max_cache_ttl, Some(7200));
+    }
+
+    #[test]
+    fn test_directive_min_cache_ttl() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("min-cache-ttl", Some("60")).unwrap();
+        assert_eq!(cfg.min_cache_ttl, Some(60));
+    }
+
+    #[test]
+    fn test_directive_auth_ttl() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("auth-ttl", Some("600")).unwrap();
+        assert_eq!(cfg.auth_ttl, 600);
+    }
+
+    #[test]
+    fn test_directive_user() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("user", Some("nobody")).unwrap();
+        assert_eq!(cfg.user.as_deref(), Some("nobody"));
+    }
+
+    #[test]
+    fn test_directive_group() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("group", Some("nogroup")).unwrap();
+        assert_eq!(cfg.group.as_deref(), Some("nogroup"));
+    }
+
+    #[test]
+    fn test_directive_domain() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("domain", Some("example.local"))
+            .unwrap();
+        assert!(!cfg.domains.is_empty());
+        assert_eq!(cfg.domains[0].domain, "example.local");
+    }
+
+    #[test]
+    fn test_directive_local_service() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("local-service", None).unwrap();
+        assert!(cfg.local_service);
+    }
+
+    #[test]
+    fn test_directive_log_facility() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("log-facility", Some("local0"))
+            .unwrap();
+        assert_eq!(cfg.log.facility.as_deref(), Some("local0"));
+    }
+
+    #[test]
+    fn test_directive_log_async() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("log-async", Some("25")).unwrap();
+        assert_eq!(cfg.log.log_async, Some(25));
+    }
+
+    #[test]
+    fn test_directive_pid_file() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("pid-file", Some("/var/run/dnsmasq.pid"))
+            .unwrap();
+        assert_eq!(cfg.pid_file.as_deref(), Some("/var/run/dnsmasq.pid"));
+    }
+
+    #[test]
+    fn test_directive_edns_packet_max() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("edns-packet-max", Some("4096"))
+            .unwrap();
+        assert_eq!(cfg.edns_packet_max, 4096);
+    }
+
+    #[test]
+    fn test_directive_query_port() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("query-port", Some("0")).unwrap();
+        assert_eq!(cfg.query_port, 0);
+    }
+
+    #[test]
+    fn test_directive_expand_hosts() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("expand-hosts", None).unwrap();
+        assert!(cfg.expand_hosts);
+    }
+
+    #[test]
+    fn test_directive_stop_dns_rebind() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("stop-dns-rebind", None).unwrap();
+        assert!(cfg.stop_dns_rebind);
+    }
+
+    #[test]
+    fn test_directive_rebind_localhost_ok() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("rebind-localhost-ok", None).unwrap();
+        assert!(cfg.rebind_localhost_ok);
+    }
+
+    #[test]
+    fn test_directive_proxy_dnssec() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("proxy-dnssec", None).unwrap();
+        assert!(cfg.proxy_dnssec);
+    }
+
+    #[test]
+    fn test_directive_no_daemon() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("no-daemon", None).unwrap();
+        assert!(cfg.no_daemon);
+    }
+
+    #[test]
+    fn test_directive_unknown() {
+        let mut cfg = DnsmasqConfig::default();
+        let r = cfg.process_directive("nonexistent-directive-xyz", None);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_directive_interface() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("interface", Some("eth0")).unwrap();
+        assert!(cfg.interfaces.contains(&"eth0".to_string()));
+    }
+
+    #[test]
+    fn test_directive_address() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("address", Some("/example.com/1.2.3.4"))
+            .unwrap();
+        assert!(!cfg.addresses.is_empty());
+    }
+
+    #[test]
+    fn test_directive_server() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("server", Some("8.8.8.8")).unwrap();
+        assert!(!cfg.servers.is_empty());
+    }
+
+    #[test]
+    fn test_directive_local() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("local", Some("/mylan/")).unwrap();
+        assert!(!cfg.local_domains.is_empty());
+    }
+
+    #[test]
+    fn test_directive_bogus_nxdomain() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("bogus-nxdomain", Some("1.2.3.4"))
+            .unwrap();
+        assert!(!cfg.bogus_nxdomain.is_empty());
+    }
+
+    #[test]
+    fn test_directive_addn_hosts() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("addn-hosts", Some("/etc/hosts.extra"))
+            .unwrap();
+        assert!(cfg.addn_hosts.contains(&"/etc/hosts.extra".to_string()));
+    }
+
+    #[test]
+    fn test_directive_resolv_file() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("resolv-file", Some("/etc/resolv2.conf"))
+            .unwrap();
+        assert!(cfg.resolv_files.contains(&"/etc/resolv2.conf".to_string()));
+    }
+
+    #[test]
+    fn test_directive_max_tcp_connections() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("max-tcp-connections", Some("100"))
+            .unwrap();
+        assert_eq!(cfg.max_tcp_connections, 100);
+    }
+
+    #[test]
+    fn test_directive_clear_on_reload() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("clear-on-reload", None).unwrap();
+        assert!(cfg.clear_on_reload);
+    }
+
+    #[test]
+    fn test_directive_no_round_robin() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("no-round-robin", None).unwrap();
+        assert!(cfg.no_round_robin);
+    }
+
+    #[test]
+    fn test_directive_bind_dynamic() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("bind-dynamic", None).unwrap();
+        assert!(cfg.bind_dynamic);
+    }
+
+    #[test]
+    fn test_directive_localise_queries() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("localise-queries", None).unwrap();
+        assert!(cfg.localise_queries);
+    }
+
+    #[test]
+    fn test_directive_add_mac() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("add-mac", None).unwrap();
+        assert!(cfg.add_mac);
+    }
+
+    #[test]
+    fn test_directive_strip_mac() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("strip-mac", None).unwrap();
+        assert!(cfg.strip_mac);
+    }
+
+    #[test]
+    fn test_directive_strip_subnet() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("strip-subnet", None).unwrap();
+        assert!(cfg.strip_subnet);
+    }
+
+    #[test]
+    fn test_directive_no_ident() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("no-ident", None).unwrap();
+        assert!(cfg.no_ident);
+    }
+
+    #[test]
+    fn test_directive_selfmx() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("selfmx", None).unwrap();
+        assert!(cfg.selfmx);
+    }
+
+    #[test]
+    fn test_directive_localmx() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("localmx", None).unwrap();
+        assert!(cfg.localmx);
+    }
+
+    #[test]
+    fn test_directive_log_dhcp() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("log-dhcp", None).unwrap();
+        assert!(cfg.log.log_dhcp);
+    }
+
+    #[test]
+    fn test_directive_log_debug() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("log-debug", None).unwrap();
+        assert!(cfg.log.log_debug);
+    }
+
+    #[test]
+    fn test_directive_mx_host() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("mx-host", Some("example.com,mail.example.com,10"))
+            .unwrap();
+        assert!(!cfg.mx_hosts.is_empty());
+    }
+
+    #[test]
+    fn test_directive_host_record() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("host-record", Some("myhost,192.168.1.1"))
+            .unwrap();
+        assert!(!cfg.host_records.is_empty());
+    }
+
+    #[test]
+    fn test_directive_cname() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("cname", Some("alias.example.com,target.example.com"))
+            .unwrap();
+        assert!(!cfg.cnames.is_empty());
+    }
+
+    #[test]
+    fn test_directive_txt_record() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("txt-record", Some("example.com,\"v=spf1 ~all\""))
+            .unwrap();
+        assert!(!cfg.txt_records.is_empty());
+    }
+
+    #[test]
+    fn test_directive_srv_host() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive(
+            "srv-host",
+            Some("_http._tcp.example.com,www.example.com,80"),
+        )
+        .unwrap();
+        assert!(!cfg.srv_hosts.is_empty());
+    }
+
+    #[test]
+    fn test_directive_ptr_record() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("ptr-record", Some("_http._tcp.example.com,www.example.com"))
+            .unwrap();
+        assert!(!cfg.ptr_records.is_empty());
+    }
+
+    #[test]
+    fn test_directive_dhcp_ttl() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("dhcp-ttl", Some("300")).unwrap();
+        assert_eq!(cfg.dhcp_ttl, Some(300));
+    }
+
+    #[test]
+    fn test_directive_edns_packet_max_too_small() {
+        let mut cfg = DnsmasqConfig::default();
+        let r = cfg.process_directive("edns-packet-max", Some("256"));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_directive_max_tcp_connections_zero() {
+        let mut cfg = DnsmasqConfig::default();
+        let r = cfg.process_directive("max-tcp-connections", Some("0"));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_directive_neg_ttl_too_large() {
+        let mut cfg = DnsmasqConfig::default();
+        let r = cfg.process_directive("neg-ttl", Some("100000"));
+        assert!(r.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // DHCP directive tests
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_directive_dhcp_range() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("dhcp-range", Some("192.168.1.100,192.168.1.200,12h"))
+            .unwrap();
+        let dhcp = cfg.dhcp.as_ref().unwrap();
+        assert!(!dhcp.ranges.is_empty());
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_directive_dhcp_host() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("dhcp-host", Some("00:11:22:33:44:55,192.168.1.50"))
+            .unwrap();
+        let dhcp = cfg.dhcp.as_ref().unwrap();
+        assert!(!dhcp.hosts.is_empty());
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_directive_dhcp_option() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("dhcp-option", Some("3,192.168.1.1"))
+            .unwrap();
+        let dhcp = cfg.dhcp.as_ref().unwrap();
+        assert!(!dhcp.options.is_empty());
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_directive_dhcp_boot() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("dhcp-boot", Some("pxelinux.0"))
+            .unwrap();
+        let dhcp = cfg.dhcp.as_ref().unwrap();
+        assert!(!dhcp.boot.is_empty());
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_directive_dhcp_authoritative() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("dhcp-authoritative", None).unwrap();
+        let dhcp = cfg.dhcp.as_ref().unwrap();
+        assert!(dhcp.authoritative);
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_directive_dhcp_leasefile() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("dhcp-leasefile", Some("/var/lib/dnsmasq.leases"))
+            .unwrap();
+        let dhcp = cfg.dhcp.as_ref().unwrap();
+        assert_eq!(dhcp.leasefile.as_str(), "/var/lib/dnsmasq.leases");
+    }
+
+    // -----------------------------------------------------------------------
+    // TFTP directive tests
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "tftp")]
+    #[test]
+    fn test_directive_enable_tftp() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("enable-tftp", None).unwrap();
+        assert!(cfg.tftp.is_some());
+    }
+
+    #[cfg(feature = "tftp")]
+    #[test]
+    fn test_directive_tftp_root() {
+        let mut cfg = DnsmasqConfig::default();
+        cfg.process_directive("enable-tftp", None).unwrap();
+        cfg.process_directive("tftp-root", Some("/srv/tftp"))
+            .unwrap();
+        let tftp = cfg.tftp.as_ref().unwrap();
+        assert_eq!(tftp.root.as_deref(), Some("/srv/tftp"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DnsmasqConfig::ensure_* helpers
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_ensure_dhcp_creates() {
+        let mut cfg = DnsmasqConfig::default();
+        assert!(cfg.dhcp.is_none());
+        let _dhcp = cfg.ensure_dhcp();
+        assert!(cfg.dhcp.is_some());
+    }
+
+    #[cfg(feature = "tftp")]
+    #[test]
+    fn test_ensure_tftp_creates() {
+        let mut cfg = DnsmasqConfig::default();
+        assert!(cfg.tftp.is_none());
+        let _tftp = cfg.ensure_tftp();
+        assert!(cfg.tftp.is_some());
+    }
+
+    #[cfg(feature = "dnssec")]
+    #[test]
+    fn test_ensure_dnssec_creates() {
+        let mut cfg = DnsmasqConfig::default();
+        assert!(cfg.dnssec.is_none());
+        let _dnssec = cfg.ensure_dnssec();
+        assert!(cfg.dnssec.is_some());
+    }
+
+    #[cfg(feature = "auth")]
+    #[test]
+    fn test_ensure_auth_creates() {
+        let mut cfg = DnsmasqConfig::default();
+        assert!(cfg.auth.is_none());
+        let _auth = cfg.ensure_auth();
+        assert!(cfg.auth.is_some());
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_ensure_dhcp_idempotent() {
+        let mut cfg = DnsmasqConfig::default();
+        let _d1 = cfg.ensure_dhcp();
+        let _d2 = cfg.ensure_dhcp();
+        assert!(cfg.dhcp.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // DnsmasqConfig::from_file tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_from_file_nonexistent() {
+        // dnsmasq silently skips non-existent config file (matches C behavior)
+        let r = DnsmasqConfig::from_file("/tmp/nonexistent_dnsmasq_test_config.conf");
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn test_from_file_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.conf");
+        std::fs::write(&path, "").unwrap();
+        let cfg = DnsmasqConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.dns_port, 53); // default from Default::default()
+    }
+
+    #[test]
+    fn test_from_file_comments_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comments.conf");
+        std::fs::write(&path, "# This is a comment\n# Another comment\n").unwrap();
+        let cfg = DnsmasqConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.dns_port, 53);
+    }
+
+    #[test]
+    fn test_from_file_with_directives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.conf");
+        std::fs::write(&path, "port=5353\ncache-size=1000\nno-daemon\n").unwrap();
+        let cfg = DnsmasqConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.dns_port, 5353);
+        assert_eq!(cfg.cache_size, 1000);
+        assert!(cfg.no_daemon);
+    }
+
+    #[test]
+    fn test_from_file_with_conf_file_include() {
+        let dir = tempfile::tempdir().unwrap();
+        let inc = dir.path().join("included.conf");
+        std::fs::write(&inc, "port=9999\n").unwrap();
+        let main = dir.path().join("main.conf");
+        std::fs::write(&main, format!("conf-file={}\n", inc.display())).unwrap();
+        let cfg = DnsmasqConfig::from_file(main.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.dns_port, 9999);
+    }
+
+    #[test]
+    fn test_from_file_whitespace_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ws.conf");
+        std::fs::write(&path, "  port = 8053  \n  no-daemon  \n").unwrap();
+        let cfg = DnsmasqConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.dns_port, 8053);
+        assert!(cfg.no_daemon);
+    }
+
+    #[test]
+    fn test_from_file_multiple_directives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.conf");
+        std::fs::write(&path, "listen-address=127.0.0.1\nlisten-address=10.0.0.1\n").unwrap();
+        let cfg = DnsmasqConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.listen_addresses.len(), 2);
+    }
+
+    #[test]
+    fn test_from_file_mixed_comments_and_directives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.conf");
+        std::fs::write(&path, "# DNS settings\nport=5353\n# end\nno-daemon\n").unwrap();
+        let cfg = DnsmasqConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.dns_port, 5353);
+        assert!(cfg.no_daemon);
+    }
 }

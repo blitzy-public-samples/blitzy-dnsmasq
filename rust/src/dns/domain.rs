@@ -616,3 +616,513 @@ pub fn get_domain6<'a>(
     }
     Ok(default_domain)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn make_v4_domain(
+        domain: &str,
+        prefix: Option<&str>,
+        start: Ipv4Addr,
+        end: Ipv4Addr,
+        is_synthetic: bool,
+        prefixlen: u8,
+    ) -> ConditionalDomain {
+        ConditionalDomain::new(
+            domain.to_string(),
+            prefix.map(|s| s.to_string()),
+            Some((start, end)),
+            None,
+            is_synthetic,
+            0,
+            prefixlen,
+        )
+    }
+
+    fn make_v6_domain(
+        domain: &str,
+        prefix: Option<&str>,
+        start: Ipv6Addr,
+        end: Ipv6Addr,
+        is_synthetic: bool,
+        prefixlen: u8,
+    ) -> ConditionalDomain {
+        ConditionalDomain::new(
+            domain.to_string(),
+            prefix.map(|s| s.to_string()),
+            None,
+            Some((start, end)),
+            is_synthetic,
+            0,
+            prefixlen,
+        )
+    }
+
+    #[test]
+    fn test_prefix_to_mask_zero() {
+        assert_eq!(prefix_to_mask(0), Ipv4Addr::UNSPECIFIED);
+    }
+    #[test]
+    fn test_prefix_to_mask_32() {
+        assert_eq!(prefix_to_mask(32), Ipv4Addr::new(255, 255, 255, 255));
+    }
+    #[test]
+    fn test_prefix_to_mask_24() {
+        assert_eq!(prefix_to_mask(24), Ipv4Addr::new(255, 255, 255, 0));
+    }
+    #[test]
+    fn test_prefix_to_mask_16() {
+        assert_eq!(prefix_to_mask(16), Ipv4Addr::new(255, 255, 0, 0));
+    }
+    #[test]
+    fn test_prefix_to_mask_8() {
+        assert_eq!(prefix_to_mask(8), Ipv4Addr::new(255, 0, 0, 0));
+    }
+    #[test]
+    fn test_prefix_to_mask_25() {
+        assert_eq!(prefix_to_mask(25), Ipv4Addr::new(255, 255, 255, 128));
+    }
+    #[test]
+    fn test_prefix_to_mask_overflow() {
+        assert_eq!(prefix_to_mask(33), Ipv4Addr::new(255, 255, 255, 255));
+    }
+
+    #[test]
+    fn test_match_domain_v4_no_range() {
+        let c = ConditionalDomain::new("test.com".into(), None, None, None, false, 0, 0);
+        assert!(!match_domain_v4(&Ipv4Addr::LOCALHOST, &c));
+    }
+
+    #[test]
+    fn test_match_domain_v4_match_all() {
+        let c = make_v4_domain(
+            "test.com",
+            None,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::UNSPECIFIED,
+            false,
+            0,
+        );
+        assert!(match_domain_v4(&Ipv4Addr::new(10, 0, 0, 1), &c));
+        assert!(match_domain_v4(&Ipv4Addr::new(192, 168, 1, 1), &c));
+    }
+
+    #[test]
+    fn test_match_domain_v4_range() {
+        let c = make_v4_domain(
+            "test.com",
+            None,
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(192, 168, 1, 20),
+            false,
+            0,
+        );
+        assert!(!match_domain_v4(&Ipv4Addr::new(192, 168, 1, 9), &c));
+        assert!(match_domain_v4(&Ipv4Addr::new(192, 168, 1, 10), &c));
+        assert!(match_domain_v4(&Ipv4Addr::new(192, 168, 1, 15), &c));
+        assert!(match_domain_v4(&Ipv4Addr::new(192, 168, 1, 20), &c));
+        assert!(!match_domain_v4(&Ipv4Addr::new(192, 168, 1, 21), &c));
+    }
+
+    #[test]
+    fn test_match_domain_v4_subnet() {
+        let c = make_v4_domain(
+            "test.com",
+            None,
+            Ipv4Addr::new(10, 0, 0, 0),
+            Ipv4Addr::new(10, 0, 0, 0),
+            false,
+            24,
+        );
+        assert!(match_domain_v4(&Ipv4Addr::new(10, 0, 0, 1), &c));
+        assert!(match_domain_v4(&Ipv4Addr::new(10, 0, 0, 254), &c));
+        assert!(!match_domain_v4(&Ipv4Addr::new(10, 0, 1, 1), &c));
+    }
+
+    #[test]
+    fn test_match_domain_v6_no_range() {
+        let c = ConditionalDomain::new("test.com".into(), None, None, None, false, 0, 0);
+        assert!(!match_domain_v6(&Ipv6Addr::LOCALHOST, &c));
+    }
+
+    #[test]
+    fn test_match_domain_v6_prefix_ge64() {
+        let s: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let e: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        let c = make_v6_domain("test.com", None, s, e, false, 64);
+        assert!(match_domain_v6(&"2001:db8::1".parse().unwrap(), &c));
+        assert!(match_domain_v6(&"2001:db8::50".parse().unwrap(), &c));
+        assert!(match_domain_v6(&"2001:db8::ff".parse().unwrap(), &c));
+        assert!(!match_domain_v6(&"2001:db8::100".parse().unwrap(), &c));
+        assert!(!match_domain_v6(&"2001:db9::1".parse().unwrap(), &c));
+    }
+
+    #[test]
+    fn test_match_domain_v6_prefix_lt64() {
+        let s: Ipv6Addr = "2001:db8::".parse().unwrap();
+        let e: Ipv6Addr = "2001:db8::".parse().unwrap();
+        let c = make_v6_domain("test.com", None, s, e, false, 32);
+        assert!(match_domain_v6(&"2001:db8::1".parse().unwrap(), &c));
+        assert!(match_domain_v6(&"2001:db8:1::1".parse().unwrap(), &c));
+        assert!(!match_domain_v6(&"2001:db9::1".parse().unwrap(), &c));
+    }
+
+    #[test]
+    fn test_match_domain_v6_full_range() {
+        let s: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let e: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        let c = make_v6_domain("test.com", None, s, e, false, 0);
+        assert!(match_domain_v6(&"2001:db8::1".parse().unwrap(), &c));
+        assert!(match_domain_v6(&"2001:db8::50".parse().unwrap(), &c));
+        assert!(!match_domain_v6(&"2001:db8::100".parse().unwrap(), &c));
+    }
+
+    #[test]
+    fn test_validate_synthetic_name_ok() {
+        assert!(validate_synthetic_name("host.example.com").is_ok());
+    }
+    #[test]
+    fn test_validate_synthetic_name_too_long() {
+        assert!(validate_synthetic_name(&"a".repeat(MAXDNAME + 1)).is_err());
+    }
+    #[test]
+    fn test_validate_synthetic_name_label_too_long() {
+        let name = format!("{}.example.com", "a".repeat(MAXLABEL + 1));
+        assert!(validate_synthetic_name(&name).is_err());
+    }
+
+    #[test]
+    fn test_is_name_synthetic_empty() {
+        assert!(is_name_synthetic("", &[]).unwrap().is_none());
+    }
+    #[test]
+    fn test_is_name_synthetic_no_domains() {
+        assert!(is_name_synthetic("host.example.com", &[])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_is_name_synthetic_ipv4_indexed() {
+        let c = make_v4_domain(
+            "internal.example.com",
+            Some("host-"),
+            Ipv4Addr::new(192, 168, 1, 0),
+            Ipv4Addr::new(192, 168, 1, 255),
+            true,
+            0,
+        );
+        let (addr, idx) = is_name_synthetic("host-5.internal.example.com", &[c])
+            .unwrap()
+            .unwrap();
+        assert_eq!(addr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)));
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_is_name_synthetic_ipv4_dash_encoded() {
+        let c = make_v4_domain(
+            "example.com",
+            None,
+            Ipv4Addr::new(192, 168, 1, 0),
+            Ipv4Addr::new(192, 168, 1, 255),
+            false,
+            0,
+        );
+        let (addr, _) = is_name_synthetic("192-168-1-100.example.com", &[c])
+            .unwrap()
+            .unwrap();
+        assert_eq!(addr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)));
+    }
+
+    #[test]
+    fn test_is_name_synthetic_ipv4_index_out_of_range() {
+        let c = make_v4_domain(
+            "example.com",
+            Some("host-"),
+            Ipv4Addr::new(192, 168, 1, 0),
+            Ipv4Addr::new(192, 168, 1, 10),
+            true,
+            0,
+        );
+        assert!(is_name_synthetic("host-20.example.com", &[c])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_is_name_synthetic_ipv6_indexed() {
+        let s: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let e: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        let c = make_v6_domain("v6.example.com", Some("host-"), s, e, true, 64);
+        let (addr, _) = is_name_synthetic("host-4.v6.example.com", &[c])
+            .unwrap()
+            .unwrap();
+        assert_eq!(addr, IpAddr::V6("2001:db8::5".parse::<Ipv6Addr>().unwrap()));
+    }
+
+    #[test]
+    fn test_is_name_synthetic_ipv6_dash_encoded() {
+        let s: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let e: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        let c = make_v6_domain("v6.example.com", None, s, e, false, 0);
+        let (addr, _) = is_name_synthetic("2001-db8--5.v6.example.com", &[c])
+            .unwrap()
+            .unwrap();
+        assert_eq!(addr, IpAddr::V6("2001:db8::5".parse::<Ipv6Addr>().unwrap()));
+    }
+
+    #[test]
+    fn test_is_name_synthetic_wrong_prefix() {
+        let c = make_v4_domain(
+            "example.com",
+            Some("host-"),
+            Ipv4Addr::new(192, 168, 1, 0),
+            Ipv4Addr::new(192, 168, 1, 255),
+            true,
+            0,
+        );
+        assert!(is_name_synthetic("bad-5.example.com", &[c])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_is_name_synthetic_name_too_short() {
+        let c = make_v4_domain(
+            "example.com",
+            None,
+            Ipv4Addr::new(0, 0, 0, 0),
+            Ipv4Addr::new(255, 255, 255, 255),
+            false,
+            0,
+        );
+        assert!(is_name_synthetic(".example.com", &[c]).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_rev_synth_ipv4_indexed() {
+        let c = make_v4_domain(
+            "internal.example.com",
+            Some("host-"),
+            Ipv4Addr::new(192, 168, 1, 0),
+            Ipv4Addr::new(192, 168, 1, 255),
+            true,
+            0,
+        );
+        let result = is_rev_synth(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), &[c]).unwrap();
+        assert_eq!(result, Some("host-5.internal.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_rev_synth_ipv4_dash() {
+        let c = make_v4_domain(
+            "example.com",
+            None,
+            Ipv4Addr::new(192, 168, 1, 0),
+            Ipv4Addr::new(192, 168, 1, 255),
+            false,
+            0,
+        );
+        let result = is_rev_synth(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), &[c]).unwrap();
+        assert_eq!(result, Some("192-168-1-100.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_rev_synth_ipv4_no_match() {
+        let c = make_v4_domain(
+            "example.com",
+            None,
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 10),
+            false,
+            0,
+        );
+        assert!(
+            is_rev_synth(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), &[c])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_rev_synth_ipv6_indexed() {
+        let s: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let e: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        let c = make_v6_domain("v6.example.com", Some("host-"), s, e, true, 64);
+        let result = is_rev_synth(&IpAddr::V6("2001:db8::5".parse().unwrap()), &[c]).unwrap();
+        assert_eq!(result, Some("host-4.v6.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_rev_synth_ipv6_dash() {
+        let s: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let e: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        let c = make_v6_domain("v6.example.com", None, s, e, false, 0);
+        let result = is_rev_synth(&IpAddr::V6("2001:db8::5".parse().unwrap()), &[c]).unwrap();
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with(".v6.example.com"));
+    }
+
+    #[test]
+    fn test_get_domain_no_cond_with_default() {
+        assert_eq!(
+            get_domain(&Ipv4Addr::new(10, 0, 0, 1), &[], Some("default.com")).unwrap(),
+            Some("default.com")
+        );
+    }
+    #[test]
+    fn test_get_domain_no_cond_no_default() {
+        assert!(get_domain(&Ipv4Addr::new(10, 0, 0, 1), &[], None)
+            .unwrap()
+            .is_none());
+    }
+    #[test]
+    fn test_get_domain_conditional_match() {
+        let c = make_v4_domain(
+            "internal.lan",
+            None,
+            Ipv4Addr::new(192, 168, 1, 0),
+            Ipv4Addr::new(192, 168, 1, 255),
+            false,
+            0,
+        );
+        assert_eq!(
+            get_domain(&Ipv4Addr::new(192, 168, 1, 50), &[c], Some("default.com")).unwrap(),
+            Some("internal.lan")
+        );
+    }
+    #[test]
+    fn test_get_domain_conditional_no_match_fallback() {
+        let c = make_v4_domain(
+            "internal.lan",
+            None,
+            Ipv4Addr::new(10, 0, 0, 0),
+            Ipv4Addr::new(10, 0, 0, 255),
+            false,
+            0,
+        );
+        assert_eq!(
+            get_domain(&Ipv4Addr::new(192, 168, 1, 50), &[c], Some("default.com")).unwrap(),
+            Some("default.com")
+        );
+    }
+    #[test]
+    fn test_get_domain6_with_match() {
+        let s: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let e: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        let c = make_v6_domain("v6.lan", None, s, e, false, 0);
+        let addr: Ipv6Addr = "2001:db8::50".parse().unwrap();
+        assert_eq!(
+            get_domain6(Some(&addr), &[c], Some("default.com")).unwrap(),
+            Some("v6.lan")
+        );
+    }
+    #[test]
+    fn test_get_domain6_none_addr() {
+        assert_eq!(
+            get_domain6(None, &[], Some("default.com")).unwrap(),
+            Some("default.com")
+        );
+    }
+    #[test]
+    fn test_get_domain6_no_match() {
+        let s: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let e: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        let c = make_v6_domain("v6.lan", None, s, e, false, 0);
+        let addr: Ipv6Addr = "2001:db9::50".parse().unwrap();
+        assert_eq!(
+            get_domain6(Some(&addr), &[c], Some("default.com")).unwrap(),
+            Some("default.com")
+        );
+    }
+    #[test]
+    fn test_conditional_domain_new() {
+        let cd = ConditionalDomain::new(
+            "test.com".into(),
+            Some("pfx-".into()),
+            Some((Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 254))),
+            None,
+            true,
+            42,
+            24,
+        );
+        assert_eq!(cd.domain, "test.com");
+        assert_eq!(cd.prefix.as_deref(), Some("pfx-"));
+        assert!(cd.is_synthetic);
+        assert_eq!(cd.index, 42);
+        assert_eq!(cd.prefixlen, 24);
+    }
+    #[test]
+    fn test_roundtrip_ipv4_indexed() {
+        let c = make_v4_domain(
+            "test.com",
+            Some("h-"),
+            Ipv4Addr::new(10, 0, 0, 0),
+            Ipv4Addr::new(10, 0, 0, 255),
+            true,
+            0,
+        );
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42));
+        let name = is_rev_synth(&ip, &[c.clone()]).unwrap().unwrap();
+        let (recovered, _) = is_name_synthetic(&name, &[c]).unwrap().unwrap();
+        assert_eq!(recovered, ip);
+    }
+    #[test]
+    fn test_roundtrip_ipv4_dash() {
+        let c = make_v4_domain(
+            "test.com",
+            None,
+            Ipv4Addr::new(10, 0, 0, 0),
+            Ipv4Addr::new(10, 0, 0, 255),
+            false,
+            0,
+        );
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42));
+        let name = is_rev_synth(&ip, &[c.clone()]).unwrap().unwrap();
+        let (recovered, _) = is_name_synthetic(&name, &[c]).unwrap().unwrap();
+        assert_eq!(recovered, ip);
+    }
+    #[test]
+    fn test_rev_synth_ipv4_prefix_dash() {
+        let c = make_v4_domain(
+            "test.com",
+            Some("srv-"),
+            Ipv4Addr::new(10, 0, 0, 0),
+            Ipv4Addr::new(10, 0, 0, 255),
+            false,
+            0,
+        );
+        assert_eq!(
+            is_rev_synth(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &[c]).unwrap(),
+            Some("srv-10-0-0-1.test.com".to_string())
+        );
+    }
+    #[test]
+    fn test_rev_synth_skips_v4_when_v6_only() {
+        let s: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let e: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        let c = make_v6_domain("v6.test.com", None, s, e, false, 0);
+        assert!(is_rev_synth(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &[c])
+            .unwrap()
+            .is_none());
+    }
+    #[test]
+    fn test_rev_synth_skips_v6_when_v4_only() {
+        let c = make_v4_domain(
+            "v4.test.com",
+            None,
+            Ipv4Addr::new(10, 0, 0, 0),
+            Ipv4Addr::new(10, 0, 0, 255),
+            false,
+            0,
+        );
+        assert!(
+            is_rev_synth(&IpAddr::V6("2001:db8::1".parse().unwrap()), &[c])
+                .unwrap()
+                .is_none()
+        );
+    }
+}

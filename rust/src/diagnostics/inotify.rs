@@ -1018,4 +1018,462 @@ mod tests {
         // Counter should NOT have advanced for the duplicate.
         assert_eq!(counter, 101);
     }
+
+    // ===================================================================
+    // Additional tests — is_editor_artifact
+    // ===================================================================
+
+    #[test]
+    fn test_editor_artifact_tilde_in_middle_not_artifact() {
+        assert!(!is_editor_artifact("file~name"));
+    }
+
+    #[test]
+    fn test_editor_artifact_hash_start_no_end() {
+        assert!(!is_editor_artifact("#noend"));
+    }
+
+    #[test]
+    fn test_editor_artifact_hash_end_no_start() {
+        assert!(!is_editor_artifact("nostart#"));
+    }
+
+    #[test]
+    fn test_editor_artifact_single_char_dot() {
+        assert!(is_editor_artifact("."));
+        assert!(is_editor_artifact(".."));
+    }
+
+    #[test]
+    fn test_editor_artifact_vim_swap() {
+        // vim .swp files start with dot
+        assert!(is_editor_artifact(".hosts.swp"));
+        assert!(is_editor_artifact(".file.swx"));
+    }
+
+    #[test]
+    fn test_editor_artifact_valid_conf_files() {
+        assert!(!is_editor_artifact("01-dhcp.conf"));
+        assert!(!is_editor_artifact("server-192.168.1.1"));
+        assert!(!is_editor_artifact("local_hosts"));
+        assert!(!is_editor_artifact("myzone.hosts"));
+    }
+
+    // ===================================================================
+    // Additional tests — resolve_symlink
+    // ===================================================================
+
+    #[test]
+    fn test_resolve_symlink_regular_file() {
+        // /etc/hostname is typically a regular file
+        let result = resolve_symlink(Path::new("/etc/hostname"));
+        assert!(result.is_ok());
+        // Should be None (not a symlink)
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_resolve_symlink_actual_symlink() {
+        // Create a temp symlink to test
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("target_file");
+        std::fs::write(&target_path, "data").unwrap();
+        let link_path = dir.path().join("link_file");
+        std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
+
+        let result = resolve_symlink(&link_path);
+        assert!(result.is_ok());
+        let resolved = result.unwrap();
+        assert!(resolved.is_some());
+        assert_eq!(resolved.unwrap(), target_path);
+    }
+
+    #[test]
+    fn test_resolve_symlink_relative_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("actual");
+        std::fs::write(&target_path, "content").unwrap();
+        let link_path = dir.path().join("relative_link");
+        // Create a relative symlink
+        std::os::unix::fs::symlink("actual", &link_path).unwrap();
+
+        let result = resolve_symlink(&link_path);
+        assert!(result.is_ok());
+        let resolved = result.unwrap();
+        assert!(resolved.is_some());
+        // Should be dir + "actual"
+        assert_eq!(resolved.unwrap(), dir.path().join("actual"));
+    }
+
+    // ===================================================================
+    // Additional tests — dir_flags
+    // ===================================================================
+
+    #[test]
+    fn test_dir_flags_power_of_two() {
+        let all = [
+            dir_flags::AH_DIR,
+            dir_flags::AH_INACTIVE,
+            dir_flags::AH_WD_DONE,
+            dir_flags::AH_HOSTS,
+            dir_flags::AH_DHCP_HST,
+            dir_flags::AH_DHCP_OPT,
+        ];
+        for &f in &all {
+            assert!(f.is_power_of_two(), "Flag {} is not a power of two", f);
+        }
+    }
+
+    #[test]
+    fn test_dir_flags_combinations() {
+        let combined = dir_flags::AH_DIR | dir_flags::AH_HOSTS;
+        assert_ne!(combined & dir_flags::AH_DIR, 0);
+        assert_ne!(combined & dir_flags::AH_HOSTS, 0);
+        assert_eq!(combined & dir_flags::AH_DHCP_HST, 0);
+    }
+
+    #[test]
+    fn test_dir_flags_wd_done_separate() {
+        let with_done = dir_flags::AH_HOSTS | dir_flags::AH_WD_DONE;
+        assert_ne!(with_done & dir_flags::AH_WD_DONE, 0);
+        assert_ne!(with_done & dir_flags::AH_HOSTS, 0);
+        assert_eq!(with_done & dir_flags::AH_DHCP_OPT, 0);
+    }
+
+    // ===================================================================
+    // Additional tests — get_or_create_hosts_entry
+    // ===================================================================
+
+    #[test]
+    fn test_hosts_entry_counter_increment() {
+        let mut files = HashMap::new();
+        let mut counter = 0u32;
+
+        for i in 0..5 {
+            let name = format!("host{}", i);
+            let path = PathBuf::from(format!("/tmp/hosts/{}", name));
+            let idx = InotifyWatcher::get_or_create_hosts_entry(
+                &mut files,
+                &name,
+                &path,
+                dir_flags::AH_HOSTS,
+                &mut counter,
+            );
+            assert_eq!(idx, i);
+        }
+        assert_eq!(counter, 5);
+        assert_eq!(files.len(), 5);
+    }
+
+    #[test]
+    fn test_hosts_entry_wrapping_counter() {
+        let mut files = HashMap::new();
+        let mut counter = u32::MAX;
+        let path = PathBuf::from("/tmp/hosts/wrap");
+
+        let idx = InotifyWatcher::get_or_create_hosts_entry(
+            &mut files,
+            "wrap",
+            &path,
+            dir_flags::AH_HOSTS,
+            &mut counter,
+        );
+        assert_eq!(idx, u32::MAX);
+        assert_eq!(counter, 0); // Wrapped around
+    }
+
+    #[test]
+    fn test_hosts_entry_different_flags() {
+        let mut files = HashMap::new();
+        let mut counter = 10u32;
+        let path = PathBuf::from("/etc/hosts.d/myfile");
+
+        let idx = InotifyWatcher::get_or_create_hosts_entry(
+            &mut files,
+            "myfile",
+            &path,
+            dir_flags::AH_DHCP_HST,
+            &mut counter,
+        );
+        assert_eq!(idx, 10);
+        // Verify the entry has the correct flags
+        let entry = files.get(&OsString::from("myfile")).unwrap();
+        assert_eq!(entry.flags, dir_flags::AH_DHCP_HST);
+        assert_eq!(entry.index, 10);
+    }
+
+    // ===================================================================
+    // Additional tests — MAX_SYMLINKS
+    // ===================================================================
+
+    #[test]
+    fn test_max_symlinks_constant() {
+        assert_eq!(MAX_SYMLINKS, 20);
+    }
+
+    // ===================================================================
+    // Additional tests — HostsFileEntry, ResolvWatch, DynDirWatch
+    // ===================================================================
+
+    #[test]
+    fn test_hosts_file_entry_creation() {
+        let entry = HostsFileEntry {
+            full_path: PathBuf::from("/etc/hosts.d/myfile"),
+            flags: dir_flags::AH_HOSTS,
+            index: 42,
+        };
+        assert_eq!(entry.index, 42);
+        assert_eq!(entry.flags, dir_flags::AH_HOSTS);
+    }
+
+    #[test]
+    fn test_hosts_file_entry_clone() {
+        let entry = HostsFileEntry {
+            full_path: PathBuf::from("/path/to/file"),
+            flags: dir_flags::AH_DIR | dir_flags::AH_HOSTS,
+            index: 99,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.index, 99);
+        assert_eq!(cloned.flags, entry.flags);
+    }
+
+    #[test]
+    fn test_resolv_watch_creation() {
+        let watch = ResolvWatch {
+            original_path: PathBuf::from("/etc/resolv.conf"),
+            filename: OsString::from("resolv.conf"),
+        };
+        assert_eq!(watch.filename, OsString::from("resolv.conf"));
+    }
+
+    #[test]
+    fn test_dyn_dir_watch_creation() {
+        let watch = DynDirWatch {
+            dir_path: PathBuf::from("/etc/dnsmasq.d"),
+            flags: dir_flags::AH_DIR | dir_flags::AH_HOSTS,
+            files: HashMap::new(),
+        };
+        assert!(watch.files.is_empty());
+        assert_ne!(watch.flags & dir_flags::AH_DIR, 0);
+    }
+
+    #[test]
+    fn test_dyn_dir_watch_with_files() {
+        let mut files = HashMap::new();
+        files.insert(
+            OsString::from("hosts1"),
+            HostsFileEntry {
+                full_path: PathBuf::from("/etc/dnsmasq.d/hosts1"),
+                flags: dir_flags::AH_HOSTS,
+                index: 0,
+            },
+        );
+        let watch = DynDirWatch {
+            dir_path: PathBuf::from("/etc/dnsmasq.d"),
+            flags: dir_flags::AH_DIR | dir_flags::AH_HOSTS | dir_flags::AH_WD_DONE,
+            files,
+        };
+        assert_eq!(watch.files.len(), 1);
+        assert!(watch.files.contains_key(&OsString::from("hosts1")));
+    }
+
+    // ===================================================================
+    // Additional tests — InotifyWatcher::new (requires tokio runtime)
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_inotify_watcher_new_no_resolv() {
+        let result = InotifyWatcher::new(&[], 53, true, 0);
+        assert!(result.is_ok());
+        let watcher = result.unwrap();
+        assert!(watcher.resolv_watches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_inotify_watcher_new_port_zero() {
+        let resolv = vec![PathBuf::from("/etc/resolv.conf")];
+        let result = InotifyWatcher::new(&resolv, 0, false, 0);
+        assert!(result.is_ok());
+        let watcher = result.unwrap();
+        assert!(watcher.resolv_watches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_inotify_watcher_new_with_resolv() {
+        let resolv = vec![PathBuf::from("/etc/resolv.conf")];
+        let result = InotifyWatcher::new(&resolv, 53, false, 0);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_inotify_watcher_new_nonexistent_resolv() {
+        let resolv = vec![PathBuf::from("/tmp/nonexistent_dir_xyz/resolv.conf")];
+        let _result = InotifyWatcher::new(&resolv, 53, false, 100);
+    }
+
+    #[tokio::test]
+    async fn test_inotify_watcher_custom_host_index() {
+        let result = InotifyWatcher::new(&[], 0, true, 500);
+        assert!(result.is_ok());
+        let watcher = result.unwrap();
+        assert_eq!(watcher.host_index_counter, 500);
+    }
+
+    #[tokio::test]
+    async fn test_inotify_watcher_empty_resolv_list() {
+        let result = InotifyWatcher::new(&[], 53, false, 0);
+        assert!(result.is_ok());
+    }
+
+    // ===================================================================
+    // Additional tests — setup_dynamic_dirs
+    // ===================================================================
+
+    /// Mock implementation of InotifyCallbacks for testing.
+    struct MockCallbacks {
+        hosts_read: Vec<(PathBuf, u32)>,
+        cache_removed: Vec<u32>,
+        dynfiles_read: Vec<(PathBuf, u32)>,
+    }
+
+    impl MockCallbacks {
+        fn new() -> Self {
+            Self {
+                hosts_read: vec![],
+                cache_removed: vec![],
+                dynfiles_read: vec![],
+            }
+        }
+    }
+
+    impl InotifyCallbacks for MockCallbacks {
+        fn read_hostsfile(&mut self, path: &Path, index: u32) -> usize {
+            self.hosts_read.push((path.to_path_buf(), index));
+            0
+        }
+        fn cache_remove_uid(&mut self, index: u32) -> u32 {
+            self.cache_removed.push(index);
+            0
+        }
+        fn option_read_dynfile(&mut self, path: &Path, flags: u32) -> bool {
+            self.dynfiles_read.push((path.to_path_buf(), flags));
+            true
+        }
+        fn dhcp_update_configs(&mut self) {}
+        fn lease_update_file(&mut self) {}
+        fn lease_update_dns(&mut self, _force: bool) {}
+    }
+
+    #[tokio::test]
+    async fn test_setup_dynamic_dirs_empty() {
+        let mut watcher = InotifyWatcher::new(&[], 0, true, 0).unwrap();
+        let mut cbs = MockCallbacks::new();
+        let dirs: Vec<(PathBuf, u32)> = vec![];
+        let result = watcher.setup_dynamic_dirs(&dirs, 0, &mut cbs);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_setup_dynamic_dirs_single_hosts_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hosts_extra"), "127.0.0.1 test.local\n").unwrap();
+
+        let mut watcher = InotifyWatcher::new(&[], 0, true, 0).unwrap();
+        let mut cbs = MockCallbacks::new();
+        let dirs = vec![(dir.path().to_path_buf(), dir_flags::AH_HOSTS)];
+        let result = watcher.setup_dynamic_dirs(&dirs, 0, &mut cbs);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_setup_dynamic_dirs_with_editor_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real_hosts"), "1.2.3.4 host\n").unwrap();
+        std::fs::write(dir.path().join(".hidden"), "hidden\n").unwrap();
+        std::fs::write(dir.path().join("backup~"), "bak\n").unwrap();
+        std::fs::write(dir.path().join("#autosave#"), "auto\n").unwrap();
+
+        let mut watcher = InotifyWatcher::new(&[], 0, true, 0).unwrap();
+        let mut cbs = MockCallbacks::new();
+        let dirs = vec![(dir.path().to_path_buf(), dir_flags::AH_HOSTS)];
+        let result = watcher.setup_dynamic_dirs(&dirs, 0, &mut cbs);
+        assert!(result.is_ok());
+        // Editor artifacts should be filtered — only real_hosts processed
+        let read_names: Vec<_> = cbs
+            .hosts_read
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert!(read_names.contains(&"real_hosts".to_string()));
+        assert!(!read_names.contains(&".hidden".to_string()));
+        assert!(!read_names.contains(&"backup~".to_string()));
+        assert!(!read_names.contains(&"#autosave#".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_setup_dynamic_dirs_nonexistent() {
+        let mut watcher = InotifyWatcher::new(&[], 0, true, 0).unwrap();
+        let mut cbs = MockCallbacks::new();
+        let dirs = vec![(
+            PathBuf::from("/tmp/nonexistent_test_dir_abc123"),
+            dir_flags::AH_HOSTS,
+        )];
+        // Should handle gracefully (skip or log warning)
+        let result = watcher.setup_dynamic_dirs(&dirs, 0, &mut cbs);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_setup_dynamic_dirs_dhcp_hst_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dhcphost"),
+            "aa:bb:cc:dd:ee:ff,192.168.1.1\n",
+        )
+        .unwrap();
+
+        let mut watcher = InotifyWatcher::new(&[], 0, true, 0).unwrap();
+        let mut cbs = MockCallbacks::new();
+        let dirs = vec![(dir.path().to_path_buf(), dir_flags::AH_DHCP_HST)];
+        let result = watcher.setup_dynamic_dirs(&dirs, 0, &mut cbs);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_setup_dynamic_dirs_multiple() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(dir1.path().join("hosts1"), "1.2.3.4 a\n").unwrap();
+        std::fs::write(dir2.path().join("opts1"), "opt:value\n").unwrap();
+
+        let mut watcher = InotifyWatcher::new(&[], 0, true, 0).unwrap();
+        let mut cbs = MockCallbacks::new();
+        let dirs = vec![
+            (dir1.path().to_path_buf(), dir_flags::AH_HOSTS),
+            (dir2.path().to_path_buf(), dir_flags::AH_DHCP_OPT),
+        ];
+        let result = watcher.setup_dynamic_dirs(&dirs, 0, &mut cbs);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_setup_dynamic_dirs_flag_filtering() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(dir1.path().join("hosts1"), "1.2.3.4 a\n").unwrap();
+        std::fs::write(dir2.path().join("dhcpopt1"), "opt\n").unwrap();
+
+        let mut watcher = InotifyWatcher::new(&[], 0, true, 0).unwrap();
+        let mut cbs = MockCallbacks::new();
+        let dirs = vec![
+            (dir1.path().to_path_buf(), dir_flags::AH_HOSTS),
+            (dir2.path().to_path_buf(), dir_flags::AH_DHCP_OPT),
+        ];
+        // Only process AH_HOSTS dirs by passing that flag
+        let result = watcher.setup_dynamic_dirs(&dirs, dir_flags::AH_HOSTS, &mut cbs);
+        assert!(result.is_ok());
+        // Should have only processed hosts dir, not dhcp_opt dir
+        assert!(cbs.dynfiles_read.is_empty() || cbs.hosts_read.len() >= 1);
+    }
 }

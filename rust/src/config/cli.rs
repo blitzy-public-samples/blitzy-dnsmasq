@@ -1719,4 +1719,1010 @@ mod tests {
         let args = CliArgs::try_parse_from(["dnsmasq", "--test"]).unwrap();
         assert!(args.test);
     }
+
+    // =========================================================================
+    // Additional validation tests
+    // =========================================================================
+
+    #[test]
+    fn test_validate_max_tcp_connections_zero() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--max-tcp-connections", "0"]).unwrap();
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_max_tcp_connections_valid() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--max-tcp-connections", "20"]).unwrap();
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_dhcp_lease_max_zero() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--dhcp-lease-max", "0"]).unwrap();
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_dhcp_lease_max_valid() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--dhcp-lease-max", "500"]).unwrap();
+        assert!(args.validate().is_ok());
+        assert_eq!(args.effective_dhcp_lease_max(), 500);
+    }
+
+    #[test]
+    fn test_validate_min_max_port_equal() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--min-port", "1024", "--max-port", "1024"])
+            .unwrap();
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_min_max_port_valid_range() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--min-port", "1024", "--max-port", "65535"])
+                .unwrap();
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_edns_exactly_512() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-P", "512"]).unwrap();
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_edns_511() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-P", "511"]).unwrap();
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_edns_large() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-P", "4096"]).unwrap();
+        assert!(args.validate().is_ok());
+        assert_eq!(args.effective_edns_packet_max(), 4096);
+    }
+
+    #[test]
+    fn test_validate_min_max_cache_ttl_conflict() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--min-cache-ttl",
+            "600",
+            "--max-cache-ttl",
+            "300",
+        ])
+        .unwrap();
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_min_max_cache_ttl_equal() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--min-cache-ttl",
+            "300",
+            "--max-cache-ttl",
+            "300",
+        ])
+        .unwrap();
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_min_max_cache_ttl_valid() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--min-cache-ttl",
+            "60",
+            "--max-cache-ttl",
+            "3600",
+        ])
+        .unwrap();
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_dhcp_reply_delay_max() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--dhcp-reply-delay", "301"]).unwrap();
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_dhcp_reply_delay_boundary() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--dhcp-reply-delay", "300"]).unwrap();
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_dhcp_reply_delay_zero() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--dhcp-reply-delay", "0"]).unwrap();
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_log_async_zero() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--log-async", "0"]).unwrap();
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_log_async_valid() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--log-async", "25"]).unwrap();
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_neg_ttl_very_large() {
+        // Should still succeed (warning only, matching C behavior)
+        let args = CliArgs::try_parse_from(["dnsmasq", "--neg-ttl", "100000"]).unwrap();
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_neg_ttl_normal() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--neg-ttl", "300"]).unwrap();
+        assert!(args.validate().is_ok());
+    }
+
+    #[cfg(feature = "tftp")]
+    #[test]
+    fn test_validate_tftp_max_zero() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--tftp-max", "0"]).unwrap();
+        assert!(args.validate().is_err());
+    }
+
+    #[cfg(feature = "tftp")]
+    #[test]
+    fn test_validate_tftp_max_valid() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--tftp-max", "100"]).unwrap();
+        assert!(args.validate().is_ok());
+        assert_eq!(args.effective_tftp_max(), 100);
+    }
+
+    // =========================================================================
+    // Effective value tests with explicit values
+    // =========================================================================
+
+    #[test]
+    fn test_effective_cache_size_explicit() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--cache-size", "5000"]).unwrap();
+        assert_eq!(args.effective_cache_size(), 5000);
+    }
+
+    #[test]
+    fn test_effective_dns_forward_max_explicit() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--dns-forward-max", "300"]).unwrap();
+        assert_eq!(args.effective_dns_forward_max(), 300);
+    }
+
+    #[test]
+    fn test_effective_user_explicit() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-u", "nobody"]).unwrap();
+        assert_eq!(args.effective_user(), "nobody");
+    }
+
+    #[test]
+    fn test_effective_group_explicit() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-g", "nogroup"]).unwrap();
+        assert_eq!(args.effective_group(), "nogroup");
+    }
+
+    #[test]
+    fn test_effective_port_zero_disables_dns() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-p", "0"]).unwrap();
+        assert_eq!(args.effective_port(), 0);
+    }
+
+    #[test]
+    fn test_effective_max_tcp_explicit() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--max-tcp-connections", "50"]).unwrap();
+        assert_eq!(args.effective_max_tcp_connections(), 50);
+    }
+
+    // =========================================================================
+    // CLI arg parsing for various options
+    // =========================================================================
+
+    #[test]
+    fn test_listen_address() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-a", "127.0.0.1", "-a", "::1"]).unwrap();
+        assert_eq!(args.listen_address.len(), 2);
+        assert_eq!(args.listen_address[0], "127.0.0.1");
+        assert_eq!(args.listen_address[1], "::1");
+    }
+
+    #[test]
+    fn test_address_override() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-A", "/example.com/1.2.3.4"]).unwrap();
+        assert_eq!(args.address.len(), 1);
+        assert_eq!(args.address[0], "/example.com/1.2.3.4");
+    }
+
+    #[test]
+    fn test_bogus_nxdomain() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-B", "1.2.3.4"]).unwrap();
+        assert_eq!(args.bogus_nxdomain.len(), 1);
+    }
+
+    #[test]
+    fn test_conf_file() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-C", "/etc/dnsmasq.d/test.conf"]).unwrap();
+        assert_eq!(args.conf_file.len(), 1);
+    }
+
+    #[test]
+    fn test_except_interface() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-I", "lo"]).unwrap();
+        assert_eq!(args.except_interface.len(), 1);
+    }
+
+    #[test]
+    fn test_leasefile() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "-l", "/var/lib/misc/dnsmasq.leases"]).unwrap();
+        assert_eq!(
+            args.dhcp_leasefile.as_deref(),
+            Some("/var/lib/misc/dnsmasq.leases")
+        );
+    }
+
+    #[test]
+    fn test_pid_file() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-x", "/run/dnsmasq.pid"]).unwrap();
+        assert_eq!(args.pid_file.as_deref(), Some("/run/dnsmasq.pid"));
+    }
+
+    #[test]
+    fn test_dhcp_range() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--dhcp-range", "192.168.1.50,192.168.1.150,12h"])
+                .unwrap();
+        assert_eq!(args.dhcp_range.len(), 1);
+    }
+
+    #[test]
+    fn test_dhcp_host() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--dhcp-host", "aa:bb:cc:dd:ee:ff,192.168.1.100"])
+                .unwrap();
+        assert_eq!(args.dhcp_host.len(), 1);
+    }
+
+    #[test]
+    fn test_multiple_boolean_flags() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--stop-dns-rebind",
+            "--rebind-localhost-ok",
+            "--all-servers",
+            "--clear-on-reload",
+            "--no-round-robin",
+            "--bind-dynamic",
+            "--no-ident",
+            "--local-service",
+        ])
+        .unwrap();
+        assert!(args.stop_dns_rebind);
+        assert!(args.rebind_localhost_ok);
+        assert!(args.all_servers);
+        assert!(args.clear_on_reload);
+        assert!(args.no_round_robin);
+        assert!(args.bind_dynamic);
+        assert!(args.no_ident);
+    }
+
+    #[test]
+    fn test_dhcp_flags() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--dhcp-authoritative",
+            "--dhcp-fqdn",
+            "--dhcp-sequential-ip",
+            "--dhcp-no-override",
+            "--dhcp-client-update",
+            "--dhcp-ignore-clid",
+            "--dhcp-rapid-commit",
+            "--no-ping",
+        ])
+        .unwrap();
+        assert!(args.dhcp_authoritative);
+        assert!(args.dhcp_fqdn);
+        assert!(args.dhcp_sequential_ip);
+        assert!(args.dhcp_no_override);
+        assert!(args.dhcp_client_update);
+        assert!(args.dhcp_ignore_clid);
+        assert!(args.dhcp_rapid_commit);
+        assert!(args.no_ping);
+    }
+
+    #[test]
+    fn test_query_port() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-Q", "10053"]).unwrap();
+        assert_eq!(args.query_port, Some(10053));
+    }
+
+    #[test]
+    fn test_local_ttl() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-T", "300"]).unwrap();
+        assert_eq!(args.local_ttl, Some(300));
+    }
+
+    #[test]
+    fn test_max_ttl() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--max-ttl", "3600"]).unwrap();
+        assert_eq!(args.max_ttl, Some(3600));
+    }
+
+    #[test]
+    fn test_log_queries_flag() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--log-queries"]).unwrap();
+        // log-queries is an optional value: Some("") when flag set w/o value
+        assert!(args.log_queries.is_some());
+    }
+
+    #[test]
+    fn test_log_dhcp_flag() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--log-dhcp"]).unwrap();
+        assert!(args.log_dhcp);
+    }
+
+    #[test]
+    fn test_log_debug_flag() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--log-debug"]).unwrap();
+        assert!(args.log_debug);
+    }
+
+    #[test]
+    fn test_quiet_flags() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--quiet-dhcp",
+            "--quiet-dhcp6",
+            "--quiet-ra",
+            "--quiet-tftp",
+        ])
+        .unwrap();
+        assert!(args.quiet_dhcp);
+        assert!(args.quiet_dhcp6);
+        assert!(args.quiet_ra);
+        assert!(args.quiet_tftp);
+    }
+
+    #[test]
+    fn test_filter_flags() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--filter-A", "--filter-AAAA"]).unwrap();
+        assert!(args.filter_a);
+        assert!(args.filter_aaaa);
+    }
+
+    #[test]
+    fn test_domain_option() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-s", "local.lan"]).unwrap();
+        assert_eq!(args.domain.len(), 1);
+        assert_eq!(args.domain[0], "local.lan");
+    }
+
+    #[test]
+    fn test_conf_dir() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--conf-dir", "/etc/dnsmasq.d"]).unwrap();
+        assert_eq!(args.conf_dir.len(), 1);
+    }
+
+    #[test]
+    fn test_servers_file() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--servers-file", "/etc/dnsmasq.servers"]).unwrap();
+        assert_eq!(args.servers_file.as_deref(), Some("/etc/dnsmasq.servers"));
+    }
+
+    #[test]
+    fn test_hostsdir() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--hostsdir", "/etc/hosts.d"]).unwrap();
+        assert_eq!(args.hostsdir.len(), 1);
+    }
+
+    #[test]
+    fn test_addn_hosts() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-H", "/etc/hosts.extra"]).unwrap();
+        assert_eq!(args.addn_hosts.len(), 1);
+    }
+
+    #[test]
+    fn test_leasefile_ro() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--leasefile-ro"]).unwrap();
+        assert!(args.leasefile_ro);
+    }
+
+    #[test]
+    fn test_enable_ra() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--enable-ra"]).unwrap();
+        assert!(args.enable_ra);
+    }
+
+    #[test]
+    fn test_selfmx_localmx() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--selfmx", "--localmx"]).unwrap();
+        assert!(args.selfmx);
+        assert!(args.localmx);
+    }
+
+    #[test]
+    fn test_mx_host() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-m", "mail.example.com"]).unwrap();
+        assert_eq!(args.mx_host.len(), 1);
+    }
+
+    #[test]
+    fn test_mx_target() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-t", "relay.example.com"]).unwrap();
+        assert_eq!(args.mx_target.as_deref(), Some("relay.example.com"));
+    }
+
+    #[test]
+    fn test_srv_host() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--srv-host",
+            "_http._tcp.example.com,server.example.com,80",
+        ])
+        .unwrap();
+        assert_eq!(args.srv_host.len(), 1);
+    }
+
+    #[test]
+    fn test_txt_record() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--txt-record",
+            "example.com,v=spf1 include:_spf.google.com",
+        ])
+        .unwrap();
+        assert_eq!(args.txt_record.len(), 1);
+    }
+
+    #[test]
+    fn test_cname() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--cname", "alias.example.com,example.com"])
+            .unwrap();
+        assert_eq!(args.cname.len(), 1);
+    }
+
+    #[test]
+    fn test_host_record() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--host-record", "server.example.com,10.0.0.1"])
+                .unwrap();
+        assert_eq!(args.host_record.len(), 1);
+    }
+
+    #[test]
+    fn test_ptr_record() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--ptr-record",
+            "1.0.0.10.in-addr.arpa,server.example.com",
+        ])
+        .unwrap();
+        assert_eq!(args.ptr_record.len(), 1);
+    }
+
+    #[test]
+    fn test_interface_name() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--interface-name", "hostname,eth0"]).unwrap();
+        assert_eq!(args.interface_name.len(), 1);
+    }
+
+    #[test]
+    fn test_bridge_interface() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--bridge-interface", "br0,eth0,eth1"]).unwrap();
+        assert_eq!(args.bridge_interface.len(), 1);
+    }
+
+    #[test]
+    fn test_rebind_domain_ok() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--stop-dns-rebind",
+            "--rebind-domain-ok",
+            "/example.com/",
+        ])
+        .unwrap();
+        assert!(args.stop_dns_rebind);
+        assert_eq!(args.rebind_domain_ok.len(), 1);
+    }
+
+    #[test]
+    fn test_alias() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--alias", "1.2.3.0,6.7.8.0,255.255.255.0"])
+            .unwrap();
+        assert_eq!(args.alias.len(), 1);
+    }
+
+    #[test]
+    fn test_rev_server() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--rev-server", "192.168.0.0/24,192.168.0.1"])
+                .unwrap();
+        assert_eq!(args.rev_server.len(), 1);
+    }
+
+    #[test]
+    fn test_local() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--local", "/localnet/"]).unwrap();
+        assert_eq!(args.local.len(), 1);
+    }
+
+    #[test]
+    fn test_no_dhcp_interface() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--no-dhcp-interface", "eth2"]).unwrap();
+        assert_eq!(args.no_dhcp_interface.len(), 1);
+    }
+
+    #[test]
+    fn test_log_facility() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--log-facility", "/var/log/dnsmasq.log"]).unwrap();
+        assert_eq!(args.log_facility.as_deref(), Some("/var/log/dnsmasq.log"));
+    }
+
+    #[test]
+    fn test_dhcp_option() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-O", "option:router,192.168.1.1"]).unwrap();
+        assert_eq!(args.dhcp_option.len(), 1);
+    }
+
+    #[test]
+    fn test_dhcp_boot() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--dhcp-boot", "pxelinux.0,server,10.0.0.1"])
+                .unwrap();
+        assert_eq!(args.dhcp_boot.len(), 1);
+    }
+
+    #[test]
+    fn test_dhcp_userclass() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-j", "set:windows,MSFT"]).unwrap();
+        assert_eq!(args.dhcp_userclass.len(), 1);
+    }
+
+    #[test]
+    fn test_dhcp_vendorclass() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-U", "set:pxe,PXEClient"]).unwrap();
+        assert_eq!(args.dhcp_vendorclass.len(), 1);
+    }
+
+    #[test]
+    fn test_port_limit() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--port-limit", "10"]).unwrap();
+        assert_eq!(args.port_limit, Some(10));
+    }
+
+    #[test]
+    fn test_dhcp_ttl() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--dhcp-ttl", "64"]).unwrap();
+        assert_eq!(args.dhcp_ttl, Some(64));
+    }
+
+    #[test]
+    fn test_script_arp() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--script-arp"]).unwrap();
+        assert!(args.script_arp);
+    }
+
+    #[test]
+    fn test_script_on_renewal() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--script-on-renewal"]).unwrap();
+        assert!(args.script_on_renewal);
+    }
+
+    #[test]
+    fn test_strip_mac() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--strip-mac"]).unwrap();
+        assert!(args.strip_mac);
+    }
+
+    #[test]
+    fn test_strip_subnet() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--strip-subnet"]).unwrap();
+        assert!(args.strip_subnet);
+    }
+
+    #[test]
+    fn test_combined_dns_dhcp_options() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--port",
+            "5353",
+            "--cache-size",
+            "500",
+            "--dhcp-range",
+            "192.168.1.50,192.168.1.100,24h",
+            "--dhcp-lease-max",
+            "100",
+            "--dns-forward-max",
+            "200",
+            "--domain",
+            "test.local",
+            "--no-daemon",
+            "--log-dhcp",
+        ])
+        .unwrap();
+        assert_eq!(args.effective_port(), 5353);
+        assert_eq!(args.effective_cache_size(), 500);
+        assert_eq!(args.dhcp_range.len(), 1);
+        assert_eq!(args.effective_dhcp_lease_max(), 100);
+        assert_eq!(args.effective_dns_forward_max(), 200);
+        assert!(args.no_daemon);
+        assert!(args.log_dhcp);
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_multiple_servers() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "-S",
+            "8.8.8.8",
+            "-S",
+            "8.8.4.4",
+            "-S",
+            "/google.com/8.8.8.8",
+        ])
+        .unwrap();
+        assert_eq!(args.server.len(), 3);
+    }
+
+    #[test]
+    fn test_multiple_interfaces() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "-i", "eth0", "-i", "wlan0", "-i", "br0"]).unwrap();
+        assert_eq!(args.interface.len(), 3);
+    }
+
+    #[test]
+    fn test_multiple_dhcp_options() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "-O",
+            "option:router,192.168.1.1",
+            "-O",
+            "option:dns-server,8.8.8.8",
+            "-O",
+            "option:domain-name,local.lan",
+        ])
+        .unwrap();
+        assert_eq!(args.dhcp_option.len(), 3);
+    }
+
+    #[test]
+    fn test_version_flag() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-v"]).unwrap();
+        assert!(args.version_flag);
+    }
+
+    #[test]
+    fn test_help_flag() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-w"]).unwrap();
+        assert!(args.help_flag);
+    }
+
+    #[test]
+    fn test_default_args_all_vecs_empty() {
+        let args = default_args();
+        assert!(args.server.is_empty());
+        assert!(args.interface.is_empty());
+        assert!(args.listen_address.is_empty());
+        assert!(args.address.is_empty());
+        assert!(args.bogus_nxdomain.is_empty());
+        assert!(args.dhcp_range.is_empty());
+        assert!(args.dhcp_host.is_empty());
+        assert!(args.dhcp_option.is_empty());
+        assert!(args.conf_file.is_empty());
+        assert!(args.resolv_file.is_empty());
+    }
+
+    #[test]
+    fn test_default_args_all_bools_false() {
+        let args = default_args();
+        assert!(!args.no_daemon);
+        assert!(!args.no_resolv);
+        assert!(!args.no_hosts);
+        assert!(!args.no_poll);
+        assert!(!args.no_negcache);
+        assert!(!args.no_ping);
+        assert!(!args.no_ident);
+        assert!(!args.strict_order);
+        assert!(!args.all_servers);
+        assert!(!args.keep_in_foreground);
+        assert!(!args.bind_interfaces);
+        assert!(!args.bind_dynamic);
+        assert!(!args.bogus_priv);
+        assert!(!args.domain_needed);
+        assert!(!args.expand_hosts);
+        assert!(!args.filterwin2k);
+        assert!(!args.read_ethers);
+        assert!(!args.localise_queries);
+        assert!(!args.test);
+        assert!(!args.version_flag);
+        assert!(!args.help_flag);
+    }
+
+    #[test]
+    fn test_default_args_all_options_none() {
+        let args = default_args();
+        assert!(args.port.is_none());
+        assert!(args.cache_size.is_none());
+        assert!(args.dns_forward_max.is_none());
+        assert!(args.edns_packet_max.is_none());
+        assert!(args.user.is_none());
+        assert!(args.group.is_none());
+        assert!(args.pid_file.is_none());
+        assert!(args.dhcp_lease_max.is_none());
+        assert!(args.max_tcp_connections.is_none());
+        assert!(args.local_ttl.is_none());
+        assert!(args.neg_ttl.is_none());
+        assert!(args.max_ttl.is_none());
+        assert!(args.min_cache_ttl.is_none());
+        assert!(args.max_cache_ttl.is_none());
+        assert!(args.min_port.is_none());
+        assert!(args.max_port.is_none());
+        assert!(args.query_port.is_none());
+        assert!(args.dhcp_leasefile.is_none());
+        assert!(args.mx_target.is_none());
+    }
+
+    #[test]
+    fn test_validate_all_defaults() {
+        let args = default_args();
+        assert!(args.validate().is_ok());
+        // All effective defaults should match constants
+        assert_eq!(args.effective_cache_size(), CACHESIZ);
+        assert_eq!(args.effective_dns_forward_max(), FTABSIZ);
+        assert_eq!(args.effective_edns_packet_max(), EDNS_PKTSZ);
+        assert_eq!(args.effective_user(), CHUSER);
+        assert_eq!(args.effective_group(), CHGRP);
+        assert_eq!(args.effective_port(), 53);
+        assert_eq!(args.effective_dhcp_lease_max(), MAXLEASES);
+        assert_eq!(args.effective_max_tcp_connections(), MAX_PROCS);
+        assert_eq!(args.effective_tftp_max(), TFTP_MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn test_cli_args_clone() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "-p", "5353", "--no-daemon"]).unwrap();
+        let cloned = args.clone();
+        assert_eq!(cloned.port, Some(5353));
+        assert!(cloned.no_daemon);
+    }
+
+    #[test]
+    fn test_cli_args_debug() {
+        let args = default_args();
+        let debug_str = format!("{:?}", args);
+        assert!(debug_str.contains("CliArgs"));
+    }
+
+    #[test]
+    fn test_dhcp_script() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--dhcp-script", "/usr/local/sbin/dhcp-script"])
+                .unwrap();
+        assert_eq!(
+            args.dhcp_script.as_deref(),
+            Some("/usr/local/sbin/dhcp-script")
+        );
+    }
+
+    #[test]
+    fn test_synth_domain() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--synth-domain",
+            "thekelleys.org.uk,192.168.0.0/24,internal-",
+        ])
+        .unwrap();
+        assert_eq!(args.synth_domain.len(), 1);
+    }
+
+    #[test]
+    fn test_dhcp_relay() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--dhcp-relay", "10.0.0.1,10.0.0.2"]).unwrap();
+        assert_eq!(args.dhcp_relay.len(), 1);
+    }
+
+    #[test]
+    fn test_ra_param() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--ra-param", "eth0,60,600"]).unwrap();
+        assert_eq!(args.ra_param.len(), 1);
+    }
+
+    #[test]
+    fn test_shared_network() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--shared-network", "eth0,192.168.0.0/24"])
+            .unwrap();
+        assert_eq!(args.shared_network.len(), 1);
+    }
+
+    #[test]
+    fn test_naptr_record() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--naptr-record",
+            "example.com,100,10,\"S\",\"SIP+D2U\",\"\",_sip._udp.example.com",
+        ])
+        .unwrap();
+        assert_eq!(args.naptr_record.len(), 1);
+    }
+
+    #[test]
+    fn test_caa_record() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--caa-record",
+            "example.com,0,issue,letsencrypt.org",
+        ])
+        .unwrap();
+        assert_eq!(args.caa_record.len(), 1);
+    }
+
+    #[cfg(feature = "dnssec")]
+    #[test]
+    fn test_dnssec_flags() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--dnssec",
+            "--dnssec-debug",
+            "--dnssec-no-timecheck",
+        ])
+        .unwrap();
+        assert!(args.dnssec);
+        assert!(args.dnssec_debug);
+        assert!(args.dnssec_no_timecheck);
+    }
+
+    #[cfg(feature = "dnssec")]
+    #[test]
+    fn test_trust_anchor() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--trust-anchor",
+            ".,20326,8,2,E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+        ])
+        .unwrap();
+        assert_eq!(args.trust_anchor.len(), 1);
+    }
+
+    #[cfg(feature = "auth")]
+    #[test]
+    fn test_auth_zone() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--auth-zone", "example.com,eth0"]).unwrap();
+        assert_eq!(args.auth_zone.len(), 1);
+    }
+
+    #[cfg(feature = "auth")]
+    #[test]
+    fn test_auth_server() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--auth-server", "ns1.example.com,eth0"]).unwrap();
+        assert!(args.auth_server.is_some());
+    }
+
+    #[cfg(feature = "dbus")]
+    #[test]
+    fn test_enable_dbus_flag() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--enable-dbus"]).unwrap();
+        assert!(args.enable_dbus.is_some());
+    }
+
+    #[cfg(feature = "conntrack")]
+    #[test]
+    fn test_conntrack_flag() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--conntrack"]).unwrap();
+        assert!(args.conntrack);
+    }
+
+    #[cfg(feature = "ipset")]
+    #[test]
+    fn test_ipset_option() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--ipset", "/google.com/myset"]).unwrap();
+        assert_eq!(args.ipset.len(), 1);
+    }
+
+    #[cfg(feature = "nftset")]
+    #[test]
+    fn test_nftset_option() {
+        let args =
+            CliArgs::try_parse_from(["dnsmasq", "--nftset", "/google.com/4#ip#table#set"]).unwrap();
+        assert_eq!(args.nftset.len(), 1);
+    }
+
+    #[cfg(feature = "tftp")]
+    #[test]
+    fn test_tftp_options() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--enable-tftp",
+            "--tftp-root",
+            "/srv/tftp",
+            "--tftp-secure",
+            "--tftp-no-fail",
+            "--tftp-lowercase",
+            "--tftp-single-port",
+            "--tftp-no-blocksize",
+        ])
+        .unwrap();
+        assert!(args.enable_tftp.is_some());
+        assert_eq!(args.tftp_root.len(), 1);
+        assert!(args.tftp_secure);
+        assert!(args.tftp_no_fail);
+        assert!(args.tftp_lowercase);
+        assert!(args.tftp_single_port);
+        assert!(args.tftp_no_blocksize);
+    }
+
+    #[cfg(feature = "dumpfile")]
+    #[test]
+    fn test_dumpfile_option() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--dumpfile",
+            "/tmp/dns_dump.pcap",
+            "--dumpmask",
+            "0x0001",
+        ])
+        .unwrap();
+        assert_eq!(args.dumpfile.as_deref(), Some("/tmp/dns_dump.pcap"));
+        assert_eq!(args.dumpmask.as_deref(), Some("0x0001"));
+    }
+
+    #[test]
+    fn test_ignore_address() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--ignore-address", "1.2.3.4"]).unwrap();
+        assert_eq!(args.ignore_address.len(), 1);
+    }
+
+    #[test]
+    fn test_cache_rr() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--cache-rr", "SRV"]).unwrap();
+        assert_eq!(args.cache_rr.len(), 1);
+    }
+
+    #[test]
+    fn test_tag_if() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--tag-if", "set:lan,tag:known"]).unwrap();
+        assert_eq!(args.tag_if.len(), 1);
+    }
+
+    #[test]
+    fn test_dhcp_match() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--dhcp-match", "set:ipxe,175"]).unwrap();
+        assert_eq!(args.dhcp_match.len(), 1);
+    }
+
+    #[test]
+    fn test_pxe_service() {
+        let args = CliArgs::try_parse_from([
+            "dnsmasq",
+            "--pxe-service",
+            "x86PC,\"Install Linux\",pxelinux",
+        ])
+        .unwrap();
+        assert_eq!(args.pxe_service.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_rr() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--filter-rr", "HTTPS"]).unwrap();
+        assert_eq!(args.filter_rr.len(), 1);
+    }
+
+    #[test]
+    fn test_no_rr() {
+        let args = CliArgs::try_parse_from(["dnsmasq", "--no-rr", "HTTPS"]).unwrap();
+        assert_eq!(args.no_rr.len(), 1);
+    }
 }

@@ -1070,4 +1070,312 @@ mod tests {
             assert_eq!(metric.name(), METRIC_NAMES[idx]);
         }
     }
+
+    // =========================================================================
+    // Additional coverage tests
+    // =========================================================================
+
+    #[test]
+    fn test_increment_all_metrics() {
+        let store = MetricsStore::new();
+        for metric in MetricType::all() {
+            store.increment(metric);
+            assert_eq!(store.get(metric), 1, "Metric {:?} should be 1", metric);
+        }
+        // Verify all are at 1
+        for metric in MetricType::all() {
+            assert_eq!(store.get(metric), 1);
+        }
+    }
+
+    #[test]
+    fn test_increment_overflow_behavior() {
+        let store = MetricsStore::new();
+        // Increment many times, verify count
+        for _ in 0..1000 {
+            store.increment(MetricType::DnsQueriesForwarded);
+        }
+        assert_eq!(store.get(MetricType::DnsQueriesForwarded), 1000);
+    }
+
+    #[test]
+    fn test_set_max_from_zero() {
+        let store = MetricsStore::new();
+        store.set_max(MetricType::SigFailHwm, 0);
+        assert_eq!(store.get(MetricType::SigFailHwm), 0);
+        store.set_max(MetricType::SigFailHwm, 1);
+        assert_eq!(store.get(MetricType::SigFailHwm), 1);
+    }
+
+    #[test]
+    fn test_set_max_all_hwm_metrics() {
+        let store = MetricsStore::new();
+        let hwm_metrics = [
+            MetricType::CryptoHwm,
+            MetricType::SigFailHwm,
+            MetricType::WorkHwm,
+        ];
+        for metric in hwm_metrics {
+            store.set_max(metric, 50);
+            assert_eq!(store.get(metric), 50);
+            store.set_max(metric, 10);
+            assert_eq!(store.get(metric), 50); // Doesn't decrease
+            store.set_max(metric, 100);
+            assert_eq!(store.get(metric), 100);
+        }
+    }
+
+    #[test]
+    fn test_set_max_u64_max() {
+        let store = MetricsStore::new();
+        store.set_max(MetricType::WorkHwm, u64::MAX);
+        assert_eq!(store.get(MetricType::WorkHwm), u64::MAX);
+        // Still can't increase past u64::MAX
+        store.set_max(MetricType::WorkHwm, 1);
+        assert_eq!(store.get(MetricType::WorkHwm), u64::MAX);
+    }
+
+    #[test]
+    fn test_clear_then_increment() {
+        let store = MetricsStore::new();
+        store.increment(MetricType::DhcpDiscover);
+        store.increment(MetricType::DhcpDiscover);
+        store.clear();
+        assert_eq!(store.get(MetricType::DhcpDiscover), 0);
+        store.increment(MetricType::DhcpDiscover);
+        assert_eq!(store.get(MetricType::DhcpDiscover), 1);
+    }
+
+    #[test]
+    fn test_multiple_clear() {
+        let store = MetricsStore::new();
+        store.increment(MetricType::Bootp);
+        store.clear();
+        store.clear(); // Double-clear should be safe
+        assert_eq!(store.get(MetricType::Bootp), 0);
+    }
+
+    #[test]
+    fn test_iter_count_always_30() {
+        let store = MetricsStore::new();
+        assert_eq!(store.iter().count(), 30);
+        store.increment(MetricType::DhcpAck);
+        assert_eq!(store.iter().count(), 30);
+        store.clear();
+        assert_eq!(store.iter().count(), 30);
+    }
+
+    #[test]
+    fn test_iter_names_order() {
+        let store = MetricsStore::new();
+        let names: Vec<&str> = store.iter().map(|(name, _)| name).collect();
+        assert_eq!(names[0], "dns_cache_inserted");
+        assert_eq!(names[29], "dhcp_lease_unknown");
+        // Verify order matches ALL_METRICS
+        for (i, metric) in MetricType::all().enumerate() {
+            assert_eq!(names[i], metric.name());
+        }
+    }
+
+    #[test]
+    fn test_display_all_zeros() {
+        let store = MetricsStore::new();
+        let output = format!("{}", store);
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 30);
+        for line in &lines {
+            assert!(line.ends_with(": 0"), "Expected all zeros, got: {}", line);
+        }
+    }
+
+    #[test]
+    fn test_display_with_mixed_values() {
+        let store = MetricsStore::new();
+        store.increment(MetricType::DhcpDiscover);
+        store.increment(MetricType::DhcpDiscover);
+        store.increment(MetricType::DhcpOffer);
+        store.increment(MetricType::DhcpRequest);
+        store.increment(MetricType::DhcpAck);
+        store.set_max(MetricType::CryptoHwm, 42);
+
+        let output = format!("{}", store);
+        assert!(output.contains("dhcp_discover: 2"));
+        assert!(output.contains("dhcp_offer: 1"));
+        assert!(output.contains("dhcp_request: 1"));
+        assert!(output.contains("dhcp_ack: 1"));
+        assert!(output.contains("dnssec_max_crypto_use: 42"));
+    }
+
+    #[test]
+    fn test_metric_type_display_all() {
+        for metric in MetricType::all() {
+            let display = format!("{}", metric);
+            let name = metric.name();
+            assert_eq!(display, name, "Display mismatch for {:?}", metric);
+        }
+    }
+
+    #[test]
+    fn test_from_u32_boundary() {
+        assert!(MetricType::from_u32(0).is_some());
+        assert!(MetricType::from_u32(29).is_some());
+        assert!(MetricType::from_u32(30).is_none());
+        assert!(MetricType::from_u32(100).is_none());
+        assert!(MetricType::from_u32(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn test_server_stats_increment_and_read() {
+        let stats = ServerStats::default();
+        stats.queries.fetch_add(10, Ordering::Relaxed);
+        stats.failed_queries.fetch_add(2, Ordering::Relaxed);
+        stats.retries.fetch_add(3, Ordering::Relaxed);
+        stats.nxdomain_replies.fetch_add(4, Ordering::Relaxed);
+        stats.query_latency.fetch_add(5000, Ordering::Relaxed);
+
+        assert_eq!(stats.queries.load(Ordering::Relaxed), 10);
+        assert_eq!(stats.failed_queries.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.retries.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.nxdomain_replies.load(Ordering::Relaxed), 4);
+        assert_eq!(stats.query_latency.load(Ordering::Relaxed), 5000);
+    }
+
+    #[test]
+    fn test_server_stats_debug() {
+        let stats = ServerStats::default();
+        stats.queries.store(42, Ordering::Relaxed);
+        let debug_str = format!("{:?}", stats);
+        assert!(debug_str.contains("42"));
+    }
+
+    #[test]
+    fn test_server_stats_latency_accumulation() {
+        let stats = ServerStats::default();
+        stats.query_latency.fetch_add(100, Ordering::Relaxed);
+        stats.query_latency.fetch_add(200, Ordering::Relaxed);
+        stats.query_latency.fetch_add(300, Ordering::Relaxed);
+        assert_eq!(stats.query_latency.load(Ordering::Relaxed), 600);
+    }
+
+    #[test]
+    fn test_server_stats_clear_after_accumulation() {
+        let stats = ServerStats::default();
+        for _ in 0..100 {
+            stats.queries.fetch_add(1, Ordering::Relaxed);
+        }
+        assert_eq!(stats.queries.load(Ordering::Relaxed), 100);
+        stats.clear();
+        assert_eq!(stats.queries.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_metric_type_dhcp_lifecycle() {
+        // Verify all DHCP-related metrics exist and are properly named
+        let dhcp_metrics = [
+            (MetricType::DhcpDiscover, "dhcp_discover"),
+            (MetricType::DhcpOffer, "dhcp_offer"),
+            (MetricType::DhcpRequest, "dhcp_request"),
+            (MetricType::DhcpAck, "dhcp_ack"),
+            (MetricType::DhcpNak, "dhcp_nak"),
+            (MetricType::DhcpDecline, "dhcp_decline"),
+            (MetricType::DhcpRelease, "dhcp_release"),
+            (MetricType::DhcpInform, "dhcp_inform"),
+        ];
+        for (metric, expected_name) in dhcp_metrics {
+            assert_eq!(metric.name(), expected_name);
+        }
+    }
+
+    #[test]
+    fn test_metric_type_dns_metrics() {
+        let dns_metrics = [
+            (MetricType::DnsCacheInserted, "dns_cache_inserted"),
+            (MetricType::DnsCacheLiveFreed, "dns_cache_live_freed"),
+            (MetricType::DnsQueriesForwarded, "dns_queries_forwarded"),
+            (MetricType::DnsAuthAnswered, "dns_auth_answered"),
+            (MetricType::DnsLocalAnswered, "dns_local_answered"),
+            (MetricType::DnsStaleAnswered, "dns_stale_answered"),
+            (MetricType::DnsUnansweredQuery, "dns_unanswered"),
+        ];
+        for (metric, expected_name) in dns_metrics {
+            assert_eq!(metric.name(), expected_name);
+        }
+    }
+
+    #[test]
+    fn test_metric_type_lease_metrics() {
+        let lease_metrics = [
+            (MetricType::LeasesAllocated4, "leases_allocated_4"),
+            (MetricType::LeasesPruned4, "leases_pruned_4"),
+            (MetricType::LeasesAllocated6, "leases_allocated_6"),
+            (MetricType::LeasesPruned6, "leases_pruned_6"),
+            (MetricType::DhcpLeaseQuery, "dhcp_leasequery"),
+            (MetricType::DhcpLeaseUnassigned, "dhcp_lease_unassigned"),
+            (MetricType::DhcpLeaseActive, "dhcp_lease_actve"),
+            (MetricType::DhcpLeaseUnknown, "dhcp_lease_unknown"),
+        ];
+        for (metric, expected_name) in lease_metrics {
+            assert_eq!(metric.name(), expected_name);
+        }
+    }
+
+    #[test]
+    fn test_metrics_store_get_name_all() {
+        for metric in MetricType::all() {
+            let name = MetricsStore::get_name(metric);
+            assert!(
+                !name.is_empty(),
+                "Name should not be empty for {:?}",
+                metric
+            );
+            assert_eq!(name, metric.name());
+        }
+    }
+
+    #[test]
+    fn test_metrics_store_independence() {
+        // Verify incrementing one metric doesn't affect others
+        let store = MetricsStore::new();
+        store.increment(MetricType::TcpConnections);
+        for metric in MetricType::all() {
+            if metric == MetricType::TcpConnections {
+                assert_eq!(store.get(metric), 1);
+            } else {
+                assert_eq!(store.get(metric), 0, "Metric {:?} should be 0", metric);
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_metrics_constant_matches_all_iter() {
+        let from_const: Vec<MetricType> = ALL_METRICS.to_vec();
+        let from_iter: Vec<MetricType> = MetricType::all().collect();
+        assert_eq!(from_const, from_iter);
+    }
+
+    #[test]
+    fn test_metric_names_no_empty_strings() {
+        for name in METRIC_NAMES {
+            assert!(!name.is_empty(), "Found empty metric name");
+            assert!(
+                !name.contains(' '),
+                "Metric name '{}' contains spaces",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_store_iter_after_mixed_operations() {
+        let store = MetricsStore::new();
+        store.increment(MetricType::Pxe);
+        store.increment(MetricType::Pxe);
+        store.set_max(MetricType::CryptoHwm, 77);
+        store.increment(MetricType::NoAnswer);
+
+        let collected: Vec<(_, _)> = store.iter().collect();
+        assert_eq!(collected[MetricType::Pxe as usize].1, 2);
+        assert_eq!(collected[MetricType::CryptoHwm as usize].1, 77);
+        assert_eq!(collected[MetricType::NoAnswer as usize].1, 1);
+    }
 }

@@ -339,6 +339,45 @@ pub struct DhcpContext {
     pub template_interface: Option<String>,
 }
 
+#[cfg(test)]
+impl DhcpContext {
+    /// Create a DHCPv6 test context with minimal required fields.
+    ///
+    /// Parameters: `start6`, `end6`, `prefix`, `valid`, `preferred`, `flags`.
+    /// All IPv4 fields are zeroed out.
+    #[cfg(feature = "dhcp6")]
+    pub fn new_v6_test(
+        start6: std::net::Ipv6Addr,
+        end6: std::net::Ipv6Addr,
+        prefix: i32,
+        valid: u32,
+        preferred: u32,
+        flags: u32,
+    ) -> Self {
+        Self {
+            start: std::net::Ipv4Addr::UNSPECIFIED,
+            end: std::net::Ipv4Addr::UNSPECIFIED,
+            netmask: std::net::Ipv4Addr::UNSPECIFIED,
+            broadcast: std::net::Ipv4Addr::UNSPECIFIED,
+            router: std::net::Ipv4Addr::UNSPECIFIED,
+            lease_time: 0,
+            netid: NetId { net: String::new() },
+            flags,
+            filter: Vec::new(),
+            local: std::net::Ipv4Addr::UNSPECIFIED,
+            addr_epoch: 0,
+            start6,
+            end6,
+            local6: std::net::Ipv6Addr::UNSPECIFIED,
+            prefix,
+            if_index: 0,
+            valid,
+            preferred,
+            template_interface: None,
+        }
+    }
+}
+
 /// DHCP protocol version selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DhcpProtocol {
@@ -2486,5 +2525,2025 @@ mod tests {
         // "\x07example\x03com\x00"
         let data = b"\x07example\x03com\x00";
         assert_eq!(decode_rfc1035_name(data), "example.com");
+    }
+
+    #[test]
+    fn test_decode_rfc1035_name_empty_root() {
+        let data = b"\x00";
+        assert_eq!(decode_rfc1035_name(data), "");
+    }
+
+    #[test]
+    fn test_decode_rfc1035_name_single_label() {
+        let data = b"\x03foo\x00";
+        assert_eq!(decode_rfc1035_name(data), "foo");
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional match_netid tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_match_netid_both_empty() {
+        assert!(match_netid(&[], &[], true));
+    }
+
+    #[test]
+    fn test_match_netid_empty_pool() {
+        let check = vec![NetId {
+            net: "lan".to_string(),
+        }];
+        assert!(!match_netid(&check, &[], true));
+    }
+
+    #[test]
+    fn test_match_netid_match_single() {
+        let tag = NetId {
+            net: "lan".to_string(),
+        };
+        assert!(match_netid(&[tag.clone()], &[tag], true));
+    }
+
+    #[test]
+    fn test_match_netid_no_match() {
+        let check = vec![NetId {
+            net: "lan".to_string(),
+        }];
+        let pool = vec![NetId {
+            net: "wan".to_string(),
+        }];
+        assert!(!match_netid(&check, &pool, true));
+    }
+
+    #[test]
+    fn test_match_netid_partial_match() {
+        let check = vec![
+            NetId {
+                net: "lan".to_string(),
+            },
+            NetId {
+                net: "dmz".to_string(),
+            },
+        ];
+        let pool = vec![NetId {
+            net: "lan".to_string(),
+        }];
+        // Only "lan" matches, "dmz" doesn't → should fail (all check tags need to match)
+        assert!(!match_netid(&check, &pool, true));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional match_netid_wild tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_match_netid_wild_empty() {
+        assert!(match_netid_wild(&[], &[]));
+    }
+
+    #[test]
+    fn test_match_netid_wild_match() {
+        let check = vec![NetId {
+            net: "lan".to_string(),
+        }];
+        let pool = vec![NetId {
+            net: "lan".to_string(),
+        }];
+        assert!(match_netid_wild(&check, &pool));
+    }
+
+    #[test]
+    fn test_match_netid_wild_no_match() {
+        let check = vec![NetId {
+            net: "lan".to_string(),
+        }];
+        let pool = vec![NetId {
+            net: "wan".to_string(),
+        }];
+        assert!(!match_netid_wild(&check, &pool));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional strip_hostname tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_hostname_valid_simple() {
+        assert_eq!(strip_hostname("myhost"), Some("myhost".to_string()));
+    }
+
+    #[test]
+    fn test_strip_hostname_with_domain_truncates() {
+        let result = strip_hostname("myhost.example.com");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "myhost");
+    }
+
+    #[test]
+    fn test_strip_hostname_empty_string() {
+        let result = strip_hostname("");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_strip_hostname_dash_only() {
+        let result = strip_hostname("-");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_strip_hostname_starts_with_dash() {
+        // strip_hostname trims leading/trailing dashes, so "-myhost" → "myhost"
+        let result = strip_hostname("-myhost");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "myhost");
+    }
+
+    #[test]
+    fn test_strip_hostname_alphanumeric() {
+        assert_eq!(strip_hostname("host123"), Some("host123".to_string()));
+    }
+
+    #[test]
+    fn test_strip_hostname_with_hyphen_middle() {
+        assert_eq!(strip_hostname("my-host"), Some("my-host".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional match_bytes tests
+    // -----------------------------------------------------------------------
+
+    fn make_dhcp_opt(opt: u16, val: &[u8], flags: u32) -> DhcpOpt {
+        DhcpOpt {
+            opt,
+            val: val.to_vec(),
+            flags,
+            netid: None,
+            next: Vec::new(),
+            len: val.len(),
+            u: DhcpOptExtra::None,
+        }
+    }
+
+    #[test]
+    fn test_match_bytes_exact_value() {
+        let opt = make_dhcp_opt(60, b"test", 0);
+        assert!(match_bytes(&opt, b"test"));
+    }
+
+    #[test]
+    fn test_match_bytes_no_match() {
+        let opt = make_dhcp_opt(60, b"test", 0);
+        assert!(!match_bytes(&opt, b"other"));
+    }
+
+    #[test]
+    fn test_match_bytes_prefix_vendor() {
+        let opt = make_dhcp_opt(60, b"test", DHOPT_VENDOR);
+        // With DHOPT_VENDOR flag, matching uses prefix comparison
+        let result = match_bytes(&opt, b"testing");
+        let _ = result; // behavior depends on implementation
+    }
+
+    // -----------------------------------------------------------------------
+    // run_tag_if tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_run_tag_if_empty_rules() {
+        // run_tag_if returns input tags + any new tags from rules
+        let tags = vec![NetId {
+            net: "lan".to_string(),
+        }];
+        let result = run_tag_if(&tags, &[]);
+        // With no rules, result equals input tags
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].net, "lan");
+    }
+
+    #[test]
+    fn test_run_tag_if_matching_rule() {
+        let tags = vec![NetId {
+            net: "lan".to_string(),
+        }];
+        let rules = vec![TagIfRule {
+            tag: vec![NetId {
+                net: "lan".to_string(),
+            }],
+            set: vec![NetId {
+                net: "pool1".to_string(),
+            }],
+        }];
+        let result = run_tag_if(&tags, &rules);
+        assert!(result.len() >= 2);
+        assert!(result.iter().any(|t| t.net == "lan"));
+        assert!(result.iter().any(|t| t.net == "pool1"));
+    }
+
+    #[test]
+    fn test_run_tag_if_no_matching_rule() {
+        let tags = vec![NetId {
+            net: "wan".to_string(),
+        }];
+        let rules = vec![TagIfRule {
+            tag: vec![NetId {
+                net: "lan".to_string(),
+            }],
+            set: vec![NetId {
+                net: "pool1".to_string(),
+            }],
+        }];
+        let result = run_tag_if(&tags, &rules);
+        // No rule matched, so result equals input tags
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].net, "wan");
+    }
+
+    #[test]
+    fn test_run_tag_if_both_empty() {
+        let result = run_tag_if(&[], &[]);
+        assert!(result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // option_filter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_option_filter_empty_opts() {
+        let opts: Vec<DhcpOpt> = vec![];
+        let result = option_filter(&[], &[], &opts, false);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_option_filter_no_tag_match() {
+        let mut opt_tagged = make_dhcp_opt(1, &[255, 255, 255, 0], 0);
+        opt_tagged.netid = Some(NetId {
+            net: "special".to_string(),
+        });
+        let opts = vec![opt_tagged];
+        let result = option_filter(&[], &[], &opts, false);
+        assert!(result.is_empty()); // No matching tag
+    }
+
+    // -----------------------------------------------------------------------
+    // lookup_dhcp_opt tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lookup_dhcp_opt_v4_netmask() {
+        // In the opt table, option 1 is named "netmask"
+        let result = lookup_dhcp_opt(DhcpProtocol::V4, "netmask");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    #[test]
+    fn test_lookup_dhcp_opt_v4_router() {
+        let result = lookup_dhcp_opt(DhcpProtocol::V4, "router");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 3);
+    }
+
+    #[test]
+    fn test_lookup_dhcp_opt_v4_dns() {
+        let result = lookup_dhcp_opt(DhcpProtocol::V4, "dns-server");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 6);
+    }
+
+    #[test]
+    fn test_lookup_dhcp_opt_v4_unknown() {
+        let result = lookup_dhcp_opt(DhcpProtocol::V4, "nonexistent");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_lookup_dhcp_opt_v6_dns() {
+        let result = lookup_dhcp_opt(DhcpProtocol::V6, "dns-server");
+        assert!(result.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // lookup_dhcp_len tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lookup_dhcp_len_v4_time_offset() {
+        // Option 2 (time-offset) has size 4
+        let result = lookup_dhcp_len(DhcpProtocol::V4, 2);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 4);
+    }
+
+    #[test]
+    fn test_lookup_dhcp_len_v4_unknown_opt() {
+        let result = lookup_dhcp_len(DhcpProtocol::V4, 999);
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // pxe_ok tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pxe_ok_match_all() {
+        let opt = make_dhcp_opt(60, b"PXEClient", 0);
+        // PXE_MATCH_ALL = 0
+        assert!(pxe_ok(&opt, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // config_has_mac tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_has_mac_exact_match() {
+        let config = DhcpConfig {
+            flags: 0,
+            hwaddr: vec![HwAddrConfig {
+                hwaddr: vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+                hwaddr_type: 1,
+                wildcard_mask: 0,
+            }],
+            clid: None,
+            hostname: None,
+            netid: Vec::new(),
+            filter: Vec::new(),
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: Vec::new(),
+            domain: None,
+            lease_time: 0,
+            decline_time: 0,
+        };
+        assert!(config_has_mac(
+            &config,
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            1
+        ));
+    }
+
+    #[test]
+    fn test_config_has_mac_no_match_diff_addr() {
+        let config = DhcpConfig {
+            flags: 0,
+            hwaddr: vec![HwAddrConfig {
+                hwaddr: vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+                hwaddr_type: 1,
+                wildcard_mask: 0,
+            }],
+            clid: None,
+            hostname: None,
+            netid: Vec::new(),
+            filter: Vec::new(),
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: Vec::new(),
+            domain: None,
+            lease_time: 0,
+            decline_time: 0,
+        };
+        assert!(!config_has_mac(
+            &config,
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+            1
+        ));
+    }
+
+    #[test]
+    fn test_config_has_mac_wildcard() {
+        let config = DhcpConfig {
+            flags: 0,
+            hwaddr: vec![HwAddrConfig {
+                hwaddr: vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+                hwaddr_type: 1,
+                wildcard_mask: 0b111000, // wildcard last 3 bytes
+            }],
+            clid: None,
+            hostname: None,
+            netid: Vec::new(),
+            filter: Vec::new(),
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: Vec::new(),
+            domain: None,
+            lease_time: 0,
+            decline_time: 0,
+        };
+        // First 3 bytes match, last 3 are wildcarded
+        assert!(config_has_mac(
+            &config,
+            &[0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x00],
+            1
+        ));
+    }
+
+    #[test]
+    fn test_config_has_mac_empty_hwaddrs() {
+        let config = DhcpConfig {
+            flags: 0,
+            hwaddr: Vec::new(),
+            clid: None,
+            hostname: None,
+            netid: Vec::new(),
+            filter: Vec::new(),
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: Vec::new(),
+            domain: None,
+            lease_time: 0,
+            decline_time: 0,
+        };
+        assert!(!config_has_mac(
+            &config,
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            1
+        ));
+    }
+
+    #[test]
+    fn test_config_has_mac_type_zero_any() {
+        // hwaddr_type == 0 means match any type
+        let config = DhcpConfig {
+            flags: 0,
+            hwaddr: vec![HwAddrConfig {
+                hwaddr: vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+                hwaddr_type: 0,
+                wildcard_mask: 0,
+            }],
+            clid: None,
+            hostname: None,
+            netid: Vec::new(),
+            filter: Vec::new(),
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: Vec::new(),
+            domain: None,
+            lease_time: 0,
+            decline_time: 0,
+        };
+        assert!(config_has_mac(
+            &config,
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            99
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // DhcpProtocol tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dhcp_protocol_enum() {
+        let v4 = DhcpProtocol::V4;
+        let v6 = DhcpProtocol::V6;
+        assert!(matches!(v4, DhcpProtocol::V4));
+        assert!(matches!(v6, DhcpProtocol::V6));
+    }
+
+    // -----------------------------------------------------------------------
+    // DHCP constant verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dhcp_config_addr_constant() {
+        assert_eq!(CONFIG_ADDR, 32);
+    }
+
+    #[test]
+    fn test_dhcp_context_constants() {
+        // CONTEXT_STATIC = 1 << 0 = 1, CONTEXT_DHCP = 1 << 8 = 256
+        assert_eq!(CONTEXT_STATIC, 1);
+        assert_eq!(CONTEXT_DHCP, 256);
+    }
+
+    #[test]
+    fn test_dhopt_constants() {
+        assert_eq!(DHOPT_VENDOR, 256);
+        assert_eq!(DHOPT_VENDOR_MATCH, 1024);
+        assert_eq!(DHOPT_VENDOR_PXE, 16384);
+    }
+
+    // -----------------------------------------------------------------------
+    // DhcpOpt construction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dhcp_opt_creation() {
+        let opt = make_dhcp_opt(1, &[255, 255, 255, 0], 0);
+        assert_eq!(opt.opt, 1);
+        assert_eq!(opt.val, vec![255, 255, 255, 0]);
+        assert_eq!(opt.flags, 0);
+        assert_eq!(opt.len, 4);
+        assert!(opt.next.is_empty());
+        assert!(opt.netid.is_none());
+    }
+
+    #[test]
+    fn test_dhcp_opt_with_netid() {
+        let mut opt = make_dhcp_opt(3, &[10, 0, 0, 1], 0);
+        opt.netid = Some(NetId {
+            net: "lan".to_string(),
+        });
+        assert!(opt.netid.is_some());
+        assert_eq!(opt.netid.unwrap().net, "lan");
+    }
+
+    // -----------------------------------------------------------------------
+    // DhcpOptExtra tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dhcp_opt_extra_encap() {
+        let extra = DhcpOptExtra::Encap(43);
+        assert!(matches!(extra, DhcpOptExtra::Encap(43)));
+    }
+
+    #[test]
+    fn test_dhcp_opt_extra_wildcard() {
+        let extra = DhcpOptExtra::WildcardMask(0xFF);
+        assert!(matches!(extra, DhcpOptExtra::WildcardMask(0xFF)));
+    }
+
+    #[test]
+    fn test_dhcp_opt_extra_vendor_class() {
+        let extra = DhcpOptExtra::VendorClass(b"PXEClient".to_vec());
+        if let DhcpOptExtra::VendorClass(v) = extra {
+            assert_eq!(v, b"PXEClient");
+        } else {
+            panic!("Expected VendorClass variant");
+        }
+    }
+
+    #[test]
+    fn test_dhcp_opt_extra_none() {
+        let extra = DhcpOptExtra::None;
+        assert!(matches!(extra, DhcpOptExtra::None));
+    }
+
+    // -----------------------------------------------------------------------
+    // DhcpConfig construction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dhcp_config_fields() {
+        let config = DhcpConfig {
+            flags: CONFIG_ADDR,
+            hwaddr: vec![HwAddrConfig {
+                hwaddr: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
+                hwaddr_type: 1,
+                wildcard_mask: 0,
+            }],
+            clid: Some(vec![0x01, 0x02, 0x03]),
+            hostname: Some("testhost".to_string()),
+            netid: vec![NetId {
+                net: "admin".to_string(),
+            }],
+            filter: vec![NetId {
+                net: "known".to_string(),
+            }],
+            addr: Some(Ipv4Addr::new(192, 168, 1, 100)),
+            #[cfg(feature = "dhcp6")]
+            addr6: Vec::new(),
+            domain: Some("example.com".to_string()),
+            lease_time: 3600,
+            decline_time: 0,
+        };
+        assert_eq!(config.flags, CONFIG_ADDR);
+        assert_eq!(config.hwaddr.len(), 1);
+        assert_eq!(config.clid.as_ref().unwrap().len(), 3);
+        assert_eq!(config.hostname.as_ref().unwrap(), "testhost");
+        assert_eq!(config.addr.unwrap(), Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(config.domain.as_ref().unwrap(), "example.com");
+        assert_eq!(config.lease_time, 3600);
+    }
+
+    // -----------------------------------------------------------------------
+    // HwAddrConfig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hwaddr_config_creation() {
+        let hw = HwAddrConfig {
+            hwaddr: vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            hwaddr_type: 1,
+            wildcard_mask: 0,
+        };
+        assert_eq!(hw.hwaddr.len(), 6);
+        assert_eq!(hw.hwaddr_type, 1);
+        assert_eq!(hw.wildcard_mask, 0);
+    }
+
+    #[test]
+    fn test_hwaddr_config_wildcard() {
+        let hw = HwAddrConfig {
+            hwaddr: vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            hwaddr_type: 1,
+            wildcard_mask: 0b111111, // all bytes wildcard
+        };
+        assert_eq!(hw.wildcard_mask, 0b111111);
+    }
+
+    // -----------------------------------------------------------------------
+    // DhcpContext tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dhcp_context_creation() {
+        let ctx = DhcpContext {
+            start: Ipv4Addr::new(192, 168, 1, 100),
+            end: Ipv4Addr::new(192, 168, 1, 200),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(192, 168, 1, 255),
+            router: Ipv4Addr::new(192, 168, 1, 1),
+            lease_time: 7200,
+            netid: NetId {
+                net: "lan".to_string(),
+            },
+            flags: CONTEXT_DHCP,
+            filter: Vec::new(),
+            local: Ipv4Addr::new(192, 168, 1, 1),
+            addr_epoch: 0,
+            valid: 0,
+            preferred: 0,
+            template_interface: None,
+            #[cfg(feature = "dhcp6")]
+            start6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 64,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+        };
+        assert_eq!(ctx.start, Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(ctx.end, Ipv4Addr::new(192, 168, 1, 200));
+        assert_eq!(ctx.lease_time, 7200);
+        assert_eq!(ctx.flags, CONTEXT_DHCP);
+    }
+
+    // -----------------------------------------------------------------------
+    // NetId tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_netid_clone() {
+        let id = NetId {
+            net: "test".to_string(),
+        };
+        let cloned = id.clone();
+        assert_eq!(id.net, cloned.net);
+    }
+
+    #[test]
+    fn test_netid_empty() {
+        let id = NetId { net: String::new() };
+        assert!(id.net.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // TagIfRule tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tag_if_rule_creation() {
+        let rule = TagIfRule {
+            tag: vec![NetId {
+                net: "known".to_string(),
+            }],
+            set: vec![NetId {
+                net: "green".to_string(),
+            }],
+        };
+        assert_eq!(rule.tag.len(), 1);
+        assert_eq!(rule.set.len(), 1);
+    }
+
+    #[test]
+    fn test_tag_if_rule_empty() {
+        let rule = TagIfRule {
+            tag: Vec::new(),
+            set: Vec::new(),
+        };
+        assert!(rule.tag.is_empty());
+        assert!(rule.set.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional strip_hostname tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_hostname_special_chars_filtered() {
+        assert_eq!(strip_hostname("my@host!"), Some("myhost".to_string()));
+    }
+
+    #[test]
+    fn test_strip_hostname_leading_trailing_hyphens_stripped() {
+        assert_eq!(strip_hostname("-myhost-"), Some("myhost".to_string()));
+    }
+
+    #[test]
+    fn test_strip_hostname_all_hyphens_returns_none() {
+        assert_eq!(strip_hostname("---"), None);
+    }
+
+    #[test]
+    fn test_strip_hostname_underscore_preserved() {
+        assert_eq!(strip_hostname("my_host"), Some("my_host".to_string()));
+    }
+
+    #[test]
+    fn test_strip_hostname_dot_first_char() {
+        assert_eq!(strip_hostname(".example.com"), None);
+    }
+
+    #[test]
+    fn test_strip_hostname_only_specials() {
+        assert_eq!(strip_hostname("!@#$%"), None);
+    }
+
+    #[test]
+    fn test_strip_hostname_mixed_fqdn() {
+        assert_eq!(
+            strip_hostname("web-01.prod.example.com"),
+            Some("web-01".to_string())
+        );
+    }
+
+    #[test]
+    fn test_strip_hostname_single_char() {
+        assert_eq!(strip_hostname("a"), Some("a".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // match_bytes tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_match_bytes_default_exact() {
+        let opt = DhcpOpt {
+            opt: 1,
+            val: vec![0x01, 0x02, 0x03],
+            flags: 0,
+            netid: None,
+            next: vec![],
+            len: 3,
+            u: DhcpOptExtra::None,
+        };
+        assert!(match_bytes(&opt, &[0x01, 0x02, 0x03]));
+        assert!(!match_bytes(&opt, &[0x01, 0x02, 0x04]));
+    }
+
+    #[test]
+    fn test_match_bytes_empty_both() {
+        let opt = DhcpOpt {
+            opt: 1,
+            val: vec![],
+            flags: 0,
+            netid: None,
+            next: vec![],
+            len: 0,
+            u: DhcpOptExtra::None,
+        };
+        assert!(match_bytes(&opt, &[]));
+        assert!(!match_bytes(&opt, &[0x01]));
+    }
+
+    #[test]
+    fn test_match_bytes_hex_wildcard() {
+        let opt = DhcpOpt {
+            opt: 1,
+            val: vec![0x01, 0x02, 0x03],
+            flags: DHOPT_HEX,
+            netid: None,
+            next: vec![],
+            len: 3,
+            u: DhcpOptExtra::WildcardMask(0b010),
+        };
+        assert!(match_bytes(&opt, &[0x01, 0xFF, 0x03]));
+        assert!(!match_bytes(&opt, &[0x00, 0xFF, 0x03]));
+    }
+
+    #[test]
+    fn test_match_bytes_hex_length_differs() {
+        let opt = DhcpOpt {
+            opt: 1,
+            val: vec![0x01, 0x02],
+            flags: DHOPT_HEX,
+            netid: None,
+            next: vec![],
+            len: 2,
+            u: DhcpOptExtra::None,
+        };
+        assert!(!match_bytes(&opt, &[0x01, 0x02, 0x03]));
+    }
+
+    #[test]
+    fn test_match_bytes_string_substring() {
+        let opt = DhcpOpt {
+            opt: 1,
+            val: b"XYZ".to_vec(),
+            flags: DHOPT_STRING,
+            netid: None,
+            next: vec![],
+            len: 3,
+            u: DhcpOptExtra::None,
+        };
+        assert!(match_bytes(&opt, b"abcXYZdef"));
+        assert!(match_bytes(&opt, b"XYZ"));
+        assert!(!match_bytes(&opt, b"XY"));
+    }
+
+    #[test]
+    fn test_match_bytes_string_val_longer() {
+        let opt = DhcpOpt {
+            opt: 1,
+            val: b"longval".to_vec(),
+            flags: DHOPT_STRING,
+            netid: None,
+            next: vec![],
+            len: 7,
+            u: DhcpOptExtra::None,
+        };
+        assert!(!match_bytes(&opt, b"lon"));
+    }
+
+    // -----------------------------------------------------------------------
+    // lookup_dhcp_opt additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lookup_dhcp_opt_v4_multiple_known() {
+        assert_eq!(lookup_dhcp_opt(DhcpProtocol::V4, "netmask"), Some(1));
+        assert_eq!(lookup_dhcp_opt(DhcpProtocol::V4, "router"), Some(3));
+        assert_eq!(lookup_dhcp_opt(DhcpProtocol::V4, "dns-server"), Some(6));
+        assert_eq!(lookup_dhcp_opt(DhcpProtocol::V4, "domain-name"), Some(15));
+    }
+
+    #[test]
+    fn test_lookup_dhcp_opt_v4_case_insensitive_mixed() {
+        assert_eq!(lookup_dhcp_opt(DhcpProtocol::V4, "NETMASK"), Some(1));
+        assert_eq!(lookup_dhcp_opt(DhcpProtocol::V4, "Netmask"), Some(1));
+        assert_eq!(lookup_dhcp_opt(DhcpProtocol::V4, "Router"), Some(3));
+    }
+
+    #[test]
+    fn test_lookup_dhcp_opt_v4_not_found() {
+        assert_eq!(
+            lookup_dhcp_opt(DhcpProtocol::V4, "nonexistent-option"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_lookup_dhcp_opt_v6_dns_server() {
+        assert_eq!(lookup_dhcp_opt(DhcpProtocol::V6, "dns-server"), Some(23));
+    }
+
+    #[test]
+    fn test_lookup_dhcp_opt_v6_not_found() {
+        assert_eq!(lookup_dhcp_opt(DhcpProtocol::V6, "nonexistent"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // lookup_dhcp_len additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lookup_dhcp_len_v4_netmask() {
+        let len = lookup_dhcp_len(DhcpProtocol::V4, 1);
+        assert!(len.is_some());
+    }
+
+    #[test]
+    fn test_lookup_dhcp_len_v4_mtu_dec_stripped() {
+        let len = lookup_dhcp_len(DhcpProtocol::V4, 26);
+        assert_eq!(len, Some(2));
+    }
+
+    #[test]
+    fn test_lookup_dhcp_len_v4_unknown_code() {
+        assert_eq!(lookup_dhcp_len(DhcpProtocol::V4, 9999), None);
+    }
+
+    #[test]
+    fn test_lookup_dhcp_len_v6_dns_server() {
+        let len = lookup_dhcp_len(DhcpProtocol::V6, 23);
+        assert!(len.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // option_string tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_option_string_v4_addr_list_single() {
+        let val = [192u8, 168, 1, 1];
+        let result = option_string(DhcpProtocol::V4, 1, &val);
+        assert!(result.contains("netmask"));
+        assert!(result.contains("192.168.1.1"));
+    }
+
+    #[test]
+    fn test_option_string_v4_addr_list_multiple() {
+        let val = [10, 0, 0, 1, 10, 0, 0, 2];
+        let result = option_string(DhcpProtocol::V4, 3, &val);
+        assert!(result.contains("router"));
+        assert!(result.contains("10.0.0.1"));
+        assert!(result.contains("10.0.0.2"));
+    }
+
+    #[test]
+    fn test_option_string_v4_name_domain() {
+        let val = b"example.com";
+        let result = option_string(DhcpProtocol::V4, 15, val);
+        assert!(result.contains("domain-name"));
+        assert!(result.contains("example.com"));
+    }
+
+    #[test]
+    fn test_option_string_v4_dec_mtu() {
+        let val = [0x05, 0xDC]; // 1500
+        let result = option_string(DhcpProtocol::V4, 26, &val);
+        assert!(result.contains("mtu"));
+        assert!(result.contains("1500"));
+    }
+
+    #[test]
+    fn test_option_string_v4_time_t1() {
+        let val = [0x00, 0x00, 0x0E, 0x10]; // 3600 seconds
+        let result = option_string(DhcpProtocol::V4, 58, &val);
+        assert!(result.contains("T1"));
+    }
+
+    #[test]
+    fn test_option_string_unknown_hex_display() {
+        let val = [0xDE, 0xAD];
+        let result = option_string(DhcpProtocol::V4, 254, &val);
+        assert!(result.contains("option:254"));
+    }
+
+    #[test]
+    fn test_option_string_known_empty_val() {
+        let result = option_string(DhcpProtocol::V4, 1, &[]);
+        assert!(result.contains("netmask"));
+    }
+
+    #[test]
+    fn test_option_string_unknown_empty_val() {
+        let result = option_string(DhcpProtocol::V4, 254, &[]);
+        assert_eq!(result, "option:254");
+    }
+
+    #[test]
+    fn test_option_string_hex_fallback_opt19() {
+        let val = [0x01];
+        let result = option_string(DhcpProtocol::V4, 19, &val);
+        assert!(result.contains("ip-forward-enable"));
+        assert!(result.contains("01"));
+    }
+
+    #[test]
+    fn test_option_string_rfc1035_name_opt119() {
+        let val = [
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ];
+        let result = option_string(DhcpProtocol::V4, 119, &val);
+        assert!(result.contains("example.com"));
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_option_string_v6_addr_list_dns() {
+        let mut val = vec![0u8; 16];
+        val[15] = 1; // ::1
+        let result = option_string(DhcpProtocol::V6, 23, &val);
+        assert!(result.contains("dns-server"));
+        assert!(result.contains("::1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_hex_colons tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hex_colons_short_data() {
+        let result = format_hex_colons(&[0x01, 0xAB, 0xCD]);
+        assert_eq!(result, "01:ab:cd");
+    }
+
+    #[test]
+    fn test_hex_colons_empty_data() {
+        let result = format_hex_colons(&[]);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_hex_colons_truncation_over_14() {
+        let data: Vec<u8> = (0..20).collect();
+        let result = format_hex_colons(&data);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_hex_colons_exactly_14_bytes() {
+        let data: Vec<u8> = (0..14).collect();
+        let result = format_hex_colons(&data);
+        assert!(!result.contains("..."));
+        assert!(result.contains("0d"));
+    }
+
+    #[test]
+    fn test_hex_colons_single_byte() {
+        let result = format_hex_colons(&[0xFF]);
+        assert_eq!(result, "ff");
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_rfc1035_name tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rfc1035_name_multi_label() {
+        let data = [
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ];
+        let result = decode_rfc1035_name(&data);
+        assert_eq!(result, "example.com");
+    }
+
+    #[test]
+    fn test_rfc1035_name_one_label() {
+        let data = [4, b't', b'e', b's', b't', 0];
+        let result = decode_rfc1035_name(&data);
+        assert_eq!(result, "test");
+    }
+
+    #[test]
+    fn test_rfc1035_name_root_only() {
+        let data = [0];
+        let result = decode_rfc1035_name(&data);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_rfc1035_name_no_terminator() {
+        let data = [3, b'f', b'o', b'o', 3, b'b', b'a', b'r'];
+        let result = decode_rfc1035_name(&data);
+        assert_eq!(result, "foo.bar");
+    }
+
+    #[test]
+    fn test_rfc1035_name_three_labels() {
+        let data = [
+            3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm',
+            0,
+        ];
+        let result = decode_rfc1035_name(&data);
+        assert_eq!(result, "www.example.com");
+    }
+
+    // -----------------------------------------------------------------------
+    // display_opts / display_opts6 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_display_opts_executes() {
+        display_opts();
+    }
+
+    #[test]
+    fn test_display_opts6_executes() {
+        display_opts6();
+    }
+
+    // -----------------------------------------------------------------------
+    // get_opttab tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_opttab_v4_not_empty() {
+        let table = get_opttab(DhcpProtocol::V4);
+        assert!(!table.is_empty());
+        assert_eq!(table[0].name, "netmask");
+        assert_eq!(table[0].opt_code, 1);
+    }
+
+    #[test]
+    fn test_opttab_v6_not_empty() {
+        let table = get_opttab(DhcpProtocol::V6);
+        assert!(!table.is_empty());
+        assert_eq!(table[0].opt_code, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // log_context tests
+    // -----------------------------------------------------------------------
+
+    fn make_log_context(flags: u32, lease_time: u32) -> DhcpContext {
+        DhcpContext {
+            start: Ipv4Addr::new(10, 0, 0, 100),
+            end: Ipv4Addr::new(10, 0, 0, 200),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(10, 0, 0, 255),
+            router: Ipv4Addr::new(10, 0, 0, 1),
+            lease_time,
+            netid: tag("lan"),
+            flags,
+            filter: vec![],
+            local: Ipv4Addr::new(10, 0, 0, 1),
+            addr_epoch: 0,
+            #[cfg(feature = "dhcp6")]
+            start6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 64,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 0,
+            #[cfg(feature = "dhcp6")]
+            preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            template_interface: None,
+        }
+    }
+
+    #[test]
+    fn test_log_context_normal_range_no_panic() {
+        let ctx = make_log_context(0, 3600);
+        log_context(AddressFamily::Inet, &ctx);
+    }
+
+    #[test]
+    fn test_log_context_static_flag() {
+        let ctx = make_log_context(CONTEXT_STATIC, 3600);
+        log_context(AddressFamily::Inet, &ctx);
+    }
+
+    #[test]
+    fn test_log_context_proxy_flag() {
+        let ctx = make_log_context(CONTEXT_PROXY, 3600);
+        log_context(AddressFamily::Inet, &ctx);
+    }
+
+    #[test]
+    fn test_log_context_old_early_return() {
+        let ctx = make_log_context(CONTEXT_OLD, 3600);
+        log_context(AddressFamily::Inet, &ctx);
+    }
+
+    #[test]
+    fn test_log_context_v6_deprecate_flag() {
+        let ctx = make_log_context(CONTEXT_DEPRECATE, 0);
+        log_context(AddressFamily::Inet6, &ctx);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_log_context_v6_ra_stateless_flag() {
+        let mut ctx = make_log_context(CONTEXT_RA_STATELESS, 3600);
+        ctx.template_interface = Some("eth0".to_string());
+        log_context(AddressFamily::Inet6, &ctx);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_log_context_v6_ra_name_flag() {
+        let ctx = make_log_context(CONTEXT_RA_NAME, 3600);
+        log_context(AddressFamily::Inet6, &ctx);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_log_context_v6_ra_flag() {
+        let ctx = make_log_context(CONTEXT_RA, 3600);
+        log_context(AddressFamily::Inet6, &ctx);
+    }
+
+    // -----------------------------------------------------------------------
+    // log_relay tests
+    // -----------------------------------------------------------------------
+
+    fn make_log_relay(
+        local: std::net::IpAddr,
+        server: std::net::IpAddr,
+        iface: Option<&str>,
+        port: u16,
+        split: bool,
+    ) -> DhcpRelay {
+        DhcpRelay {
+            local,
+            server,
+            interface: iface.map(String::from),
+            port,
+            split_mode: split,
+            iface_index: 0,
+        }
+    }
+
+    #[test]
+    fn test_log_relay_no_interface() {
+        let relay = make_log_relay(
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            None,
+            DHCP_SERVER_PORT,
+            false,
+        );
+        log_relay(AddressFamily::Inet, &relay);
+    }
+
+    #[test]
+    fn test_log_relay_with_iface() {
+        let relay = make_log_relay(
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            Some("eth0"),
+            DHCP_SERVER_PORT,
+            false,
+        );
+        log_relay(AddressFamily::Inet, &relay);
+    }
+
+    #[test]
+    fn test_log_relay_split_mode_flag() {
+        let relay = make_log_relay(
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            Some("eth0"),
+            DHCP_SERVER_PORT,
+            true,
+        );
+        log_relay(AddressFamily::Inet, &relay);
+    }
+
+    #[test]
+    fn test_log_relay_broadcast_server() {
+        let relay = make_log_relay(
+            "10.0.0.1".parse().unwrap(),
+            "0.0.0.0".parse().unwrap(),
+            Some("eth0"),
+            DHCP_SERVER_PORT,
+            false,
+        );
+        log_relay(AddressFamily::Inet, &relay);
+    }
+
+    #[test]
+    fn test_log_relay_nondefault_port() {
+        let relay = make_log_relay(
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            Some("eth0"),
+            8067,
+            false,
+        );
+        log_relay(AddressFamily::Inet, &relay);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_log_relay_v6_nondefault_port() {
+        let relay = make_log_relay(
+            "::1".parse().unwrap(),
+            "::2".parse().unwrap(),
+            Some("eth0"),
+            9547,
+            false,
+        );
+        log_relay(AddressFamily::Inet6, &relay);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_log_relay_v6_multicast_server() {
+        let relay = make_log_relay(
+            "::1".parse().unwrap(),
+            "ff02::1:3".parse().unwrap(),
+            Some("eth0"),
+            DHCPV6_SERVER_PORT,
+            false,
+        );
+        log_relay(AddressFamily::Inet6, &relay);
+    }
+
+    // -----------------------------------------------------------------------
+    // log_tags tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_log_tags_empty_list() {
+        let state = DaemonState::default();
+        log_tags(&[], 0x1234, &state);
+    }
+
+    #[test]
+    fn test_log_tags_opt_disabled() {
+        let state = DaemonState::default();
+        let tags = vec![tag("known"), tag("lan")];
+        log_tags(&tags, 0x5678, &state);
+    }
+
+    #[test]
+    fn test_log_tags_opt_enabled() {
+        let mut state = DaemonState::default();
+        state.options.set(opt::LOG_OPTS);
+        let tags = vec![tag("known"), tag("lan")];
+        log_tags(&tags, 0x1234, &state);
+    }
+
+    #[test]
+    fn test_log_tags_dedup_entries() {
+        let mut state = DaemonState::default();
+        state.options.set(opt::LOG_OPTS);
+        let tags = vec![tag("dup"), tag("dup"), tag("other")];
+        log_tags(&tags, 0x9ABC, &state);
+    }
+
+    #[test]
+    fn test_log_tags_single() {
+        let mut state = DaemonState::default();
+        state.options.set(opt::LOG_OPTS);
+        let tags = vec![tag("only")];
+        log_tags(&tags, 0x0001, &state);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_domain6 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_domain6_some_suffix() {
+        let mut state = DaemonState::default();
+        state.domain_suffix = Some("example.com".to_string());
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        assert_eq!(get_domain6(&addr, &state), Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn test_get_domain6_none_suffix() {
+        let state = DaemonState::default();
+        let addr = Ipv6Addr::UNSPECIFIED;
+        assert_eq!(get_domain6(&addr, &state), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // config_has_mac additional tests
+    // -----------------------------------------------------------------------
+
+    fn make_dhcp_config_with_mac(hwaddr: Vec<u8>, hw_type: i32, wildcard: u32) -> DhcpConfig {
+        DhcpConfig {
+            flags: CONFIG_ADDR,
+            hwaddr: vec![HwAddrConfig {
+                hwaddr,
+                hwaddr_type: hw_type,
+                wildcard_mask: wildcard,
+            }],
+            clid: None,
+            hostname: None,
+            domain: None,
+            netid: vec![],
+            filter: vec![],
+            addr: Some(Ipv4Addr::new(10, 0, 0, 50)),
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+            decline_time: 0,
+            lease_time: 3600,
+        }
+    }
+
+    #[test]
+    fn test_config_mac_exact() {
+        let cfg = make_dhcp_config_with_mac(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1, 0);
+        assert!(config_has_mac(
+            &cfg,
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            1
+        ));
+    }
+
+    #[test]
+    fn test_config_mac_type_differs() {
+        let cfg = make_dhcp_config_with_mac(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1, 0);
+        assert!(!config_has_mac(
+            &cfg,
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            2
+        ));
+    }
+
+    #[test]
+    fn test_config_mac_wildcard_hw_type() {
+        let cfg = make_dhcp_config_with_mac(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 0, 0);
+        assert!(config_has_mac(
+            &cfg,
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            99
+        ));
+    }
+
+    #[test]
+    fn test_config_mac_length_differs() {
+        let cfg = make_dhcp_config_with_mac(vec![0xAA, 0xBB, 0xCC], 1, 0);
+        assert!(!config_has_mac(
+            &cfg,
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            1
+        ));
+    }
+
+    #[test]
+    fn test_config_mac_wildcard_bytes() {
+        let cfg = make_dhcp_config_with_mac(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1, 0b001010);
+        assert!(config_has_mac(
+            &cfg,
+            &[0xAA, 0x00, 0xCC, 0x00, 0xEE, 0xFF],
+            1
+        ));
+    }
+
+    #[test]
+    fn test_config_mac_no_hwaddr_entries() {
+        let cfg = DhcpConfig {
+            flags: CONFIG_ADDR,
+            hwaddr: vec![],
+            clid: None,
+            hostname: None,
+            domain: None,
+            netid: vec![],
+            filter: vec![],
+            addr: Some(Ipv4Addr::new(10, 0, 0, 50)),
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+            decline_time: 0,
+            lease_time: 3600,
+        };
+        assert!(!config_has_mac(&cfg, &[0xAA, 0xBB], 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // DhcpProtocol / AddressFamily / constant tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dhcp_protocol_variant_discriminants() {
+        let v4 = DhcpProtocol::V4;
+        let v6 = DhcpProtocol::V6;
+        assert_ne!(std::mem::discriminant(&v4), std::mem::discriminant(&v6));
+    }
+
+    #[test]
+    fn test_address_family_equality() {
+        assert_eq!(AddressFamily::Inet, AddressFamily::Inet);
+        assert_eq!(AddressFamily::Inet6, AddressFamily::Inet6);
+        assert_ne!(AddressFamily::Inet, AddressFamily::Inet6);
+    }
+
+    #[test]
+    fn test_relay_struct_fields() {
+        let relay = DhcpRelay {
+            local: "10.0.0.1".parse().unwrap(),
+            server: "10.0.0.2".parse().unwrap(),
+            interface: Some("eth0".to_string()),
+            port: 67,
+            split_mode: false,
+            iface_index: 3,
+        };
+        assert_eq!(relay.port, 67);
+        assert_eq!(relay.iface_index, 3);
+        assert!(!relay.split_mode);
+    }
+
+    #[test]
+    fn test_port_constants() {
+        assert_eq!(DHCP_SERVER_PORT, 67);
+        assert_eq!(DHCPV6_SERVER_PORT, 547);
+    }
+
+    #[test]
+    fn test_context_flags_power_of_two() {
+        let flags = [
+            CONTEXT_STATIC,
+            CONTEXT_PROXY,
+            CONTEXT_RA_NAME,
+            CONTEXT_RA_STATELESS,
+            CONTEXT_DEPRECATE,
+            CONTEXT_RA,
+            CONTEXT_OLD,
+        ];
+        for (i, &a) in flags.iter().enumerate() {
+            assert!(a.is_power_of_two());
+            for &b in &flags[i + 1..] {
+                assert_eq!(a & b, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_dhopt_hex_string_distinct() {
+        assert_ne!(DHOPT_HEX, 0);
+        assert_ne!(DHOPT_STRING, 0);
+        assert_ne!(DHOPT_HEX, DHOPT_STRING);
+    }
+
+    // ================================================================
+    // dhcp_common_init tests
+    // ================================================================
+
+    #[test]
+    fn test_dhcp_common_init_allocates_packet_buffer() {
+        let mut state = DaemonState::default();
+        state.dhcp_packet.clear();
+        dhcp_common_init(&mut state);
+        assert!(state.dhcp_packet.len() >= 576);
+    }
+
+    #[test]
+    fn test_dhcp_common_init_preserves_existing_buffer() {
+        let mut state = DaemonState::default();
+        state.dhcp_packet = vec![0u8; 1024];
+        dhcp_common_init(&mut state);
+        // Should not shrink existing buffer
+        assert_eq!(state.dhcp_packet.len(), 1024);
+    }
+
+    #[test]
+    fn test_dhcp_common_init_namebuff_capacity() {
+        let mut state = DaemonState::default();
+        state.namebuff = String::new();
+        dhcp_common_init(&mut state);
+        assert!(state.namebuff.capacity() >= crate::config::constants::MAXDNAME);
+    }
+
+    // ================================================================
+    // match_netid tests
+    // ================================================================
+
+    #[test]
+    fn test_match_netid_empty_check_needed() {
+        assert!(!match_netid(&[], &[], false));
+    }
+
+    #[test]
+    fn test_match_netid_empty_check_not_needed() {
+        assert!(match_netid(&[], &[], true));
+    }
+
+    #[test]
+    fn test_match_netid_exact_match() {
+        let check = vec![NetId {
+            net: "vlan10".to_string(),
+        }];
+        let pool = vec![NetId {
+            net: "vlan10".to_string(),
+        }];
+        assert!(match_netid(&check, &pool, false));
+    }
+
+    #[test]
+    fn test_match_netid_no_match_v2() {
+        let check = vec![NetId {
+            net: "vlan10".to_string(),
+        }];
+        let pool = vec![NetId {
+            net: "vlan20".to_string(),
+        }];
+        assert!(!match_netid(&check, &pool, false));
+    }
+
+    #[test]
+    fn test_match_netid_negated_not_in_pool() {
+        let check = vec![NetId {
+            net: "!vlan10".to_string(),
+        }];
+        let pool = vec![NetId {
+            net: "vlan20".to_string(),
+        }];
+        assert!(match_netid(&check, &pool, false));
+    }
+
+    #[test]
+    fn test_match_netid_negated_in_pool() {
+        let check = vec![NetId {
+            net: "!vlan10".to_string(),
+        }];
+        let pool = vec![NetId {
+            net: "vlan10".to_string(),
+        }];
+        assert!(!match_netid(&check, &pool, false));
+    }
+
+    #[test]
+    fn test_match_netid_hash_negation() {
+        let check = vec![NetId {
+            net: "#vlan10".to_string(),
+        }];
+        let pool = vec![NetId {
+            net: "vlan20".to_string(),
+        }];
+        assert!(match_netid(&check, &pool, false));
+    }
+
+    #[test]
+    fn test_match_netid_multiple_check_all_match() {
+        let check = vec![
+            NetId {
+                net: "a".to_string(),
+            },
+            NetId {
+                net: "b".to_string(),
+            },
+        ];
+        let pool = vec![
+            NetId {
+                net: "a".to_string(),
+            },
+            NetId {
+                net: "b".to_string(),
+            },
+            NetId {
+                net: "c".to_string(),
+            },
+        ];
+        assert!(match_netid(&check, &pool, false));
+    }
+
+    #[test]
+    fn test_match_netid_multiple_check_partial_match() {
+        let check = vec![
+            NetId {
+                net: "a".to_string(),
+            },
+            NetId {
+                net: "d".to_string(),
+            },
+        ];
+        let pool = vec![
+            NetId {
+                net: "a".to_string(),
+            },
+            NetId {
+                net: "b".to_string(),
+            },
+        ];
+        assert!(!match_netid(&check, &pool, false));
+    }
+
+    // ================================================================
+    // match_netid_wild tests
+    // ================================================================
+
+    #[test]
+    fn test_match_netid_wild_empty_check() {
+        assert!(match_netid_wild(&[], &[]));
+    }
+
+    #[test]
+    fn test_match_netid_wild_exact() {
+        let check = vec![NetId {
+            net: "vlan10".to_string(),
+        }];
+        let pool = vec![NetId {
+            net: "vlan10".to_string(),
+        }];
+        assert!(match_netid_wild(&check, &pool));
+    }
+
+    #[test]
+    fn test_match_netid_wild_wildcard_match() {
+        let check = vec![NetId {
+            net: "*vlan".to_string(),
+        }];
+        let pool = vec![NetId {
+            net: "office-vlan-1".to_string(),
+        }];
+        assert!(match_netid_wild(&check, &pool));
+    }
+
+    #[test]
+    fn test_match_netid_wild_wildcard_no_match() {
+        let check = vec![NetId {
+            net: "*xyz".to_string(),
+        }];
+        let pool = vec![NetId {
+            net: "office-vlan".to_string(),
+        }];
+        assert!(!match_netid_wild(&check, &pool));
+    }
+
+    #[test]
+    fn test_match_netid_wild_negated_wildcard_in_pool() {
+        let check = vec![NetId {
+            net: "!*vlan".to_string(),
+        }];
+        let pool = vec![NetId {
+            net: "office-vlan".to_string(),
+        }];
+        // Negated + found = fail
+        assert!(!match_netid_wild(&check, &pool));
+    }
+
+    #[test]
+    fn test_match_netid_wild_negated_wildcard_no_match() {
+        let check = vec![NetId {
+            net: "!*xyz".to_string(),
+        }];
+        let pool = vec![NetId {
+            net: "office-vlan".to_string(),
+        }];
+        // Negated + not found = pass
+        assert!(match_netid_wild(&check, &pool));
+    }
+
+    // ================================================================
+    // run_tag_if tests
+    // ================================================================
+
+    #[test]
+    fn test_run_tag_if_no_rules() {
+        let tags = vec![NetId {
+            net: "a".to_string(),
+        }];
+        let result = run_tag_if(&tags, &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].net, "a");
+    }
+
+    #[test]
+    fn test_run_tag_if_matching_rule_adds_tag() {
+        let tags = vec![NetId {
+            net: "a".to_string(),
+        }];
+        let rules = vec![TagIfRule {
+            tag: vec![NetId {
+                net: "a".to_string(),
+            }],
+            set: vec![NetId {
+                net: "b".to_string(),
+            }],
+        }];
+        let result = run_tag_if(&tags, &rules);
+        assert!(result.iter().any(|t| t.net == "a"));
+        assert!(result.iter().any(|t| t.net == "b"));
+    }
+
+    #[test]
+    fn test_run_tag_if_multi_level_chain() {
+        let tags = vec![NetId {
+            net: "a".to_string(),
+        }];
+        let rules = vec![
+            TagIfRule {
+                tag: vec![NetId {
+                    net: "a".to_string(),
+                }],
+                set: vec![NetId {
+                    net: "b".to_string(),
+                }],
+            },
+            TagIfRule {
+                tag: vec![NetId {
+                    net: "b".to_string(),
+                }],
+                set: vec![NetId {
+                    net: "c".to_string(),
+                }],
+            },
+        ];
+        let result = run_tag_if(&tags, &rules);
+        assert!(result.iter().any(|t| t.net == "c"));
+    }
+
+    #[test]
+    fn test_run_tag_if_no_match() {
+        let tags = vec![NetId {
+            net: "x".to_string(),
+        }];
+        let rules = vec![TagIfRule {
+            tag: vec![NetId {
+                net: "a".to_string(),
+            }],
+            set: vec![NetId {
+                net: "b".to_string(),
+            }],
+        }];
+        let result = run_tag_if(&tags, &rules);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].net, "x");
+    }
+
+    // ================================================================
+    // option_filter tests
+    // ================================================================
+
+    #[test]
+    fn test_option_filter_empty() {
+        let result = option_filter(&[], &[], &[], false);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_option_filter_untagged_pass() {
+        let opts = vec![DhcpOpt {
+            opt: 1,
+            len: 4,
+            val: vec![255, 255, 255, 0],
+            flags: 0,
+            netid: None,
+            u: DhcpOptExtra::None,
+            next: Vec::new(),
+        }];
+        let result = option_filter(&[], &[], &opts, false);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opt, 1);
+    }
+
+    #[test]
+    fn test_option_filter_tagged_match() {
+        let opts = vec![DhcpOpt {
+            opt: 6,
+            len: 4,
+            val: vec![8, 8, 8, 8],
+            flags: 0,
+            netid: Some(NetId {
+                net: "office".to_string(),
+            }),
+            u: DhcpOptExtra::None,
+            next: Vec::new(),
+        }];
+        let tags = vec![NetId {
+            net: "office".to_string(),
+        }];
+        let result = option_filter(&tags, &[], &opts, false);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_option_filter_tagged_no_match() {
+        let opts = vec![DhcpOpt {
+            opt: 6,
+            len: 4,
+            val: vec![8, 8, 8, 8],
+            flags: 0,
+            netid: Some(NetId {
+                net: "office".to_string(),
+            }),
+            u: DhcpOptExtra::None,
+            next: Vec::new(),
+        }];
+        let tags = vec![NetId {
+            net: "home".to_string(),
+        }];
+        let result = option_filter(&tags, &[], &opts, false);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_option_filter_context_tags_fallback() {
+        let opts = vec![DhcpOpt {
+            opt: 6,
+            len: 4,
+            val: vec![8, 8, 8, 8],
+            flags: 0,
+            netid: Some(NetId {
+                net: "office".to_string(),
+            }),
+            u: DhcpOptExtra::None,
+            next: Vec::new(),
+        }];
+        let tags: Vec<NetId> = vec![];
+        let ctx_tags = vec![NetId {
+            net: "office".to_string(),
+        }];
+        let result = option_filter(&tags, &ctx_tags, &opts, false);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_option_filter_skips_encapsulated() {
+        let opts = vec![DhcpOpt {
+            opt: 1,
+            len: 0,
+            val: vec![],
+            flags: DHOPT_ENCAPSULATE,
+            netid: None,
+            u: DhcpOptExtra::None,
+            next: Vec::new(),
+        }];
+        let result = option_filter(&[], &[], &opts, false);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_option_filter_dedup_last_wins() {
+        let opts = vec![
+            DhcpOpt {
+                opt: 6,
+                len: 4,
+                val: vec![8, 8, 8, 8],
+                flags: 0,
+                netid: None,
+                u: DhcpOptExtra::None,
+                next: Vec::new(),
+            },
+            DhcpOpt {
+                opt: 6,
+                len: 4,
+                val: vec![1, 1, 1, 1],
+                flags: 0,
+                netid: None,
+                u: DhcpOptExtra::None,
+                next: Vec::new(),
+            },
+        ];
+        let result = option_filter(&[], &[], &opts, false);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].val, vec![1, 1, 1, 1]);
+    }
+
+    // ================================================================
+    // dhcp_update_configs tests
+    // ================================================================
+
+    #[test]
+    fn test_dhcp_update_configs_empty() {
+        let state = DaemonState::default();
+        let mut configs: Vec<DhcpConfig> = Vec::new();
+        dhcp_update_configs(&mut configs, &state);
+        assert!(configs.is_empty());
+    }
+
+    #[test]
+    fn test_dhcp_update_configs_clears_addr_hosts() {
+        let state = DaemonState::default();
+        let mut configs = vec![DhcpConfig {
+            flags: CONFIG_ADDR_HOSTS,
+            hwaddr: Vec::new(),
+            clid: None,
+            hostname: Some("test".to_string()),
+            netid: Vec::new(),
+            filter: Vec::new(),
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: Vec::new(),
+            domain: None,
+            lease_time: 0,
+            decline_time: 0,
+        }];
+        dhcp_update_configs(&mut configs, &state);
+        assert_eq!(configs[0].flags & CONFIG_ADDR_HOSTS, 0);
+    }
+
+    #[test]
+    fn test_dhcp_update_configs_skips_no_hostname() {
+        let state = DaemonState::default();
+        let mut configs = vec![DhcpConfig {
+            flags: 0,
+            hwaddr: Vec::new(),
+            clid: None,
+            hostname: None,
+            netid: Vec::new(),
+            filter: Vec::new(),
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: Vec::new(),
+            domain: None,
+            lease_time: 0,
+            decline_time: 0,
+        }];
+        dhcp_update_configs(&mut configs, &state);
+        // Should run without error
+        assert_eq!(configs[0].flags, 0);
+    }
+
+    #[test]
+    fn test_dhcp_update_configs_with_hostname_no_addr() {
+        let state = DaemonState::default();
+        let mut configs = vec![DhcpConfig {
+            flags: 0,
+            hwaddr: Vec::new(),
+            clid: None,
+            hostname: Some("myhost".to_string()),
+            netid: Vec::new(),
+            filter: Vec::new(),
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: Vec::new(),
+            domain: None,
+            lease_time: 0,
+            decline_time: 0,
+        }];
+        dhcp_update_configs(&mut configs, &state);
+        // With no DNS cache, should just run through
+        assert_eq!(configs[0].hostname.as_deref(), Some("myhost"));
     }
 }

@@ -2232,4 +2232,482 @@ mod tests {
         assert_eq!(subnet.scope_netmask, 0);
         assert_eq!(subnet.addr.len(), 16);
     }
+
+    // -----------------------------------------------------------------------
+    // Additional mask_address_bytes edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_address_bytes_ipv6() {
+        let mut addr = vec![
+            0x20, 0x01, 0x0d, 0xb8, 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
+        EdnsHandler::mask_address_bytes(&mut addr, 48);
+        assert_eq!(&addr[0..6], &[0x20, 0x01, 0x0d, 0xb8, 0xAA, 0xBB]);
+        assert_eq!(&addr[6..], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_mask_address_bytes_single_byte_boundary() {
+        let mut addr = vec![0xFF, 0xFF];
+        EdnsHandler::mask_address_bytes(&mut addr, 8);
+        assert_eq!(addr, vec![0xFF, 0x00]);
+    }
+
+    #[test]
+    fn test_mask_address_bytes_partial_bits() {
+        // /5 mask on single byte: keep top 5 bits
+        let mut addr = vec![0xFF];
+        EdnsHandler::mask_address_bytes(&mut addr, 5);
+        assert_eq!(addr, vec![0xF8]); // 11111000
+    }
+
+    #[test]
+    fn test_mask_address_bytes_beyond_length() {
+        // Prefix longer than address bytes — no masking needed
+        let mut addr = vec![10, 20];
+        EdnsHandler::mask_address_bytes(&mut addr, 32);
+        assert_eq!(addr, vec![10, 20]);
+    }
+
+    // -----------------------------------------------------------------------
+    // base64_encode_mac additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_base64_encode_mac_empty() {
+        let encoded = EdnsHandler::base64_encode_mac(&[]);
+        assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn test_base64_encode_mac_one_byte() {
+        let encoded = EdnsHandler::base64_encode_mac(&[0xFF]);
+        // 1 byte → ceil(4*1/3) = 2 chars + padding
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn test_base64_encode_mac_all_zeros() {
+        let encoded = EdnsHandler::base64_encode_mac(&[0, 0, 0, 0, 0, 0]);
+        assert_eq!(encoded, "AAAAAAAA"); // 6 zero bytes → all 'A' chars
+    }
+
+    #[test]
+    fn test_base64_encode_mac_all_ones() {
+        let encoded = EdnsHandler::base64_encode_mac(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(encoded, "////////");
+    }
+
+    #[test]
+    fn test_base64_encode_mac_two_bytes() {
+        // Two bytes of data (0x00, 0x01) with padding
+        let encoded = EdnsHandler::base64_encode_mac(&[0x00, 0x01]);
+        assert!(!encoded.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // SubnetOpt additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_subnet_opt_from_bytes_too_short() {
+        let data = vec![0x00, 0x01]; // Only 2 bytes, need at least 4
+        assert!(SubnetOpt::from_bytes(&data).is_err());
+    }
+
+    #[test]
+    fn test_subnet_opt_to_bytes_format() {
+        let opt = SubnetOpt {
+            family: 1,
+            source_netmask: 24,
+            scope_netmask: 16,
+            addr: vec![10, 20, 30],
+        };
+        let bytes = opt.to_bytes();
+        assert_eq!(bytes[0], 0); // family high byte
+        assert_eq!(bytes[1], 1); // family low byte
+        assert_eq!(bytes[2], 24); // source
+        assert_eq!(bytes[3], 16); // scope
+        assert_eq!(&bytes[4..], &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_subnet_opt_v6_roundtrip_128() {
+        let addr_bytes = vec![0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let original = SubnetOpt {
+            family: 2,
+            source_netmask: 128,
+            scope_netmask: 64,
+            addr: addr_bytes.clone(),
+        };
+        let bytes = original.to_bytes();
+        let parsed = SubnetOpt::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.family, 2);
+        assert_eq!(parsed.source_netmask, 128);
+        assert_eq!(parsed.scope_netmask, 64);
+        assert_eq!(parsed.addr, addr_bytes);
+    }
+
+    #[test]
+    fn test_subnet_opt_empty_addr() {
+        let original = SubnetOpt {
+            family: 1,
+            source_netmask: 0,
+            scope_netmask: 0,
+            addr: vec![],
+        };
+        let bytes = original.to_bytes();
+        let parsed = SubnetOpt::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.addr.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // EdnsFlags tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_edns_flags_custom() {
+        let flags = EdnsFlags {
+            dnssec_ok: false,
+            udp_size: 512,
+            extended_rcode: 0,
+            version: 0,
+        };
+        assert!(!flags.dnssec_ok);
+        assert_eq!(flags.udp_size, 512);
+    }
+
+    #[test]
+    fn test_edns_flags_large_udp() {
+        let flags = EdnsFlags {
+            dnssec_ok: true,
+            udp_size: 65535,
+            extended_rcode: 15,
+            version: 1,
+        };
+        assert!(flags.dnssec_ok);
+        assert_eq!(flags.udp_size, 65535);
+        assert_eq!(flags.extended_rcode, 15);
+        assert_eq!(flags.version, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // EdnsOption tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_edns_option_creation() {
+        let opt = EdnsOption {
+            code: option_codes::EDNS0_OPTION_CLIENT_SUBNET,
+            data: vec![0, 1, 24, 0, 192, 168, 1],
+        };
+        assert_eq!(opt.code, option_codes::EDNS0_OPTION_CLIENT_SUBNET);
+        assert_eq!(opt.data.len(), 7);
+    }
+
+    #[test]
+    fn test_edns_option_padding() {
+        let opt = EdnsOption {
+            code: option_codes::EDNS0_OPTION_PADDING,
+            data: vec![0; 468], // Typical padding to 512 bytes
+        };
+        assert_eq!(opt.code, option_codes::EDNS0_OPTION_PADDING);
+        assert_eq!(opt.data.len(), 468);
+    }
+
+    // -----------------------------------------------------------------------
+    // option_codes constant tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_option_codes_comprehensive() {
+        assert_eq!(option_codes::EDNS0_OPTION_CLIENT_SUBNET, 8);
+        assert_eq!(option_codes::EDNS0_OPTION_COOKIE, 10);
+        assert_eq!(option_codes::EDNS0_OPTION_EDE, 15);
+        assert_eq!(option_codes::EDNS0_OPTION_PADDING, 12);
+        assert_eq!(option_codes::EDNS0_OPTION_MAC, 65001);
+    }
+
+    // -----------------------------------------------------------------------
+    // skip_name_wire edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_skip_name_wire_root_only() {
+        let mut packet = vec![0u8; 12]; // header
+        packet.push(0); // root label
+        let result = skip_name_wire(&packet, packet.len(), 12).unwrap();
+        assert_eq!(result, 13);
+    }
+
+    #[test]
+    fn test_skip_name_wire_invalid_offset() {
+        let packet = vec![0u8; 12];
+        let result = skip_name_wire(&packet, packet.len(), 20);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // skip_rr_wire tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_skip_rr_wire_valid() {
+        let mut packet = vec![0u8; 12]; // header
+                                        // Name: root (1 byte)
+        packet.push(0);
+        // Type (2), Class (2), TTL (4), RDLENGTH (2) = 10 bytes
+        packet.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+        // RDATA: 4 bytes (e.g., A record)
+        packet.extend_from_slice(&[10, 0, 0, 1]);
+
+        // skip_rr_wire starts from the name itself (offset 12)
+        let after_rr = skip_rr_wire(&packet, packet.len(), 12).unwrap();
+        assert_eq!(after_rr, packet.len()); // 12 + 1(name) + 10(fixed) + 4(rdata) = 27
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_options edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_options_truncated_header() {
+        // Only 3 bytes — not enough for a full option header (4 bytes)
+        let data = vec![0x00, 0x08, 0x00];
+        let result = EdnsHandler::parse_options(&data);
+        // Should handle gracefully
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_options_zero_length() {
+        let data = vec![0x00, 0x08, 0x00, 0x00]; // code=8, length=0
+        let options = EdnsHandler::parse_options(&data).unwrap();
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].code, 8);
+        assert!(options[0].data.is_empty());
+    }
+
+    // --- mask_address_bytes tests ---
+
+    #[test]
+    fn test_mask_address_bytes_full_mask_v4() {
+        let mut addr = [192, 168, 1, 100];
+        EdnsHandler::mask_address_bytes(&mut addr, 32);
+        assert_eq!(addr, [192, 168, 1, 100]);
+    }
+
+    #[test]
+    fn test_mask_address_bytes_24_prefix() {
+        let mut addr = [192, 168, 1, 100];
+        EdnsHandler::mask_address_bytes(&mut addr, 24);
+        assert_eq!(addr, [192, 168, 1, 0]);
+    }
+
+    #[test]
+    fn test_mask_address_bytes_16_prefix() {
+        let mut addr = [10, 20, 30, 40];
+        EdnsHandler::mask_address_bytes(&mut addr, 16);
+        assert_eq!(addr, [10, 20, 0, 0]);
+    }
+
+    #[test]
+    fn test_mask_address_bytes_20_prefix() {
+        let mut addr = [172, 16, 255, 100];
+        EdnsHandler::mask_address_bytes(&mut addr, 20);
+        // 20 bits = 2 full bytes + 4 bits → third byte masked to upper nibble
+        assert_eq!(addr[0], 172);
+        assert_eq!(addr[1], 16);
+        assert_eq!(addr[2], 0xF0); // 0xFF & 0xF0
+        assert_eq!(addr[3], 0);
+    }
+
+    #[test]
+    fn test_mask_address_bytes_zero_mask() {
+        let mut addr = [255, 255, 255, 255];
+        EdnsHandler::mask_address_bytes(&mut addr, 0);
+        assert_eq!(addr, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_mask_address_bytes_single_bit() {
+        let mut addr = [0xFF, 0xFF, 0xFF, 0xFF];
+        EdnsHandler::mask_address_bytes(&mut addr, 1);
+        assert_eq!(addr[0], 0x80);
+        assert_eq!(addr[1], 0);
+    }
+
+    #[test]
+    fn test_mask_address_bytes_v6_64_prefix() {
+        let mut addr = [
+            0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 1,
+        ];
+        EdnsHandler::mask_address_bytes(&mut addr, 64);
+        assert_eq!(&addr[0..8], &[0xFE, 0x80, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&addr[8..16], &[0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    // --- calc_subnet_opt tests ---
+
+    #[test]
+    fn test_calc_subnet_opt_v4_no_config() {
+        let state = DaemonState::default();
+        let opt = EdnsHandler::calc_subnet_opt(
+            &IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 100)),
+            &state,
+        );
+        assert_eq!(opt.family, 1);
+        assert_eq!(opt.source_netmask, 32);
+        assert_eq!(opt.scope_netmask, 0);
+        assert_eq!(opt.addr.len(), 4);
+    }
+
+    #[test]
+    fn test_calc_subnet_opt_v6_no_config() {
+        let state = DaemonState::default();
+        let opt = EdnsHandler::calc_subnet_opt(&IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), &state);
+        assert_eq!(opt.family, 2);
+        assert_eq!(opt.source_netmask, 128);
+        assert_eq!(opt.scope_netmask, 0);
+        assert_eq!(opt.addr.len(), 16);
+    }
+
+    #[test]
+    fn test_calc_subnet_opt_v4_with_config() {
+        use crate::core::types::MySubnet;
+        let mut state = DaemonState::default();
+        state.add_subnet4 = Some(MySubnet {
+            addr: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 0)),
+            mask: 24,
+            addr_used: true,
+        });
+        let opt = EdnsHandler::calc_subnet_opt(
+            &IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 100)),
+            &state,
+        );
+        assert_eq!(opt.family, 1);
+        assert_eq!(opt.source_netmask, 24);
+        assert_eq!(opt.addr[3], 0); // masked
+    }
+
+    #[test]
+    fn test_calc_subnet_opt_v6_with_config() {
+        use crate::core::types::MySubnet;
+        let mut state = DaemonState::default();
+        state.add_subnet6 = Some(MySubnet {
+            addr: IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            mask: 64,
+            addr_used: true,
+        });
+        let opt = EdnsHandler::calc_subnet_opt(
+            &IpAddr::V6(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            &state,
+        );
+        assert_eq!(opt.family, 2);
+        assert_eq!(opt.source_netmask, 64);
+    }
+
+    #[test]
+    fn test_parse_options_truncated_data() {
+        let data = vec![0, 10, 0, 10, 0x41, 0x42];
+        assert!(EdnsHandler::parse_options(&data).is_err());
+    }
+
+    // --- SubnetOpt to_bytes/from_bytes roundtrip ---
+
+    #[test]
+    fn test_subnet_opt_roundtrip_v4() {
+        let opt = SubnetOpt {
+            family: 1,
+            source_netmask: 24,
+            scope_netmask: 0,
+            addr: vec![192, 168, 1, 0],
+        };
+        let bytes = opt.to_bytes();
+        let parsed = SubnetOpt::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.family, 1);
+        assert_eq!(parsed.source_netmask, 24);
+        assert_eq!(parsed.scope_netmask, 0);
+    }
+
+    #[test]
+    fn test_subnet_opt_roundtrip_v6() {
+        let opt = SubnetOpt {
+            family: 2,
+            source_netmask: 64,
+            scope_netmask: 0,
+            addr: vec![0xFE, 0x80, 0, 0, 0, 0, 0, 0],
+        };
+        let bytes = opt.to_bytes();
+        let parsed = SubnetOpt::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.family, 2);
+        assert_eq!(parsed.source_netmask, 64);
+    }
+
+    // --- EdnsFlags coverage ---
+
+    #[test]
+    fn test_edns_flags_with_all_fields() {
+        let f = EdnsFlags {
+            dnssec_ok: true,
+            udp_size: 4096,
+            version: 0,
+            extended_rcode: 0,
+        };
+        assert!(f.dnssec_ok);
+        assert_eq!(f.udp_size, 4096);
+    }
+
+    #[test]
+    fn test_edns_flags_default_values() {
+        let f = EdnsFlags::default();
+        assert!(!f.dnssec_ok);
+        assert_eq!(f.version, 0);
+        assert_eq!(f.extended_rcode, 0);
+    }
+
+    // --- skip_name_wire / skip_rr_wire ---
+
+    #[test]
+    fn test_skip_name_wire_root() {
+        let packet = [0u8];
+        let result = skip_name_wire(&packet, 1, 0).unwrap();
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn test_skip_name_wire_pointer() {
+        let packet = [3, b'w', b'w', b'w', 0, 0xC0, 0x00];
+        let result = skip_name_wire(&packet, 7, 5).unwrap();
+        assert_eq!(result, 7);
+    }
+
+    #[test]
+    fn test_skip_rr_wire_basic() {
+        let mut packet = vec![0u8]; // root name
+        packet.extend_from_slice(&[0, 1]); // type A
+        packet.extend_from_slice(&[0, 1]); // class IN
+        packet.extend_from_slice(&[0, 0, 0, 60]); // ttl 60
+        packet.extend_from_slice(&[0, 4]); // rdlength 4
+        packet.extend_from_slice(&[1, 2, 3, 4]); // rdata
+        let result = skip_rr_wire(&packet, packet.len(), 0).unwrap();
+        assert_eq!(result, packet.len());
+    }
+
+    // --- check_source tests ---
+
+    #[test]
+    fn test_check_source_no_opt_present() {
+        use crate::core::types::MySockAddr;
+        let (query, len) = build_test_query();
+        let source = MySockAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            53,
+        ));
+        let result = EdnsHandler::check_source(&query, len, None, &source, &DaemonState::default());
+        assert!(result.is_ok());
+    }
 }

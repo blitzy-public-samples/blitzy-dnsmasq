@@ -1490,4 +1490,423 @@ mod tests {
         let hdr = DnsHeader::parse(&pkt[..new_len]).unwrap();
         assert_eq!(hdr.ancount, 1);
     }
+
+    // -----------------------------------------------------------------------
+    // rr_type_descriptor coverage — every branch in the match
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rr_type_descriptor_ns() {
+        let desc = rr_type_descriptor(RRType::NS);
+        assert_eq!(desc.len(), 1);
+        assert!(matches!(desc[0], RdataField::Name));
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_md() {
+        assert_eq!(rr_type_descriptor(RRType::MD).len(), 1);
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_mf() {
+        assert_eq!(rr_type_descriptor(RRType::MF).len(), 1);
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_cname() {
+        let desc = rr_type_descriptor(RRType::CNAME);
+        assert_eq!(desc.len(), 1);
+        assert!(matches!(desc[0], RdataField::Name));
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_soa() {
+        let desc = rr_type_descriptor(RRType::SOA);
+        assert_eq!(desc.len(), 2);
+        assert!(matches!(desc[0], RdataField::Name));
+        assert!(matches!(desc[1], RdataField::Name));
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_mb() {
+        assert_eq!(rr_type_descriptor(RRType::MB).len(), 1);
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_mg() {
+        assert_eq!(rr_type_descriptor(RRType::MG).len(), 1);
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_mr() {
+        assert_eq!(rr_type_descriptor(RRType::MR).len(), 1);
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_ptr() {
+        let desc = rr_type_descriptor(RRType::PTR);
+        assert_eq!(desc.len(), 1);
+        assert!(matches!(desc[0], RdataField::Name));
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_minfo() {
+        let desc = rr_type_descriptor(RRType::MINFO);
+        assert_eq!(desc.len(), 2);
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_mx() {
+        let desc = rr_type_descriptor(RRType::MX);
+        assert_eq!(desc.len(), 2);
+        assert!(matches!(desc[0], RdataField::Skip(2)));
+        assert!(matches!(desc[1], RdataField::Name));
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_rp() {
+        assert_eq!(rr_type_descriptor(RRType::RP).len(), 2);
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_afsdb() {
+        let desc = rr_type_descriptor(RRType::AFSDB);
+        assert_eq!(desc.len(), 2);
+        assert!(matches!(desc[0], RdataField::Skip(2)));
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_rt() {
+        assert_eq!(rr_type_descriptor(RRType::RT).len(), 2);
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_sig() {
+        let desc = rr_type_descriptor(RRType::SIG);
+        assert_eq!(desc.len(), 2);
+        assert!(matches!(desc[0], RdataField::Skip(18)));
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_px() {
+        let desc = rr_type_descriptor(RRType::PX);
+        assert_eq!(desc.len(), 3);
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_nxt() {
+        assert_eq!(rr_type_descriptor(RRType::NXT).len(), 1);
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_kx() {
+        let desc = rr_type_descriptor(RRType::KX);
+        assert_eq!(desc.len(), 2);
+        assert!(matches!(desc[0], RdataField::Skip(2)));
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_srv() {
+        let desc = rr_type_descriptor(RRType::SRV);
+        assert_eq!(desc.len(), 2);
+        assert!(matches!(desc[0], RdataField::Skip(6)));
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_dname() {
+        let desc = rr_type_descriptor(RRType::DNAME);
+        assert_eq!(desc.len(), 1);
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_a() {
+        assert!(rr_type_descriptor(RRType::A).is_empty());
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_aaaa() {
+        assert!(rr_type_descriptor(RRType::AAAA).is_empty());
+    }
+
+    #[test]
+    fn test_rr_type_descriptor_txt() {
+        assert!(rr_type_descriptor(RRType::TXT).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // skip_name edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_skip_name_normal() {
+        // "\x07example\x03com\x00"
+        let packet = b"\x07example\x03com\x00";
+        let result = skip_name(packet, 0).unwrap();
+        assert_eq!(result, packet.len());
+    }
+
+    #[test]
+    fn test_skip_name_compression_pointer() {
+        // Build a packet with a name at offset 0 and a compression pointer at offset 13
+        let mut pkt = vec![];
+        pkt.extend_from_slice(b"\x07example\x03com\x00"); // 13 bytes
+        pkt.push(0xC0); // compression pointer
+        pkt.push(0x00); // points to offset 0
+        let result = skip_name(&pkt, 13).unwrap();
+        assert_eq!(result, 15); // skips the 2-byte compression pointer
+    }
+
+    #[test]
+    fn test_skip_name_truncated() {
+        let packet = b"\x07exam"; // Label says 7 bytes but only 4 available
+        assert!(skip_name(packet, 0).is_err());
+    }
+
+    #[test]
+    fn test_skip_name_beyond_packet() {
+        let packet = b"\x00";
+        assert!(skip_name(packet, 5).is_err());
+    }
+
+    #[test]
+    fn test_skip_name_reserved_label_type() {
+        let packet = [0x80, 0x00]; // reserved label type 0x80
+        assert!(skip_name(&packet, 0).is_err());
+    }
+
+    #[test]
+    fn test_skip_name_compression_loop() {
+        // Create a pointer loop: offset 0 → offset 0
+        let packet = [0xC0, 0x00];
+        // This should hit the 256-hop limit
+        assert!(skip_name(&packet, 0).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // check_name edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_name_empty_rrs() {
+        let mut packet = b"\x07example\x03com\x00".to_vec();
+        let result = check_name(&mut packet, 0, false, &[]).unwrap();
+        assert_eq!(result, 13);
+    }
+
+    #[test]
+    fn test_check_name_fixup_adjusts_pointer() {
+        // Name at offset 0: "\x07example\x03com\x00" (13 bytes)
+        // RR was at offsets 13..20 (7 bytes removed)
+        // Pointer at offset 20: 0xC0 0x00 (points to offset 0)
+        let mut pkt = vec![];
+        pkt.extend_from_slice(b"\x07example\x03com\x00"); // 0..13
+        pkt.extend_from_slice(&[0u8; 7]); // 13..20 (removed range)
+        pkt.push(0xC0); // pointer at 20
+        pkt.push(0x00); // points to 0
+                        // After removing 13..20, pointer should remain at offset 0 (before the removed range)
+        let result = check_name(&mut pkt, 20, true, &[(13, 20)]).unwrap();
+        assert_eq!(result, 22);
+    }
+
+    #[test]
+    fn test_check_name_pointer_into_removed_record() {
+        // Pointer targets offset 15, which is within removed range 13..20
+        let mut pkt = vec![0u8; 25];
+        pkt[20] = 0xC0;
+        pkt[21] = 15; // points to offset 15, inside removed (13..20)
+        let result = check_name(&mut pkt, 20, false, &[(13, 20)]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_name_reserved_label_type() {
+        let mut pkt = vec![0x80, 0x00];
+        assert!(check_name(&mut pkt, 0, false, &[]).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_question_name tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_question_name_valid() {
+        // Build minimal DNS query: 12-byte header + "\x03www\x07example\x03com\x00" + qtype(A) + qclass(IN)
+        let mut pkt = vec![0u8; 12]; // header
+        pkt[4] = 0;
+        pkt[5] = 1; // qdcount = 1
+        pkt.extend_from_slice(b"\x03www\x07example\x03com\x00");
+        pkt.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // qtype=A, qclass=IN
+        let name = extract_question_name(&pkt).unwrap();
+        assert_eq!(name.to_string().trim_end_matches('.'), "www.example.com");
+    }
+
+    #[test]
+    fn test_extract_question_name_too_short() {
+        let pkt = vec![0u8; 10]; // less than HDRSIZE
+        assert!(extract_question_name(&pkt).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // check_rrs basic tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_rrs_empty() {
+        // Build a valid DNS packet with 0 RRs
+        let mut pkt = vec![0u8; 12]; // header, all counts = 0
+        pkt.extend_from_slice(b"\x03www\x07example\x03com\x00");
+        pkt.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // qtype, qclass
+        let qs_end = 12 + 17 + 4;
+        let result = check_rrs(&mut pkt, qs_end, 0, 0, 0, false, &[]);
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // to_wire/from_wire additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_to_wire_trailing_dot() {
+        let mut name = b"example.com.".to_vec();
+        let len = to_wire(&mut name);
+        assert!(len > 0);
+    }
+
+    #[test]
+    fn test_to_wire_multiple_labels() {
+        let mut name = b"a.b.c.d.e.f".to_vec();
+        let len = to_wire(&mut name);
+        assert!(len > 0);
+    }
+
+    #[test]
+    fn test_from_wire_multiple_labels() {
+        let mut name = b"\x01a\x01b\x01c\x01d\x00".to_vec();
+        from_wire(&mut name);
+        let s = String::from_utf8_lossy(&name);
+        assert!(s.contains('.'));
+    }
+
+    #[test]
+    fn test_to_wire_from_wire_long_name() {
+        let mut name = b"subdomain.host.region.cloud.example.org".to_vec();
+        let len = to_wire(&mut name);
+        assert!(len > 0);
+        let mut wire = name[..len].to_vec();
+        from_wire(&mut wire);
+        assert!(String::from_utf8_lossy(&wire).contains("subdomain"));
+    }
+
+    // -----------------------------------------------------------------------
+    // rrfilter edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rrfilter_packet_too_short() {
+        let mut pkt = BytesMut::from(&[0u8; 5][..]);
+        let result = rrfilter(&mut pkt, 5, RRFilterMode::Address);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rrfilter_address_removes_aaaa() {
+        // Address mode removes A/AAAA from answer section
+        let qname = example_com_wire();
+        let mut pkt = build_test_packet(
+            &qname,
+            28,
+            1,                                   // AAAA query
+            &[(&qname, 28, 1, 300, &[0u8; 16])], // AAAA answer
+            &[],
+            &[],
+        );
+        let orig_len = pkt.len();
+        let new_len = rrfilter(&mut pkt, orig_len, RRFilterMode::Address).unwrap();
+        let hdr = DnsHeader::parse(&pkt[..new_len]).unwrap();
+        assert_eq!(hdr.ancount, 0); // AAAA is address type, removed
+    }
+
+    #[test]
+    fn test_rrfilter_address_keeps_ns() {
+        // Address mode only removes A/AAAA; NS is kept
+        let qname = example_com_wire();
+        let ns_rdata = example_com_wire();
+        let mut pkt = build_test_packet(
+            &qname,
+            2,
+            1,                                 // NS query
+            &[(&qname, 2, 1, 300, &ns_rdata)], // NS answer
+            &[],
+            &[],
+        );
+        let orig_len = pkt.len();
+        let new_len = rrfilter(&mut pkt, orig_len, RRFilterMode::Address).unwrap();
+        let hdr = DnsHeader::parse(&pkt[..new_len]).unwrap();
+        assert_eq!(hdr.ancount, 1); // NS is not address type, kept
+    }
+
+    #[test]
+    fn test_rrfilter_no_question() {
+        let mut pkt = BytesMut::new();
+        pkt.put_u16(0x1234); // ID
+        pkt.put_u8(0x81);
+        pkt.put_u8(0x80); // flags
+        pkt.put_u16(0); // qdcount = 0
+        pkt.put_u16(0);
+        pkt.put_u16(0);
+        pkt.put_u16(0);
+        let len = pkt.len();
+        let result = rrfilter(&mut pkt, len, RRFilterMode::Address).unwrap();
+        assert_eq!(result, len); // unchanged
+    }
+
+    #[test]
+    fn test_rrfilter_multiple_answers_partial_remove() {
+        let qname = example_com_wire();
+        let mx_rdata = {
+            let mut v = vec![0u8, 10]; // preference = 10
+            v.extend_from_slice(&example_com_wire());
+            v
+        };
+        let mut pkt = build_test_packet(
+            &qname,
+            255,
+            1, // ANY query
+            &[
+                (&qname, 1, 1, 300, &[192, 168, 1, 1]), // A record
+                (&qname, 15, 1, 300, &mx_rdata),        // MX record
+            ],
+            &[],
+            &[],
+        );
+        let orig_len = pkt.len();
+        // In Address mode, both A and AAAA are kept; MX is removed for non-address
+        // Actually: RRFilterMode::Address removes A/AAAA (address records) for non-address queries.
+        // Let's use ByType to remove MX instead for clearer semantics
+        let new_len = rrfilter(&mut pkt, orig_len, RRFilterMode::ByType(RRType::MX)).unwrap();
+        let hdr = DnsHeader::parse(&pkt[..new_len]).unwrap();
+        assert_eq!(hdr.ancount, 1); // Only A kept
+    }
+
+    // -----------------------------------------------------------------------
+    // rrfilter_to_packet tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rrfilter_to_packet_no_change() {
+        let qname = example_com_wire();
+        let pkt = build_test_packet(
+            &qname,
+            1,
+            1,
+            &[(&qname, 1, 1, 300, &[10, 0, 0, 1])],
+            &[],
+            &[],
+        );
+        let orig = pkt.to_vec();
+        // Address mode with A query and A answer — the A record won't be filtered
+        // (address filter removes non-address-type answers when query is address type)
+        let result = rrfilter_to_packet(&orig, RRFilterMode::Address);
+        assert!(result.is_ok());
+    }
 }

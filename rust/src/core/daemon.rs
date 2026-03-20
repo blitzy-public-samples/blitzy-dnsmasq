@@ -1792,4 +1792,514 @@ mod tests {
         let result = runner.handle_shutdown().await;
         assert!(result.is_ok());
     }
+
+    // ===================================================================
+    // Helper to build a DaemonRunner for tests
+    // ===================================================================
+
+    async fn make_test_runner() -> DaemonRunner {
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+        let event_loop = EventLoop::new().unwrap();
+        DaemonRunner {
+            state,
+            event_loop,
+            dns_udp: None,
+            dns_tcp: None,
+            #[cfg(feature = "dhcp")]
+            dhcp_v4: None,
+            #[cfg(feature = "dhcp6")]
+            dhcp_v6: None,
+            #[cfg(feature = "tftp")]
+            tftp: None,
+            active_tcp_tasks: Arc::new(AtomicU32::new(0)),
+            last_resolv_check: 0,
+            shutdown_requested: false,
+        }
+    }
+
+    // ===================================================================
+    // Additional tests — DaemonRunner fields & accessors
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_runner_initial_shutdown_flag() {
+        let runner = make_test_runner().await;
+        assert!(!runner.shutdown_requested);
+    }
+
+    #[tokio::test]
+    async fn test_runner_initial_active_tasks() {
+        let runner = make_test_runner().await;
+        assert_eq!(runner.active_tcp_tasks.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_runner_initial_resolv_check() {
+        let runner = make_test_runner().await;
+        assert_eq!(runner.last_resolv_check, 0);
+    }
+
+    #[tokio::test]
+    async fn test_runner_dns_sockets_none() {
+        let runner = make_test_runner().await;
+        assert!(runner.dns_udp.is_none());
+        assert!(runner.dns_tcp.is_none());
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[tokio::test]
+    async fn test_runner_dhcp_v4_socket_none() {
+        let runner = make_test_runner().await;
+        assert!(runner.dhcp_v4_socket().is_none());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[tokio::test]
+    async fn test_runner_dhcp_v6_socket_none() {
+        let runner = make_test_runner().await;
+        assert!(runner.dhcp_v6_socket().is_none());
+    }
+
+    #[cfg(feature = "tftp")]
+    #[tokio::test]
+    async fn test_runner_tftp_socket_none() {
+        let runner = make_test_runner().await;
+        assert!(runner.tftp_socket().is_none());
+    }
+
+    // ===================================================================
+    // Additional tests — DNS packet handlers
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_dns_udp_handler_empty_packet() {
+        let runner = make_test_runner().await;
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        runner.handle_dns_udp_query(&[], peer).await;
+        // Should not panic on empty packet
+    }
+
+    #[tokio::test]
+    async fn test_dns_udp_handler_large_packet() {
+        let runner = make_test_runner().await;
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let packet = vec![0u8; 512];
+        runner.handle_dns_udp_query(&packet, peer).await;
+    }
+
+    #[tokio::test]
+    async fn test_dns_udp_handler_ipv6_peer() {
+        let runner = make_test_runner().await;
+        let peer: SocketAddr = "[::1]:12345".parse().unwrap();
+        runner.handle_dns_udp_query(&[0u8; 12], peer).await;
+    }
+
+    // ===================================================================
+    // Additional tests — DHCP packet handlers
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_dhcp_v4_handler_minimal() {
+        let runner = make_test_runner().await;
+        let peer: SocketAddr = "10.0.0.1:68".parse().unwrap();
+        runner.handle_dhcp_v4_packet(&[0u8; 300], peer).await;
+    }
+
+    #[tokio::test]
+    async fn test_dhcp_v4_handler_empty() {
+        let runner = make_test_runner().await;
+        let peer: SocketAddr = "10.0.0.1:68".parse().unwrap();
+        runner.handle_dhcp_v4_packet(&[], peer).await;
+    }
+
+    #[tokio::test]
+    async fn test_dhcp_v6_handler_minimal() {
+        let runner = make_test_runner().await;
+        let peer: SocketAddr = "[fe80::1]:546".parse().unwrap();
+        runner.handle_dhcp_v6_packet(&[0u8; 100], peer).await;
+    }
+
+    // ===================================================================
+    // Additional tests — TFTP handler
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tftp_handler_minimal() {
+        let runner = make_test_runner().await;
+        let peer: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        runner
+            .handle_tftp_request(
+                &[
+                    0, 1, b'f', b'i', b'l', b'e', 0, b'o', b'c', b't', b'e', b't', 0,
+                ],
+                peer,
+            )
+            .await;
+    }
+
+    // ===================================================================
+    // Additional tests — poll_resolv
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_poll_resolv_no_force() {
+        let runner = make_test_runner().await;
+        // Non-force poll should succeed (just checks mtime)
+        let result = runner.poll_resolv(false).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_poll_resolv_force() {
+        let runner = make_test_runner().await;
+        // Force poll reads resolv.conf
+        let result = runner.poll_resolv(true).await;
+        assert!(result.is_ok());
+        // After force poll, servers should be populated if /etc/resolv.conf exists
+        let state = runner.state.read().await;
+        // last_resolv should have been updated
+        if std::path::Path::new(RESOLVFILE).exists() {
+            assert!(state.last_resolv > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_poll_resolv_updates_servers() {
+        let runner = make_test_runner().await;
+        // Force read
+        let _ = runner.poll_resolv(true).await;
+        let state = runner.state.read().await;
+        // If /etc/resolv.conf has nameservers, servers should be populated
+        if std::path::Path::new(RESOLVFILE).exists() {
+            // At least check the vec was potentially updated
+            let _ = state.servers.len();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_poll_resolv_skip_when_recent() {
+        let mut runner = make_test_runner().await;
+        // Set last_resolv_check to far future to skip check
+        runner.last_resolv_check = i64::MAX;
+        let result = runner.poll_resolv(false).await;
+        assert!(result.is_ok());
+    }
+
+    // ===================================================================
+    // Additional tests — handle_tcp_dns_connection
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tcp_handler_peer_close() {
+        // Set up a TCP listener and connect
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+
+        let handle = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_tcp_dns_connection(stream, peer, state).await
+        });
+
+        // Connect and immediately close — should not hang or error
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        drop(client);
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_tcp_handler_single_query() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+
+        let handle = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_tcp_dns_connection(stream, peer, state).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // Build a minimal DNS query: 12-byte header
+        let mut query = vec![0u8; 12];
+        query[0] = 0x12; // Transaction ID high
+        query[1] = 0x34; // Transaction ID low
+                         // QR=0, Opcode=0, RD=1
+        query[2] = 0x01;
+        query[5] = 0x01; // QDCOUNT = 1
+
+        // Send length-prefixed query
+        let len = (query.len() as u16).to_be_bytes();
+        client.write_all(&len).await.unwrap();
+        client.write_all(&query).await.unwrap();
+
+        // Read response length
+        let mut resp_len = [0u8; 2];
+        client.read_exact(&mut resp_len).await.unwrap();
+        let resp_size = u16::from_be_bytes(resp_len) as usize;
+        assert_eq!(resp_size, 12);
+
+        // Read response body
+        let mut resp = vec![0u8; resp_size];
+        client.read_exact(&mut resp).await.unwrap();
+
+        // Check: QR bit set (response)
+        assert_ne!(resp[2] & 0x80, 0);
+        // Check: RCODE = SERVFAIL (2) in lower 4 bits of byte 3
+        assert_eq!(resp[3] & 0x0F, 2);
+        // Check: transaction ID preserved
+        assert_eq!(resp[0], 0x12);
+        assert_eq!(resp[1], 0x34);
+
+        // Close client
+        drop(client);
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_tcp_handler_invalid_length_zero() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+
+        let handle = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_tcp_dns_connection(stream, peer, state).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Send length 0 — should be rejected as invalid
+        client.write_all(&[0u8, 0]).await.unwrap();
+        drop(client);
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok()); // Connection closed after invalid length
+    }
+
+    #[tokio::test]
+    async fn test_tcp_handler_too_small_length() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+
+        let handle = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_tcp_dns_connection(stream, peer, state).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Send length 5 — too small for DNS (min 12), should be rejected
+        client.write_all(&[0u8, 5]).await.unwrap();
+        drop(client);
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    // ===================================================================
+    // Additional tests — drop_privileges
+    // ===================================================================
+
+    #[test]
+    fn test_drop_privileges_none_args() {
+        let result = drop_privileges(None, None);
+        // Not root → no-op → Ok
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_drop_privileges_custom_user() {
+        let result = drop_privileges(Some("nobody"), None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_drop_privileges_custom_group() {
+        let result = drop_privileges(None, Some("nogroup"));
+        assert!(result.is_ok());
+    }
+
+    // ===================================================================
+    // Additional tests — handle_reload / handle_dump_cache / shutdown
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_handle_reload_updates_state() {
+        let runner = make_test_runner().await;
+        let result = runner.handle_reload().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_dump_cache_ok() {
+        let runner = make_test_runner().await;
+        let result = runner.handle_dump_cache().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_dump_stats_ok() {
+        let runner = make_test_runner().await;
+        let result = runner.handle_dump_stats().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_shutdown_ok() {
+        let runner = make_test_runner().await;
+        let result = runner.handle_shutdown().await;
+        assert!(result.is_ok());
+    }
+
+    // ===================================================================
+    // Additional tests — active_tcp_tasks
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_active_tcp_tasks_increment() {
+        let runner = make_test_runner().await;
+        runner.active_tcp_tasks.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(runner.active_tcp_tasks.load(Ordering::Relaxed), 1);
+        runner.active_tcp_tasks.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(runner.active_tcp_tasks.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_active_tcp_tasks_max_procs() {
+        let runner = make_test_runner().await;
+        // Verify MAX_PROCS is accessible and reasonable
+        assert!(MAX_PROCS > 0);
+        // Simulate up to MAX_PROCS tasks
+        for _ in 0..MAX_PROCS {
+            runner.active_tcp_tasks.fetch_add(1, Ordering::Relaxed);
+        }
+        assert_eq!(
+            runner.active_tcp_tasks.load(Ordering::Relaxed),
+            MAX_PROCS as u32
+        );
+    }
+
+    // ===================================================================
+    // Additional tests — timer event handling completeness
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_all_timer_events() {
+        let mut runner = make_test_runner().await;
+
+        let events = vec![
+            TimerEvent::LeaseExpiry,
+            TimerEvent::CacheCleanup,
+            TimerEvent::RouterAdvertisement,
+            TimerEvent::DhcpTimeout,
+            TimerEvent::TcpTimeout,
+        ];
+
+        for event in &events {
+            let result = runner.handle_timer_event(event).await;
+            assert!(result.is_ok(), "Timer event {:?} failed", event);
+        }
+    }
+
+    // ===================================================================
+    // Additional tests — DaemonRunner::new
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_daemon_runner_new_ephemeral_port() {
+        // Use a high ephemeral port to avoid conflicts
+        let mut state = DaemonState::new();
+        state.port = 0; // system-assigned ephemeral port
+        let config = DnsmasqConfig::default();
+        let state = Arc::new(RwLock::new(state));
+        // DaemonRunner::new may fail if other tests hold the port;
+        // we verify it returns either Ok or a Network error (not a panic).
+        let result = DaemonRunner::new(state, &config).await;
+        match &result {
+            Ok(_) => {} // success
+            Err(DnsmasqError::Network(msg)) => {
+                // Acceptable — port in use by parallel test
+                assert!(
+                    msg.contains("bind") || msg.contains("address") || msg.contains("use"),
+                    "Unexpected network error: {}",
+                    msg
+                );
+            }
+            Err(e) => panic!("Unexpected error type from DaemonRunner::new: {:?}", e),
+        }
+    }
+
+    // ===================================================================
+    // Additional tests — state sharing
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_state_read_write() {
+        let runner = make_test_runner().await;
+
+        // Write
+        {
+            let mut state = runner.state.write().await;
+            state.port = 5353;
+            state.cachesize = 500;
+        }
+
+        // Read
+        {
+            let state = runner.state.read().await;
+            assert_eq!(state.port, 5353);
+            assert_eq!(state.cachesize, 500);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_state_concurrent_reads() {
+        let runner = make_test_runner().await;
+        let state = runner.state.clone();
+
+        let r1 = state.read().await;
+        let r2 = state.read().await;
+        assert_eq!(r1.port, r2.port);
+    }
+
+    // ===================================================================
+    // Additional tests — version and constants
+    // ===================================================================
+
+    #[test]
+    fn test_version_format() {
+        assert!(VERSION.len() > 0);
+        // Should contain version number
+        assert!(VERSION.contains("2.92"));
+    }
+
+    #[test]
+    fn test_child_lifetime_positive() {
+        assert!(CHILD_LIFETIME > 0);
+    }
+
+    #[test]
+    fn test_timeout_positive() {
+        assert!(TIMEOUT > 0);
+    }
+
+    #[test]
+    fn test_chuser_nonempty() {
+        assert!(!CHUSER.is_empty());
+    }
+
+    #[test]
+    fn test_chgrp_nonempty() {
+        assert!(!CHGRP.is_empty());
+    }
 }

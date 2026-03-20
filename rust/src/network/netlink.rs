@@ -1908,4 +1908,405 @@ mod tests {
         let new_size = peek_len + 100;
         assert_eq!(new_size, 116);
     }
+
+    // -----------------------------------------------------------------------
+    // Additional nlmsg alignment and header tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_nlmsg_align_zero() {
+        assert_eq!(nlmsg_align(0), 0);
+    }
+
+    #[test]
+    fn test_nlmsg_align_exact() {
+        // Already aligned to 4 bytes
+        assert_eq!(nlmsg_align(4), 4);
+        assert_eq!(nlmsg_align(8), 8);
+        assert_eq!(nlmsg_align(16), 16);
+    }
+
+    #[test]
+    fn test_nlmsg_align_unaligned() {
+        assert_eq!(nlmsg_align(1), 4);
+        assert_eq!(nlmsg_align(2), 4);
+        assert_eq!(nlmsg_align(3), 4);
+        assert_eq!(nlmsg_align(5), 8);
+        assert_eq!(nlmsg_align(6), 8);
+        assert_eq!(nlmsg_align(7), 8);
+    }
+
+    #[test]
+    fn test_rta_align_zero() {
+        assert_eq!(rta_align(0), 0);
+    }
+
+    #[test]
+    fn test_rta_align_exact() {
+        assert_eq!(rta_align(4), 4);
+        assert_eq!(rta_align(8), 8);
+    }
+
+    #[test]
+    fn test_rta_align_unaligned() {
+        assert_eq!(rta_align(1), 4);
+        assert_eq!(rta_align(5), 8);
+    }
+
+    #[test]
+    fn test_nlmsg_hdrlen_value() {
+        // nlmsghdr is 16 bytes, should align to 16
+        let hdrlen = nlmsg_hdrlen();
+        assert!(hdrlen >= 16);
+        assert_eq!(hdrlen % 4, 0); // Must be aligned
+    }
+
+    #[test]
+    fn test_rta_hdrlen_value() {
+        let hdrlen = rta_hdrlen();
+        assert!(hdrlen >= 4);
+        assert_eq!(hdrlen % 4, 0); // Must be aligned
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional nl_async tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_nl_async_unknown_msg_type() {
+        let mut state: u32 = 0;
+        // Build a valid nlmsghdr with unknown type 99
+        let nlh_size = std::mem::size_of::<libc::nlmsghdr>();
+        let mut buf = vec![0u8; nlh_size + 16];
+        let nlh = unsafe { &mut *(buf.as_mut_ptr() as *mut libc::nlmsghdr) };
+        nlh.nlmsg_len = buf.len() as u32;
+        nlh.nlmsg_type = 99;
+        nlh.nlmsg_flags = 0;
+        nlh.nlmsg_seq = 0;
+        nlh.nlmsg_pid = 0;
+
+        let result = nl_async(99, 0, &buf, &mut state);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_nl_async_deladdr_event() {
+        let mut state: u32 = 0;
+        let nlh_size = std::mem::size_of::<libc::nlmsghdr>();
+        let ifa_size = std::mem::size_of::<IfAddrMsg>();
+        let total_size = nlh_size + ifa_size;
+
+        let mut buf = vec![0u8; total_size + 32];
+        let nlh = unsafe { &mut *(buf.as_mut_ptr() as *mut libc::nlmsghdr) };
+        nlh.nlmsg_len = total_size as u32;
+        nlh.nlmsg_type = libc::RTM_DELADDR;
+        nlh.nlmsg_flags = 0;
+        nlh.nlmsg_seq = 0;
+        nlh.nlmsg_pid = 0;
+
+        let result = nl_async(libc::RTM_DELADDR as u16, 0, &buf, &mut state);
+        assert_eq!(result, Some(EventCode::NewAddr));
+    }
+
+    #[test]
+    fn test_nl_async_deladdr_deduplicated() {
+        let mut state: u32 = 0;
+        let nlh_size = std::mem::size_of::<libc::nlmsghdr>();
+        let ifa_size = std::mem::size_of::<IfAddrMsg>();
+        let total_size = nlh_size + ifa_size;
+
+        let mut buf = vec![0u8; total_size + 32];
+        let nlh = unsafe { &mut *(buf.as_mut_ptr() as *mut libc::nlmsghdr) };
+        nlh.nlmsg_len = total_size as u32;
+        nlh.nlmsg_type = libc::RTM_DELADDR;
+        nlh.nlmsg_flags = 0;
+        nlh.nlmsg_seq = 0;
+        nlh.nlmsg_pid = 0;
+
+        // First call returns event
+        let r1 = nl_async(libc::RTM_DELADDR as u16, 0, &buf, &mut state);
+        assert_eq!(r1, Some(EventCode::NewAddr));
+
+        // Second call deduplicates
+        let r2 = nl_async(libc::RTM_DELADDR as u16, 0, &buf, &mut state);
+        assert_eq!(r2, None);
+    }
+
+    #[test]
+    fn test_nl_async_error_msg() {
+        let mut state: u32 = 0;
+        let nlh_size = std::mem::size_of::<libc::nlmsghdr>();
+        let err_size = std::mem::size_of::<NlMsgErr>();
+        let total_size = nlh_size + err_size;
+
+        let mut buf = vec![0u8; total_size + 32];
+        let nlh = unsafe { &mut *(buf.as_mut_ptr() as *mut libc::nlmsghdr) };
+        nlh.nlmsg_len = total_size as u32;
+        nlh.nlmsg_type = libc::NLMSG_ERROR as u16;
+        nlh.nlmsg_flags = 0;
+        nlh.nlmsg_seq = 0;
+        nlh.nlmsg_pid = 0;
+
+        // Error message returns None
+        let result = nl_async(libc::NLMSG_ERROR as u16, 0, &buf, &mut state);
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Netmask computation from prefix tests (inline algorithm from parse_inet_addr)
+    // -----------------------------------------------------------------------
+
+    /// Helper to compute netmask from prefix using the same algorithm as parse_inet_addr.
+    fn compute_netmask(prefixlen: u32) -> Ipv4Addr {
+        let bits = if prefixlen == 0 {
+            0u32
+        } else if prefixlen >= 32 {
+            !0u32
+        } else {
+            !0u32 << (32 - prefixlen)
+        };
+        Ipv4Addr::from(bits.to_be_bytes())
+    }
+
+    #[test]
+    fn test_netmask_computation_prefix_0() {
+        assert_eq!(compute_netmask(0), Ipv4Addr::new(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_netmask_computation_prefix_8() {
+        assert_eq!(compute_netmask(8), Ipv4Addr::new(255, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_netmask_computation_prefix_16() {
+        assert_eq!(compute_netmask(16), Ipv4Addr::new(255, 255, 0, 0));
+    }
+
+    #[test]
+    fn test_netmask_computation_prefix_32() {
+        assert_eq!(compute_netmask(32), Ipv4Addr::new(255, 255, 255, 255));
+    }
+
+    #[test]
+    fn test_netmask_computation_prefix_25() {
+        assert_eq!(compute_netmask(25), Ipv4Addr::new(255, 255, 255, 128));
+    }
+
+    #[test]
+    fn test_netmask_computation_prefix_1() {
+        assert_eq!(compute_netmask(1), Ipv4Addr::new(128, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_netmask_computation_prefix_24() {
+        assert_eq!(compute_netmask(24), Ipv4Addr::new(255, 255, 255, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // State constants tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_state_constants_distinct() {
+        assert_ne!(STATE_NEWADDR, STATE_NEWROUTE);
+        assert_eq!(STATE_NEWADDR, 1);
+        assert_eq!(STATE_NEWROUTE, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // RTM type constants tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rtm_type_constants() {
+        assert_eq!(RTN_UNICAST, 1);
+    }
+
+    #[test]
+    fn test_rt_scope_link() {
+        assert_eq!(RT_SCOPE_LINK, 253);
+    }
+
+    #[test]
+    fn test_rt_table_constants() {
+        assert_eq!(RT_TABLE_MAIN, 254);
+        assert_eq!(RT_TABLE_LOCAL, 255);
+    }
+
+    // -----------------------------------------------------------------------
+    // IPv6 flags additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ifa_f_tentative_value() {
+        assert_eq!(IFA_F_TENTATIVE, 0x40);
+    }
+
+    #[test]
+    fn test_ifa_f_deprecated_value() {
+        assert_eq!(IFA_F_DEPRECATED, 0x20);
+    }
+
+    #[test]
+    fn test_ifa_f_temporary_value() {
+        assert_eq!(IFA_F_TEMPORARY, 0x01);
+    }
+
+    #[test]
+    fn test_combined_ipv6_flags() {
+        let flags = IFA_F_TENTATIVE | IFA_F_DEPRECATED;
+        assert_ne!(flags & IFA_F_TENTATIVE, 0);
+        assert_ne!(flags & IFA_F_DEPRECATED, 0);
+        assert_eq!(flags & IFA_F_TEMPORARY, 0);
+    }
+
+    #[test]
+    fn test_all_ipv6_flags_combined() {
+        let all = IFA_F_TENTATIVE | IFA_F_DEPRECATED | IFA_F_TEMPORARY;
+        assert_eq!(all, 0x61);
+    }
+
+    // -----------------------------------------------------------------------
+    // NlMsgIter additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_nlmsg_iter_truncated_length() {
+        // nlmsghdr with length larger than buffer
+        let nlh_size = std::mem::size_of::<libc::nlmsghdr>();
+        let mut buf = vec![0u8; nlh_size];
+        let nlh = unsafe { &mut *(buf.as_mut_ptr() as *mut libc::nlmsghdr) };
+        nlh.nlmsg_len = (nlh_size + 100) as u32; // Lies about length
+        nlh.nlmsg_type = libc::RTM_NEWADDR;
+
+        let iter = NlMsgIter::new(&buf);
+        // Should handle gracefully (may yield 0 or 1 items)
+        let items: Vec<_> = iter.collect();
+        let _ = items;
+    }
+
+    #[test]
+    fn test_rtattr_iter_empty_data() {
+        let iter = RtAttrIter::new(&[]);
+        let items: Vec<_> = iter.collect();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_rtattr_iter_short_data() {
+        let iter = RtAttrIter::new(&[0, 0, 0]);
+        let items: Vec<_> = iter.collect();
+        assert!(items.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // IfaceCallback enum tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_iface_callback_inet_variant() {
+        // Verify IfaceCallback::Inet can be constructed with a closure
+        let mut called = false;
+        let mut cb = |_addr: Ipv4Addr,
+                      _idx: u32,
+                      _label: Option<&str>,
+                      _mask: Ipv4Addr,
+                      _bc: Ipv4Addr|
+         -> bool {
+            called = true;
+            true
+        };
+        let _cb_enum = IfaceCallback::Inet(&mut cb);
+        // Construction succeeded - closures cannot be called through the enum without parse_inet_addr
+        assert!(!called);
+    }
+
+    #[test]
+    fn test_iface_callback_inet6_variant() {
+        // Verify IfaceCallback::Inet6 can be constructed with a closure
+        let mut called = false;
+        let mut cb = |_addr: Ipv6Addr,
+                      _prefix: u32,
+                      _scope: u32,
+                      _idx: u32,
+                      _flags: u32,
+                      _pref: u32,
+                      _valid: u32|
+         -> bool {
+            called = true;
+            true
+        };
+        let _cb_enum = IfaceCallback::Inet6(&mut cb);
+        assert!(!called);
+    }
+
+    #[test]
+    fn test_iface_callback_unspec_variant() {
+        let mut cb = |_family: u16, _addr: std::net::IpAddr, _mac: &[u8]| -> bool { true };
+        let _cb_enum = IfaceCallback::Unspec(&mut cb);
+        assert!(true);
+    }
+
+    #[test]
+    fn test_iface_callback_local_variant() {
+        let mut cb = |_idx: u32, _hw_type: u32, _mac: &[u8]| -> bool { true };
+        let _cb_enum = IfaceCallback::Local(&mut cb);
+        assert!(true);
+    }
+
+    // -----------------------------------------------------------------------
+    // IfAddrMsg struct layout tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ifaddrmsg_size() {
+        // IfAddrMsg should be 8 bytes (4 u8 fields + 1 u32)
+        assert_eq!(std::mem::size_of::<IfAddrMsg>(), 8);
+    }
+
+    #[test]
+    fn test_ifaddrmsg_zeroed() {
+        let ifa = IfAddrMsg {
+            ifa_family: 0,
+            ifa_prefixlen: 24,
+            ifa_flags: 0,
+            ifa_scope: 0,
+            ifa_index: 1,
+        };
+        assert_eq!(ifa.ifa_prefixlen, 24);
+        assert_eq!(ifa.ifa_index, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // NdMsg struct layout tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ndmsg_size() {
+        // NdMsg: 5 u8 fields + 2 padding + 1 u32 = 12 bytes with alignment
+        let size = std::mem::size_of::<NdMsg>();
+        assert!(size >= 8, "NdMsg should be at least 8 bytes, got {}", size);
+    }
+
+    // -----------------------------------------------------------------------
+    // RtAttr and NlMsgHdr size tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rta_hdr_struct_size() {
+        // RtAttr has rta_len (u16) + rta_type (u16) = 4 bytes
+        assert_eq!(std::mem::size_of::<RtAttr>(), 4);
+    }
+
+    #[test]
+    fn test_nlmsg_error_struct_size() {
+        // NlMsgErr has error (i32) + nlmsghdr inside = at least 4 + 16 = 20 bytes
+        let size = std::mem::size_of::<NlMsgErr>();
+        assert!(
+            size >= 20,
+            "NlMsgErr should be at least 20 bytes, got {}",
+            size
+        );
+    }
 }

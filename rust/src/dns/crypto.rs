@@ -1054,4 +1054,129 @@ mod tests {
         let result2 = h.finalize();
         assert_eq!(result2, b"new");
     }
+
+    #[test]
+    fn test_verify_rsa_three_byte_exponent_too_short() {
+        // Key starts with 0x00 (3-byte exponent length) but too short
+        let key = BlockData::new(&[0x00, 0x01]); // Only 2 bytes, need 3
+        let sig = BlockData::new(&[0u8; 64]);
+        let digest = [0u8; 32];
+        let result = CryptoVerifier::verify(DnssecAlgorithm::RsaSha256, &key, &sig, &digest);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_rsa_three_byte_exponent_truncated() {
+        // Key with 3-byte exponent length but data truncated before exponent
+        let key = BlockData::new(&[0x00, 0x00, 0x10]); // exp_len=16, but no exponent data
+        let sig = BlockData::new(&[0u8; 64]);
+        let digest = [0u8; 32];
+        let result = CryptoVerifier::verify(DnssecAlgorithm::RsaSha256, &key, &sig, &digest);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_rsa_empty_modulus() {
+        // Key: exp_len=1, exponent=0x03, no modulus
+        let key = BlockData::new(&[0x01, 0x03]); // 1-byte exp length (value 1), 1-byte exponent, empty modulus
+        let sig = BlockData::new(&[0u8; 64]);
+        let digest = [0u8; 32];
+        let result = CryptoVerifier::verify(DnssecAlgorithm::RsaSha256, &key, &sig, &digest);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_ecdsa_p256_wrong_sig_size_short() {
+        let key = BlockData::new(&[0u8; 64]); // correct key size
+        let sig = BlockData::new(&[0u8; 63]); // wrong sig size (should be 64)
+        let digest = [0u8; 32];
+        let result = CryptoVerifier::verify(DnssecAlgorithm::EcdsaP256Sha256, &key, &sig, &digest);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_ecdsa_p384_wrong_key_size_short() {
+        let key = BlockData::new(&[0u8; 95]); // wrong (should be 96)
+        let sig = BlockData::new(&[0u8; 96]);
+        let digest = [0u8; 48];
+        let result = CryptoVerifier::verify(DnssecAlgorithm::EcdsaP384Sha384, &key, &sig, &digest);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_ecdsa_p384_wrong_sig_size_short() {
+        let key = BlockData::new(&[0u8; 96]);
+        let sig = BlockData::new(&[0u8; 95]); // wrong (should be 96)
+        let digest = [0u8; 48];
+        let result = CryptoVerifier::verify(DnssecAlgorithm::EcdsaP384Sha384, &key, &sig, &digest);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_ed25519_wrong_sig_size_short() {
+        let key = BlockData::new(&[0u8; 32]); // correct
+        let sig = BlockData::new(&[0u8; 63]); // wrong (should be 64)
+        let digest = [0u8; 32];
+        let result = CryptoVerifier::verify(DnssecAlgorithm::Ed25519, &key, &sig, &digest);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_ed448_wrong_key_size_short() {
+        let key = BlockData::new(&[0u8; 56]); // wrong (should be 57)
+        let sig = BlockData::new(&[0u8; 114]);
+        let digest = [0u8; 57];
+        let result = CryptoVerifier::verify(DnssecAlgorithm::Ed448, &key, &sig, &digest);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_rsa_three_byte_exponent_valid_structure() {
+        // 3-byte exponent length form: 0x00 || 0x00 || 0x03 means exp_len=3
+        let mut key_data = vec![0x00, 0x00, 0x03]; // 3-byte exp len = 3
+        key_data.extend_from_slice(&[0x01, 0x00, 0x01]); // exponent = 65537
+        key_data.extend_from_slice(&[0x42; 128]); // dummy modulus
+        let key = BlockData::new(&key_data);
+        let sig = BlockData::new(&[0u8; 128]);
+        let digest = [0u8; 32];
+        // Exercises the 3-byte path; verification fails but parsing succeeds
+        let _result = CryptoVerifier::verify(DnssecAlgorithm::RsaSha256, &key, &sig, &digest);
+    }
+
+    #[test]
+    fn test_nsec3_digest_name_sha1_found() {
+        let name = CryptoVerifier::nsec3_digest_name(super::Nsec3HashAlgorithm::Sha1);
+        assert!(name.is_some());
+        assert_eq!(name.unwrap(), "sha1");
+    }
+
+    #[test]
+    fn test_hash_find_sha1_produces_digest() {
+        let hash = CryptoVerifier::hash_find("sha1");
+        assert!(hash.is_ok());
+        let mut h = hash.unwrap();
+        h.update(b"test");
+        let digest = h.finalize();
+        assert!(!digest.is_empty());
+    }
+
+    #[test]
+    fn test_hash_find_sha384_digest_length() {
+        let hash = CryptoVerifier::hash_find("sha384");
+        assert!(hash.is_ok());
+        let mut h = hash.unwrap();
+        h.update(b"test");
+        let digest = h.finalize();
+        assert_eq!(digest.len(), 48);
+    }
+
+    #[test]
+    fn test_hash_find_sha512_digest_length() {
+        let hash = CryptoVerifier::hash_find("sha512");
+        assert!(hash.is_ok());
+        let mut h = hash.unwrap();
+        h.update(b"data");
+        let digest = h.finalize();
+        assert_eq!(digest.len(), 64);
+    }
 }

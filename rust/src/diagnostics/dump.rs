@@ -970,3 +970,872 @@ fn ipv4_header_checksum(header: &[u8; IPV4_HEADER_LEN]) -> u16 {
         !folded
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    // ===== mask constants =============================================
+
+    #[test]
+    fn mask_constants_correct_values() {
+        assert_eq!(mask::DUMP_QUERY, 0x0001);
+        assert_eq!(mask::DUMP_REPLY, 0x0002);
+        assert_eq!(mask::DUMP_UP_QUERY, 0x0004);
+        assert_eq!(mask::DUMP_UP_REPLY, 0x0008);
+        assert_eq!(mask::DUMP_SEC_QUERY, 0x0010);
+        assert_eq!(mask::DUMP_SEC_REPLY, 0x0020);
+        assert_eq!(mask::DUMP_BOGUS, 0x0040);
+        assert_eq!(mask::DUMP_SEC_BOGUS, 0x0080);
+        assert_eq!(mask::DUMP_DHCP, 0x1000);
+        assert_eq!(mask::DUMP_DHCPV6, 0x2000);
+        assert_eq!(mask::DUMP_RA, 0x4000);
+        assert_eq!(mask::DUMP_TFTP, 0x8000);
+    }
+
+    #[test]
+    fn mask_constants_no_overlap() {
+        let all = [
+            mask::DUMP_QUERY,
+            mask::DUMP_REPLY,
+            mask::DUMP_UP_QUERY,
+            mask::DUMP_UP_REPLY,
+            mask::DUMP_SEC_QUERY,
+            mask::DUMP_SEC_REPLY,
+            mask::DUMP_BOGUS,
+            mask::DUMP_SEC_BOGUS,
+            mask::DUMP_DHCP,
+            mask::DUMP_DHCPV6,
+            mask::DUMP_RA,
+            mask::DUMP_TFTP,
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_eq!(
+                    all[i] & all[j],
+                    0,
+                    "mask overlap between index {} and {}",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mask_combined_or() {
+        let combined = mask::DUMP_QUERY | mask::DUMP_REPLY | mask::DUMP_DHCP;
+        assert_eq!(combined, 0x1003);
+        assert_ne!(combined & mask::DUMP_QUERY, 0);
+        assert_ne!(combined & mask::DUMP_REPLY, 0);
+        assert_ne!(combined & mask::DUMP_DHCP, 0);
+        assert_eq!(combined & mask::DUMP_TFTP, 0);
+    }
+
+    // ===== Module-level constants =====================================
+
+    #[test]
+    fn pcap_constants() {
+        assert_eq!(PCAP_MAGIC, 0xa1b2c3d4);
+        assert_eq!(PCAP_VERSION_MAJOR, 2);
+        assert_eq!(PCAP_VERSION_MINOR, 4);
+        assert_eq!(DLT_RAW, 101);
+    }
+
+    #[test]
+    fn protocol_constants() {
+        assert_eq!(IPVERSION, 4);
+        assert_eq!(IP6VERSION, 6);
+        assert_eq!(IPDEFTTL, 64);
+        assert_eq!(IPV4_IHL, 5);
+        assert_eq!(IPV4_HEADER_LEN, 20);
+        assert_eq!(IPV6_HEADER_LEN, 40);
+        assert_eq!(UDP_HEADER_LEN, 8);
+        assert_eq!(IPPROTO_UDP, 17);
+        assert_eq!(IPPROTO_ICMP, 1);
+        assert_eq!(IPPROTO_ICMPV6, 58);
+    }
+
+    // ===== PcapFileHeader =============================================
+
+    #[test]
+    fn pcap_file_header_new_fields() {
+        let hdr = PcapFileHeader::new(65535);
+        assert_eq!(hdr.magic_number, PCAP_MAGIC);
+        assert_eq!(hdr.version_major, 2);
+        assert_eq!(hdr.version_minor, 4);
+        assert_eq!(hdr.thiszone, 0);
+        assert_eq!(hdr.sigfigs, 0);
+        assert_eq!(hdr.snaplen, 65535);
+        assert_eq!(hdr.network, DLT_RAW);
+    }
+
+    #[test]
+    fn pcap_file_header_write_read_roundtrip() {
+        let original = PcapFileHeader::new(4296);
+        let mut buf = Vec::new();
+        original.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), 24, "pcap global header must be 24 bytes");
+
+        let mut cursor = Cursor::new(&buf);
+        let decoded = PcapFileHeader::read_from(&mut cursor).unwrap();
+        assert_eq!(decoded.magic_number, original.magic_number);
+        assert_eq!(decoded.version_major, original.version_major);
+        assert_eq!(decoded.version_minor, original.version_minor);
+        assert_eq!(decoded.thiszone, original.thiszone);
+        assert_eq!(decoded.sigfigs, original.sigfigs);
+        assert_eq!(decoded.snaplen, original.snaplen);
+        assert_eq!(decoded.network, original.network);
+    }
+
+    #[test]
+    fn pcap_file_header_different_snaplen() {
+        for snaplen in [0u32, 1500, 4296, 65535, u32::MAX] {
+            let hdr = PcapFileHeader::new(snaplen);
+            let mut buf = Vec::new();
+            hdr.write_to(&mut buf).unwrap();
+            let mut cursor = Cursor::new(&buf);
+            let decoded = PcapFileHeader::read_from(&mut cursor).unwrap();
+            assert_eq!(decoded.snaplen, snaplen);
+        }
+    }
+
+    #[test]
+    fn pcap_file_header_read_from_short_buffer() {
+        let buf = vec![0u8; 10]; // too short for 24 bytes
+        let mut cursor = Cursor::new(&buf);
+        let result = PcapFileHeader::read_from(&mut cursor);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pcap_file_header_magic_in_native_byte_order() {
+        let hdr = PcapFileHeader::new(4096);
+        let mut buf = Vec::new();
+        hdr.write_to(&mut buf).unwrap();
+        let first_four: [u8; 4] = buf[0..4].try_into().unwrap();
+        let magic = u32::from_ne_bytes(first_four);
+        assert_eq!(magic, PCAP_MAGIC);
+    }
+
+    // ===== PcapRecordHeader ===========================================
+
+    #[test]
+    fn pcap_record_header_write_read_roundtrip() {
+        let original = PcapRecordHeader {
+            ts_sec: 1700000000,
+            ts_usec: 123456,
+            incl_len: 512,
+            orig_len: 1024,
+        };
+        let mut buf = Vec::new();
+        original.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), 16, "pcap record header must be 16 bytes");
+
+        let mut cursor = Cursor::new(&buf);
+        let decoded = PcapRecordHeader::read_from(&mut cursor).unwrap();
+        assert_eq!(decoded.ts_sec, original.ts_sec);
+        assert_eq!(decoded.ts_usec, original.ts_usec);
+        assert_eq!(decoded.incl_len, original.incl_len);
+        assert_eq!(decoded.orig_len, original.orig_len);
+    }
+
+    #[test]
+    fn pcap_record_header_zero_values() {
+        let hdr = PcapRecordHeader {
+            ts_sec: 0,
+            ts_usec: 0,
+            incl_len: 0,
+            orig_len: 0,
+        };
+        let mut buf = Vec::new();
+        hdr.write_to(&mut buf).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        let decoded = PcapRecordHeader::read_from(&mut cursor).unwrap();
+        assert_eq!(decoded.ts_sec, 0);
+        assert_eq!(decoded.incl_len, 0);
+    }
+
+    #[test]
+    fn pcap_record_header_read_from_short_buffer() {
+        let buf = vec![0u8; 8]; // too short for 16 bytes
+        let mut cursor = Cursor::new(&buf);
+        assert!(PcapRecordHeader::read_from(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn pcap_record_header_max_values() {
+        let hdr = PcapRecordHeader {
+            ts_sec: u32::MAX,
+            ts_usec: u32::MAX,
+            incl_len: u32::MAX,
+            orig_len: u32::MAX,
+        };
+        let mut buf = Vec::new();
+        hdr.write_to(&mut buf).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        let decoded = PcapRecordHeader::read_from(&mut cursor).unwrap();
+        assert_eq!(decoded.ts_sec, u32::MAX);
+        assert_eq!(decoded.ts_usec, u32::MAX);
+    }
+
+    // ===== addr_to_v4_octets ==========================================
+
+    #[test]
+    fn addr_to_v4_octets_ipv4() {
+        let addr: SocketAddr = "192.168.1.1:53".parse().unwrap();
+        assert_eq!(addr_to_v4_octets(&addr), [192, 168, 1, 1]);
+    }
+
+    #[test]
+    fn addr_to_v4_octets_loopback() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        assert_eq!(addr_to_v4_octets(&addr), [127, 0, 0, 1]);
+    }
+
+    #[test]
+    fn addr_to_v4_octets_all_zeros() {
+        let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        assert_eq!(addr_to_v4_octets(&addr), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn addr_to_v4_octets_broadcast() {
+        let addr: SocketAddr = "255.255.255.255:65535".parse().unwrap();
+        assert_eq!(addr_to_v4_octets(&addr), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn addr_to_v4_octets_ipv6_mapped() {
+        // ::ffff:10.0.0.1 — should extract the IPv4 part
+        let addr: SocketAddr = "[::ffff:10.0.0.1]:53".parse().unwrap();
+        assert_eq!(addr_to_v4_octets(&addr), [10, 0, 0, 1]);
+    }
+
+    #[test]
+    fn addr_to_v4_octets_pure_ipv6_returns_zeros() {
+        let addr: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        assert_eq!(addr_to_v4_octets(&addr), [0, 0, 0, 0]);
+    }
+
+    // ===== addr_to_v6_octets ==========================================
+
+    #[test]
+    fn addr_to_v6_octets_pure_ipv6() {
+        let addr: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        let octets = addr_to_v6_octets(&addr);
+        assert_eq!(octets[0..2], [0x20, 0x01]);
+        assert_eq!(octets[2..4], [0x0d, 0xb8]);
+        assert_eq!(octets[14..16], [0x00, 0x01]);
+    }
+
+    #[test]
+    fn addr_to_v6_octets_loopback() {
+        let addr: SocketAddr = "[::1]:0".parse().unwrap();
+        let octets = addr_to_v6_octets(&addr);
+        assert_eq!(octets[..15], [0u8; 15]);
+        assert_eq!(octets[15], 1);
+    }
+
+    #[test]
+    fn addr_to_v6_octets_from_ipv4() {
+        // IPv4 10.0.0.1 → ::ffff:10.0.0.1
+        let addr: SocketAddr = "10.0.0.1:53".parse().unwrap();
+        let octets = addr_to_v6_octets(&addr);
+        assert_eq!(octets[10..12], [0xff, 0xff]);
+        assert_eq!(octets[12..16], [10, 0, 0, 1]);
+    }
+
+    #[test]
+    fn addr_to_v6_octets_all_zeros() {
+        let addr: SocketAddr = "[::]:0".parse().unwrap();
+        assert_eq!(addr_to_v6_octets(&addr), [0u8; 16]);
+    }
+
+    #[test]
+    fn addr_to_v6_octets_all_ones() {
+        let addr: SocketAddr = "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:0"
+            .parse()
+            .unwrap();
+        assert_eq!(addr_to_v6_octets(&addr), [0xff; 16]);
+    }
+
+    // ===== checksum_add_bytes =========================================
+
+    #[test]
+    fn checksum_add_bytes_empty() {
+        let mut sum = 0u32;
+        checksum_add_bytes(&mut sum, &[]);
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn checksum_add_bytes_single_word() {
+        let mut sum = 0u32;
+        checksum_add_bytes(&mut sum, &[0x01, 0x02]);
+        assert_eq!(sum, 0x0102);
+    }
+
+    #[test]
+    fn checksum_add_bytes_two_words() {
+        let mut sum = 0u32;
+        checksum_add_bytes(&mut sum, &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(sum, 0x0102 + 0x0304);
+    }
+
+    #[test]
+    fn checksum_add_bytes_odd_length() {
+        // Odd trailing byte 0xAB is padded with virtual zero → 0xAB00
+        let mut sum = 0u32;
+        checksum_add_bytes(&mut sum, &[0xAB]);
+        assert_eq!(sum, 0xAB00);
+    }
+
+    #[test]
+    fn checksum_add_bytes_three_bytes() {
+        let mut sum = 0u32;
+        checksum_add_bytes(&mut sum, &[0x01, 0x02, 0x03]);
+        assert_eq!(sum, 0x0102 + 0x0300);
+    }
+
+    #[test]
+    fn checksum_add_bytes_accumulates() {
+        let mut sum = 100u32;
+        checksum_add_bytes(&mut sum, &[0x00, 0x05]);
+        assert_eq!(sum, 105);
+    }
+
+    #[test]
+    fn checksum_add_bytes_large_payload() {
+        let data = vec![0xFF; 256]; // 128 words of 0xFFFF
+        let mut sum = 0u32;
+        checksum_add_bytes(&mut sum, &data);
+        assert_eq!(sum, 128 * 0xFFFF);
+    }
+
+    // ===== checksum_finalize ==========================================
+
+    #[test]
+    fn checksum_finalize_zero() {
+        assert_eq!(checksum_finalize(0), 0xFFFF);
+    }
+
+    #[test]
+    fn checksum_finalize_one() {
+        // ~0x0001 = 0xFFFE
+        assert_eq!(checksum_finalize(1), 0xFFFE);
+    }
+
+    #[test]
+    fn checksum_finalize_max_u16() {
+        // sum = 0xFFFF → folded = 0xFFFF → special case: return 0xFFFF
+        assert_eq!(checksum_finalize(0xFFFF), 0xFFFF);
+    }
+
+    #[test]
+    fn checksum_finalize_carry_fold() {
+        // 0x1_0000 → fold carry: (0x0000 + 0x0001) = 0x0001 → ~0x0001 = 0xFFFE
+        assert_eq!(checksum_finalize(0x10000), 0xFFFE);
+    }
+
+    #[test]
+    fn checksum_finalize_large_carry() {
+        // 0x3FFFE → fold: (0xFFFE + 0x0003) = 0x10001 → fold again: 0x0002 → ~0x0002 = 0xFFFD
+        assert_eq!(checksum_finalize(0x3FFFE), 0xFFFD);
+    }
+
+    #[test]
+    fn checksum_finalize_known_value() {
+        // Typical DNS-like checksum: sum of some header words
+        let sum = 0x4500u32 + 0x003Cu32 + 0x0000u32 + 0x4011u32 + 0xC0A80101u32;
+        // This will have large carries to fold
+        let result = checksum_finalize(sum);
+        // Just verify it produces a valid u16 and is not zero
+        assert!(result > 0);
+        assert!(result <= 0xFFFF);
+    }
+
+    // ===== ipv4_header_checksum =======================================
+
+    #[test]
+    fn ipv4_header_checksum_all_zeros() {
+        let header = [0u8; 20];
+        let cksum = ipv4_header_checksum(&header);
+        // Sum is 0, folded is 0, complement is 0xFFFF
+        assert_eq!(cksum, 0xFFFF);
+    }
+
+    #[test]
+    fn ipv4_header_checksum_known_packet() {
+        // Construct a known IPv4 header for 192.168.1.1 → 192.168.1.2, UDP, TTL=64
+        let mut hdr = [0u8; 20];
+        hdr[0] = 0x45; // version + IHL
+        hdr[2..4].copy_from_slice(&60u16.to_be_bytes()); // total length
+        hdr[8] = 64; // TTL
+        hdr[9] = 17; // protocol: UDP
+                     // checksum field at 10..12 is zero
+        hdr[12..16].copy_from_slice(&[192, 168, 1, 1]); // source
+        hdr[16..20].copy_from_slice(&[192, 168, 1, 2]); // destination
+
+        let cksum = ipv4_header_checksum(&hdr);
+        // Verify: place checksum back and re-sum should be 0 or 0xFFFF
+        hdr[10..12].copy_from_slice(&cksum.to_be_bytes());
+        let mut verify_sum = 0u32;
+        for i in (0..20).step_by(2) {
+            verify_sum += u16::from_be_bytes([hdr[i], hdr[i + 1]]) as u32;
+        }
+        while verify_sum >> 16 != 0 {
+            verify_sum = (verify_sum & 0xffff) + (verify_sum >> 16);
+        }
+        // After adding checksum back, the result should fold to 0xFFFF
+        assert_eq!(verify_sum as u16, 0xFFFF, "IP checksum verification failed");
+    }
+
+    #[test]
+    fn ipv4_header_checksum_loopback() {
+        let mut hdr = [0u8; 20];
+        hdr[0] = 0x45;
+        hdr[2..4].copy_from_slice(&40u16.to_be_bytes());
+        hdr[8] = 64;
+        hdr[9] = 17;
+        hdr[12..16].copy_from_slice(&[127, 0, 0, 1]);
+        hdr[16..20].copy_from_slice(&[127, 0, 0, 1]);
+
+        let cksum = ipv4_header_checksum(&hdr);
+        // Verify using the same re-sum approach
+        hdr[10..12].copy_from_slice(&cksum.to_be_bytes());
+        let mut verify = 0u32;
+        for i in (0..20).step_by(2) {
+            verify += u16::from_be_bytes([hdr[i], hdr[i + 1]]) as u32;
+        }
+        while verify >> 16 != 0 {
+            verify = (verify & 0xffff) + (verify >> 16);
+        }
+        assert_eq!(verify as u16, 0xFFFF);
+    }
+
+    // ===== PacketDumper new / dump functionality ======================
+
+    #[test]
+    fn packet_dumper_new_creates_valid_pcap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.pcap");
+        let dumper = PacketDumper::new(&path, mask::DUMP_QUERY, None).unwrap();
+        assert_eq!(dumper.packet_count, 0);
+        assert_eq!(dumper.dump_mask, mask::DUMP_QUERY);
+        assert!(dumper.file.is_some());
+
+        // Read back and verify pcap header
+        drop(dumper);
+        let data = std::fs::read(&path).unwrap();
+        assert!(data.len() >= 24, "file too small for pcap header");
+        let mut cursor = Cursor::new(&data);
+        let hdr = PcapFileHeader::read_from(&mut cursor).unwrap();
+        assert_eq!(hdr.magic_number, PCAP_MAGIC);
+        assert_eq!(hdr.network, DLT_RAW);
+    }
+
+    #[test]
+    fn packet_dumper_custom_snaplen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap.pcap");
+        let _dumper = PacketDumper::new(&path, 0xFFFF, Some(1232)).unwrap();
+        drop(_dumper);
+        let data = std::fs::read(&path).unwrap();
+        let mut cursor = Cursor::new(&data);
+        let hdr = PcapFileHeader::read_from(&mut cursor).unwrap();
+        // snaplen = 1232 + 200 = 1432
+        assert_eq!(hdr.snaplen, 1432);
+    }
+
+    #[test]
+    fn packet_dumper_default_snaplen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("default.pcap");
+        let _dumper = PacketDumper::new(&path, 0xFFFF, None).unwrap();
+        drop(_dumper);
+        let data = std::fs::read(&path).unwrap();
+        let mut cursor = Cursor::new(&data);
+        let hdr = PcapFileHeader::read_from(&mut cursor).unwrap();
+        // default EDNS_PKTSZ + 200
+        assert_eq!(hdr.snaplen, u32::from(EDNS_PKTSZ) + 200);
+    }
+
+    #[test]
+    fn packet_dumper_reopen_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reopen.pcap");
+
+        // Create initial file
+        let dumper1 = PacketDumper::new(&path, mask::DUMP_QUERY, None).unwrap();
+        drop(dumper1);
+
+        // Reopen — should validate header and set packet_count=0
+        let dumper2 = PacketDumper::new(&path, mask::DUMP_REPLY, None).unwrap();
+        assert_eq!(dumper2.packet_count, 0);
+    }
+
+    #[test]
+    fn packet_dumper_bad_magic_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_magic.pcap");
+        // Write a file with wrong magic
+        std::fs::write(
+            &path,
+            &[
+                0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+        let result = PacketDumper::new(&path, 0xFFFF, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn packet_dumper_nonexistent_parent_dir() {
+        let result = PacketDumper::new("/nonexistent/dir/test.pcap", 0xFFFF, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn packet_dumper_dump_udp_mask_mismatch_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("noop.pcap");
+        let mut dumper = PacketDumper::new(&path, mask::DUMP_QUERY, None).unwrap();
+        let initial_count = dumper.packet_count;
+
+        // DUMP_REPLY doesn't match DUMP_QUERY mask — should be no-op
+        dumper.dump_packet_udp(
+            mask::DUMP_REPLY,
+            &[0x00, 0x01],
+            Some("192.168.1.1:53".parse().unwrap()),
+            Some("192.168.1.2:1234".parse().unwrap()),
+            -53,
+        );
+        assert_eq!(dumper.packet_count, initial_count);
+    }
+
+    #[test]
+    fn packet_dumper_dump_udp_ipv4_writes_packet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("udp4.pcap");
+        let mut dumper = PacketDumper::new(&path, mask::DUMP_QUERY, None).unwrap();
+
+        let payload = vec![0xAA; 32]; // 32-byte fake DNS payload
+        dumper.dump_packet_udp(
+            mask::DUMP_QUERY,
+            &payload,
+            Some("10.0.0.1:53".parse().unwrap()),
+            Some("10.0.0.2:1234".parse().unwrap()),
+            -53,
+        );
+        assert_eq!(dumper.packet_count, 1);
+
+        // Verify file grew beyond just the pcap header
+        drop(dumper);
+        let data = std::fs::read(&path).unwrap();
+        // 24 (pcap header) + 16 (record header) + 20 (IPv4) + 8 (UDP) + 32 (payload) = 100
+        assert_eq!(data.len(), 100);
+    }
+
+    #[test]
+    fn packet_dumper_dump_udp_ipv6_writes_packet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("udp6.pcap");
+        let mut dumper = PacketDumper::new(&path, mask::DUMP_QUERY, None).unwrap();
+
+        let payload = vec![0xBB; 16];
+        dumper.dump_packet_udp(
+            mask::DUMP_QUERY,
+            &payload,
+            Some("[2001:db8::1]:53".parse().unwrap()),
+            Some("[2001:db8::2]:1234".parse().unwrap()),
+            -53,
+        );
+        assert_eq!(dumper.packet_count, 1);
+
+        drop(dumper);
+        let data = std::fs::read(&path).unwrap();
+        // 24 + 16 + 40 (IPv6) + 8 (UDP) + 16 (payload) = 104
+        assert_eq!(data.len(), 104);
+    }
+
+    #[test]
+    fn packet_dumper_dump_icmp_mask_mismatch_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icmp_noop.pcap");
+        let mut dumper = PacketDumper::new(&path, mask::DUMP_QUERY, None).unwrap();
+
+        dumper.dump_packet_icmp(
+            mask::DUMP_RA,
+            &[0x86, 0x00, 0x00, 0x00],
+            Some("[fe80::1]:0".parse().unwrap()),
+            Some("[ff02::1]:0".parse().unwrap()),
+        );
+        assert_eq!(dumper.packet_count, 0);
+    }
+
+    #[test]
+    fn packet_dumper_dump_icmp_ipv4() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icmp4.pcap");
+        let mut dumper = PacketDumper::new(&path, mask::DUMP_RA, None).unwrap();
+
+        let payload = vec![0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01]; // echo request
+        dumper.dump_packet_icmp(
+            mask::DUMP_RA,
+            &payload,
+            Some("10.0.0.1:0".parse().unwrap()),
+            Some("10.0.0.2:0".parse().unwrap()),
+        );
+        assert_eq!(dumper.packet_count, 1);
+
+        drop(dumper);
+        let data = std::fs::read(&path).unwrap();
+        // 24 + 16 + 20 (IPv4) + 8 (ICMP payload) = 68
+        assert_eq!(data.len(), 68);
+    }
+
+    #[test]
+    fn packet_dumper_dump_icmpv6() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icmp6.pcap");
+        let mut dumper = PacketDumper::new(&path, mask::DUMP_RA, None).unwrap();
+
+        // Router Advertisement: type=134, code=0, checksum=0x0000
+        let payload = vec![0x86, 0x00, 0x00, 0x00, 0x40, 0x00, 0x07, 0x08];
+        dumper.dump_packet_icmp(
+            mask::DUMP_RA,
+            &payload,
+            Some("[fe80::1]:0".parse().unwrap()),
+            Some("[ff02::1]:0".parse().unwrap()),
+        );
+        assert_eq!(dumper.packet_count, 1);
+
+        drop(dumper);
+        let data = std::fs::read(&path).unwrap();
+        // 24 + 16 + 40 (IPv6) + 8 (ICMPv6 payload) = 88
+        assert_eq!(data.len(), 88);
+    }
+
+    #[test]
+    fn packet_dumper_multiple_packets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.pcap");
+        let mut dumper = PacketDumper::new(&path, 0xFFFF, None).unwrap();
+
+        for _ in 0..5 {
+            dumper.dump_packet_udp(
+                mask::DUMP_QUERY,
+                &[0x00; 12],
+                Some("10.0.0.1:53".parse().unwrap()),
+                Some("10.0.0.2:1234".parse().unwrap()),
+                -53,
+            );
+        }
+        assert_eq!(dumper.packet_count, 5);
+    }
+
+    #[test]
+    fn packet_dumper_reopen_counts_existing_packets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("count.pcap");
+
+        // Write 3 packets
+        {
+            let mut dumper = PacketDumper::new(&path, 0xFFFF, None).unwrap();
+            for _ in 0..3 {
+                dumper.dump_packet_udp(
+                    mask::DUMP_QUERY,
+                    &[0x00; 12],
+                    Some("10.0.0.1:53".parse().unwrap()),
+                    Some("10.0.0.2:1234".parse().unwrap()),
+                    -53,
+                );
+            }
+        }
+
+        // Reopen and check count
+        let dumper2 = PacketDumper::new(&path, 0xFFFF, None).unwrap();
+        assert_eq!(dumper2.packet_count, 3);
+    }
+
+    #[test]
+    fn packet_dumper_pcap_record_valid_structure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("structure.pcap");
+        let mut dumper = PacketDumper::new(&path, 0xFFFF, None).unwrap();
+
+        let payload = vec![0xCC; 20];
+        dumper.dump_packet_udp(
+            mask::DUMP_QUERY,
+            &payload,
+            Some("10.0.0.1:53".parse().unwrap()),
+            Some("10.0.0.2:1234".parse().unwrap()),
+            -53,
+        );
+        drop(dumper);
+
+        let data = std::fs::read(&path).unwrap();
+        let mut cursor = Cursor::new(&data);
+
+        // Skip pcap header
+        let _hdr = PcapFileHeader::read_from(&mut cursor).unwrap();
+
+        // Read record header
+        let rec = PcapRecordHeader::read_from(&mut cursor).unwrap();
+        // incl_len = 20 (IPv4) + 8 (UDP) + 20 (payload) = 48
+        assert_eq!(rec.incl_len, 48);
+        assert_eq!(rec.orig_len, 48);
+        assert!(rec.ts_sec > 0, "timestamp should be positive");
+    }
+
+    #[test]
+    fn packet_dumper_dump_none_file_noop() {
+        // A dumper with file=None should silently no-op
+        let dumper_inner = PacketDumper {
+            file: None,
+            dump_file: PathBuf::from("/dev/null"),
+            dump_mask: 0xFFFF,
+            packet_count: 0,
+            snaplen: 4296,
+        };
+        // dump_packet_udp checks file.is_none() first
+        let mut d = dumper_inner;
+        d.dump_packet_udp(
+            mask::DUMP_QUERY,
+            &[0],
+            Some("10.0.0.1:53".parse().unwrap()),
+            Some("10.0.0.2:53".parse().unwrap()),
+            -53,
+        );
+        assert_eq!(d.packet_count, 0);
+    }
+
+    #[test]
+    fn packet_dumper_ipv4_header_in_pcap_valid() {
+        // Verify the IPv4 header within a captured packet has valid checksum
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v4check.pcap");
+        let mut dumper = PacketDumper::new(&path, 0xFFFF, None).unwrap();
+
+        dumper.dump_packet_udp(
+            mask::DUMP_QUERY,
+            &[0x00; 12],
+            Some("10.0.0.1:53".parse().unwrap()),
+            Some("10.0.0.2:1234".parse().unwrap()),
+            -53,
+        );
+        drop(dumper);
+
+        let data = std::fs::read(&path).unwrap();
+        // pcap header(24) + record header(16) = 40, then IPv4 header starts
+        let ip_hdr: &[u8] = &data[40..60];
+        // Verify IP version
+        assert_eq!(ip_hdr[0] >> 4, 4, "IP version should be 4");
+        assert_eq!(ip_hdr[0] & 0x0F, 5, "IHL should be 5");
+        assert_eq!(ip_hdr[8], 64, "TTL should be 64");
+        assert_eq!(ip_hdr[9], 17, "protocol should be UDP (17)");
+        // Source address
+        assert_eq!(&ip_hdr[12..16], &[10, 0, 0, 1]);
+        // Destination address
+        assert_eq!(&ip_hdr[16..20], &[10, 0, 0, 2]);
+
+        // Verify checksum
+        let hdr_array: [u8; 20] = ip_hdr.try_into().unwrap();
+        let mut sum = 0u32;
+        for i in (0..20).step_by(2) {
+            sum += u16::from_be_bytes([hdr_array[i], hdr_array[i + 1]]) as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        assert_eq!(sum as u16, 0xFFFF, "IP header checksum verification failed");
+    }
+
+    #[test]
+    fn packet_dumper_ipv6_header_in_pcap_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v6check.pcap");
+        let mut dumper = PacketDumper::new(&path, 0xFFFF, None).unwrap();
+
+        dumper.dump_packet_udp(
+            mask::DUMP_QUERY,
+            &[0x00; 12],
+            Some("[2001:db8::1]:53".parse().unwrap()),
+            Some("[2001:db8::2]:1234".parse().unwrap()),
+            -53,
+        );
+        drop(dumper);
+
+        let data = std::fs::read(&path).unwrap();
+        // pcap header(24) + record header(16) = 40, then IPv6 header starts
+        let ip6_hdr: &[u8] = &data[40..80];
+        // Version should be 6
+        assert_eq!(ip6_hdr[0] >> 4, 6, "IPv6 version should be 6");
+        // Next header should be UDP (17)
+        assert_eq!(ip6_hdr[6], 17, "next header should be UDP");
+        // Hop limit
+        assert_eq!(ip6_hdr[7], 64, "hop limit should be 64");
+    }
+
+    // ===== checksum end-to-end: UDP over IPv4 =========================
+
+    #[test]
+    fn checksum_udp_over_ipv4_valid() {
+        // Manually compute a UDP checksum for a known payload and verify
+        let src_addr: [u8; 4] = [10, 0, 0, 1];
+        let dst_addr: [u8; 4] = [10, 0, 0, 2];
+        let payload = b"hello";
+        let udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
+
+        // Pseudo-header sum: src + dst + proto + udp_len
+        let mut pseudo_sum = 0u32;
+        pseudo_sum += u16::from_be_bytes([src_addr[0], src_addr[1]]) as u32;
+        pseudo_sum += u16::from_be_bytes([src_addr[2], src_addr[3]]) as u32;
+        pseudo_sum += u16::from_be_bytes([dst_addr[0], dst_addr[1]]) as u32;
+        pseudo_sum += u16::from_be_bytes([dst_addr[2], dst_addr[3]]) as u32;
+        pseudo_sum += IPPROTO_UDP as u32;
+        pseudo_sum += udp_len as u32;
+
+        // UDP header
+        let mut udp = [0u8; 8];
+        udp[0..2].copy_from_slice(&53u16.to_be_bytes()); // src port
+        udp[2..4].copy_from_slice(&1234u16.to_be_bytes()); // dst port
+        udp[4..6].copy_from_slice(&udp_len.to_be_bytes());
+        // checksum at [6..8] is 0
+
+        for i in (0..8).step_by(2) {
+            pseudo_sum += u16::from_be_bytes([udp[i], udp[i + 1]]) as u32;
+        }
+        checksum_add_bytes(&mut pseudo_sum, payload);
+        let cksum = checksum_finalize(pseudo_sum);
+
+        // Checksum should be non-zero (valid)
+        assert_ne!(cksum, 0);
+
+        // Verify: adding checksum back should produce 0xFFFF
+        let mut verify = pseudo_sum; // reuse the same sum
+                                     // Actually we need to recompute with checksum included
+        let mut total = 0u32;
+        total += IPPROTO_UDP as u32 + udp_len as u32;
+        total += u16::from_be_bytes([src_addr[0], src_addr[1]]) as u32;
+        total += u16::from_be_bytes([src_addr[2], src_addr[3]]) as u32;
+        total += u16::from_be_bytes([dst_addr[0], dst_addr[1]]) as u32;
+        total += u16::from_be_bytes([dst_addr[2], dst_addr[3]]) as u32;
+        udp[6..8].copy_from_slice(&cksum.to_be_bytes());
+        for i in (0..8).step_by(2) {
+            total += u16::from_be_bytes([udp[i], udp[i + 1]]) as u32;
+        }
+        checksum_add_bytes(&mut total, payload);
+        while total >> 16 != 0 {
+            total = (total & 0xffff) + (total >> 16);
+        }
+        assert_eq!(total as u16, 0xFFFF, "UDP checksum verification failed");
+    }
+}

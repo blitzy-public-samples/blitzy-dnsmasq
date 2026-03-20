@@ -2018,4 +2018,1007 @@ mod tests {
         assert!(result.is_ok(), "Missing ethers file should not be an error");
         assert!(configs.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Additional sdbm_hash tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sdbm_hash_empty() {
+        let h = sdbm_hash(b"");
+        // Empty input → hash is 0 (no iterations)
+        assert_eq!(h, 0);
+    }
+
+    #[test]
+    fn test_sdbm_hash_single_byte() {
+        let h = sdbm_hash(&[0x42]);
+        assert_ne!(h, 0);
+    }
+
+    #[test]
+    fn test_sdbm_hash_collision_resistance() {
+        // Not a rigorous test, but basic check
+        let mut hashes = std::collections::HashSet::new();
+        for i in 0..100u8 {
+            let h = sdbm_hash(&[i]);
+            hashes.insert(h);
+        }
+        assert!(
+            hashes.len() > 90,
+            "Should have few collisions for single-byte inputs"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional extract_ipv4 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_ipv4_all_zeros() {
+        let pkt = [0u8; 300];
+        assert_eq!(extract_ipv4(&pkt, 0), Ipv4Addr::new(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_extract_ipv4_all_ones() {
+        let mut pkt = [0u8; 300];
+        pkt[0] = 255;
+        pkt[1] = 255;
+        pkt[2] = 255;
+        pkt[3] = 255;
+        assert_eq!(extract_ipv4(&pkt, 0), Ipv4Addr::new(255, 255, 255, 255));
+    }
+
+    #[test]
+    fn test_extract_ipv4_loopback() {
+        let mut pkt = [0u8; 300];
+        pkt[10] = 127;
+        pkt[11] = 0;
+        pkt[12] = 0;
+        pkt[13] = 1;
+        assert_eq!(extract_ipv4(&pkt, 10), Ipv4Addr::new(127, 0, 0, 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional address_available tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_address_available_at_start() {
+        let ctx = make_context([10, 0, 0, 1], [10, 0, 0, 254]);
+        assert!(address_available(&ctx, Ipv4Addr::new(10, 0, 0, 1), &[]));
+    }
+
+    #[test]
+    fn test_address_available_at_end() {
+        let ctx = make_context([10, 0, 0, 1], [10, 0, 0, 254]);
+        assert!(address_available(&ctx, Ipv4Addr::new(10, 0, 0, 254), &[]));
+    }
+
+    #[test]
+    fn test_address_available_just_before_start() {
+        let ctx = make_context([10, 0, 0, 10], [10, 0, 0, 20]);
+        assert!(!address_available(&ctx, Ipv4Addr::new(10, 0, 0, 9), &[]));
+    }
+
+    #[test]
+    fn test_address_available_just_after_end() {
+        let ctx = make_context([10, 0, 0, 10], [10, 0, 0, 20]);
+        assert!(!address_available(&ctx, Ipv4Addr::new(10, 0, 0, 21), &[]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional icmp_checksum tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_icmp_checksum_empty() {
+        let cksum = icmp_checksum(&[]);
+        assert_eq!(cksum, 0xFFFF);
+    }
+
+    #[test]
+    fn test_icmp_checksum_odd_length() {
+        let pkt = [8, 0, 0]; // 3 bytes
+        let cksum = icmp_checksum(&pkt);
+        // Should handle odd-length gracefully
+        assert_ne!(cksum, 0);
+    }
+
+    #[test]
+    fn test_icmp_checksum_all_zeros() {
+        let pkt = [0u8; 8];
+        let cksum = icmp_checksum(&pkt);
+        assert_eq!(cksum, 0xFFFF);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional dhcp_msg_name tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dhcp_msg_name_all_types() {
+        assert_eq!(dhcp_msg_name(1), "DHCPDISCOVER");
+        assert_eq!(dhcp_msg_name(2), "DHCPOFFER");
+        assert_eq!(dhcp_msg_name(3), "DHCPREQUEST");
+        assert_eq!(dhcp_msg_name(4), "DHCPDECLINE");
+        assert_eq!(dhcp_msg_name(5), "DHCPACK");
+        assert_eq!(dhcp_msg_name(6), "DHCPNAK");
+        assert_eq!(dhcp_msg_name(7), "DHCPRELEASE");
+        assert_eq!(dhcp_msg_name(8), "DHCPINFORM");
+        assert_eq!(dhcp_msg_name(0), "UNKNOWN");
+        assert_eq!(dhcp_msg_name(255), "UNKNOWN");
+    }
+
+    // -----------------------------------------------------------------------
+    // config_find_by_address tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_find_by_address_empty() {
+        let result = config_find_by_address(&[], Ipv4Addr::new(192, 168, 1, 100));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_config_find_by_address_exact_hit() {
+        let addr = Ipv4Addr::new(192, 168, 1, 100);
+        let config = DhcpConfig {
+            flags: CONFIG_ADDR,
+            hwaddr: Vec::new(),
+            clid: None,
+            hostname: None,
+            netid: Vec::new(),
+            filter: Vec::new(),
+            addr: Some(addr),
+            #[cfg(feature = "dhcp6")]
+            addr6: Vec::new(),
+            domain: None,
+            lease_time: 0,
+            decline_time: 0,
+        };
+        let configs = vec![config];
+        let result = config_find_by_address(&configs, addr);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_config_find_by_address_miss() {
+        let config = DhcpConfig {
+            flags: 0,
+            hwaddr: Vec::new(),
+            clid: None,
+            hostname: None,
+            netid: Vec::new(),
+            filter: Vec::new(),
+            addr: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            #[cfg(feature = "dhcp6")]
+            addr6: Vec::new(),
+            domain: None,
+            lease_time: 0,
+            decline_time: 0,
+        };
+        let configs = vec![config];
+        let result = config_find_by_address(&configs, Ipv4Addr::new(10, 0, 0, 2));
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // narrow_context / narrow_context3 additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_narrow_context_empty() {
+        let result = narrow_context(&[], Ipv4Addr::new(192, 168, 1, 100), &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_narrow_context3_empty() {
+        let result = narrow_context3(&[], Ipv4Addr::new(192, 168, 1, 100), &[], false);
+        assert!(result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // guess_range_netmask tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_guess_range_netmask_no_contexts() {
+        let mut contexts: Vec<DhcpContext> = vec![];
+        guess_range_netmask(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(255, 255, 255, 0),
+            &mut contexts,
+        );
+        // No contexts, no panic
+    }
+
+    // -----------------------------------------------------------------------
+    // is_bind_interfaces_mode tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_bind_interfaces_mode() {
+        let opts = OptionFlags::new();
+        // Default should be false
+        assert!(!is_bind_interfaces_mode(&opts));
+    }
+
+    // -----------------------------------------------------------------------
+    // MatchParam tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_match_param_default_state() {
+        let params = MatchParam {
+            ind: 0,
+            matched: false,
+            netmask: Ipv4Addr::UNSPECIFIED,
+            broadcast: Ipv4Addr::UNSPECIFIED,
+            addr: Ipv4Addr::UNSPECIFIED,
+        };
+        assert!(!params.matched);
+        assert_eq!(params.ind, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage tests for dhcp/v4/server utility functions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_ipv4_exact_four_bytes() {
+        let packet = vec![172, 16, 0, 1];
+        let addr = extract_ipv4(&packet, 0);
+        assert_eq!(addr, Ipv4Addr::new(172, 16, 0, 1));
+    }
+
+    #[test]
+    fn test_extract_ipv4_with_offset_padding() {
+        let packet = vec![0xFF, 0xFF, 0xFF, 0xFF, 10, 20, 30, 40, 0, 0];
+        let addr = extract_ipv4(&packet, 4);
+        assert_eq!(addr, Ipv4Addr::new(10, 20, 30, 40));
+    }
+
+    #[test]
+    fn test_extract_ipv4_short_packet() {
+        let packet = vec![10, 0];
+        let addr = extract_ipv4(&packet, 0);
+        assert_eq!(addr, Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[test]
+    fn test_extract_ipv4_offset_beyond_end() {
+        let packet = vec![10, 0, 0, 1];
+        let addr = extract_ipv4(&packet, 3);
+        assert_eq!(addr, Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[test]
+    fn test_resolve_bridge_alias_empty_bridges() {
+        let state = DaemonState::default();
+        let result = resolve_bridge_alias("eth0", &state);
+        assert_eq!(result, "eth0");
+    }
+
+    #[test]
+    fn test_resolve_bridge_alias_match_first() {
+        let mut state = DaemonState::default();
+        state.bridges.push(crate::core::types::DhcpBridge {
+            iface: "br0".to_string(),
+            alias: vec!["eth0".to_string(), "eth1".to_string()],
+        });
+        let result = resolve_bridge_alias("eth0", &state);
+        assert_eq!(result, "br0");
+    }
+
+    #[test]
+    fn test_resolve_bridge_alias_match_second() {
+        let mut state = DaemonState::default();
+        state.bridges.push(crate::core::types::DhcpBridge {
+            iface: "br0".to_string(),
+            alias: vec!["eth0".to_string(), "eth1".to_string()],
+        });
+        let result = resolve_bridge_alias("eth1", &state);
+        assert_eq!(result, "br0");
+    }
+
+    #[test]
+    fn test_resolve_bridge_alias_no_match_2() {
+        let mut state = DaemonState::default();
+        state.bridges.push(crate::core::types::DhcpBridge {
+            iface: "br0".to_string(),
+            alias: vec!["eth0".to_string()],
+        });
+        let result = resolve_bridge_alias("wlan0", &state);
+        assert_eq!(result, "wlan0");
+    }
+
+    #[test]
+    fn test_resolve_bridge_alias_multiple_bridges() {
+        let mut state = DaemonState::default();
+        state.bridges.push(crate::core::types::DhcpBridge {
+            iface: "br0".to_string(),
+            alias: vec!["eth0".to_string()],
+        });
+        state.bridges.push(crate::core::types::DhcpBridge {
+            iface: "br1".to_string(),
+            alias: vec!["wlan0".to_string()],
+        });
+        assert_eq!(resolve_bridge_alias("wlan0", &state), "br1");
+    }
+
+    #[test]
+    fn test_sdbm_hash_large_data() {
+        let data = vec![0xABu8; 256];
+        let h = sdbm_hash(&data);
+        assert_ne!(h, 0);
+    }
+
+    #[test]
+    fn test_sdbm_hash_incremental_differs() {
+        let h1 = sdbm_hash(b"a");
+        let h2 = sdbm_hash(b"ab");
+        let h3 = sdbm_hash(b"abc");
+        assert_ne!(h1, h2);
+        assert_ne!(h2, h3);
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn test_address_available_proxy_flag() {
+        let mut ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        ctx.flags = CONTEXT_PROXY;
+        assert!(!address_available(
+            &ctx,
+            Ipv4Addr::new(192, 168, 1, 150),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_address_available_combined_flags() {
+        let mut ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        ctx.flags = CONTEXT_STATIC | CONTEXT_PROXY;
+        assert!(!address_available(
+            &ctx,
+            Ipv4Addr::new(192, 168, 1, 150),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_address_available_unspecified_router_allowed() {
+        let mut ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        ctx.router = Ipv4Addr::UNSPECIFIED;
+        assert!(address_available(
+            &ctx,
+            Ipv4Addr::new(192, 168, 1, 150),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_icmp_checksum_two_bytes() {
+        let data = [0x00, 0x01];
+        let cksum = icmp_checksum(&data);
+        assert_eq!(cksum, 0xFFFE);
+    }
+
+    #[test]
+    fn test_icmp_checksum_known_rfc() {
+        let data = [0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04];
+        let cksum = icmp_checksum(&data);
+        assert_eq!(cksum, 0xFFF5);
+    }
+
+    #[test]
+    fn test_icmp_checksum_single_byte() {
+        let data = [0x01];
+        let cksum = icmp_checksum(&data);
+        assert_ne!(cksum, 0);
+    }
+
+    #[test]
+    fn test_icmp_checksum_max_values() {
+        let data = [0xFF, 0xFF, 0xFF, 0xFF];
+        let cksum = icmp_checksum(&data);
+        assert_eq!(cksum, 0x0000);
+    }
+
+    #[test]
+    fn test_dhcp_msg_name_all_individual_types() {
+        assert_eq!(dhcp_msg_name(1), "DHCPDISCOVER");
+        assert_eq!(dhcp_msg_name(2), "DHCPOFFER");
+        assert_eq!(dhcp_msg_name(3), "DHCPREQUEST");
+        assert_eq!(dhcp_msg_name(4), "DHCPDECLINE");
+        assert_eq!(dhcp_msg_name(5), "DHCPACK");
+        assert_eq!(dhcp_msg_name(6), "DHCPNAK");
+        assert_eq!(dhcp_msg_name(7), "DHCPRELEASE");
+        assert_eq!(dhcp_msg_name(8), "DHCPINFORM");
+    }
+
+    #[test]
+    fn test_dhcp_msg_name_out_of_range() {
+        let name = dhcp_msg_name(0);
+        assert!(!name.is_empty());
+        let name2 = dhcp_msg_name(255);
+        assert!(!name2.is_empty());
+    }
+
+    #[test]
+    fn test_is_bind_interfaces_mode_default_false() {
+        let opts = OptionFlags::default();
+        assert!(!is_bind_interfaces_mode(&opts));
+    }
+
+    #[test]
+    fn test_narrow_context_multi_two_contexts() {
+        let ctx1 = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        let mut ctx2 = make_context([10, 0, 0, 100], [10, 0, 0, 200]);
+        ctx2.netmask = Ipv4Addr::new(255, 255, 255, 0);
+        let contexts = vec![ctx1, ctx2];
+        let result = narrow_context(&contexts, Ipv4Addr::new(192, 168, 1, 150), &[]);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_narrow_context_no_match_2() {
+        let ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        let contexts = vec![ctx];
+        let result = narrow_context(&contexts, Ipv4Addr::new(10, 10, 10, 10), &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_narrow_context3_with_match_2() {
+        let ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        let contexts = vec![ctx];
+        let result = narrow_context3(&contexts, Ipv4Addr::new(192, 168, 1, 150), &[], false);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_narrow_context3_always_match_flag() {
+        let ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        let contexts = vec![ctx];
+        let result = narrow_context3(&contexts, Ipv4Addr::new(192, 168, 1, 150), &[], true);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_lookup_client_config_no_match() {
+        let ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        let configs: Vec<DhcpConfig> = vec![];
+        let result = lookup_client_config(
+            &configs,
+            &ctx,
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            1,
+            None,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_lookup_client_lease_empty_2() {
+        let leases: Vec<DhcpLease> = vec![];
+        let result = lookup_client_lease(&leases, &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_complete_context_sets_broadcast() {
+        let mut ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        ctx.broadcast = Ipv4Addr::UNSPECIFIED;
+        let mut contexts = [ctx];
+        complete_context(
+            Ipv4Addr::new(192, 168, 1, 5),
+            1,
+            Ipv4Addr::new(255, 255, 255, 0),
+            Ipv4Addr::new(192, 168, 1, 255),
+            &mut contexts,
+            &[],
+        );
+    }
+
+    #[test]
+    fn test_complete_context_preserves_existing() {
+        let mut ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        let original_broadcast = ctx.broadcast;
+        let mut contexts = [ctx];
+        complete_context(
+            Ipv4Addr::new(192, 168, 1, 5),
+            1,
+            Ipv4Addr::new(255, 255, 255, 0),
+            Ipv4Addr::new(192, 168, 1, 255),
+            &mut contexts,
+            &[],
+        );
+        assert_eq!(contexts[0].broadcast, original_broadcast);
+    }
+
+    #[test]
+    fn test_check_listen_addrs_matching_address() {
+        let mut params = MatchParam {
+            ind: 1,
+            matched: false,
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(192, 168, 1, 255),
+            addr: Ipv4Addr::new(192, 168, 1, 100),
+        };
+        let result = check_listen_addrs(Ipv4Addr::new(192, 168, 1, 100), 1, &mut params);
+        assert!(result);
+        assert!(params.matched);
+    }
+
+    #[test]
+    fn test_check_listen_addrs_different_if_index() {
+        let mut params = MatchParam {
+            ind: 2,
+            matched: false,
+            netmask: Ipv4Addr::UNSPECIFIED,
+            broadcast: Ipv4Addr::UNSPECIFIED,
+            addr: Ipv4Addr::new(192, 168, 1, 100),
+        };
+        let _ = check_listen_addrs(Ipv4Addr::new(192, 168, 1, 100), 1, &mut params);
+    }
+
+    #[test]
+    fn test_dhcp_read_ethers_missing_file() {
+        let mut configs = vec![];
+        let result = dhcp_read_ethers("/tmp/absolutely_nonexistent_dhcp_ethers_file", &mut configs);
+        // Missing file is treated as OK (no entries) per C dnsmasq behavior
+        assert!(result.is_ok());
+        assert!(configs.is_empty());
+    }
+
+    #[test]
+    fn test_dhcp_read_ethers_from_tempfile() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ethers");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "# Comment line").unwrap();
+        writeln!(f, "").unwrap();
+        drop(f);
+        let mut configs = vec![];
+        let _ = dhcp_read_ethers(path.to_str().unwrap(), &mut configs);
+    }
+
+    #[test]
+    fn test_address_allocate_no_contexts() {
+        let contexts: Vec<DhcpContext> = vec![];
+        let leases: Vec<DhcpLease> = vec![];
+        let configs: Vec<DhcpConfig> = vec![];
+        let result = address_allocate(&contexts, None, &[], &configs, 0, &leases);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_address_allocate_single_ctx_available() {
+        let ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        let contexts = vec![ctx];
+        let leases: Vec<DhcpLease> = vec![];
+        let configs: Vec<DhcpConfig> = vec![];
+        let result = address_allocate(&contexts, Some("testhost"), &[], &configs, 0, &leases);
+        if let Some(addr) = result {
+            let addr_u32 = u32::from(addr);
+            assert!(addr_u32 >= u32::from(Ipv4Addr::new(192, 168, 1, 100)));
+            assert!(addr_u32 <= u32::from(Ipv4Addr::new(192, 168, 1, 200)));
+        }
+    }
+
+    #[test]
+    fn test_address_allocate_with_hostname_hash() {
+        let ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        let contexts = vec![ctx];
+        let leases: Vec<DhcpLease> = vec![];
+        let configs: Vec<DhcpConfig> = vec![];
+        let r1 = address_allocate(&contexts, Some("host-alpha"), &[], &configs, 0, &leases);
+        let r2 = address_allocate(&contexts, Some("host-beta"), &[], &configs, 0, &leases);
+        assert!(r1.is_some());
+        assert!(r2.is_some());
+    }
+
+    #[test]
+    fn test_address_allocate_no_hostname_2() {
+        let ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        let contexts = vec![ctx];
+        let leases: Vec<DhcpLease> = vec![];
+        let configs: Vec<DhcpConfig> = vec![];
+        let result = address_allocate(&contexts, None, &[], &configs, 0, &leases);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_address_allocate_static_context_skipped() {
+        let mut ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        ctx.flags = CONTEXT_STATIC;
+        let contexts = vec![ctx];
+        let leases: Vec<DhcpLease> = vec![];
+        let configs: Vec<DhcpConfig> = vec![];
+        let result = address_allocate(&contexts, Some("host"), &[], &configs, 0, &leases);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_guess_range_netmask_unspecified_gets_set() {
+        let mut ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        ctx.netmask = Ipv4Addr::UNSPECIFIED;
+        let mut contexts = vec![ctx];
+        guess_range_netmask(
+            Ipv4Addr::new(192, 168, 1, 5),
+            Ipv4Addr::new(255, 255, 255, 0),
+            &mut contexts,
+        );
+    }
+
+    #[test]
+    fn test_guess_range_netmask_different_subnet_untouched() {
+        let ctx = make_context([192, 168, 1, 100], [192, 168, 1, 200]);
+        let original = ctx.netmask;
+        let mut contexts = vec![ctx];
+        guess_range_netmask(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(255, 0, 0, 0),
+            &mut contexts,
+        );
+        assert_eq!(contexts[0].netmask, original);
+    }
+
+    #[test]
+    fn test_relay_reply4_short_packet() {
+        let state = DaemonState::default();
+        let packet = vec![0u8; 10];
+        let result = relay_reply4(&packet, "eth0", &state);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_relay_reply4_empty_packet() {
+        let state = DaemonState::default();
+        let result = relay_reply4(&[], "eth0", &state);
+        assert!(result.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // dhcp_read_ethers tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_read_ethers_nonexistent_file() {
+        let mut configs = Vec::new();
+        let result = dhcp_read_ethers("/nonexistent_ethers_file_12345", &mut configs);
+        assert!(result.is_ok()); // Missing file is OK, returns Ok(())
+        assert!(configs.is_empty());
+    }
+
+    #[test]
+    fn test_read_ethers_valid_mac_ip() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ethers");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "00:11:22:33:44:55 192.168.1.100").unwrap();
+        let mut configs = Vec::new();
+        let result = dhcp_read_ethers(path.to_str().unwrap(), &mut configs);
+        assert!(result.is_ok());
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].addr, Some("192.168.1.100".parse().unwrap()));
+        assert!(configs[0].flags & CONFIG_ADDR != 0);
+        assert!(configs[0].flags & CONFIG_FROM_ETHERS != 0);
+    }
+
+    #[test]
+    fn test_read_ethers_valid_mac_hostname() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ethers");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "AA:BB:CC:DD:EE:FF myhost").unwrap();
+        let mut configs = Vec::new();
+        let result = dhcp_read_ethers(path.to_str().unwrap(), &mut configs);
+        assert!(result.is_ok());
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].hostname, Some("myhost".to_string()));
+        assert!(configs[0].flags & CONFIG_NAME != 0);
+    }
+
+    #[test]
+    fn test_read_ethers_comments_and_blank_lines() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ethers");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "# This is a comment").unwrap();
+        writeln!(f, "").unwrap();
+        writeln!(f, "  ").unwrap();
+        writeln!(f, "00:11:22:33:44:55 10.0.0.1").unwrap();
+        writeln!(f, "# Another comment").unwrap();
+        let mut configs = Vec::new();
+        let result = dhcp_read_ethers(path.to_str().unwrap(), &mut configs);
+        assert!(result.is_ok());
+        assert_eq!(configs.len(), 1);
+    }
+
+    #[test]
+    fn test_read_ethers_invalid_mac_skipped() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ethers");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "ZZZZ notamac").unwrap();
+        writeln!(f, "00:11:22:33:44:55 10.0.0.1").unwrap();
+        let mut configs = Vec::new();
+        let result = dhcp_read_ethers(path.to_str().unwrap(), &mut configs);
+        assert!(result.is_ok());
+        assert_eq!(configs.len(), 1);
+    }
+
+    #[test]
+    fn test_read_ethers_duplicate_mac_skipped() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ethers");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "00:11:22:33:44:55 10.0.0.1").unwrap();
+        writeln!(f, "00:11:22:33:44:55 10.0.0.2").unwrap();
+        let mut configs = Vec::new();
+        let result = dhcp_read_ethers(path.to_str().unwrap(), &mut configs);
+        assert!(result.is_ok());
+        assert_eq!(configs.len(), 1); // Second duplicate skipped
+    }
+
+    #[test]
+    fn test_read_ethers_reload_removes_old() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ethers");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "00:11:22:33:44:55 10.0.0.1").unwrap();
+        let mut configs = Vec::new();
+        dhcp_read_ethers(path.to_str().unwrap(), &mut configs).unwrap();
+        assert_eq!(configs.len(), 1);
+        // Re-read — old entries should be cleared first
+        let mut f2 = std::fs::File::create(&path).unwrap();
+        writeln!(f2, "AA:BB:CC:DD:EE:FF 10.0.0.2").unwrap();
+        dhcp_read_ethers(path.to_str().unwrap(), &mut configs).unwrap();
+        assert_eq!(configs.len(), 1); // Old entry removed, new added
+    }
+
+    #[test]
+    fn test_read_ethers_single_field_skipped() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ethers");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "00:11:22:33:44:55").unwrap(); // Missing hostname/IP
+        let mut configs = Vec::new();
+        let result = dhcp_read_ethers(path.to_str().unwrap(), &mut configs);
+        assert!(result.is_ok());
+        assert!(configs.is_empty());
+    }
+
+    #[test]
+    fn test_read_ethers_multiple_entries() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ethers");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "00:11:22:33:44:55 10.0.0.1").unwrap();
+        writeln!(f, "AA:BB:CC:DD:EE:FF host2").unwrap();
+        writeln!(f, "11:22:33:44:55:66 192.168.1.50").unwrap();
+        let mut configs = Vec::new();
+        let result = dhcp_read_ethers(path.to_str().unwrap(), &mut configs);
+        assert!(result.is_ok());
+        assert_eq!(configs.len(), 3);
+    }
+
+    // -------------------------------------------------------------------
+    // icmp_checksum tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_icmp_checksum_echo_request() {
+        // Construct a minimal ICMP echo request packet
+        let pkt = vec![8, 0, 0, 0, 0, 1, 0, 1]; // Type=8, Code=0, Checksum=0, ID=1, Seq=1
+        let csum = icmp_checksum(&pkt);
+        // Apply the checksum back
+        let mut pkt2 = pkt.clone();
+        pkt2[2] = (csum >> 8) as u8;
+        pkt2[3] = (csum & 0xFF) as u8;
+        // Verify checksum is now valid (re-computing over checksummed packet gives 0)
+        let verify = icmp_checksum(&pkt2);
+        assert_eq!(verify, 0);
+    }
+
+    #[test]
+    fn test_icmp_checksum_deterministic() {
+        let pkt = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let c1 = icmp_checksum(&pkt);
+        let c2 = icmp_checksum(&pkt);
+        assert_eq!(c1, c2);
+    }
+
+    // -------------------------------------------------------------------
+    // host_from_dns tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_host_from_dns_port_zero() {
+        let mut state = DaemonState::default();
+        state.port = 0;
+        let result = host_from_dns("10.0.0.1".parse().unwrap(), &state, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_host_from_dns_no_cache() {
+        let state = DaemonState::default();
+        let result = host_from_dns("10.0.0.1".parse().unwrap(), &state, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_host_from_dns_empty_cache() {
+        let state = DaemonState::default();
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let result = host_from_dns("10.0.0.1".parse().unwrap(), &state, Some(&mut cache));
+        assert!(result.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // relay_reply4 tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_relay_reply4_bad_cookie() {
+        let state = DaemonState::default();
+        let mut pkt = vec![0u8; 600]; // Larger than MIN_PACKETSZ
+                                      // Set invalid magic cookie at OPTIONS_OFFSET (236)
+        if pkt.len() > OPTIONS_OFFSET + 4 {
+            pkt[OPTIONS_OFFSET] = 0xFF;
+            pkt[OPTIONS_OFFSET + 1] = 0xFF;
+            pkt[OPTIONS_OFFSET + 2] = 0xFF;
+            pkt[OPTIONS_OFFSET + 3] = 0xFF;
+        }
+        let result = relay_reply4(&pkt, "eth0", &state);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_relay_reply4_no_relay_config() {
+        let state = DaemonState::default();
+        let mut pkt = vec![0u8; 600];
+        // Set valid DHCP cookie
+        if pkt.len() > OPTIONS_OFFSET + 4 {
+            pkt[OPTIONS_OFFSET] = DHCP_COOKIE[0];
+            pkt[OPTIONS_OFFSET + 1] = DHCP_COOKIE[1];
+            pkt[OPTIONS_OFFSET + 2] = DHCP_COOKIE[2];
+            pkt[OPTIONS_OFFSET + 3] = DHCP_COOKIE[3];
+        }
+        let result = relay_reply4(&pkt, "eth0", &state);
+        assert!(result.is_none()); // No relay config
+    }
+
+    // -------------------------------------------------------------------
+    // resolve_bridge_alias tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_bridge_alias_no_alias() {
+        let state = DaemonState::default();
+        let result = resolve_bridge_alias("eth0", &state);
+        assert_eq!(result, "eth0");
+    }
+
+    // -------------------------------------------------------------------
+    // lookup_client_lease & lookup_client_config tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_lookup_client_lease_empty_db() {
+        let db: Vec<crate::dhcp::lease::DhcpLease> = Vec::new();
+        let mac = vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let result = lookup_client_lease(&db, &mac, 1, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_lookup_client_config_empty() {
+        let configs: Vec<DhcpConfig> = Vec::new();
+        let mac = vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let context = make_context([10, 0, 0, 100], [10, 0, 0, 200]);
+        let result = lookup_client_config(&configs, &context, &mac, 1, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_is_bind_interfaces_mode_default() {
+        let opts = OptionFlags::default();
+        assert!(!is_bind_interfaces_mode(&opts));
+    }
+
+    #[test]
+    fn test_dhcp_msg_name_discover() {
+        assert_eq!(dhcp_msg_name(1), "DHCPDISCOVER");
+    }
+
+    #[test]
+    fn test_dhcp_msg_name_offer() {
+        assert_eq!(dhcp_msg_name(2), "DHCPOFFER");
+    }
+
+    #[test]
+    fn test_dhcp_msg_name_request() {
+        assert_eq!(dhcp_msg_name(3), "DHCPREQUEST");
+    }
+
+    #[test]
+    fn test_dhcp_msg_name_ack() {
+        assert_eq!(dhcp_msg_name(5), "DHCPACK");
+    }
+
+    #[test]
+    fn test_dhcp_msg_name_nak() {
+        assert_eq!(dhcp_msg_name(6), "DHCPNAK");
+    }
+
+    #[test]
+    fn test_dhcp_msg_name_release() {
+        assert_eq!(dhcp_msg_name(7), "DHCPRELEASE");
+    }
+
+    #[test]
+    fn test_dhcp_msg_name_inform() {
+        assert_eq!(dhcp_msg_name(8), "DHCPINFORM");
+    }
+
+    #[test]
+    fn test_dhcp_msg_name_decline() {
+        assert_eq!(dhcp_msg_name(4), "DHCPDECLINE");
+    }
+
+    #[test]
+    fn test_dhcp_msg_name_unknown() {
+        let name = dhcp_msg_name(99);
+        assert_eq!(name, "UNKNOWN");
+    }
+
+    // -------------------------------------------------------------------
+    // complete_context tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_complete_context_non_matching() {
+        let mut ctxs = vec![make_context([10, 0, 0, 100], [10, 0, 0, 200])];
+        // Address outside any context range — should not panic
+        let relays: Vec<DhcpRelay> = Vec::new();
+        complete_context(
+            "10.0.0.50".parse().unwrap(),
+            0,
+            Ipv4Addr::new(255, 255, 255, 0),
+            Ipv4Addr::BROADCAST,
+            &mut ctxs,
+            &relays,
+        );
+    }
+
+    #[test]
+    fn test_complete_context_matching_addr() {
+        let mut ctxs = vec![make_context([192, 168, 1, 100], [192, 168, 1, 200])];
+        ctxs[0].netmask = Ipv4Addr::new(255, 255, 255, 0);
+        let relays: Vec<DhcpRelay> = Vec::new();
+        complete_context(
+            "192.168.1.1".parse().unwrap(),
+            0,
+            Ipv4Addr::new(255, 255, 255, 0),
+            Ipv4Addr::BROADCAST,
+            &mut ctxs,
+            &relays,
+        );
+        assert_eq!(ctxs[0].local, "192.168.1.1".parse::<Ipv4Addr>().unwrap());
+    }
 }

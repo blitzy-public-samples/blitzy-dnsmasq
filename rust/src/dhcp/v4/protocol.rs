@@ -2977,6 +2977,19 @@ mod tests {
         }
     }
 
+    /// Helper: create a minimal valid DHCP options buffer for testing
+    /// option-writing functions. Buffer has header + magic cookie + OPTION_END.
+    fn make_options_buf() -> Vec<u8> {
+        let mut buf = vec![0u8; 241]; // 236 header + 4 cookie + 1 END
+                                      // Set DHCP magic cookie at byte 236
+        buf[236] = 99; // 0x63
+        buf[237] = 130; // 0x82
+        buf[238] = 83; // 0x53
+        buf[239] = 99; // 0x63
+        buf[240] = 0xFF; // OPTION_END
+        buf
+    }
+
     #[test]
     fn test_server_id_selection() {
         let ctx = make_test_context(
@@ -3150,5 +3163,1774 @@ mod tests {
         let pkt_len = reply_pkt.len();
         let result = relay_reply4(&mut reply_pkt, pkt_len, "eth0", &state);
         assert!(result.is_none());
+    }
+
+    // --- Additional tests for expanded coverage ---
+
+    #[test]
+    fn test_protocol_version() {
+        assert!(matches!(protocol_version(), DhcpProtocol::V4));
+    }
+
+    #[test]
+    fn test_ipv4_to_alladdr() {
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        let all = ipv4_to_alladdr(addr);
+        match all {
+            AllAddr::V4(a) => assert_eq!(a, Ipv4Addr::new(10, 0, 0, 1)),
+            _ => panic!("expected V4"),
+        }
+    }
+
+    #[test]
+    fn test_ipv4_to_alladdr_unspecified() {
+        let all = ipv4_to_alladdr(Ipv4Addr::UNSPECIFIED);
+        match all {
+            AllAddr::V4(a) => assert!(a.is_unspecified()),
+            _ => panic!("expected V4"),
+        }
+    }
+
+    #[test]
+    fn test_ipv4_to_alladdr_broadcast() {
+        let all = ipv4_to_alladdr(Ipv4Addr::BROADCAST);
+        match all {
+            AllAddr::V4(a) => assert_eq!(a, Ipv4Addr::BROADCAST),
+            _ => panic!("expected V4"),
+        }
+    }
+
+    #[test]
+    fn test_check_option_set() {
+        let mut flags = OptionFlags::default();
+        flags.set(0); // bit 0
+        assert!(check_option(&flags, 0));
+    }
+
+    #[test]
+    fn test_check_option_unset() {
+        let flags = OptionFlags::default();
+        assert!(!check_option(&flags, 0));
+    }
+
+    #[test]
+    fn test_server_id_override_priority() {
+        let ctx = make_test_context(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            3600,
+        );
+        // Override should take priority
+        let result = server_id(
+            Some(&ctx),
+            Some(Ipv4Addr::new(10, 0, 0, 1)),
+            Ipv4Addr::new(172, 16, 0, 1),
+        );
+        assert_eq!(result, Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn test_server_id_context_when_no_override() {
+        let ctx = make_test_context(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            3600,
+        );
+        let result = server_id(Some(&ctx), None, Ipv4Addr::new(172, 16, 0, 1));
+        assert_eq!(result, Ipv4Addr::new(192, 168, 1, 1));
+    }
+
+    #[test]
+    fn test_server_id_fallback_when_all_unspecified() {
+        let ctx = make_test_context(
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            3600,
+        );
+        let result = server_id(
+            Some(&ctx),
+            Some(Ipv4Addr::UNSPECIFIED),
+            Ipv4Addr::new(172, 16, 0, 1),
+        );
+        assert_eq!(result, Ipv4Addr::new(172, 16, 0, 1));
+    }
+
+    #[test]
+    fn test_server_id_no_context() {
+        let result = server_id(None, None, Ipv4Addr::new(172, 16, 0, 1));
+        assert_eq!(result, Ipv4Addr::new(172, 16, 0, 1));
+    }
+
+    #[test]
+    fn test_calc_time_context_default() {
+        let ctx = make_test_context(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            7200,
+        );
+        assert_eq!(calc_time(&ctx, None, None, 0), 7200);
+    }
+
+    #[test]
+    fn test_calc_time_config_override() {
+        let ctx = make_test_context(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            7200,
+        );
+        let config = DhcpConfig {
+            flags: CONFIG_TIME,
+            hwaddr: vec![],
+            clid: None,
+            hostname: None,
+            netid: vec![],
+            filter: vec![],
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+            domain: None,
+            lease_time: 3600,
+            decline_time: 0,
+        };
+        assert_eq!(calc_time(&ctx, Some(&config), None, 0), 3600);
+    }
+
+    #[test]
+    fn test_calc_time_client_requested_shorter() {
+        let ctx = make_test_context(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            7200,
+        );
+        assert_eq!(calc_time(&ctx, None, Some(1800), 0), 1800);
+    }
+
+    #[test]
+    fn test_calc_time_client_requested_longer_ignored() {
+        let ctx = make_test_context(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            7200,
+        );
+        assert_eq!(calc_time(&ctx, None, Some(14400), 0), 7200);
+    }
+
+    #[test]
+    fn test_calc_time_min_lease_enforced() {
+        let ctx = make_test_context(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            7200,
+        );
+        // Client requests 60 but min is 300
+        assert_eq!(calc_time(&ctx, None, Some(60), 300), 300);
+    }
+
+    #[test]
+    fn test_calc_time_zero_context_uses_deflease() {
+        let ctx = make_test_context(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            0, // zero lease_time -> uses DEFLEASE
+        );
+        assert_eq!(calc_time(&ctx, None, None, 0), DEFLEASE);
+    }
+
+    #[test]
+    fn test_calc_time_config_zero_ignored() {
+        let ctx = make_test_context(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            7200,
+        );
+        let config = DhcpConfig {
+            flags: CONFIG_TIME,
+            hwaddr: vec![],
+            clid: None,
+            hostname: None,
+            netid: vec![],
+            filter: vec![],
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+            domain: None,
+            lease_time: 0, // zero — should not override
+            decline_time: 0,
+        };
+        assert_eq!(calc_time(&ctx, Some(&config), None, 0), 7200);
+    }
+
+    #[test]
+    fn test_match_vendor_opts_empty() {
+        let tags = match_vendor_opts(&[], &[]);
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn test_match_vendor_opts_no_vendor_match_flag() {
+        let opts = vec![DhcpOpt {
+            opt: 43,
+            val: vec![1, 2, 3],
+            flags: 0, // No DHOPT_VENDOR_MATCH
+            netid: Some(NetId {
+                net: "test".to_string(),
+            }),
+            next: Vec::new(),
+            len: 3,
+            u: DhcpOptExtra::None,
+        }];
+        let tags = match_vendor_opts(&[1, 2, 3], &opts);
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn test_prune_vendor_opts_empty() {
+        let result = prune_vendor_opts(&[], &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_prune_vendor_opts_non_vendor_excluded() {
+        let opts = vec![DhcpOpt {
+            opt: 43,
+            val: vec![1, 2, 3],
+            flags: 0, // Not DHOPT_VENDOR
+            netid: None,
+            next: Vec::new(),
+            len: 3,
+            u: DhcpOptExtra::None,
+        }];
+        let result = prune_vendor_opts(&[], &opts);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_prune_vendor_opts_vendor_no_tag_included() {
+        let opts = vec![DhcpOpt {
+            opt: 43,
+            val: vec![1, 2, 3],
+            flags: DHOPT_VENDOR,
+            netid: None, // No tag — always included
+            next: Vec::new(),
+            len: 3,
+            u: DhcpOptExtra::None,
+        }];
+        let result = prune_vendor_opts(&[], &opts);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_prune_vendor_opts_vendor_tag_mismatch() {
+        let opts = vec![DhcpOpt {
+            opt: 43,
+            val: vec![1, 2, 3],
+            flags: DHOPT_VENDOR,
+            netid: Some(NetId {
+                net: "lan".to_string(),
+            }),
+            next: Vec::new(),
+            len: 3,
+            u: DhcpOptExtra::None,
+        }];
+        let result = prune_vendor_opts(
+            &[NetId {
+                net: "wan".to_string(),
+            }],
+            &opts,
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_prune_vendor_opts_vendor_tag_match() {
+        let opts = vec![DhcpOpt {
+            opt: 43,
+            val: vec![1, 2, 3],
+            flags: DHOPT_VENDOR,
+            netid: Some(NetId {
+                net: "lan".to_string(),
+            }),
+            next: Vec::new(),
+            len: 3,
+            u: DhcpOptExtra::None,
+        }];
+        let result = prune_vendor_opts(
+            &[NetId {
+                net: "lan".to_string(),
+            }],
+            &opts,
+        );
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_do_encap_opts_empty() {
+        let mut buf = Vec::new();
+        let found = do_encap_opts(&[], 43, 0, &mut buf, false);
+        assert!(!found);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_state_time_positive() {
+        let t = state_time();
+        assert!(t > 0);
+    }
+
+    #[test]
+    fn test_log_packet_with_all_fields() {
+        // Just verify it doesn't panic
+        log_packet(
+            "DHCPOFFER",
+            Some(Ipv4Addr::new(192, 168, 1, 100)),
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            "eth0",
+            Some("testhost"),
+            None,
+            0xDEADBEEF,
+        );
+    }
+
+    #[test]
+    fn test_log_packet_with_error() {
+        log_packet(
+            "DHCPNAK",
+            None,
+            &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            "eth0",
+            None,
+            Some("no available address"),
+            0x12345678,
+        );
+    }
+
+    #[test]
+    fn test_log_packet_empty_mac() {
+        log_packet(
+            "DHCPDISCOVER",
+            Some(Ipv4Addr::UNSPECIFIED),
+            &[],
+            "lo",
+            Some(""),
+            None,
+            0,
+        );
+    }
+
+    #[test]
+    fn test_dhcp_packet_set_fields() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let mut pkt = DhcpPacket::from_bytes(&packet).unwrap();
+        pkt.set_op(BOOTREPLY);
+        assert_eq!(pkt.op(), BOOTREPLY);
+        pkt.set_hops(3);
+        assert_eq!(pkt.hops(), 3);
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        pkt.set_ciaddr(addr);
+        assert_eq!(pkt.ciaddr_addr(), addr);
+        pkt.set_yiaddr(Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(pkt.yiaddr_addr(), Ipv4Addr::new(10, 0, 0, 2));
+        pkt.set_siaddr(Ipv4Addr::new(10, 0, 0, 3));
+        assert_eq!(pkt.siaddr_addr(), Ipv4Addr::new(10, 0, 0, 3));
+        pkt.set_giaddr(Ipv4Addr::new(10, 0, 0, 4));
+        assert_eq!(pkt.giaddr_addr(), Ipv4Addr::new(10, 0, 0, 4));
+    }
+
+    #[test]
+    fn test_dhcp_packet_set_flags() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let mut pkt = DhcpPacket::from_bytes(&packet).unwrap();
+        pkt.set_flags(0x8000); // Broadcast flag
+        assert_eq!(pkt.flags(), 0x8000);
+        pkt.set_flags(0);
+        assert_eq!(pkt.flags(), 0);
+    }
+
+    #[test]
+    fn test_dhcp_packet_set_sname() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let mut pkt = DhcpPacket::from_bytes(&packet).unwrap();
+        let name = b"bootserver.example.com";
+        pkt.set_sname(name);
+        let sname = pkt.sname();
+        assert!(sname.starts_with(name.as_slice()));
+    }
+
+    #[test]
+    fn test_dhcp_packet_set_file() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let mut pkt = DhcpPacket::from_bytes(&packet).unwrap();
+        let file = b"pxelinux.0";
+        pkt.set_file(file);
+        let f = pkt.file();
+        assert!(f.starts_with(file.as_slice()));
+    }
+
+    #[test]
+    fn test_dhcp_packet_display() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let pkt = DhcpPacket::from_bytes(&packet).unwrap();
+        let display = format!("{}", pkt);
+        assert!(display.contains("op="));
+        assert!(display.contains("xid="));
+    }
+
+    #[test]
+    fn test_dhcp_packet_chaddr_length() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let pkt = DhcpPacket::from_bytes(&packet).unwrap();
+        assert_eq!(pkt.chaddr().len(), 16);
+    }
+
+    #[test]
+    fn test_dhcp_packet_sname_length() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let pkt = DhcpPacket::from_bytes(&packet).unwrap();
+        assert_eq!(pkt.sname().len(), 64);
+    }
+
+    #[test]
+    fn test_dhcp_packet_file_length() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let pkt = DhcpPacket::from_bytes(&packet).unwrap();
+        assert_eq!(pkt.file().len(), 128);
+    }
+
+    #[test]
+    fn test_dhcp_packet_options_start_with_cookie() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let pkt = DhcpPacket::from_bytes(&packet).unwrap();
+        assert!(pkt.has_dhcp_cookie());
+    }
+
+    #[test]
+    fn test_dhcp_packet_secs() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let pkt = DhcpPacket::from_bytes(&packet).unwrap();
+        // secs field at offset 8-9 should be 0 in our test packet
+        assert_eq!(pkt.secs(), 0);
+    }
+
+    #[test]
+    fn test_dhcp_packet_new_reply_preserves_xid() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let req = DhcpPacket::from_bytes(&packet).unwrap();
+        let reply = DhcpPacket::new_reply(&req);
+        assert_eq!(reply.xid(), req.xid());
+        assert_eq!(reply.op(), BOOTREPLY);
+        assert_eq!(reply.htype(), req.htype());
+        assert_eq!(reply.hlen(), req.hlen());
+    }
+
+    #[test]
+    fn test_dhcp_packet_len_and_empty() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let pkt = DhcpPacket::from_bytes(&packet).unwrap();
+        assert!(!pkt.is_empty());
+        assert!(pkt.len() >= DHCP_HEADER_SIZE);
+    }
+
+    #[test]
+    fn test_dhcp_packet_as_bytes_roundtrip() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let pkt = DhcpPacket::from_bytes(&packet).unwrap();
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes.len(), packet.len());
+    }
+
+    #[test]
+    fn test_pxe_misc_with_uuid() {
+        let uuid = vec![0u8; 17]; // 17 bytes: 1 type + 16 UUID
+        let mut buf = Vec::new();
+        pxe_misc(&mut buf, Some(&uuid), None);
+        assert!(!buf.is_empty());
+        assert_eq!(buf[0], OPTION_PXE_UUID);
+    }
+
+    #[test]
+    fn test_pxe_misc_with_vendor() {
+        // option_put_string needs pre-allocated space via free_space mechanism.
+        // Just verify the function doesn't panic with vendor string.
+        let mut buf = Vec::new();
+        pxe_misc(&mut buf, None, Some("PXEClient:Arch:00000:UNDI:002001"));
+        // The buffer may or may not be modified depending on internal option allocation.
+    }
+
+    #[test]
+    fn test_pxe_misc_empty() {
+        let mut buf = Vec::new();
+        pxe_misc(&mut buf, None, None);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_pxe_misc_short_uuid_ignored() {
+        let uuid = vec![0u8; 10]; // Too short
+        let mut buf = Vec::new();
+        pxe_misc(&mut buf, Some(&uuid), None);
+        assert!(buf.is_empty()); // UUID too short to emit
+    }
+
+    #[test]
+    fn test_pxe_misc_empty_vendor_ignored() {
+        let mut buf = Vec::new();
+        pxe_misc(&mut buf, None, Some(""));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_find_boot_no_config() {
+        let state = DaemonState::default();
+        let result = find_boot(&[], &state);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_boot_with_default_config() {
+        let mut state = DaemonState::default();
+        state.boot_config = Some(crate::core::types::DhcpBoot {
+            file: Some("pxelinux.0".to_string()),
+            sname: Some("tftp.example.com".to_string()),
+            next_server: Some(Ipv4Addr::new(192, 168, 1, 1)),
+            netid: None, // No tag restriction
+        });
+        let result = find_boot(&[], &state);
+        assert!(result.is_some());
+        let boot = result.unwrap();
+        assert_eq!(boot.file, Some("pxelinux.0".to_string()));
+        assert_eq!(boot.sname, Some("tftp.example.com".to_string()));
+        assert_eq!(boot.next_server, Some(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn test_find_boot_tag_mismatch() {
+        let mut state = DaemonState::default();
+        state.boot_config = Some(crate::core::types::DhcpBoot {
+            file: Some("boot.img".to_string()),
+            sname: None,
+            next_server: None,
+            netid: Some("vlan100".to_string()), // Requires "vlan100" tag
+        });
+        let result = find_boot(
+            &[NetId {
+                net: "vlan200".to_string(),
+            }],
+            &state,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_boot_tag_matches_netid() {
+        let mut state = DaemonState::default();
+        state.boot_config = Some(crate::core::types::DhcpBoot {
+            file: Some("boot.img".to_string()),
+            sname: None,
+            next_server: None,
+            netid: Some("vlan100".to_string()),
+        });
+        let result = find_boot(
+            &[NetId {
+                net: "vlan100".to_string(),
+            }],
+            &state,
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_convert_boot_all_fields() {
+        let boot = crate::core::types::DhcpBoot {
+            file: Some("pxelinux.0".to_string()),
+            sname: Some("tftp.local".to_string()),
+            next_server: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            netid: Some("office".to_string()),
+        };
+        let result = convert_boot(&boot);
+        assert_eq!(result.file, Some("pxelinux.0".to_string()));
+        assert_eq!(result.sname, Some("tftp.local".to_string()));
+        assert_eq!(result.next_server, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(result.netid.len(), 1);
+        assert_eq!(result.netid[0].net, "office");
+    }
+
+    #[test]
+    fn test_convert_boot_no_netid() {
+        let boot = crate::core::types::DhcpBoot {
+            file: None,
+            sname: None,
+            next_server: None,
+            netid: None,
+        };
+        let result = convert_boot(&boot);
+        assert!(result.file.is_none());
+        assert!(result.sname.is_none());
+        assert!(result.next_server.is_none());
+        assert!(result.netid.is_empty());
+    }
+
+    #[test]
+    fn test_is_pxe_client_too_short() {
+        let short = vec![0u8; 10];
+        assert!(is_pxe_client(&short).is_none());
+    }
+
+    #[test]
+    fn test_pxe_opts_no_services() {
+        let state = DaemonState::default();
+        let result = pxe_opts(0, &[], Ipv4Addr::new(192, 168, 1, 1), 0, &state);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_dhcp_v4_state_all_names() {
+        let states = [
+            (DhcpV4State::Discover, "DHCPDISCOVER"),
+            (DhcpV4State::Offer, "DHCPOFFER"),
+            (DhcpV4State::Request, "DHCPREQUEST"),
+            (DhcpV4State::Decline, "DHCPDECLINE"),
+            (DhcpV4State::Ack, "DHCPACK"),
+            (DhcpV4State::Nak, "DHCPNAK"),
+            (DhcpV4State::Release, "DHCPRELEASE"),
+            (DhcpV4State::Inform, "DHCPINFORM"),
+        ];
+        for (state, expected_name) in &states {
+            assert_eq!(state.name(), *expected_name);
+        }
+    }
+
+    #[test]
+    fn test_dhcp_v4_state_display_all() {
+        for i in 1u8..=13 {
+            if let Ok(s) = DhcpV4State::try_from(i) {
+                let display = format!("{}", s);
+                assert!(!display.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_dhcp_packet_from_exact_minimum() {
+        let mut data = vec![0u8; DHCP_HEADER_SIZE + 4]; // header + magic cookie
+        data[0] = BOOTREQUEST; // op
+        data[1] = 1; // htype = ethernet
+        data[2] = 6; // hlen = 6
+                     // Write DHCP magic cookie at offset 236
+        data[DHCP_HEADER_SIZE] = 99;
+        data[DHCP_HEADER_SIZE + 1] = 130;
+        data[DHCP_HEADER_SIZE + 2] = 83;
+        data[DHCP_HEADER_SIZE + 3] = 99;
+        let pkt = DhcpPacket::from_bytes(&data);
+        assert!(pkt.is_some());
+    }
+
+    #[test]
+    fn test_dhcp_packet_from_one_short() {
+        let data = vec![0u8; DHCP_HEADER_SIZE - 1];
+        let pkt = DhcpPacket::from_bytes(&data);
+        assert!(pkt.is_none());
+    }
+
+    #[test]
+    fn test_relay_upstream4_no_relay_config() {
+        let state = DaemonState::default();
+        let mut packet = make_test_packet(DhcpV4State::Discover as u8);
+        let pkt_len = packet.len();
+        let result = relay_upstream4(&mut packet, pkt_len, 0, &state);
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_make_test_context_fields() {
+        let ctx = make_test_context(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            3600,
+        );
+        assert_eq!(ctx.start, Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(ctx.end, Ipv4Addr::new(192, 168, 1, 200));
+        assert_eq!(ctx.local, Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(ctx.lease_time, 3600);
+        assert_eq!(ctx.netmask, Ipv4Addr::new(255, 255, 255, 0));
+    }
+
+    #[test]
+    fn test_dhcp_packet_as_bytes_mut() {
+        let packet = make_test_packet(DhcpV4State::Discover as u8);
+        let mut pkt = DhcpPacket::from_bytes(&packet).unwrap();
+        let bytes = pkt.as_bytes_mut();
+        bytes[0] = BOOTREPLY;
+        assert_eq!(pkt.op(), BOOTREPLY);
+    }
+
+    // ---------------------------------------------------------------
+    // Additional tests for deeper coverage of protocol functions
+    // ---------------------------------------------------------------
+
+    /// Build a minimal valid DHCP packet with magic cookie and message type.
+    fn build_dhcp_request_packet(msg_type: u8) -> Vec<u8> {
+        let mut pkt = vec![0u8; DHCP_HEADER_SIZE + 4 + 3 + 1];
+        pkt[0] = BOOTREQUEST;
+        pkt[1] = 1; // htype = Ethernet
+        pkt[2] = 6; // hlen = 6
+                    // xid = 0x12345678
+        pkt[4] = 0x12;
+        pkt[5] = 0x34;
+        pkt[6] = 0x56;
+        pkt[7] = 0x78;
+        // DHCP magic cookie
+        let co = DhcpPacket::OFF_OPTIONS;
+        pkt[co] = 99;
+        pkt[co + 1] = 130;
+        pkt[co + 2] = 83;
+        pkt[co + 3] = 99;
+        // Option 53 (Message Type) length=1 value=msg_type
+        pkt[co + 4] = OPTION_MESSAGE_TYPE;
+        pkt[co + 5] = 1;
+        pkt[co + 6] = msg_type;
+        // End
+        pkt[co + 7] = OPTION_END;
+        pkt
+    }
+
+    #[test]
+    fn test_is_pxe_client_with_pxe_vendor() {
+        let mut pkt = vec![0u8; DHCP_HEADER_SIZE + 4 + 2 + 20 + 1];
+        let co = DhcpPacket::OFF_OPTIONS;
+        pkt[co] = 99;
+        pkt[co + 1] = 130;
+        pkt[co + 2] = 83;
+        pkt[co + 3] = 99;
+        let vc = b"PXEClient:Arch:00000";
+        pkt[co + 4] = OPTION_VENDOR_CLASS_OPT;
+        pkt[co + 5] = vc.len() as u8;
+        pkt[co + 6..co + 6 + vc.len()].copy_from_slice(vc);
+        pkt[co + 6 + vc.len()] = OPTION_END;
+        let result = is_pxe_client(&pkt);
+        assert!(result.is_some());
+        assert!(result.unwrap().starts_with("PXEClient:"));
+    }
+
+    #[test]
+    fn test_is_pxe_client_non_pxe_vendor() {
+        let mut pkt = vec![0u8; DHCP_HEADER_SIZE + 4 + 2 + 12 + 1];
+        let co = DhcpPacket::OFF_OPTIONS;
+        pkt[co] = 99;
+        pkt[co + 1] = 130;
+        pkt[co + 2] = 83;
+        pkt[co + 3] = 99;
+        let vc = b"MSFT 5.0";
+        pkt[co + 4] = OPTION_VENDOR_CLASS_OPT;
+        pkt[co + 5] = vc.len() as u8;
+        pkt[co + 6..co + 6 + vc.len()].copy_from_slice(vc);
+        pkt[co + 6 + vc.len()] = OPTION_END;
+        assert!(is_pxe_client(&pkt).is_none());
+    }
+
+    #[test]
+    fn test_is_pxe_client_packet_too_small() {
+        assert!(is_pxe_client(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn test_pxe_misc_uuid_and_vendor() {
+        let mut buf = Vec::new();
+        let uuid = vec![0u8; 17];
+        pxe_misc(&mut buf, Some(&uuid), Some("PXEClient:Arch:00000"));
+        assert!(buf.len() > 17);
+        assert_eq!(buf[0], OPTION_PXE_UUID);
+        assert_eq!(buf[1], 17);
+    }
+
+    #[test]
+    fn test_pxe_misc_no_uuid() {
+        let mut buf = make_options_buf();
+        let initial_len = buf.len();
+        pxe_misc(&mut buf, None, Some("PXEClient:Arch:00000"));
+        // Should have written vendor class option, so buf grew
+        assert!(buf.len() > initial_len);
+    }
+
+    #[test]
+    fn test_pxe_misc_uuid_too_short() {
+        let mut buf = make_options_buf();
+        let initial_len = buf.len();
+        pxe_misc(&mut buf, Some(&[0u8; 10]), None);
+        // UUID too short (< 17 bytes), nothing should be written
+        assert_eq!(buf.len(), initial_len);
+    }
+
+    #[test]
+    fn test_pxe_misc_empty_vendor_class() {
+        let mut buf = make_options_buf();
+        let initial_len = buf.len();
+        pxe_misc(&mut buf, None, Some(""));
+        // Empty vendor string means nothing written
+        assert_eq!(buf.len(), initial_len);
+    }
+
+    #[test]
+    fn test_pxe_misc_none_none() {
+        let mut buf = make_options_buf();
+        let initial_len = buf.len();
+        pxe_misc(&mut buf, None, None);
+        // No UUID and no vendor means nothing written
+        assert_eq!(buf.len(), initial_len);
+    }
+
+    #[test]
+    fn test_pxe_opts_empty_services() {
+        let state = DaemonState::default();
+        let opts = pxe_opts(0, &[], Ipv4Addr::LOCALHOST, 0, &state);
+        assert!(opts.is_empty());
+    }
+
+    #[test]
+    fn test_pxe_opts_single_service() {
+        let mut state = DaemonState::default();
+        state.pxe_services.push(PxeService {
+            csa: 0,
+            service_type: 1,
+            menu: "Boot".to_string(),
+            basename: None,
+            sname: None,
+            server: None,
+        });
+        let opts = pxe_opts(0, &[], Ipv4Addr::new(192, 168, 1, 1), 0, &state);
+        assert!(opts.len() >= 3);
+    }
+
+    #[test]
+    fn test_pxe_opts_arch_mismatch() {
+        let mut state = DaemonState::default();
+        state.pxe_services.push(PxeService {
+            csa: 7,
+            service_type: 1,
+            menu: "EFI Boot".to_string(),
+            basename: None,
+            sname: None,
+            server: None,
+        });
+        assert!(pxe_opts(0, &[], Ipv4Addr::LOCALHOST, 0, &state).is_empty());
+        assert!(!pxe_opts(7, &[], Ipv4Addr::LOCALHOST, 0, &state).is_empty());
+    }
+
+    #[test]
+    fn test_pxe_opts_explicit_server_addr() {
+        let mut state = DaemonState::default();
+        state.pxe_services.push(PxeService {
+            csa: 0,
+            service_type: 2,
+            menu: "PXE".to_string(),
+            basename: None,
+            sname: None,
+            server: Some(Ipv4Addr::new(10, 0, 0, 100)),
+        });
+        let opts = pxe_opts(0, &[], Ipv4Addr::new(192, 168, 1, 1), 0, &state);
+        let srv_opt = opts.iter().find(|o| o.opt == SUBOPT_PXE_SERVERS as u16);
+        assert!(srv_opt.is_some());
+        assert!(srv_opt
+            .unwrap()
+            .val
+            .windows(4)
+            .any(|w| w == [10, 0, 0, 100]));
+    }
+
+    #[test]
+    fn test_pxe_opts_two_services() {
+        let mut state = DaemonState::default();
+        for i in 0..2 {
+            state.pxe_services.push(PxeService {
+                csa: 0,
+                service_type: i + 1,
+                menu: format!("Boot{}", i + 1),
+                basename: None,
+                sname: None,
+                server: None,
+            });
+        }
+        let opts = pxe_opts(0, &[], Ipv4Addr::LOCALHOST, 0, &state);
+        assert!(opts.len() >= 4);
+    }
+
+    #[test]
+    fn test_find_boot_empty_state() {
+        assert!(find_boot(&[], &DaemonState::default()).is_none());
+    }
+
+    #[test]
+    fn test_find_boot_untagged() {
+        let mut state = DaemonState::default();
+        state.boot_config = Some(TypesDhcpBoot {
+            file: Some("pxelinux.0".into()),
+            sname: Some("tftp".into()),
+            next_server: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            netid: None,
+        });
+        let r = find_boot(&[], &state);
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().file.as_deref(), Some("pxelinux.0"));
+    }
+
+    #[test]
+    fn test_find_boot_tag_matches_netid_v2() {
+        let mut state = DaemonState::default();
+        state.boot_config = Some(TypesDhcpBoot {
+            file: Some("pxe.0".into()),
+            sname: None,
+            next_server: None,
+            netid: Some("pxenet".into()),
+        });
+        assert!(find_boot(
+            &[NetId {
+                net: "pxenet".into()
+            }],
+            &state
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn test_find_boot_tag_no_match() {
+        let mut state = DaemonState::default();
+        state.boot_config = Some(TypesDhcpBoot {
+            file: Some("pxe.0".into()),
+            sname: None,
+            next_server: None,
+            netid: Some("pxenet".into()),
+        });
+        assert!(find_boot(
+            &[NetId {
+                net: "other".into()
+            }],
+            &state
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_relay_reply4_short_packet() {
+        assert!(relay_reply4(&mut [0u8; 10], 10, "eth0", &DaemonState::default()).is_none());
+    }
+
+    #[test]
+    fn test_relay_reply4_not_reply() {
+        let mut pkt = vec![0u8; DHCP_HEADER_SIZE + 10];
+        pkt[0] = BOOTREQUEST;
+        let pkt_len = pkt.len();
+        assert!(relay_reply4(&mut pkt, pkt_len, "eth0", &DaemonState::default()).is_none());
+    }
+
+    #[test]
+    fn test_relay_reply4_giaddr_zero() {
+        let mut pkt = vec![0u8; DHCP_HEADER_SIZE + 10];
+        pkt[0] = BOOTREPLY;
+        let pkt_len = pkt.len();
+        assert!(relay_reply4(&mut pkt, pkt_len, "eth0", &DaemonState::default()).is_none());
+    }
+
+    #[test]
+    fn test_relay_reply4_no_relay_match() {
+        let mut pkt = vec![0u8; DHCP_HEADER_SIZE + 10];
+        pkt[0] = BOOTREPLY;
+        let gi = DhcpPacket::OFF_GIADDR;
+        pkt[gi] = 10;
+        pkt[gi + 1] = 0;
+        pkt[gi + 2] = 0;
+        pkt[gi + 3] = 1;
+        let pkt_len = pkt.len();
+        assert!(relay_reply4(&mut pkt, pkt_len, "eth0", &DaemonState::default()).is_none());
+    }
+
+    #[test]
+    fn test_relay_upstream4_no_relay_config_v2() {
+        let mut pkt = vec![0u8; DHCP_HEADER_SIZE + 10];
+        pkt[0] = BOOTREQUEST;
+        let pkt_len = pkt.len();
+        let r = relay_upstream4(&mut pkt, pkt_len, 0, &DaemonState::default()).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn test_relay_upstream4_short() {
+        let mut state = DaemonState::default();
+        state.relay4.push(crate::core::types::DhcpRelay {
+            local: std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            server: std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            interface: Some("eth0".into()),
+            mask: None,
+            iface_index: 0,
+            port: 67,
+            split_mode: false,
+        });
+        let r = relay_upstream4(&mut [0u8; 10], 10, 0, &state).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn test_relay_upstream4_not_request() {
+        let mut state = DaemonState::default();
+        state.relay4.push(crate::core::types::DhcpRelay {
+            local: std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            server: std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            interface: Some("eth0".into()),
+            mask: None,
+            iface_index: 0,
+            port: 67,
+            split_mode: false,
+        });
+        let mut pkt = vec![0u8; DHCP_HEADER_SIZE + 10];
+        pkt[0] = BOOTREPLY;
+        let pkt_len = pkt.len();
+        let r = relay_upstream4(&mut pkt, pkt_len, 0, &state).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn test_do_options_empty_request_list() {
+        let mut buf = make_options_buf();
+        let req: Vec<u8> = vec![];
+        let mut ctx = DhcpOptionsContext {
+            context: None,
+            buf: &mut buf,
+            req_options: &req,
+            hostname: None,
+            domain: None,
+            netids: &[],
+            subnet_addr: None,
+            fqdn_flags: 0,
+            null_term: false,
+            pxe_arch: None,
+            uuid: None,
+            vendor_class_len: 0,
+            now: 0,
+            lease_time: 3600,
+            fuzz: 0,
+            pxe_vendor: None,
+            is_leasequery: false,
+            state: &DaemonState::default(),
+        };
+        assert!(do_options(&mut ctx).is_ok());
+    }
+
+    #[test]
+    fn test_do_options_subnet_and_router() {
+        let dctx = make_test_context(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            3600,
+        );
+        let mut buf = make_options_buf();
+        let req: Vec<u8> = vec![OPTION_NETMASK, OPTION_ROUTER, OPTION_BROADCAST];
+        let mut ctx = DhcpOptionsContext {
+            context: Some(&dctx),
+            buf: &mut buf,
+            req_options: &req,
+            hostname: None,
+            domain: None,
+            netids: &[],
+            subnet_addr: None,
+            fqdn_flags: 0,
+            null_term: false,
+            pxe_arch: None,
+            uuid: None,
+            vendor_class_len: 0,
+            now: 0,
+            lease_time: 3600,
+            fuzz: 0,
+            pxe_vendor: None,
+            is_leasequery: false,
+            state: &DaemonState::default(),
+        };
+        assert!(do_options(&mut ctx).is_ok());
+        assert!(buf.len() >= 12);
+    }
+
+    #[test]
+    fn test_do_options_hostname_and_domain() {
+        let mut buf = make_options_buf();
+        let req: Vec<u8> = vec![OPTION_HOSTNAME, OPTION_DOMAINNAME];
+        let mut ctx = DhcpOptionsContext {
+            context: None,
+            buf: &mut buf,
+            req_options: &req,
+            hostname: Some("myhost"),
+            domain: Some("example.com"),
+            netids: &[],
+            subnet_addr: None,
+            fqdn_flags: 0,
+            null_term: false,
+            pxe_arch: None,
+            uuid: None,
+            vendor_class_len: 0,
+            now: 0,
+            lease_time: 3600,
+            fuzz: 0,
+            pxe_vendor: None,
+            is_leasequery: false,
+            state: &DaemonState::default(),
+        };
+        assert!(do_options(&mut ctx).is_ok());
+    }
+
+    #[test]
+    fn test_do_options_lease_time_options() {
+        let mut buf = make_options_buf();
+        let req: Vec<u8> = vec![
+            OPTION_LEASE_TIME,
+            OPTION_SERVER_IDENTIFIER,
+            OPTION_T1,
+            OPTION_T2,
+        ];
+        let mut ctx = DhcpOptionsContext {
+            context: None,
+            buf: &mut buf,
+            req_options: &req,
+            hostname: None,
+            domain: None,
+            netids: &[],
+            subnet_addr: None,
+            fqdn_flags: 0,
+            null_term: false,
+            pxe_arch: None,
+            uuid: None,
+            vendor_class_len: 0,
+            now: 0,
+            lease_time: 7200,
+            fuzz: 0,
+            pxe_vendor: None,
+            is_leasequery: false,
+            state: &DaemonState::default(),
+        };
+        assert!(do_options(&mut ctx).is_ok());
+    }
+
+    #[test]
+    fn test_do_options_dns_server_request() {
+        let mut buf = make_options_buf();
+        let req: Vec<u8> = vec![OPTION_DNSSERVER];
+        let mut state = DaemonState::default();
+        // DNS port is configured in state
+        let mut ctx = DhcpOptionsContext {
+            context: None,
+            buf: &mut buf,
+            req_options: &req,
+            hostname: None,
+            domain: None,
+            netids: &[],
+            subnet_addr: None,
+            fqdn_flags: 0,
+            null_term: false,
+            pxe_arch: None,
+            uuid: None,
+            vendor_class_len: 0,
+            now: 0,
+            lease_time: 3600,
+            fuzz: 0,
+            pxe_vendor: None,
+            is_leasequery: false,
+            state: &state,
+        };
+        assert!(do_options(&mut ctx).is_ok());
+    }
+
+    #[test]
+    fn test_dhcp_reply_short_packet() {
+        let mut pkt = vec![0u8; 10];
+        let mut state = DaemonState::default();
+        let mut ctx = DhcpReplyContext {
+            contexts: vec![],
+            iface_name: "eth0",
+            if_index: 0,
+            packet_data: &mut pkt,
+            now: 0,
+            unicast_dest: false,
+            loopback: false,
+            pxe: false,
+            fallback_addr: Ipv4Addr::UNSPECIFIED,
+            recv_time: 0,
+            leasequery_source: None,
+            state: &mut state,
+        };
+        let mut lease_db = LeaseDatabase::new(1000);
+        let mut dns_cache = DnsCache::cache_init(None).unwrap();
+        assert!(dhcp_reply(&mut ctx, &mut lease_db, &mut dns_cache).is_err());
+    }
+
+    #[test]
+    fn test_dhcp_reply_non_request() {
+        let mut pkt = vec![0u8; DHCP_HEADER_SIZE + 10];
+        pkt[0] = BOOTREPLY;
+        let mut state = DaemonState::default();
+        let mut ctx = DhcpReplyContext {
+            contexts: vec![],
+            iface_name: "eth0",
+            if_index: 0,
+            packet_data: &mut pkt,
+            now: 0,
+            unicast_dest: false,
+            loopback: false,
+            pxe: false,
+            fallback_addr: Ipv4Addr::UNSPECIFIED,
+            recv_time: 0,
+            leasequery_source: None,
+            state: &mut state,
+        };
+        let mut lease_db = LeaseDatabase::new(1000);
+        let mut dns_cache = DnsCache::cache_init(None).unwrap();
+        let r = dhcp_reply(&mut ctx, &mut lease_db, &mut dns_cache);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_dhcp_reply_hlen_too_large() {
+        let mut pkt = vec![0u8; DHCP_HEADER_SIZE + 10];
+        pkt[0] = BOOTREQUEST;
+        pkt[2] = 255; // hlen > max
+        let mut state = DaemonState::default();
+        let mut ctx = DhcpReplyContext {
+            contexts: vec![],
+            iface_name: "eth0",
+            if_index: 0,
+            packet_data: &mut pkt,
+            now: 0,
+            unicast_dest: false,
+            loopback: false,
+            pxe: false,
+            fallback_addr: Ipv4Addr::UNSPECIFIED,
+            recv_time: 0,
+            leasequery_source: None,
+            state: &mut state,
+        };
+        let mut lease_db = LeaseDatabase::new(1000);
+        let mut dns_cache = DnsCache::cache_init(None).unwrap();
+        let r = dhcp_reply(&mut ctx, &mut lease_db, &mut dns_cache);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_dhcp_reply_discover_no_context() {
+        let mut pkt = build_dhcp_request_packet(1); // DISCOVER
+        let mut state = DaemonState::default();
+        let mut ctx = DhcpReplyContext {
+            contexts: vec![],
+            iface_name: "eth0",
+            if_index: 0,
+            packet_data: &mut pkt,
+            now: 100,
+            unicast_dest: false,
+            loopback: false,
+            pxe: false,
+            fallback_addr: Ipv4Addr::new(192, 168, 1, 1),
+            recv_time: 100,
+            leasequery_source: None,
+            state: &mut state,
+        };
+        let mut lease_db = LeaseDatabase::new(1000);
+        let mut dns_cache = DnsCache::cache_init(None).unwrap();
+        let _r = dhcp_reply(&mut ctx, &mut lease_db, &mut dns_cache);
+    }
+
+    #[test]
+    fn test_dhcp_reply_request_no_context() {
+        let mut pkt = build_dhcp_request_packet(3); // REQUEST
+        let mut state = DaemonState::default();
+        let mut ctx = DhcpReplyContext {
+            contexts: vec![],
+            iface_name: "eth0",
+            if_index: 0,
+            packet_data: &mut pkt,
+            now: 100,
+            unicast_dest: false,
+            loopback: false,
+            pxe: false,
+            fallback_addr: Ipv4Addr::new(192, 168, 1, 1),
+            recv_time: 100,
+            leasequery_source: None,
+            state: &mut state,
+        };
+        let mut lease_db = LeaseDatabase::new(1000);
+        let mut dns_cache = DnsCache::cache_init(None).unwrap();
+        let _r = dhcp_reply(&mut ctx, &mut lease_db, &mut dns_cache);
+    }
+
+    #[test]
+    fn test_dhcp_reply_inform_no_context() {
+        let mut pkt = build_dhcp_request_packet(8); // INFORM
+        let mut state = DaemonState::default();
+        let mut ctx = DhcpReplyContext {
+            contexts: vec![],
+            iface_name: "eth0",
+            if_index: 0,
+            packet_data: &mut pkt,
+            now: 100,
+            unicast_dest: false,
+            loopback: false,
+            pxe: false,
+            fallback_addr: Ipv4Addr::new(192, 168, 1, 1),
+            recv_time: 100,
+            leasequery_source: None,
+            state: &mut state,
+        };
+        let mut lease_db = LeaseDatabase::new(1000);
+        let mut dns_cache = DnsCache::cache_init(None).unwrap();
+        let _r = dhcp_reply(&mut ctx, &mut lease_db, &mut dns_cache);
+    }
+
+    #[test]
+    fn test_dhcp_reply_release_no_context() {
+        let mut pkt = build_dhcp_request_packet(7); // RELEASE
+        let mut state = DaemonState::default();
+        let mut ctx = DhcpReplyContext {
+            contexts: vec![],
+            iface_name: "eth0",
+            if_index: 0,
+            packet_data: &mut pkt,
+            now: 100,
+            unicast_dest: false,
+            loopback: false,
+            pxe: false,
+            fallback_addr: Ipv4Addr::new(192, 168, 1, 1),
+            recv_time: 100,
+            leasequery_source: None,
+            state: &mut state,
+        };
+        let mut lease_db = LeaseDatabase::new(1000);
+        let mut dns_cache = DnsCache::cache_init(None).unwrap();
+        let _r = dhcp_reply(&mut ctx, &mut lease_db, &mut dns_cache);
+    }
+
+    #[test]
+    fn test_dhcp_reply_decline_no_context() {
+        let mut pkt = build_dhcp_request_packet(4); // DECLINE
+        let mut state = DaemonState::default();
+        let mut ctx = DhcpReplyContext {
+            contexts: vec![],
+            iface_name: "eth0",
+            if_index: 0,
+            packet_data: &mut pkt,
+            now: 100,
+            unicast_dest: false,
+            loopback: false,
+            pxe: false,
+            fallback_addr: Ipv4Addr::new(192, 168, 1, 1),
+            recv_time: 100,
+            leasequery_source: None,
+            state: &mut state,
+        };
+        let mut lease_db = LeaseDatabase::new(1000);
+        let mut dns_cache = DnsCache::cache_init(None).unwrap();
+        let _r = dhcp_reply(&mut ctx, &mut lease_db, &mut dns_cache);
+    }
+
+    #[test]
+    fn test_dhcp_reply_bootp_no_magic_cookie() {
+        let mut pkt = vec![0u8; DHCP_HEADER_SIZE + 10];
+        pkt[0] = BOOTREQUEST;
+        pkt[1] = 1;
+        pkt[2] = 6;
+        let mut state = DaemonState::default();
+        let mut ctx = DhcpReplyContext {
+            contexts: vec![],
+            iface_name: "eth0",
+            if_index: 0,
+            packet_data: &mut pkt,
+            now: 100,
+            unicast_dest: false,
+            loopback: false,
+            pxe: false,
+            fallback_addr: Ipv4Addr::new(192, 168, 1, 1),
+            recv_time: 100,
+            leasequery_source: None,
+            state: &mut state,
+        };
+        let mut lease_db = LeaseDatabase::new(1000);
+        let mut dns_cache = DnsCache::cache_init(None).unwrap();
+        let _r = dhcp_reply(&mut ctx, &mut lease_db, &mut dns_cache);
+    }
+
+    #[test]
+    fn test_all_dhcpv4_state_names() {
+        assert_eq!(DhcpV4State::Discover.name(), "DHCPDISCOVER");
+        assert_eq!(DhcpV4State::Offer.name(), "DHCPOFFER");
+        assert_eq!(DhcpV4State::Request.name(), "DHCPREQUEST");
+        assert_eq!(DhcpV4State::Decline.name(), "DHCPDECLINE");
+        assert_eq!(DhcpV4State::Ack.name(), "DHCPACK");
+        assert_eq!(DhcpV4State::Nak.name(), "DHCPNAK");
+        assert_eq!(DhcpV4State::Release.name(), "DHCPRELEASE");
+        assert_eq!(DhcpV4State::Inform.name(), "DHCPINFORM");
+    }
+
+    #[test]
+    fn test_dhcpv4_state_try_from_all_values() {
+        for v in 1u8..=13 {
+            assert!(
+                DhcpV4State::try_from(v).is_ok(),
+                "Value {} should be valid",
+                v
+            );
+        }
+        assert!(DhcpV4State::try_from(0u8).is_err());
+        assert!(DhcpV4State::try_from(14u8).is_err());
+        assert!(DhcpV4State::try_from(255u8).is_err());
+    }
+
+    #[test]
+    fn test_packet_all_setters_and_getters() {
+        let raw = vec![0u8; DHCP_HEADER_SIZE + 10];
+        let mut pkt = DhcpPacket::from_bytes(&raw).unwrap();
+        pkt.set_op(BOOTREPLY);
+        pkt.set_hops(3);
+        pkt.set_ciaddr(Ipv4Addr::new(10, 0, 0, 1));
+        pkt.set_yiaddr(Ipv4Addr::new(10, 0, 0, 2));
+        pkt.set_siaddr(Ipv4Addr::new(10, 0, 0, 3));
+        pkt.set_giaddr(Ipv4Addr::new(10, 0, 0, 4));
+        pkt.set_flags(0x8000);
+        assert_eq!(pkt.op(), BOOTREPLY);
+        assert_eq!(pkt.hops(), 3);
+        assert_eq!(pkt.ciaddr_addr(), Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(pkt.yiaddr_addr(), Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(pkt.siaddr_addr(), Ipv4Addr::new(10, 0, 0, 3));
+        assert_eq!(pkt.giaddr_addr(), Ipv4Addr::new(10, 0, 0, 4));
+        assert_eq!(pkt.flags(), 0x8000);
+    }
+
+    #[test]
+    fn test_packet_sname_and_file_setters() {
+        let raw = vec![0u8; DHCP_HEADER_SIZE + 10];
+        let mut pkt = DhcpPacket::from_bytes(&raw).unwrap();
+        pkt.set_sname(b"tftpserver");
+        pkt.set_file(b"pxelinux.0");
+        assert!(pkt.sname().starts_with(b"tftpserver"));
+        assert!(pkt.file().starts_with(b"pxelinux.0"));
+    }
+
+    #[test]
+    fn test_packet_htype_secs() {
+        let mut raw = vec![0u8; DHCP_HEADER_SIZE + 10];
+        raw[1] = 1;
+        raw[8] = 0;
+        raw[9] = 30;
+        let pkt = DhcpPacket::from_bytes(&raw).unwrap();
+        assert_eq!(pkt.htype(), 1);
+        assert_eq!(pkt.secs(), 30);
+    }
+
+    #[test]
+    fn test_relay_reply4_giaddr_set_no_relay() {
+        let mut pkt = vec![0u8; DHCP_HEADER_SIZE + 10];
+        pkt[0] = BOOTREPLY;
+        let gi = DhcpPacket::OFF_GIADDR;
+        pkt[gi] = 10;
+        pkt[gi + 1] = 0;
+        pkt[gi + 2] = 0;
+        pkt[gi + 3] = 1;
+        let pkt_len = pkt.len();
+        assert!(relay_reply4(&mut pkt, pkt_len, "eth0", &DaemonState::default()).is_none());
+    }
+
+    #[test]
+    fn test_do_options_with_pxe_arch() {
+        let mut buf = make_options_buf();
+        let req: Vec<u8> = vec![];
+        let mut ctx = DhcpOptionsContext {
+            context: None,
+            buf: &mut buf,
+            req_options: &req,
+            hostname: None,
+            domain: None,
+            netids: &[],
+            subnet_addr: None,
+            fqdn_flags: 0,
+            null_term: false,
+            pxe_arch: Some(0),
+            uuid: None,
+            vendor_class_len: 0,
+            now: 0,
+            lease_time: 3600,
+            fuzz: 0,
+            pxe_vendor: Some("PXEClient:Arch:00000"),
+            is_leasequery: false,
+            state: &DaemonState::default(),
+        };
+        assert!(do_options(&mut ctx).is_ok());
+    }
+
+    #[test]
+    fn test_do_options_leasequery() {
+        let mut buf = make_options_buf();
+        let req: Vec<u8> = vec![OPTION_LEASE_TIME];
+        let mut ctx = DhcpOptionsContext {
+            context: None,
+            buf: &mut buf,
+            req_options: &req,
+            hostname: None,
+            domain: None,
+            netids: &[],
+            subnet_addr: None,
+            fqdn_flags: 0,
+            null_term: false,
+            pxe_arch: None,
+            uuid: None,
+            vendor_class_len: 0,
+            now: 0,
+            lease_time: 3600,
+            fuzz: 0,
+            pxe_vendor: None,
+            is_leasequery: true,
+            state: &DaemonState::default(),
+        };
+        assert!(do_options(&mut ctx).is_ok());
+    }
+
+    #[test]
+    fn test_dhcp_reply_with_context() {
+        let dctx = make_test_context(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            3600,
+        );
+        let mut pkt = build_dhcp_request_packet(1); // DISCOVER
+        let mut state = DaemonState::default();
+        let mut ctx = DhcpReplyContext {
+            contexts: vec![&dctx],
+            iface_name: "eth0",
+            if_index: 0,
+            packet_data: &mut pkt,
+            now: 100,
+            unicast_dest: false,
+            loopback: false,
+            pxe: false,
+            fallback_addr: Ipv4Addr::new(192, 168, 1, 1),
+            recv_time: 100,
+            leasequery_source: None,
+            state: &mut state,
+        };
+        let mut lease_db = LeaseDatabase::new(1000);
+        let mut dns_cache = DnsCache::cache_init(None).unwrap();
+        let _r = dhcp_reply(&mut ctx, &mut lease_db, &mut dns_cache);
+    }
+
+    #[test]
+    fn test_dhcp_reply_pxe_flag() {
+        let dctx = make_test_context(
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            3600,
+        );
+        let mut pkt = build_dhcp_request_packet(1);
+        let mut state = DaemonState::default();
+        let mut ctx = DhcpReplyContext {
+            contexts: vec![&dctx],
+            iface_name: "eth0",
+            if_index: 0,
+            packet_data: &mut pkt,
+            now: 100,
+            unicast_dest: false,
+            loopback: false,
+            pxe: true, // PXE enabled
+            fallback_addr: Ipv4Addr::new(192, 168, 1, 1),
+            recv_time: 100,
+            leasequery_source: None,
+            state: &mut state,
+        };
+        let mut lease_db = LeaseDatabase::new(1000);
+        let mut dns_cache = DnsCache::cache_init(None).unwrap();
+        let _r = dhcp_reply(&mut ctx, &mut lease_db, &mut dns_cache);
+    }
+
+    // --- DhcpPacket Debug/Display/setter coverage ---
+
+    fn make_zeroed_pkt() -> DhcpPacket {
+        DhcpPacket::from_bytes(&vec![0u8; DHCP_PACKET_SIZE]).unwrap()
+    }
+
+    #[test]
+    fn test_dhcp_packet_debug_display() {
+        let mut pkt = make_zeroed_pkt();
+        pkt.set_op(BOOTREQUEST);
+        pkt.set_ciaddr(Ipv4Addr::new(10, 0, 0, 1));
+        pkt.set_yiaddr(Ipv4Addr::new(10, 0, 0, 2));
+        pkt.set_siaddr(Ipv4Addr::new(10, 0, 0, 3));
+        pkt.set_giaddr(Ipv4Addr::new(10, 0, 0, 4));
+        let dbg = format!("{:?}", pkt);
+        assert!(dbg.contains("DhcpPacket"));
+        assert!(dbg.contains("10.0.0.1"));
+        let disp = format!("{}", pkt);
+        assert!(disp.contains("DhcpPacket"));
+        assert!(disp.contains("10.0.0.2"));
+    }
+
+    #[test]
+    fn test_dhcp_packet_setters_and_getters_full() {
+        let mut pkt = make_zeroed_pkt();
+        pkt.set_op(BOOTREPLY);
+        assert_eq!(pkt.op(), BOOTREPLY);
+        pkt.set_hops(5);
+        assert_eq!(pkt.hops(), 5);
+        pkt.set_flags(0x8000);
+        assert_eq!(pkt.flags(), 0x8000);
+        pkt.set_sname(b"testserver");
+        assert_eq!(&pkt.sname()[..10], b"testserver");
+        pkt.set_file(b"pxelinux.0");
+        assert_eq!(&pkt.file()[..10], b"pxelinux.0");
+    }
+
+    #[test]
+    fn test_dhcp_packet_addr_accessors() {
+        let mut pkt = make_zeroed_pkt();
+        pkt.set_ciaddr(Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(pkt.ciaddr_addr(), Ipv4Addr::new(192, 168, 1, 100));
+        pkt.set_yiaddr(Ipv4Addr::new(192, 168, 1, 200));
+        assert_eq!(pkt.yiaddr_addr(), Ipv4Addr::new(192, 168, 1, 200));
+        pkt.set_siaddr(Ipv4Addr::new(172, 16, 0, 1));
+        assert_eq!(pkt.siaddr_addr(), Ipv4Addr::new(172, 16, 0, 1));
+        pkt.set_giaddr(Ipv4Addr::new(10, 255, 255, 254));
+        assert_eq!(pkt.giaddr_addr(), Ipv4Addr::new(10, 255, 255, 254));
+    }
+
+    #[test]
+    fn test_dhcp_packet_has_dhcp_cookie() {
+        let mut pkt = make_zeroed_pkt();
+        // Without cookie, should be false
+        assert!(!pkt.has_dhcp_cookie());
+        // Set the magic cookie at options offset
+        let off = DhcpPacket::OFF_OPTIONS;
+        pkt.data[off] = 99;
+        pkt.data[off + 1] = 130;
+        pkt.data[off + 2] = 83;
+        pkt.data[off + 3] = 99;
+        assert!(pkt.has_dhcp_cookie());
+    }
+
+    #[test]
+    fn test_dhcp_v4_state_name_all() {
+        let types: &[(DhcpV4State, &str)] = &[
+            (DhcpV4State::Discover, "DHCPDISCOVER"),
+            (DhcpV4State::Offer, "DHCPOFFER"),
+            (DhcpV4State::Request, "DHCPREQUEST"),
+            (DhcpV4State::Decline, "DHCPDECLINE"),
+            (DhcpV4State::Ack, "DHCPACK"),
+            (DhcpV4State::Nak, "DHCPNAK"),
+            (DhcpV4State::Release, "DHCPRELEASE"),
+            (DhcpV4State::Inform, "DHCPINFORM"),
+            (DhcpV4State::ForceRenew, "DHCPFORCERENEW"),
+            (DhcpV4State::LeaseQuery, "DHCPLEASEQUERY"),
+            (DhcpV4State::LeaseUnassigned, "DHCPLEASEUNASSIGNED"),
+            (DhcpV4State::LeaseUnknown, "DHCPLEASEUNKNOWN"),
+            (DhcpV4State::LeaseActive, "DHCPLEASEACTIVE"),
+        ];
+        for (state, name) in types {
+            assert_eq!(state.name(), *name);
+        }
+    }
+
+    #[test]
+    fn test_dhcp_v4_state_try_from_all() {
+        for v in 1u8..=13 {
+            let s = DhcpV4State::try_from(v);
+            assert!(s.is_ok(), "valid value {} should parse", v);
+            assert_eq!(s.unwrap() as u8, v);
+        }
+        assert!(DhcpV4State::try_from(0).is_err());
+        assert!(DhcpV4State::try_from(14).is_err());
+        assert!(DhcpV4State::try_from(255).is_err());
+    }
+
+    #[test]
+    fn test_dhcp_packet_cookie_and_option() {
+        let mut pkt = make_zeroed_pkt();
+        let off = DhcpPacket::OFF_OPTIONS;
+        pkt.data[off] = 99;
+        pkt.data[off + 1] = 130;
+        pkt.data[off + 2] = 83;
+        pkt.data[off + 3] = 99;
+        // Add message type option: type=53, len=1, val=1 (DISCOVER)
+        pkt.data[off + 4] = 53;
+        pkt.data[off + 5] = 1;
+        pkt.data[off + 6] = 1;
+        // End option
+        pkt.data[off + 7] = 255;
+        assert!(pkt.has_dhcp_cookie());
+    }
+
+    #[test]
+    fn test_dhcp_packet_options_accessor() {
+        let pkt = make_zeroed_pkt();
+        let opts = pkt.options();
+        // Options section starts after fixed fields (offset 236)
+        assert!(!opts.is_empty());
+    }
+
+    #[test]
+    fn test_dhcp_packet_sname_file_truncation() {
+        let mut pkt = make_zeroed_pkt();
+        let long_sname = vec![b'A'; 128];
+        pkt.set_sname(&long_sname);
+        // sname is max 64 bytes
+        assert_eq!(pkt.sname().len(), 64);
+        assert!(pkt.sname().iter().all(|&b| b == b'A'));
+        let long_file = vec![b'B'; 256];
+        pkt.set_file(&long_file);
+        // file is max 128 bytes
+        assert_eq!(pkt.file().len(), 128);
+        assert!(pkt.file().iter().all(|&b| b == b'B'));
+    }
+
+    #[test]
+    fn test_dhcp_packet_chaddr_and_fields() {
+        let pkt = make_zeroed_pkt();
+        let ch = pkt.chaddr();
+        assert_eq!(ch.len(), 16);
+        assert_eq!(pkt.htype(), 0);
+        assert_eq!(pkt.hlen(), 0);
+        assert_eq!(pkt.secs(), 0);
+        assert_eq!(pkt.xid(), 0);
+    }
+
+    #[test]
+    fn test_dhcp_packet_new_reply_copies_fields() {
+        let mut req = make_zeroed_pkt();
+        req.set_op(BOOTREQUEST);
+        let xid_bytes = 0xDEADBEEFu32.to_be_bytes();
+        req.data[DhcpPacket::OFF_XID..DhcpPacket::OFF_XID + 4].copy_from_slice(&xid_bytes);
+        req.data[DhcpPacket::OFF_HTYPE] = 1;
+        req.data[DhcpPacket::OFF_HLEN] = 6;
+        let reply = DhcpPacket::new_reply(&req);
+        assert_eq!(reply.op(), BOOTREPLY);
+        assert_eq!(reply.xid(), 0xDEADBEEF);
+        assert_eq!(reply.htype(), 1);
+        assert_eq!(reply.hlen(), 6);
+        assert!(reply.has_dhcp_cookie());
+    }
+
+    #[test]
+    fn test_dhcp_packet_from_bytes_tiny() {
+        let tiny = vec![0u8; 5];
+        assert!(DhcpPacket::from_bytes(&tiny).is_none());
+    }
+
+    #[test]
+    fn test_state_time_monotonic() {
+        let t1 = state_time();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let t2 = state_time();
+        assert!(t2 >= t1);
     }
 }

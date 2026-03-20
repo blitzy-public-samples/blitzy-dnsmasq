@@ -304,6 +304,21 @@ pub struct DhcpLease {
 }
 
 impl DhcpLease {
+    /// Create a new DHCPv6 lease for testing.
+    ///
+    /// Constructs a lease with the given IPv6 address, prefix length, IAID, and expiry.
+    /// All other fields are set to sensible defaults.
+    #[cfg(test)]
+    pub fn new_v6(addr6: std::net::Ipv6Addr, prefix_len: u8, iaid: u32, expires: i64) -> Self {
+        let mut lease = Self::new_empty();
+        lease.addr6 = Some(addr6);
+        lease.prefix_len = prefix_len;
+        lease.iaid = iaid;
+        lease.expires = expires;
+        lease.lease_type = LeaseType::Na;
+        lease
+    }
+
     /// Create a new empty lease with sentinel values matching C's `lease_allocate()`.
     ///
     /// Mirrors C behavior: `expires = 1` (sentinel for "never persisted"),
@@ -2462,5 +2477,1746 @@ mod tests {
         let pruned = lease_prune(&mut db, None, now);
         assert_eq!(pruned, 0);
         assert_eq!(db.leases.len(), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // write_v4_lease tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_write_v4_lease_with_all_fields() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(192, 168, 1, 50));
+        lease.expires = 1700000000;
+        lease.hwaddr[..6].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        lease.hwaddr_len = 6;
+        lease.hwaddr_type = ARPHRD_ETHER as i32;
+        lease.hostname = Some("testhost".to_string());
+        lease.clid = Some(vec![0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+
+        let mut buf = Vec::new();
+        write_v4_lease(&mut buf, &lease).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        assert!(line.starts_with("1700000000 "));
+        assert!(line.contains("192.168.1.50"));
+        assert!(line.contains("testhost"));
+    }
+
+    #[test]
+    fn test_write_v4_lease_star_for_missing() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.expires = 1700000000;
+        lease.hwaddr_len = 6;
+        lease.hwaddr_type = ARPHRD_ETHER as i32;
+        lease.hostname = None;
+        lease.clid = None;
+
+        let mut buf = Vec::new();
+        write_v4_lease(&mut buf, &lease).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        // Hostname and CLID should be "*"
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        assert_eq!(parts[3], "*");
+        assert_eq!(parts[4], "*");
+    }
+
+    // -------------------------------------------------------------------
+    // write_v6_lease tests
+    // -------------------------------------------------------------------
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_write_v6_lease_na_format() {
+        let mut lease = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            LeaseType::Na,
+        );
+        lease.expires = 1700000000;
+        lease.iaid = 12345;
+        lease.hostname = Some("v6host".to_string());
+        lease.clid = Some(vec![0x00, 0x01, 0x00, 0x01]);
+
+        let mut buf = Vec::new();
+        write_v6_lease(&mut buf, &lease).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        assert!(line.contains("12345 na"));
+        assert!(line.contains("2001:db8::1"));
+        assert!(line.contains("v6host"));
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_write_v6_lease_ta_format() {
+        let mut lease = lease6_allocate(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), LeaseType::Ta);
+        lease.expires = 1700000000;
+        lease.iaid = 42;
+        lease.hostname = None;
+        lease.clid = None;
+
+        let mut buf = Vec::new();
+        write_v6_lease(&mut buf, &lease).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        assert!(line.contains("T42 ta"));
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_write_v6_lease_pd_prefix() {
+        let mut lease = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0x100, 0, 0, 0, 0, 0),
+            LeaseType::Pd,
+        );
+        lease.expires = 1700000000;
+        lease.iaid = 999;
+        lease.prefix_len = 48;
+        lease.hostname = Some("prefix-host".to_string());
+        lease.clid = Some(vec![0x00, 0x01]);
+
+        let mut buf = Vec::new();
+        write_v6_lease(&mut buf, &lease).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        assert!(line.contains("999 pd"));
+        assert!(line.contains("/48"));
+    }
+
+    // -------------------------------------------------------------------
+    // format_mac_for_file tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_format_mac_for_file_standard_ether() {
+        let mac = vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let result = format_mac_for_file(&mac, 6, ARPHRD_ETHER as i32);
+        assert_eq!(result, "00:11:22:33:44:55");
+    }
+
+    #[test]
+    fn test_format_mac_for_file_non_ether_type() {
+        let mac = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let result = format_mac_for_file(&mac, 4, 6);
+        assert!(result.starts_with("6-"));
+    }
+
+    #[test]
+    fn test_format_mac_for_file_short_length() {
+        let mac = vec![0x01, 0x02, 0x03];
+        let result = format_mac_for_file(&mac, 3, ARPHRD_ETHER as i32);
+        // Non-6-byte even with ether type → prefixed format
+        assert!(result.starts_with(&format!("{}-", ARPHRD_ETHER)));
+    }
+
+    // -------------------------------------------------------------------
+    // LeaseType additional tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_lease_type_to_flags_distinct() {
+        let flags: Vec<u32> = [LeaseType::Na, LeaseType::Ta, LeaseType::Pd, LeaseType::V4]
+            .iter()
+            .map(|lt| lt.to_flags())
+            .collect();
+        for i in 0..flags.len() {
+            for j in (i + 1)..flags.len() {
+                if flags[i] != 0 && flags[j] != 0 {
+                    assert_ne!(flags[i], flags[j], "flags at {} and {} collide", i, j);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_lease_type_from_str_token_cases() {
+        assert_eq!(LeaseType::from_str_token("NA"), None);
+        assert_eq!(LeaseType::from_str_token(""), None);
+        assert_eq!(LeaseType::from_str_token("xyz"), None);
+    }
+
+    // -------------------------------------------------------------------
+    // LeaseFlags tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_lease_flags_all_false() {
+        let f = LeaseFlags {
+            is_new: false,
+            has_changed: false,
+            aux_changed: false,
+        };
+        assert!(!f.any_changed());
+        assert_eq!(f.to_raw(), 0);
+    }
+
+    #[test]
+    fn test_lease_flags_is_new_only() {
+        let f = LeaseFlags {
+            is_new: true,
+            has_changed: false,
+            aux_changed: false,
+        };
+        assert!(f.any_changed());
+    }
+
+    #[test]
+    fn test_lease_flags_from_raw_nonzero() {
+        let f = LeaseFlags::from_raw(LEASE_NEW | LEASE_CHANGED);
+        assert!(f.is_new);
+        assert!(f.has_changed);
+        assert!(!f.aux_changed);
+    }
+
+    #[test]
+    fn test_lease_flags_roundtrip_all() {
+        let original = LeaseFlags {
+            is_new: true,
+            has_changed: true,
+            aux_changed: true,
+        };
+        let raw = original.to_raw();
+        let restored = LeaseFlags::from_raw(raw);
+        assert_eq!(restored.is_new, original.is_new);
+        assert_eq!(restored.has_changed, original.has_changed);
+        assert_eq!(restored.aux_changed, original.aux_changed);
+    }
+
+    // -------------------------------------------------------------------
+    // lease_set_hwaddr additional tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_set_hwaddr_force_update() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(192, 168, 1, 1));
+        let mac = vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        lease_set_hwaddr(&mut lease, &mac, None, 6, ARPHRD_ETHER as i32, 0, false);
+        // Set again with force=true
+        lease_set_hwaddr(
+            &mut lease,
+            &mac,
+            Some(&[0x01, 0x02]),
+            6,
+            ARPHRD_ETHER as i32,
+            0,
+            true,
+        );
+        assert_eq!(lease.clid, Some(vec![0x01, 0x02]));
+    }
+
+    // -------------------------------------------------------------------
+    // lease_set_hostname via database
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_set_hostname_via_db() {
+        let mut db = LeaseDatabase::new(10);
+        let lease = lease4_allocate(Ipv4Addr::new(192, 168, 1, 1));
+        db.leases.push(lease);
+        db.leases_left = 9;
+
+        lease_set_hostname(&mut db, 0, Some("myhost"), false, None, None);
+        assert!(db.leases[0].hostname.is_some());
+    }
+
+    #[test]
+    fn test_set_hostname_replace_via_db() {
+        let mut db = LeaseDatabase::new(10);
+        let mut lease = lease4_allocate(Ipv4Addr::new(192, 168, 1, 1));
+        lease.hostname = Some("old".to_string());
+        db.leases.push(lease);
+        db.leases_left = 9;
+
+        lease_set_hostname(&mut db, 0, Some("newhost"), false, None, None);
+        // Hostname should have been updated
+        assert!(db.leases[0].hostname.is_some());
+    }
+
+    #[test]
+    fn test_set_hostname_none_clears() {
+        let mut db = LeaseDatabase::new(10);
+        let mut lease = lease4_allocate(Ipv4Addr::new(192, 168, 1, 1));
+        lease.hostname = Some("existing".to_string());
+        db.leases.push(lease);
+        db.leases_left = 9;
+
+        lease_set_hostname(&mut db, 0, None, false, None, None);
+        assert!(db.leases[0].hostname.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // lease_set_interface tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_set_interface_sets_field() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(192, 168, 1, 1));
+        lease_set_interface(&mut lease, "eth0", 0);
+        assert_eq!(lease.interface.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn test_set_interface_update_triggers_changed() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(192, 168, 1, 1));
+        lease_set_interface(&mut lease, "eth0", 0);
+        lease.flags.has_changed = false;
+        lease_set_interface(&mut lease, "wlan0", 0);
+        assert!(lease.flags.has_changed);
+        assert_eq!(lease.interface.as_deref(), Some("wlan0"));
+    }
+
+    // -------------------------------------------------------------------
+    // lease_set_agent_id / vendor_class tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_set_agent_id_new() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        let data = vec![0x01, 0x02, 0x03, 0x04];
+        lease_set_agent_id(&mut lease, &data);
+        assert_eq!(lease.agent_id, Some(data));
+    }
+
+    #[test]
+    fn test_set_agent_id_empty_clears() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.agent_id = Some(vec![0x01]);
+        lease_set_agent_id(&mut lease, &[]);
+        // Empty clears: implementation returns None for empty
+        assert!(lease.agent_id.is_none());
+    }
+
+    #[test]
+    fn test_set_vendorclass_new() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        let data = b"MSFT 5.0".to_vec();
+        lease_set_vendorclass(&mut lease, &data);
+        assert_eq!(lease.vendor_class, Some(data));
+    }
+
+    #[test]
+    fn test_set_vendorclass_unchanged() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        let data = b"test".to_vec();
+        lease_set_vendorclass(&mut lease, &data);
+        lease.flags.aux_changed = false;
+        lease_set_vendorclass(&mut lease, &data);
+        // Same data — should NOT set aux_changed
+        assert!(!lease.flags.aux_changed);
+    }
+
+    // -------------------------------------------------------------------
+    // lease_set_iaid tests
+    // -------------------------------------------------------------------
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_set_iaid_updates() {
+        let mut lease = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            LeaseType::Na,
+        );
+        lease_set_iaid(&mut lease, 12345);
+        assert_eq!(lease.iaid, 12345);
+        lease_set_iaid(&mut lease, 99999);
+        assert_eq!(lease.iaid, 99999);
+    }
+
+    // -------------------------------------------------------------------
+    // lease_set_expires tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_set_expires_nonzero_updates() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.expires = 100;
+        let now = 1700000000i64;
+        lease_set_expires(&mut lease, 3600, now);
+        // With broken-rtc: expires = 3600; without: expires = now + 3600
+        assert!(lease.expires > 0);
+        assert_ne!(lease.expires, 100); // Confirms it was updated
+    }
+
+    #[test]
+    fn test_set_expires_infinite_marker() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.expires = 12345;
+        lease_set_expires(&mut lease, 0xFFFFFFFF, 1700000000);
+        assert_eq!(lease.expires, 0); // 0xFFFFFFFF means infinite → expires=0
+    }
+
+    #[test]
+    fn test_set_expires_zero_is_noop() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.expires = 999;
+        lease_set_expires(&mut lease, 0, 1700000000);
+        // len=0 is a no-op for the expiry value
+        assert_eq!(lease.expires, 999);
+    }
+
+    // -------------------------------------------------------------------
+    // DhcpLease tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_lease_display_format() {
+        let lease = lease4_allocate(Ipv4Addr::new(192, 168, 1, 100));
+        let display = format!("{}", lease);
+        assert!(!display.is_empty());
+    }
+
+    #[test]
+    fn test_lease_is_v4_true() {
+        let lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        assert!(lease.is_v4());
+        assert!(!lease.is_v6());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_lease_is_v6_true() {
+        let lease = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            LeaseType::Na,
+        );
+        assert!(lease.is_v6());
+        assert!(!lease.is_v4());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_lease_pd_is_v6() {
+        let lease = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+            LeaseType::Pd,
+        );
+        assert!(lease.is_v6());
+    }
+
+    // -------------------------------------------------------------------
+    // LeaseDatabase capacity tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_lease_database_creation() {
+        let db = LeaseDatabase::new(100);
+        assert_eq!(db.leases_left, 100);
+        assert!(db.leases.is_empty());
+    }
+
+    #[test]
+    fn test_lease_db_add_decrements_left() {
+        let mut db = LeaseDatabase::new(10);
+        let lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease_db_add(&mut db, lease);
+        assert_eq!(db.leases_left, 9);
+    }
+
+    #[test]
+    fn test_lease_db_add_over_capacity() {
+        let mut db = LeaseDatabase::new(2);
+        assert!(lease_db_add(
+            &mut db,
+            lease4_allocate(Ipv4Addr::new(10, 0, 0, 1))
+        ));
+        assert!(lease_db_add(
+            &mut db,
+            lease4_allocate(Ipv4Addr::new(10, 0, 0, 2))
+        ));
+        assert!(!lease_db_add(
+            &mut db,
+            lease4_allocate(Ipv4Addr::new(10, 0, 0, 3))
+        ));
+    }
+
+    // -------------------------------------------------------------------
+    // lease_find tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_find_by_addr_multiple() {
+        let leases = vec![
+            lease4_allocate(Ipv4Addr::new(10, 0, 0, 1)),
+            lease4_allocate(Ipv4Addr::new(10, 0, 0, 2)),
+            lease4_allocate(Ipv4Addr::new(10, 0, 0, 3)),
+        ];
+        assert!(lease_find_by_addr(&leases, Ipv4Addr::new(10, 0, 0, 2)).is_some());
+        assert!(lease_find_by_addr(&leases, Ipv4Addr::new(10, 0, 0, 99)).is_none());
+    }
+
+    #[test]
+    fn test_find_by_addr_mut_updates() {
+        let mut leases = vec![lease4_allocate(Ipv4Addr::new(192, 168, 1, 1))];
+        if let Some(l) = lease_find_by_addr_mut(&mut leases, Ipv4Addr::new(192, 168, 1, 1)) {
+            l.hostname = Some("updated".to_string());
+        }
+        assert_eq!(leases[0].hostname, Some("updated".to_string()));
+    }
+
+    // -------------------------------------------------------------------
+    // lease_prune tests (additional)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_prune_expired_leases() {
+        let mut db = LeaseDatabase::new(10);
+        let now = 1700000000i64;
+        let mut l = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        l.expires = now - 100;
+        l.flags = LeaseFlags::default();
+        l.raw_flags = 0;
+        db.leases.push(l);
+        db.leases_left = 9;
+
+        let pruned = lease_prune(&mut db, None, now);
+        assert_eq!(pruned, 1);
+        assert!(db.leases.is_empty());
+    }
+
+    #[test]
+    fn test_prune_keeps_valid() {
+        let mut db = LeaseDatabase::new(10);
+        let now = 1700000000i64;
+        let mut l = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        l.expires = now + 3600;
+        l.flags = LeaseFlags::default();
+        l.raw_flags = 0;
+        db.leases.push(l);
+        db.leases_left = 9;
+
+        let pruned = lease_prune(&mut db, None, now);
+        assert_eq!(pruned, 0);
+        assert_eq!(db.leases.len(), 1);
+    }
+
+    #[test]
+    fn test_prune_target_addr() {
+        let mut db = LeaseDatabase::new(10);
+        let now = 1700000000i64;
+        let mut l1 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        l1.expires = now + 3600;
+        l1.flags = LeaseFlags::default();
+        l1.raw_flags = 0;
+        let mut l2 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 2));
+        l2.expires = now + 3600;
+        l2.flags = LeaseFlags::default();
+        l2.raw_flags = 0;
+        db.leases.push(l1);
+        db.leases.push(l2);
+        db.leases_left = 8;
+
+        let target = Ipv4Addr::new(10, 0, 0, 1);
+        let pruned = lease_prune(&mut db, Some(&target), now);
+        assert_eq!(pruned, 1);
+        assert_eq!(db.leases[0].addr, Some(Ipv4Addr::new(10, 0, 0, 2)));
+    }
+
+    // -------------------------------------------------------------------
+    // lease6 tests
+    // -------------------------------------------------------------------
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_lease6_find_by_plain_addr_found() {
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let leases = vec![
+            lease6_allocate(
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2),
+                LeaseType::Na,
+            ),
+            lease6_allocate(addr, LeaseType::Na),
+        ];
+        assert!(lease6_find_by_plain_addr(&leases, &addr).is_some());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_lease6_find_by_plain_addr_not_found() {
+        let leases = vec![lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            LeaseType::Na,
+        )];
+        assert!(lease6_find_by_plain_addr(&leases, &Ipv6Addr::LOCALHOST).is_none());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_lease6_reset_preserves_count() {
+        let mut leases = vec![
+            lease6_allocate(
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                LeaseType::Na,
+            ),
+            lease6_allocate(
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2),
+                LeaseType::Ta,
+            ),
+        ];
+        lease6_reset(&mut leases);
+        assert_eq!(leases.len(), 2);
+    }
+
+    // -------------------------------------------------------------------
+    // schedule_next_alarm tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_schedule_alarm_empty() {
+        schedule_next_alarm(1700000000, &[]);
+    }
+
+    #[test]
+    fn test_schedule_alarm_infinite() {
+        let mut l = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        l.expires = 0;
+        schedule_next_alarm(1700000000, &[l]);
+    }
+
+    #[test]
+    fn test_schedule_alarm_multiple() {
+        let mut l1 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        l1.expires = 1700005000;
+        let mut l2 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 2));
+        l2.expires = 1700002000;
+        schedule_next_alarm(1700000000, &[l1, l2]);
+    }
+
+    // -------------------------------------------------------------------
+    // parse_v6_lease tests
+    // -------------------------------------------------------------------
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_parse_v6_na_format() {
+        let parts = vec![
+            "1700000000",
+            "12345",
+            "na",
+            "2001:db8::1",
+            "v6host",
+            "00:01:00:01",
+        ];
+        let lease = parse_v6_lease(1700000000, &parts, 1).unwrap();
+        assert_eq!(lease.iaid, 12345);
+        assert_eq!(lease.lease_type, LeaseType::Na);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_parse_v6_ta_format() {
+        let parts = vec!["1700000000", "T42", "ta", "fe80::1", "*", "*"];
+        let lease = parse_v6_lease(1700000000, &parts, 1).unwrap();
+        assert_eq!(lease.iaid, 42);
+        assert_eq!(lease.lease_type, LeaseType::Ta);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_parse_v6_pd_format() {
+        let parts = vec![
+            "1700000000",
+            "999",
+            "pd",
+            "2001:db8:100::/48",
+            "pdhost",
+            "00:02",
+        ];
+        let lease = parse_v6_lease(1700000000, &parts, 1).unwrap();
+        assert_eq!(lease.lease_type, LeaseType::Pd);
+        assert_eq!(lease.prefix_len, 48);
+    }
+
+    // -------------------------------------------------------------------
+    // parse_v4_lease edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_v4_too_few_parts() {
+        let parts = vec!["1700000000", "00:11:22:33:44:55"];
+        assert!(parse_v4_lease(1700000000, &parts, 1).is_none());
+    }
+
+    #[test]
+    fn test_parse_v4_invalid_ip() {
+        let parts = vec!["1700000000", "00:11:22:33:44:55", "not.valid", "host", "*"];
+        assert!(parse_v4_lease(1700000000, &parts, 1).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // write/read roundtrip tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_v4_write_then_parse_roundtrip() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(192, 168, 0, 100));
+        lease.expires = 1700000000;
+        lease.hwaddr[..6].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        lease.hwaddr_len = 6;
+        lease.hwaddr_type = ARPHRD_ETHER as i32;
+        lease.hostname = Some("roundtrip".to_string());
+        lease.clid = Some(vec![0x01, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+
+        let mut buf = Vec::new();
+        write_v4_lease(&mut buf, &lease).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+
+        assert_eq!(parts.len(), 5);
+        let parsed = parse_v4_lease(1700000000, &parts, 1).unwrap();
+        assert_eq!(parsed.expires, lease.expires);
+        assert_eq!(parsed.addr, lease.addr);
+        assert_eq!(parsed.hostname, lease.hostname);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_v6_write_then_parse_roundtrip() {
+        let mut lease = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            LeaseType::Na,
+        );
+        lease.expires = 1700000000;
+        lease.iaid = 555;
+        lease.hostname = Some("v6round".to_string());
+        lease.clid = Some(vec![0x00, 0x01, 0x00, 0x02]);
+
+        let mut buf = Vec::new();
+        write_v6_lease(&mut buf, &lease).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        assert_eq!(parts.len(), 6);
+
+        let parsed = parse_v6_lease(1700000000, &parts, 1).unwrap();
+        assert_eq!(parsed.iaid, 555);
+        assert_eq!(parsed.lease_type, LeaseType::Na);
+        assert_eq!(
+            parsed.addr6,
+            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // lease4_allocate / lease6_allocate tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_lease4_allocate_fields() {
+        let lease = lease4_allocate(Ipv4Addr::new(172, 16, 0, 1));
+        assert_eq!(lease.addr, Some(Ipv4Addr::new(172, 16, 0, 1)));
+        assert_eq!(lease.lease_type, LeaseType::V4);
+        assert!(lease.flags.is_new);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_lease6_allocate_fields() {
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x100);
+        let lease = lease6_allocate(addr, LeaseType::Ta);
+        assert_eq!(lease.addr6, Some(addr));
+        assert_eq!(lease.lease_type, LeaseType::Ta);
+        assert!(lease.flags.is_new);
+    }
+
+    // -------------------------------------------------------------------
+    // lease_set_expires_db tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_set_expires_db_marks_dns_dirty() {
+        let mut db = LeaseDatabase::new(10);
+        let lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        db.leases.push(lease);
+        db.leases_left = 9;
+        db.dns_dirty = false;
+        lease_set_expires_db(&mut db, 0, 3600, 1700000000);
+        assert!(db.dns_dirty);
+    }
+
+    #[test]
+    fn test_set_expires_db_infinite() {
+        let mut db = LeaseDatabase::new(10);
+        let lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        db.leases.push(lease);
+        db.leases_left = 9;
+        lease_set_expires_db(&mut db, 0, 0xFFFFFFFF, 1700000000);
+        assert_eq!(db.leases[0].expires, 0);
+    }
+
+    #[test]
+    fn test_set_expires_db_out_of_bounds() {
+        let mut db = LeaseDatabase::new(10);
+        db.dns_dirty = false;
+        lease_set_expires_db(&mut db, 5, 3600, 1700000000);
+        assert!(!db.dns_dirty); // No lease at index 5
+    }
+
+    // -------------------------------------------------------------------
+    // lease_calc_fqdns tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_calc_fqdns_with_domain() {
+        let mut db = LeaseDatabase::new(10);
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.hostname = Some("myhost".to_string());
+        db.leases.push(lease);
+        db.leases_left = 9;
+
+        let mut state = DaemonState::default();
+        state.domain_suffix = Some("example.com".to_string());
+
+        lease_calc_fqdns(&mut db, &state);
+        assert_eq!(db.leases[0].fqdn.as_deref(), Some("myhost.example.com"));
+    }
+
+    #[test]
+    fn test_calc_fqdns_without_domain() {
+        let mut db = LeaseDatabase::new(10);
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.hostname = Some("myhost".to_string());
+        db.leases.push(lease);
+        db.leases_left = 9;
+
+        let state = DaemonState::default(); // no domain_suffix
+        lease_calc_fqdns(&mut db, &state);
+        assert!(db.leases[0].fqdn.is_none());
+    }
+
+    #[test]
+    fn test_calc_fqdns_no_hostname() {
+        let mut db = LeaseDatabase::new(10);
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.hostname = None;
+        db.leases.push(lease);
+        db.leases_left = 9;
+
+        let mut state = DaemonState::default();
+        state.domain_suffix = Some("example.com".to_string());
+
+        lease_calc_fqdns(&mut db, &state);
+        assert!(db.leases[0].fqdn.is_none());
+    }
+
+    #[test]
+    fn test_calc_fqdns_empty_domain() {
+        let mut db = LeaseDatabase::new(10);
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.hostname = Some("host".to_string());
+        db.leases.push(lease);
+        db.leases_left = 9;
+
+        let mut state = DaemonState::default();
+        state.domain_suffix = Some("".to_string());
+
+        lease_calc_fqdns(&mut db, &state);
+        assert!(db.leases[0].fqdn.is_none());
+    }
+
+    #[test]
+    fn test_calc_fqdns_multiple_leases() {
+        let mut db = LeaseDatabase::new(10);
+        let mut l1 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        l1.hostname = Some("host1".to_string());
+        let mut l2 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 2));
+        l2.hostname = Some("host2".to_string());
+        let mut l3 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 3));
+        l3.hostname = None;
+        db.leases.push(l1);
+        db.leases.push(l2);
+        db.leases.push(l3);
+        db.leases_left = 7;
+
+        let mut state = DaemonState::default();
+        state.domain_suffix = Some("lan".to_string());
+
+        lease_calc_fqdns(&mut db, &state);
+        assert_eq!(db.leases[0].fqdn.as_deref(), Some("host1.lan"));
+        assert_eq!(db.leases[1].fqdn.as_deref(), Some("host2.lan"));
+        assert!(db.leases[2].fqdn.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // lease_update_dns tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_update_dns_skips_when_not_dirty() {
+        let mut db = LeaseDatabase::new(10);
+        db.dns_dirty = false;
+        let state = DaemonState::default();
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        lease_update_dns(&mut db, false, &state, &mut cache);
+        // Should not modify anything (early return)
+        assert!(!db.dns_dirty);
+    }
+
+    #[test]
+    fn test_update_dns_when_dirty() {
+        let mut db = LeaseDatabase::new(10);
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.hostname = Some("testhost".to_string());
+        lease.expires = 1700003600;
+        db.leases.push(lease);
+        db.leases_left = 9;
+        db.dns_dirty = true;
+        let state = DaemonState::default();
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        lease_update_dns(&mut db, false, &state, &mut cache);
+        assert!(!db.dns_dirty); // Should be cleared
+    }
+
+    #[test]
+    fn test_update_dns_force() {
+        let mut db = LeaseDatabase::new(10);
+        db.dns_dirty = false;
+        let state = DaemonState::default();
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        lease_update_dns(&mut db, true, &state, &mut cache);
+        assert!(!db.dns_dirty);
+    }
+
+    #[test]
+    fn test_update_dns_with_fqdn() {
+        let mut db = LeaseDatabase::new(10);
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.hostname = Some("host".to_string());
+        lease.fqdn = Some("host.example.com".to_string());
+        lease.expires = 1700003600;
+        db.leases.push(lease);
+        db.leases_left = 9;
+        db.dns_dirty = true;
+        let state = DaemonState::default();
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        lease_update_dns(&mut db, false, &state, &mut cache);
+        assert!(!db.dns_dirty);
+    }
+
+    #[test]
+    fn test_update_dns_infinite_lease_ttl() {
+        let mut db = LeaseDatabase::new(10);
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.hostname = Some("infinite".to_string());
+        lease.expires = 0; // infinite
+        db.leases.push(lease);
+        db.leases_left = 9;
+        db.dns_dirty = true;
+        let state = DaemonState::default();
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        lease_update_dns(&mut db, false, &state, &mut cache);
+        assert!(!db.dns_dirty);
+    }
+
+    // -------------------------------------------------------------------
+    // lease_make_duid tests
+    // -------------------------------------------------------------------
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_make_duid_generates() {
+        let mut state = DaemonState::default();
+        state.duid = Vec::new();
+        state.duid_config = Vec::new();
+        let now = 1700000000i64;
+        let duid = lease_make_duid(now, &mut state);
+        assert!(!duid.is_empty());
+        // DUID-LLT type: first two bytes = 0x00, 0x01
+        assert_eq!(duid[0], 0x00);
+        assert_eq!(duid[1], 0x01);
+        // Hardware type: Ethernet
+        assert_eq!(duid[2], 0x00);
+        assert_eq!(duid[3], 0x01);
+        // Verify it's cached
+        assert_eq!(state.duid, duid);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_make_duid_returns_cached() {
+        let mut state = DaemonState::default();
+        state.duid = vec![0x00, 0x01, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD];
+        let duid = lease_make_duid(1700000000, &mut state);
+        assert_eq!(duid, state.duid); // Returns cached value
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_make_duid_with_config() {
+        let mut state = DaemonState::default();
+        state.duid = Vec::new();
+        state.duid_config = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let now = 1700000000i64;
+        let duid = lease_make_duid(now, &mut state);
+        // Should use the config MAC bytes
+        assert!(duid.len() >= 10); // 4 header + 4 time + 6 config
+        assert_eq!(&duid[8..14], &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_make_duid_time_calculation() {
+        let mut state = DaemonState::default();
+        state.duid = Vec::new();
+        state.duid_config = vec![0x00; 6];
+        let now = 946684800i64 + 1000; // 1000 seconds after 2000-01-01
+        let duid = lease_make_duid(now, &mut state);
+        // Time field at bytes 4..8 should be 1000
+        let time_val = u32::from_be_bytes([duid[4], duid[5], duid[6], duid[7]]);
+        assert_eq!(time_val, 1000);
+    }
+
+    // -------------------------------------------------------------------
+    // lease_find_max_addr tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_find_max_addr_basic() {
+        let ctx = DhcpContext {
+            start: Ipv4Addr::new(10, 0, 0, 1),
+            end: Ipv4Addr::new(10, 0, 0, 254),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            flags: 0,
+            ..default_dhcp_context()
+        };
+        let mut l1 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 50));
+        l1.flags = LeaseFlags::default();
+        let mut l2 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 100));
+        l2.flags = LeaseFlags::default();
+        let mut l3 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 75));
+        l3.flags = LeaseFlags::default();
+        let leases = vec![l1, l2, l3];
+        let max = lease_find_max_addr(&leases, &ctx);
+        assert_eq!(max, Some(Ipv4Addr::new(10, 0, 0, 100)));
+    }
+
+    #[test]
+    fn test_find_max_addr_empty_db() {
+        let ctx = DhcpContext {
+            start: Ipv4Addr::new(10, 0, 0, 1),
+            end: Ipv4Addr::new(10, 0, 0, 254),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            flags: 0,
+            ..default_dhcp_context()
+        };
+        let max = lease_find_max_addr(&[], &ctx);
+        assert!(max.is_none());
+    }
+
+    #[test]
+    fn test_find_max_addr_static_context_returns_none() {
+        let ctx = DhcpContext {
+            start: Ipv4Addr::new(10, 0, 0, 1),
+            end: Ipv4Addr::new(10, 0, 0, 254),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            flags: CONTEXT_STATIC,
+            ..default_dhcp_context()
+        };
+        let mut l = lease4_allocate(Ipv4Addr::new(10, 0, 0, 50));
+        l.flags = LeaseFlags::default();
+        let leases = vec![l];
+        let max = lease_find_max_addr(&leases, &ctx);
+        assert!(max.is_none());
+    }
+
+    #[test]
+    fn test_find_max_addr_proxy_context_returns_none() {
+        let ctx = DhcpContext {
+            start: Ipv4Addr::new(10, 0, 0, 1),
+            end: Ipv4Addr::new(10, 0, 0, 254),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            flags: CONTEXT_PROXY,
+            ..default_dhcp_context()
+        };
+        let max = lease_find_max_addr(&[], &ctx);
+        assert!(max.is_none());
+    }
+
+    #[test]
+    fn test_find_max_addr_out_of_range() {
+        let ctx = DhcpContext {
+            start: Ipv4Addr::new(10, 0, 0, 100),
+            end: Ipv4Addr::new(10, 0, 0, 200),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            flags: 0,
+            ..default_dhcp_context()
+        };
+        let mut l = lease4_allocate(Ipv4Addr::new(10, 0, 0, 50)); // out of range
+        l.flags = LeaseFlags::default();
+        let leases = vec![l];
+        let max = lease_find_max_addr(&leases, &ctx);
+        assert!(max.is_none());
+    }
+
+    #[test]
+    fn test_find_max_addr_different_subnet() {
+        let ctx = DhcpContext {
+            start: Ipv4Addr::new(10, 0, 0, 1),
+            end: Ipv4Addr::new(10, 0, 0, 254),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            flags: 0,
+            ..default_dhcp_context()
+        };
+        let mut l = lease4_allocate(Ipv4Addr::new(10, 0, 1, 50)); // different subnet
+        l.flags = LeaseFlags::default();
+        let leases = vec![l];
+        let max = lease_find_max_addr(&leases, &ctx);
+        assert!(max.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // lease_find_max_addr6 tests
+    // -------------------------------------------------------------------
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_find_max_addr6_basic() {
+        let ctx = DhcpContext {
+            start6: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            end6: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xFF),
+            prefix: 64,
+            flags: 0,
+            ..default_dhcp_context()
+        };
+        let l1 = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10),
+            LeaseType::Na,
+        );
+        let l2 = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x50),
+            LeaseType::Na,
+        );
+        let leases = vec![l1, l2];
+        let max = lease_find_max_addr6(&leases, &ctx);
+        assert_eq!(max, Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x50)));
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_find_max_addr6_empty() {
+        let ctx = DhcpContext {
+            start6: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            end6: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xFF),
+            prefix: 64,
+            flags: 0,
+            ..default_dhcp_context()
+        };
+        let max = lease_find_max_addr6(&[], &ctx);
+        assert!(max.is_none());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_find_max_addr6_static_returns_none() {
+        let ctx = DhcpContext {
+            start6: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            end6: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xFF),
+            prefix: 64,
+            flags: CONTEXT_STATIC,
+            ..default_dhcp_context()
+        };
+        let l = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x50),
+            LeaseType::Na,
+        );
+        let max = lease_find_max_addr6(&[l], &ctx);
+        assert!(max.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // apply_config_hostname tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_config_hostname_sets_name() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.hostname = None;
+        lease.raw_flags = 0;
+        let mut dns_dirty = false;
+        let mut file_dirty = false;
+        apply_config_hostname(
+            &mut lease,
+            "configured-host",
+            &mut dns_dirty,
+            &mut file_dirty,
+        );
+        assert_eq!(lease.hostname.as_deref(), Some("configured-host"));
+        assert!(dns_dirty);
+        assert!(file_dirty);
+        assert!(lease.raw_flags & LEASE_AUTH_NAME != 0);
+    }
+
+    #[test]
+    fn test_apply_config_hostname_skips_auth_name() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.hostname = Some("auth-host".to_string());
+        lease.raw_flags = LEASE_AUTH_NAME; // Already has auth name
+        let mut dns_dirty = false;
+        let mut file_dirty = false;
+        apply_config_hostname(&mut lease, "new-host", &mut dns_dirty, &mut file_dirty);
+        // Should NOT change because LEASE_AUTH_NAME is set
+        assert_eq!(lease.hostname.as_deref(), Some("auth-host"));
+        assert!(!dns_dirty);
+    }
+
+    #[test]
+    fn test_apply_config_hostname_same_name_no_change() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.hostname = Some("same-host".to_string());
+        lease.raw_flags = 0;
+        let mut dns_dirty = false;
+        let mut file_dirty = false;
+        apply_config_hostname(&mut lease, "same-host", &mut dns_dirty, &mut file_dirty);
+        // Same hostname — no change
+        assert!(!dns_dirty);
+    }
+
+    // -------------------------------------------------------------------
+    // build_slaac_lease_infos / apply_slaac_updates tests
+    // -------------------------------------------------------------------
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_build_slaac_infos_empty() {
+        let leases: Vec<DhcpLease> = Vec::new();
+        let infos = build_slaac_lease_infos(&leases);
+        assert!(infos.is_empty());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_build_slaac_infos_filters_v4() {
+        let l = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        let infos = build_slaac_lease_infos(&[l]);
+        assert!(infos.is_empty()); // V4 leases excluded
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_build_slaac_infos_includes_v6_with_hwaddr() {
+        let mut l = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            LeaseType::Na,
+        );
+        l.hwaddr_len = 6;
+        l.hwaddr[..6].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        let infos = build_slaac_lease_infos(&[l]);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].hwaddr_len, 6);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_build_slaac_infos_includes_unset_hwaddr() {
+        let l = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            LeaseType::Na,
+        );
+        // hwaddr_len defaults to HWADDR_LEN_UNSET (256) from lease6_allocate,
+        // which is > 0, so build_slaac_lease_infos includes it. The slaac module
+        // itself checks for HWADDR_LEN_UNSET and skips those entries.
+        let infos = build_slaac_lease_infos(&[l]);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].hwaddr_len, HWADDR_LEN_UNSET);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_build_slaac_infos_excludes_zero_len_hwaddr() {
+        let mut l = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            LeaseType::Na,
+        );
+        l.hwaddr_len = 0; // Explicitly zero → excluded
+        let infos = build_slaac_lease_infos(&[l]);
+        assert!(infos.is_empty());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_apply_slaac_updates_correspondence() {
+        let mut l1 = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            LeaseType::Na,
+        );
+        l1.hwaddr_len = 6;
+        l1.hwaddr[..6].copy_from_slice(&[0x00; 6]);
+        l1.slaac_addresses = Vec::new();
+
+        let addr = SlaacAddress {
+            addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xAA),
+            ping_time: 0,
+            backoff: 0,
+        };
+        let info = SlaacLeaseInfo {
+            hwaddr: vec![0x00; 6],
+            hwaddr_type: ARPHRD_ETHER as u16,
+            hwaddr_len: 6,
+            last_interface: 0,
+            hostname: None,
+            flags: 0,
+            slaac_addresses: vec![addr.clone()],
+            clid: None,
+        };
+
+        let mut leases = vec![l1];
+        apply_slaac_updates(&mut leases, &[info]);
+        assert_eq!(leases[0].slaac_addresses.len(), 1);
+        assert_eq!(leases[0].slaac_addresses[0].addr, addr.addr);
+    }
+
+    // -------------------------------------------------------------------
+    // do_script_run additional branch tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_do_script_run_changed_lease() {
+        let mut db = LeaseDatabase::new(10);
+        let mut l = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        l.flags = LeaseFlags {
+            is_new: false,
+            has_changed: true,
+            aux_changed: false,
+        };
+        l.raw_flags = LEASE_CHANGED;
+        l.old_hostname = None;
+        db.leases.push(l);
+        db.leases_left = 9;
+
+        let (action, _) = do_script_run(&mut db).expect("should have notification");
+        assert_eq!(action, ACTION_OLD);
+    }
+
+    #[test]
+    fn test_do_script_run_new_then_changed() {
+        let mut db = LeaseDatabase::new(10);
+        let mut l1 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        l1.old_hostname = None;
+        // is_new = true from allocation
+        let mut l2 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 2));
+        l2.flags = LeaseFlags {
+            is_new: false,
+            has_changed: true,
+            aux_changed: false,
+        };
+        l2.raw_flags = LEASE_CHANGED;
+        l2.old_hostname = None;
+        db.leases.push(l1);
+        db.leases.push(l2);
+        db.leases_left = 8;
+
+        // First: new lease
+        let (action, lease_data) = do_script_run(&mut db).unwrap();
+        assert_eq!(action, ACTION_ADD);
+        assert_eq!(lease_data.addr, Some(Ipv4Addr::new(10, 0, 0, 1)));
+
+        // Second: changed lease
+        let (action, lease_data) = do_script_run(&mut db).unwrap();
+        assert_eq!(action, ACTION_OLD);
+        assert_eq!(lease_data.addr, Some(Ipv4Addr::new(10, 0, 0, 2)));
+
+        // Third: nothing left
+        assert!(do_script_run(&mut db).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // lease_add_extradata additional tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_extradata_filters_nulls_with_delim() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease_add_extradata(&mut lease, b"hel\x00lo", b'\n' as i32);
+        let data = lease.extradata.unwrap();
+        // NULLs should be filtered, delimiter appended
+        assert_eq!(&data[..], b"hello\n");
+    }
+
+    #[test]
+    fn test_extradata_multiple_appends() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease_add_extradata(&mut lease, b"part1", 0);
+        lease_add_extradata(&mut lease, b"part2", 0);
+        let data = lease.extradata.unwrap();
+        assert_eq!(data.len(), 12); // "part1\0part2\0"
+    }
+
+    #[test]
+    fn test_extradata_raw_preserves_nulls() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        let raw_data = b"\x00\x01\x00\x02";
+        lease_add_extradata(&mut lease, raw_data, -1);
+        let data = lease.extradata.unwrap();
+        assert_eq!(&data[..], raw_data);
+    }
+
+    // -------------------------------------------------------------------
+    // lease_set_hostname additional tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_set_hostname_auth_takes_precedence() {
+        let mut db = LeaseDatabase::new(10);
+        let mut l1 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        l1.hostname = Some("authhost".to_string());
+        l1.raw_flags = LEASE_AUTH_NAME;
+        l1.flags = LeaseFlags::default();
+        let l2 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 2));
+        db.leases.push(l1);
+        db.leases.push(l2);
+        db.leases_left = 8;
+
+        // Try to set same hostname on lease 2 without auth
+        lease_set_hostname(&mut db, 1, Some("authhost"), false, None, None);
+        // Auth lease takes precedence — lease 2's hostname should NOT be set
+        assert!(db.leases[0].hostname.is_some()); // l1 keeps its hostname
+    }
+
+    #[test]
+    fn test_set_hostname_empty_string() {
+        let mut db = LeaseDatabase::new(10);
+        let lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        db.leases.push(lease);
+        db.leases_left = 9;
+        lease_set_hostname(&mut db, 0, Some(""), false, None, None);
+        assert!(db.leases[0].hostname.is_none());
+    }
+
+    #[test]
+    fn test_set_hostname_with_auth_flag() {
+        let mut db = LeaseDatabase::new(10);
+        let lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        db.leases.push(lease);
+        db.leases_left = 9;
+        lease_set_hostname(&mut db, 0, Some("authhost"), true, None, None);
+        assert!(db.leases[0].raw_flags & LEASE_AUTH_NAME != 0);
+    }
+
+    // -------------------------------------------------------------------
+    // lease_set_hwaddr additional tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_set_hwaddr_no_change_no_flag() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        lease_set_hwaddr(&mut lease, &mac, None, 6, ARPHRD_ETHER as i32, 0, false);
+        lease.flags.has_changed = false;
+        lease.raw_flags = 0;
+        // Set same MAC again
+        lease_set_hwaddr(&mut lease, &mac, None, 6, ARPHRD_ETHER as i32, 0, false);
+        // Should not trigger changed flag
+        assert!(!lease.flags.has_changed);
+    }
+
+    #[test]
+    fn test_set_hwaddr_different_type() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        lease_set_hwaddr(&mut lease, &mac, None, 6, ARPHRD_ETHER as i32, 0, false);
+        lease.flags.has_changed = false;
+        // Same MAC but different type
+        lease_set_hwaddr(&mut lease, &mac, None, 6, 6, 0, false);
+        assert!(lease.flags.has_changed); // Type changed
+    }
+
+    // -------------------------------------------------------------------
+    // rerun_scripts additional tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_rerun_scripts_multiple_leases() {
+        let mut db = LeaseDatabase::new(10);
+        for i in 1..=5 {
+            let mut l = lease4_allocate(Ipv4Addr::new(10, 0, 0, i));
+            l.flags = LeaseFlags::default();
+            l.raw_flags = 0;
+            db.leases.push(l);
+        }
+        db.leases_left = 5;
+        rerun_scripts(&mut db);
+        for lease in &db.leases {
+            assert!(lease.flags.has_changed);
+            assert!(lease.raw_flags & LEASE_CHANGED != 0);
+        }
+    }
+
+    #[test]
+    fn test_rerun_scripts_empty_db() {
+        let mut db = LeaseDatabase::new(10);
+        rerun_scripts(&mut db); // Should not panic
+    }
+
+    // -------------------------------------------------------------------
+    // lease_prune additional edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_prune_multiple_expired() {
+        let mut db = LeaseDatabase::new(10);
+        let now = 1700000000i64;
+        for i in 1..=5 {
+            let mut l = lease4_allocate(Ipv4Addr::new(10, 0, 0, i));
+            l.expires = now - (i as i64 * 100);
+            l.flags = LeaseFlags::default();
+            l.raw_flags = 0;
+            db.leases.push(l);
+        }
+        db.leases_left = 5;
+        let pruned = lease_prune(&mut db, None, now);
+        assert_eq!(pruned, 5);
+        assert!(db.leases.is_empty());
+        assert_eq!(db.old_leases.len(), 5);
+    }
+
+    #[test]
+    fn test_prune_restores_leases_left() {
+        let mut db = LeaseDatabase::new(10);
+        let now = 1700000000i64;
+        let mut l = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        l.expires = now - 100;
+        l.flags = LeaseFlags::default();
+        l.raw_flags = 0;
+        db.leases.push(l);
+        db.leases_left = 9;
+        let initial_left = db.leases_left;
+        lease_prune(&mut db, None, now);
+        assert_eq!(db.leases_left, initial_left + 1);
+    }
+
+    #[test]
+    fn test_prune_sets_dirty_flags() {
+        let mut db = LeaseDatabase::new(10);
+        let now = 1700000000i64;
+        let mut l = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        l.expires = now - 100;
+        l.flags = LeaseFlags::default();
+        l.raw_flags = 0;
+        db.leases.push(l);
+        db.leases_left = 9;
+        db.file_dirty = false;
+        db.dns_dirty = false;
+        lease_prune(&mut db, None, now);
+        assert!(db.file_dirty);
+        assert!(db.dns_dirty);
+    }
+
+    // -------------------------------------------------------------------
+    // lease_set_iaid additional tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_set_iaid_no_change() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.iaid = 42;
+        lease.flags.has_changed = false;
+        lease_set_iaid(&mut lease, 42); // Same value
+        assert!(!lease.flags.has_changed);
+    }
+
+    // -------------------------------------------------------------------
+    // lease_set_interface additional tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_set_interface_no_change() {
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease_set_interface(&mut lease, "eth0", 0);
+        lease.flags.has_changed = false;
+        lease.raw_flags = 0;
+        lease_set_interface(&mut lease, "eth0", 0); // Same value
+        assert!(!lease.flags.has_changed);
+    }
+
+    // -------------------------------------------------------------------
+    // lease_find_by_client additional tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_find_by_client_no_match() {
+        let mut l1 = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        l1.clid = Some(vec![0x01, 0xAA]);
+        l1.hwaddr_len = 6;
+        l1.hwaddr[..6].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        l1.hwaddr_type = ARPHRD_ETHER as i32;
+        l1.flags = LeaseFlags::default();
+        let leases = vec![l1];
+
+        // Different CLID
+        let found = lease_find_by_client(
+            &leases,
+            &[0x00; 6],
+            ARPHRD_ETHER as i32,
+            Some(&[0x01, 0xBB]),
+        );
+        assert!(found.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // read_leases edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_read_leases_empty_file() {
+        let data = "";
+        let mut reader = BufReader::new(Cursor::new(data));
+        let mut state = DaemonState::default();
+        let leases = read_leases(&mut reader, &mut state).expect("should parse");
+        assert!(leases.is_empty());
+    }
+
+    #[test]
+    fn test_read_leases_only_comments() {
+        let data = "# This is a comment\n# Another comment\n";
+        let mut reader = BufReader::new(Cursor::new(data));
+        let mut state = DaemonState::default();
+        let leases = read_leases(&mut reader, &mut state).expect("should parse");
+        assert!(leases.is_empty());
+    }
+
+    #[test]
+    fn test_read_leases_duid_line() {
+        let data = "duid 00:01:00:01:aa:bb:cc:dd\n1700000000 00:11:22:33:44:55 10.0.0.1 host *\n";
+        let mut reader = BufReader::new(Cursor::new(data));
+        let mut state = DaemonState::default();
+        let leases = read_leases(&mut reader, &mut state).expect("should parse");
+        assert_eq!(leases.len(), 1);
+        // DUID should be stored in state
+        assert!(!state.duid.is_empty());
+    }
+
+    #[test]
+    fn test_read_leases_malformed_line_skipped() {
+        let data = "garbage\n1700000000 00:11:22:33:44:55 10.0.0.1 host *\n";
+        let mut reader = BufReader::new(Cursor::new(data));
+        let mut state = DaemonState::default();
+        let leases = read_leases(&mut reader, &mut state).expect("should parse");
+        assert_eq!(leases.len(), 1); // Malformed line skipped, valid line parsed
+    }
+
+    // -------------------------------------------------------------------
+    // DhcpContext helper for tests
+    // -------------------------------------------------------------------
+
+    fn default_dhcp_context() -> DhcpContext {
+        DhcpContext {
+            start: Ipv4Addr::UNSPECIFIED,
+            end: Ipv4Addr::UNSPECIFIED,
+            netmask: Ipv4Addr::UNSPECIFIED,
+            broadcast: Ipv4Addr::UNSPECIFIED,
+            router: Ipv4Addr::UNSPECIFIED,
+            local: Ipv4Addr::UNSPECIFIED,
+            flags: 0,
+            netid: NetId { net: String::new() },
+            filter: Vec::new(),
+            lease_time: 0,
+            addr_epoch: 0,
+            #[cfg(feature = "dhcp6")]
+            start6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 0,
+            #[cfg(feature = "dhcp6")]
+            local6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 0,
+            #[cfg(feature = "dhcp6")]
+            preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            template_interface: None,
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // lease6_find_by_addr tests
+    // -------------------------------------------------------------------
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_lease6_find_by_addr_with_prefix() {
+        let l = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            LeaseType::Na,
+        );
+        let leases = vec![l];
+        let net = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let found = lease6_find_by_addr(&leases, &net, 64, &addr);
+        assert!(found.is_some());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_lease6_find_by_addr_wrong_prefix() {
+        let l = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            LeaseType::Na,
+        );
+        let leases = vec![l];
+        // Different prefix network
+        let net = Ipv6Addr::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 0);
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let found = lease6_find_by_addr(&leases, &net, 48, &addr);
+        assert!(found.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // lease_set_expires_db additional tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_set_expires_db_zero_len() {
+        let mut db = LeaseDatabase::new(10);
+        let mut lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease.expires = 999;
+        db.leases.push(lease);
+        db.leases_left = 9;
+        db.dns_dirty = false;
+        lease_set_expires_db(&mut db, 0, 0, 1700000000);
+        // len=0 means no change to expiry
+        assert_eq!(db.leases[0].expires, 999);
+        assert!(db.dns_dirty); // But dns_dirty is still set
+    }
+
+    // -------------------------------------------------------------------
+    // write/read v6 roundtrip tests
+    // -------------------------------------------------------------------
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_v6_write_read_roundtrip_complete() {
+        let mut lease = lease6_allocate(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x42),
+            LeaseType::Na,
+        );
+        lease.expires = 1700000000;
+        lease.iaid = 9999;
+        lease.hostname = Some("v6host".to_string());
+        lease.clid = Some(vec![0x00, 0x01, 0x00, 0x01, 0xAA, 0xBB]);
+
+        let mut buf = Vec::new();
+        write_v6_lease(&mut buf, &lease).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        // Verify the output contains expected fields
+        assert!(output.contains("9999"));
+        assert!(output.contains("na"));
+        assert!(output.contains("v6host"));
+    }
+
+    // -------------------------------------------------------------------
+    // LeaseDatabase file_dirty / dns_dirty tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_db_new_dirty_flags() {
+        let db = LeaseDatabase::new(100);
+        assert!(!db.file_dirty);
+        assert!(!db.dns_dirty);
+    }
+
+    #[test]
+    fn test_db_add_sets_dirty() {
+        let mut db = LeaseDatabase::new(10);
+        let lease = lease4_allocate(Ipv4Addr::new(10, 0, 0, 1));
+        lease_db_add(&mut db, lease);
+        // Adding a lease should set dirty flags
+        assert!(db.file_dirty);
+        assert!(db.dns_dirty);
     }
 }

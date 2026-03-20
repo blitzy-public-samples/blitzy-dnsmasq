@@ -1069,4 +1069,438 @@ mod tests {
         let result = FileWriter::open("/nonexistent/dir/test.log");
         assert!(result.is_err());
     }
+
+    // ===================================================================
+    // Additional tests — LogFacility
+    // ===================================================================
+
+    #[test]
+    fn log_facility_local0_code() {
+        assert_eq!(LogFacility::Local0.as_syslog_code(), 128);
+    }
+
+    #[test]
+    fn log_facility_from_local_codes() {
+        // Local0 is recognized, others become Custom
+        assert_eq!(LogFacility::from_syslog_code(128), LogFacility::Local0);
+        // Code 136 (local1) becomes Custom since we only have Local0
+        let fac = LogFacility::from_syslog_code(136);
+        assert_eq!(fac.as_syslog_code(), 136);
+    }
+
+    #[test]
+    fn log_facility_custom_roundtrip() {
+        for code in [0, 32, 40, 48, 56, 64, 72, 80, 136, 200] {
+            let fac = LogFacility::from_syslog_code(code);
+            assert_eq!(fac.as_syslog_code(), code);
+        }
+    }
+
+    #[test]
+    fn log_facility_kern_is_custom() {
+        let kern = LogFacility::from_syslog_code(0);
+        assert_eq!(kern.as_syslog_code(), 0);
+        // kern is not a recognized variant, becomes Custom
+        assert!(matches!(kern, LogFacility::Custom(0)));
+    }
+
+    // ===================================================================
+    // Additional tests — LogConfig
+    // ===================================================================
+
+    #[test]
+    fn log_config_with_debug() {
+        let config = LogConfig {
+            debug: true,
+            ..LogConfig::default()
+        };
+        assert!(config.debug);
+        assert_eq!(config.facility, LogFacility::Daemon);
+    }
+
+    #[test]
+    fn log_config_with_json() {
+        let config = LogConfig {
+            json_output: true,
+            ..LogConfig::default()
+        };
+        assert!(config.json_output);
+    }
+
+    #[test]
+    fn log_config_with_extra_logging() {
+        let config = LogConfig {
+            extra_logging: true,
+            ..LogConfig::default()
+        };
+        assert!(config.extra_logging);
+    }
+
+    #[test]
+    fn log_config_with_log_file() {
+        let config = LogConfig {
+            log_file: Some("/var/log/dnsmasq.log".to_string()),
+            ..LogConfig::default()
+        };
+        assert_eq!(config.log_file.as_deref(), Some("/var/log/dnsmasq.log"));
+    }
+
+    #[test]
+    fn log_config_with_trace_level() {
+        let config = LogConfig {
+            max_level: Level::TRACE,
+            ..LogConfig::default()
+        };
+        assert_eq!(config.max_level, Level::TRACE);
+    }
+
+    #[test]
+    fn log_config_with_error_level() {
+        let config = LogConfig {
+            max_level: Level::ERROR,
+            ..LogConfig::default()
+        };
+        assert_eq!(config.max_level, Level::ERROR);
+    }
+
+    // ===================================================================
+    // Additional tests — build_env_filter
+    // ===================================================================
+
+    #[test]
+    fn env_filter_debug_mode() {
+        let config = LogConfig {
+            max_level: Level::DEBUG,
+            ..LogConfig::default()
+        };
+        let filter = build_env_filter(&config);
+        let filter_str = format!("{}", filter);
+        assert!(
+            filter_str.contains("debug"),
+            "Debug filter should contain 'debug', got: {}",
+            filter_str
+        );
+    }
+
+    #[test]
+    fn env_filter_trace_mode() {
+        let config = LogConfig {
+            max_level: Level::TRACE,
+            ..LogConfig::default()
+        };
+        let filter = build_env_filter(&config);
+        let filter_str = format!("{}", filter);
+        assert!(
+            filter_str.contains("trace"),
+            "Trace filter should contain 'trace', got: {}",
+            filter_str
+        );
+    }
+
+    #[test]
+    fn env_filter_extra_logging() {
+        let config = LogConfig {
+            extra_logging: true,
+            ..LogConfig::default()
+        };
+        let filter = build_env_filter(&config);
+        let filter_str = format!("{}", filter);
+        // Extra logging should enable more verbose output
+        assert!(!filter_str.is_empty());
+    }
+
+    #[test]
+    fn env_filter_with_both_queries_and_dhcp() {
+        let config = LogConfig {
+            log_queries: true,
+            log_dhcp: true,
+            ..LogConfig::default()
+        };
+        let filter = build_env_filter(&config);
+        let filter_str = format!("{}", filter);
+        assert!(filter_str.contains("dns=debug") || filter_str.contains("debug"));
+        assert!(filter_str.contains("dhcp=debug") || filter_str.contains("debug"));
+    }
+
+    #[test]
+    fn env_filter_no_queries_no_dhcp() {
+        let config = LogConfig {
+            log_queries: false,
+            log_dhcp: false,
+            ..LogConfig::default()
+        };
+        let filter = build_env_filter(&config);
+        let filter_str = format!("{}", filter);
+        assert!(!filter_str.is_empty());
+    }
+
+    // ===================================================================
+    // Additional tests — level_to_directive_str completeness
+    // ===================================================================
+
+    #[test]
+    fn level_directive_all_levels() {
+        let levels = [
+            Level::ERROR,
+            Level::WARN,
+            Level::INFO,
+            Level::DEBUG,
+            Level::TRACE,
+        ];
+        let expected = ["error", "warn", "info", "debug", "trace"];
+        for (level, exp) in levels.iter().zip(expected.iter()) {
+            assert_eq!(level_to_directive_str(*level), *exp);
+        }
+    }
+
+    // ===================================================================
+    // Additional tests — syslog operations
+    // ===================================================================
+
+    #[test]
+    fn syslog_priority_all_levels() {
+        // Verify all levels map to valid syslog priorities
+        let levels = [
+            Level::ERROR,
+            Level::WARN,
+            Level::INFO,
+            Level::DEBUG,
+            Level::TRACE,
+        ];
+        for level in levels {
+            let priority = tracing_level_to_syslog_priority(level);
+            assert!(priority >= 0, "Priority for {:?} should be >= 0", level);
+            assert!(priority <= 7, "Priority for {:?} should be <= 7", level);
+        }
+    }
+
+    #[test]
+    fn syslog_open_and_write() {
+        // Test syslog operations (safe even if syslog not truly open)
+        open_system_syslog(&LogFacility::Daemon);
+        write_system_syslog(libc::LOG_INFO, "test message from unit test");
+    }
+
+    #[test]
+    fn syslog_open_local_facility() {
+        open_system_syslog(&LogFacility::Local0);
+        write_system_syslog(libc::LOG_DEBUG, "local0 test");
+    }
+
+    #[test]
+    fn syslog_open_user_facility() {
+        open_system_syslog(&LogFacility::User);
+        write_system_syslog(libc::LOG_WARNING, "user test");
+    }
+
+    // ===================================================================
+    // Additional tests — log event functions
+    // ===================================================================
+
+    #[test]
+    fn log_dns_query_does_not_panic() {
+        log_dns_query("example.com", 1, "127.0.0.1", 0);
+        log_dns_query("test.local", 28, "::1", 0x8000);
+        log_dns_query("", 0, "", 0);
+    }
+
+    #[test]
+    fn log_dhcp_event_does_not_panic() {
+        log_dhcp_event(
+            "DHCPOFFER",
+            "aa:bb:cc:dd:ee:ff",
+            "192.168.1.100",
+            Some("client1"),
+        );
+        log_dhcp_event("DHCPACK", "11:22:33:44:55:66", "10.0.0.1", None);
+        log_dhcp_event("", "", "", None);
+    }
+
+    #[test]
+    fn log_privilege_drop_does_not_panic() {
+        log_privilege_drop("nobody");
+        log_privilege_drop("dnsmasq");
+    }
+
+    #[test]
+    fn log_config_reload_does_not_panic() {
+        log_config_reload("/etc/dnsmasq.conf");
+        log_config_reload("/tmp/test.conf");
+    }
+
+    #[test]
+    fn log_dnssec_failure_does_not_panic() {
+        log_dnssec_failure("example.com", "signature expired");
+        log_dnssec_failure("test.org", "no DNSKEY");
+    }
+
+    #[test]
+    fn log_cache_poisoning_does_not_panic() {
+        log_cache_poisoning_attempt("evil.com", "192.168.1.1:53");
+        log_cache_poisoning_attempt("", "");
+    }
+
+    #[test]
+    fn log_tftp_event_does_not_panic() {
+        log_tftp_event("RRQ", "/boot/pxelinux.0", "10.0.0.50");
+        log_tftp_event("WRQ", "/test.txt", "::1");
+    }
+
+    #[test]
+    fn log_script_event_does_not_panic() {
+        log_script_event("add", "192.168.1.100 aa:bb:cc:dd:ee:ff");
+        log_script_event("del", "10.0.0.1 hostname");
+    }
+
+    #[test]
+    fn log_debug_message_does_not_panic() {
+        log_debug_message("Test debug message");
+        log_debug_message("");
+        log_debug_message("Multi\nline\nmessage");
+    }
+
+    // ===================================================================
+    // Additional tests — FileWriter
+    // ===================================================================
+
+    #[test]
+    fn file_writer_write_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("write_test.log");
+        let writer = FileWriter::open(path.to_str().unwrap()).unwrap();
+
+        // Write data
+        {
+            let mut handle = writer.state.lock().unwrap();
+            handle.file.write_all(b"hello world\n").unwrap();
+            handle.file.flush().unwrap();
+        }
+
+        // Verify content
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("hello world"));
+    }
+
+    #[test]
+    fn file_writer_multiple_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.log");
+        let writer = FileWriter::open(path.to_str().unwrap()).unwrap();
+
+        for i in 0..10 {
+            let mut handle = writer.state.lock().unwrap();
+            write!(handle.file, "line {}\n", i).unwrap();
+        }
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        for i in 0..10 {
+            assert!(content.contains(&format!("line {}", i)));
+        }
+    }
+
+    #[test]
+    fn file_writer_reopen_preserves_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reopen.log");
+        let writer = FileWriter::open(path.to_str().unwrap()).unwrap();
+
+        // Write before reopen
+        {
+            let mut handle = writer.state.lock().unwrap();
+            handle.file.write_all(b"before\n").unwrap();
+        }
+
+        writer.reopen().unwrap();
+
+        // Write after reopen
+        {
+            let mut handle = writer.state.lock().unwrap();
+            handle.file.write_all(b"after\n").unwrap();
+        }
+
+        // File should exist and have content
+        assert!(path.exists());
+    }
+
+    // ===================================================================
+    // Additional tests — init_logging
+    // ===================================================================
+
+    #[test]
+    fn init_logging_stderr_default() {
+        // Init with default config (stderr logging)
+        let config = LogConfig::default();
+        // This may fail if already initialized, but should not panic
+        let _ = init_logging(&config);
+    }
+
+    #[test]
+    fn init_logging_with_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init_test.log");
+        let config = LogConfig {
+            log_file: Some(path.to_str().unwrap().to_string()),
+            ..LogConfig::default()
+        };
+        let _ = init_logging(&config);
+    }
+
+    // ===================================================================
+    // Additional tests — flush and reopen
+    // ===================================================================
+
+    #[test]
+    fn flush_logging_does_not_panic() {
+        flush_logging();
+    }
+
+    #[test]
+    fn reopen_log_no_file_is_ok() {
+        let result = reopen_log();
+        assert!(result.is_ok());
+    }
+
+    // ===================================================================
+    // Additional tests — syslog constants
+    // ===================================================================
+
+    #[test]
+    fn syslog_facility_constants() {
+        assert_eq!(SYSLOG_FACILITY_DAEMON, 24);
+        assert_eq!(SYSLOG_FACILITY_USER, 8);
+        assert_eq!(SYSLOG_FACILITY_MAIL, 16);
+        assert_eq!(SYSLOG_FACILITY_LOCAL0, 128);
+    }
+
+    #[test]
+    fn tracing_to_syslog_priority_all_levels() {
+        assert_eq!(
+            tracing_level_to_syslog_priority(tracing::Level::ERROR),
+            libc::LOG_ERR
+        );
+        assert_eq!(
+            tracing_level_to_syslog_priority(tracing::Level::WARN),
+            libc::LOG_WARNING
+        );
+        assert_eq!(
+            tracing_level_to_syslog_priority(tracing::Level::INFO),
+            libc::LOG_INFO
+        );
+        assert_eq!(
+            tracing_level_to_syslog_priority(tracing::Level::DEBUG),
+            libc::LOG_DEBUG
+        );
+        assert_eq!(
+            tracing_level_to_syslog_priority(tracing::Level::TRACE),
+            libc::LOG_DEBUG
+        );
+    }
+
+    #[test]
+    fn custom_facility_syslog_code() {
+        let fac = LogFacility::Custom(32);
+        assert_eq!(fac.as_syslog_code(), 32);
+        let fac2 = LogFacility::Custom(200);
+        assert_eq!(fac2.as_syslog_code(), 200);
+    }
 }

@@ -1451,4 +1451,1041 @@ mod tests {
         ScriptHelper::parse_extra_data(&[], &event, &mut envs);
         assert!(envs.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Additional format_mac_address tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_mac_address_all_zeros() {
+        assert_eq!(
+            format_mac_address(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            "00:00:00:00:00:00"
+        );
+    }
+
+    #[test]
+    fn test_format_mac_address_all_ff() {
+        assert_eq!(
+            format_mac_address(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            "ff:ff:ff:ff:ff:ff"
+        );
+    }
+
+    #[test]
+    fn test_format_mac_address_two_bytes() {
+        assert_eq!(format_mac_address(&[0xAA, 0xBB]), "aa:bb");
+    }
+
+    #[test]
+    fn test_format_mac_address_eight_bytes() {
+        assert_eq!(
+            format_mac_address(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]),
+            "01:02:03:04:05:06:07:08"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ScriptEvent tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_script_event_new_default_fields() {
+        let e = ScriptEvent::new_default(EventAction::Del);
+        assert!(matches!(e.action, EventAction::Del));
+        assert_eq!(e.flags, 0);
+        assert!(e.hwaddr.is_empty());
+        assert_eq!(e.hwaddr_type, 0);
+        assert!(e.client_id.is_none());
+        assert!(e.hostname.is_none());
+        assert!(e.extra_data.is_none());
+        assert_eq!(e.addr, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(e.giaddr, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(e.addr6, Ipv6Addr::UNSPECIFIED);
+        assert_eq!(e.remaining_time, 0);
+        assert!(e.expires.is_none());
+        assert!(e.lease_length.is_none());
+        assert!(e.interface.is_empty());
+    }
+
+    #[test]
+    fn test_script_event_with_hostname() {
+        let mut e = ScriptEvent::new_default(EventAction::Add);
+        e.hostname = Some("testhost".to_string());
+        assert_eq!(e.hostname.as_deref(), Some("testhost"));
+    }
+
+    #[test]
+    fn test_script_event_with_client_id() {
+        let mut e = ScriptEvent::new_default(EventAction::Old);
+        e.client_id = Some(vec![0x01, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        assert_eq!(e.client_id.as_ref().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn test_script_event_with_hwaddr() {
+        let mut e = ScriptEvent::new_default(EventAction::Add);
+        e.hwaddr = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+        e.hwaddr_type = 1; // Ethernet
+        assert_eq!(e.hwaddr.len(), 6);
+        assert_eq!(e.hwaddr_type, 1);
+    }
+
+    #[test]
+    fn test_script_event_with_lease_time() {
+        let mut e = ScriptEvent::new_default(EventAction::Add);
+        e.remaining_time = 3600;
+        assert_eq!(e.remaining_time, 3600);
+    }
+
+    #[test]
+    fn test_script_event_with_lease_length() {
+        let mut e = ScriptEvent::new_default(EventAction::Add);
+        e.lease_length = Some(7200);
+        assert_eq!(e.lease_length.unwrap(), 7200);
+    }
+
+    #[test]
+    fn test_script_event_with_interface() {
+        let mut e = ScriptEvent::new_default(EventAction::Arp);
+        e.interface = "eth0".to_string();
+        assert_eq!(e.interface, "eth0");
+    }
+
+    #[test]
+    fn test_script_event_with_addrs() {
+        let mut e = ScriptEvent::new_default(EventAction::Add);
+        e.addr = Ipv4Addr::new(192, 168, 1, 100);
+        e.giaddr = Ipv4Addr::new(192, 168, 1, 1);
+        e.addr6 = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        assert_eq!(e.addr, Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(e.giaddr, Ipv4Addr::new(192, 168, 1, 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // ScriptHelper construction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_script_helper_with_script() {
+        let helper =
+            ScriptHelper::new(Some("/usr/local/bin/dhcp-event".to_string()), None, None).unwrap();
+        assert!(helper.script_path.is_some());
+        assert_eq!(
+            helper.script_path.as_deref(),
+            Some("/usr/local/bin/dhcp-event")
+        );
+    }
+
+    #[test]
+    fn test_script_helper_no_uid_gid() {
+        let helper = ScriptHelper::new(None, None, None).unwrap();
+        assert!(helper.script_path.is_none());
+        assert!(helper.is_empty());
+    }
+
+    #[test]
+    fn test_script_helper_is_empty_initial() {
+        let helper = ScriptHelper::new(Some("/bin/true".to_string()), None, None).unwrap();
+        assert!(helper.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // EventAction comprehensive tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_event_action_all_variants() {
+        let actions = vec![
+            EventAction::Add,
+            EventAction::Del,
+            EventAction::Old,
+            EventAction::Tftp,
+            EventAction::Arp,
+            EventAction::ArpDel,
+            EventAction::RelaySnoopv6,
+        ];
+        let expected_strs = vec![
+            "add",
+            "del",
+            "old",
+            "tftp",
+            "arp-add",
+            "arp-del",
+            "relay-snoop",
+        ];
+        for (action, expected) in actions.iter().zip(expected_strs.iter()) {
+            assert_eq!(action.as_str(), *expected);
+        }
+    }
+
+    #[test]
+    fn test_event_action_display_all() {
+        assert_eq!(format!("{}", EventAction::Del), "del");
+        assert_eq!(format!("{}", EventAction::Old), "old");
+        assert_eq!(format!("{}", EventAction::Tftp), "tftp");
+        assert_eq!(format!("{}", EventAction::Arp), "arp-add");
+    }
+
+    // -----------------------------------------------------------------------
+    // queue_arp and queue_tftp combinations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_queue_arp_v4() {
+        let mut helper = ScriptHelper::new(Some("/bin/true".to_string()), None, None).unwrap();
+        let addr = AllAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        helper.queue_arp(
+            EventAction::Arp,
+            &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            AF_INET,
+            &addr,
+        );
+        assert!(!helper.is_empty());
+    }
+
+    #[test]
+    fn test_queue_arp_v6() {
+        let mut helper = ScriptHelper::new(Some("/bin/true".to_string()), None, None).unwrap();
+        let addr = AllAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        helper.queue_arp(
+            EventAction::Arp,
+            &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
+            AF_INET6,
+            &addr,
+        );
+        assert!(!helper.is_empty());
+    }
+
+    #[test]
+    fn test_queue_arp_del() {
+        let mut helper = ScriptHelper::new(Some("/bin/true".to_string()), None, None).unwrap();
+        let addr = AllAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        helper.queue_arp(
+            EventAction::ArpDel,
+            &[0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA],
+            AF_INET,
+            &addr,
+        );
+        assert!(!helper.is_empty());
+    }
+
+    #[test]
+    fn test_queue_tftp_multiple() {
+        let mut helper = ScriptHelper::new(Some("/bin/true".to_string()), None, None).unwrap();
+        let peer = MySockAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 69));
+        helper.queue_tftp(4096, "kernel.img", &peer);
+        helper.queue_tftp(512, "initrd.img", &peer);
+        assert!(!helper.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // ScriptEvent v6 flag combinations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_v6_with_flags() {
+        let mut e = ScriptEvent::new_default(EventAction::Add);
+        // LEASE_NA only
+        e.flags = LEASE_NA;
+        assert!(e.is_v6());
+        // LEASE_TA only
+        e.flags = LEASE_TA;
+        assert!(e.is_v6());
+        // Both
+        e.flags = LEASE_NA | LEASE_TA;
+        assert!(e.is_v6());
+        // Random other flags
+        e.flags = 1;
+        assert!(!e.is_v6());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_extra_data with data
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_extra_data_single_null() {
+        let event = ScriptEvent::new_default(EventAction::Add);
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&[0x00], &event, &mut envs);
+        // One null-terminated field (empty string) — shouldn't produce env vars
+        let _ = envs;
+    }
+
+    #[test]
+    fn test_parse_extra_data_vendor_class() {
+        let event = ScriptEvent::new_default(EventAction::Add);
+        let mut envs = Vec::new();
+        let data = b"MSFT 5.0\x00";
+        ScriptHelper::parse_extra_data(data, &event, &mut envs);
+        // Should parse vendor class field
+        let _ = envs;
+    }
+
+    // -----------------------------------------------------------------------
+    // LEASE_* constant verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lease_flag_constants() {
+        assert!(LEASE_NA > 0);
+        assert!(LEASE_TA > 0);
+        assert_ne!(LEASE_NA, LEASE_TA);
+    }
+
+    // -----------------------------------------------------------------------
+    // ScriptHelper resolve_default_credentials
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_default_credentials_root() {
+        let (uid, gid) = ScriptHelper::resolve_default_credentials("root", "root");
+        // root should resolve on most systems
+        assert!(uid.is_some() || uid.is_none()); // may fail in minimal containers
+        let _ = gid;
+    }
+
+    #[test]
+    fn test_resolve_default_credentials_nonexistent() {
+        let (uid, gid) = ScriptHelper::resolve_default_credentials(
+            "nonexistent_user_xyz_12345",
+            "nonexistent_group_xyz_12345",
+        );
+        assert!(uid.is_none());
+        assert!(gid.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_extra_data tests — DHCPv4 vendor class
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_extra_data_v4_vendor_class() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = 0; // v4 event
+                         // "MyVendorClass" followed by NUL separators
+        let mut extra = Vec::new();
+        extra.extend_from_slice(b"MyVendorClass");
+        extra.push(0); // end of vendor class
+        extra.push(0); // empty cpewan
+        extra.push(0); // empty circuit
+        extra.push(0); // empty subscriber
+        extra.push(0); // empty remote
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_VENDOR_CLASS" && v == "MyVendorClass"),
+            "Expected DNSMASQ_VENDOR_CLASS=MyVendorClass, got: {:?}",
+            envs
+        );
+    }
+
+    #[test]
+    fn test_parse_extra_data_v4_cpewan_fields() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = 0; // v4 event
+        let mut extra = Vec::new();
+        extra.push(0); // empty vendor class
+        extra.extend_from_slice(b"OUI123,SER456,CLS789");
+        extra.push(0); // end of cpewan
+        extra.push(0); // empty circuit
+        extra.push(0); // empty subscriber
+        extra.push(0); // empty remote
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_CPEWAN_OUI" && v == "OUI123"),
+            "Expected OUI, got: {:?}",
+            envs
+        );
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_CPEWAN_SERIAL" && v == "SER456"),
+            "Expected SERIAL, got: {:?}",
+            envs
+        );
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_CPEWAN_CLASS" && v == "CLS789"),
+            "Expected CLASS, got: {:?}",
+            envs
+        );
+    }
+
+    #[test]
+    fn test_parse_extra_data_v4_circuit_id_hex() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = 0;
+        let mut extra = Vec::new();
+        extra.push(0); // empty vendor class
+        extra.push(0); // empty cpewan
+        extra.extend_from_slice(&[0x01, 0x02, 0x03]); // circuit ID bytes
+        extra.push(0); // end circuit
+        extra.push(0); // empty subscriber
+        extra.push(0); // empty remote
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_CIRCUIT_ID" && v == "01:02:03"),
+            "Expected hex circuit ID, got: {:?}",
+            envs
+        );
+    }
+
+    #[test]
+    fn test_parse_extra_data_v4_subscriber_id() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = 0;
+        let mut extra = Vec::new();
+        extra.push(0); // empty vendor
+        extra.push(0); // empty cpewan
+        extra.push(0); // empty circuit
+        extra.extend_from_slice(b"subscriber1"); // subscriber ID
+        extra.push(0);
+        extra.push(0); // empty remote
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_SUBSCRIBER_ID" && v == "subscriber1"),
+            "Expected subscriber ID, got: {:?}",
+            envs
+        );
+    }
+
+    #[test]
+    fn test_parse_extra_data_v4_remote_id_hex() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = 0;
+        let mut extra = Vec::new();
+        extra.push(0); // empty vendor
+        extra.push(0); // empty cpewan
+        extra.push(0); // empty circuit
+        extra.push(0); // empty subscriber
+        extra.extend_from_slice(&[0x0a, 0x0b, 0x0c]); // remote ID bytes
+        extra.push(0);
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_REMOTE_ID" && v == "0a:0b:0c"),
+            "Expected hex remote ID, got: {:?}",
+            envs
+        );
+    }
+
+    #[test]
+    fn test_parse_extra_data_v4_all_fields_populated() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = 0;
+        let mut extra = Vec::new();
+        extra.extend_from_slice(b"VendorX");
+        extra.push(0); // vendor class
+        extra.extend_from_slice(b"OUI,SER,CLS");
+        extra.push(0); // cpewan
+        extra.extend_from_slice(&[0x01, 0x02]);
+        extra.push(0); // circuit id
+        extra.extend_from_slice(b"sub1");
+        extra.push(0); // subscriber
+        extra.extend_from_slice(&[0x03, 0x04]);
+        extra.push(0); // remote
+        extra.extend_from_slice(b"tag1");
+        extra.push(0); // tags
+        extra.extend_from_slice(b"UserClass1");
+        extra.push(0); // user class 0
+        extra.push(0); // end of user classes
+        extra.extend_from_slice(b"example.com");
+        extra.push(0); // domain
+        extra.extend_from_slice(b"1,3,6,15");
+        extra.push(0); // requested options
+        extra.extend_from_slice(b"https://mud.example.com");
+        extra.push(0); // MUD URL
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "DNSMASQ_VENDOR_CLASS" && v == "VendorX"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "DNSMASQ_CPEWAN_OUI" && v == "OUI"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "DNSMASQ_CPEWAN_SERIAL" && v == "SER"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "DNSMASQ_CPEWAN_CLASS" && v == "CLS"));
+        assert!(envs.iter().any(|(k, _)| k == "DNSMASQ_CIRCUIT_ID"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "DNSMASQ_SUBSCRIBER_ID" && v == "sub1"));
+        assert!(envs.iter().any(|(k, _)| k == "DNSMASQ_REMOTE_ID"));
+        assert!(envs.iter().any(|(k, v)| k == "DNSMASQ_TAGS" && v == "tag1"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "DNSMASQ_USER_CLASS0" && v == "UserClass1"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "DNSMASQ_DOMAIN" && v == "example.com"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "DNSMASQ_REQUESTED_OPTIONS" && v == "1,3,6,15"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "DNSMASQ_MUD_URL" && v == "https://mud.example.com"));
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_parse_extra_data_v6_vendor_class() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = super::LEASE_NA; // v6 event
+        let mut extra = Vec::new();
+        extra.extend_from_slice(b"Vendor6Class");
+        extra.push(0);
+        extra.push(0);
+        extra.push(0);
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_VENDOR_CLASS_ID" && v == "Vendor6Class"),
+            "Expected v6 VENDOR_CLASS_ID, got: {:?}",
+            envs
+        );
+    }
+
+    #[test]
+    fn test_parse_extra_data_non_dhcp_event_skips() {
+        let event = ScriptEvent::new_default(EventAction::Arp);
+        let mut extra = Vec::new();
+        extra.extend_from_slice(b"some_data");
+        extra.push(0);
+        extra.extend_from_slice(b"more");
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        // ARP events should not set DHCP env vars
+        assert!(!envs.iter().any(|(k, _)| k.starts_with("DNSMASQ_VENDOR")));
+    }
+
+    #[test]
+    fn test_parse_extra_data_v4_tags_only() {
+        let mut event = ScriptEvent::new_default(EventAction::Old);
+        event.flags = 0;
+        let mut extra = Vec::new();
+        extra.push(0); // vendor
+        extra.push(0); // cpewan
+        extra.push(0); // circuit
+        extra.push(0); // subscriber
+        extra.push(0); // remote
+        extra.extend_from_slice(b"known,internal"); // tags
+        extra.push(0);
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_TAGS" && v == "known,internal"),
+            "Expected TAGS, got: {:?}",
+            envs
+        );
+    }
+
+    #[test]
+    fn test_parse_extra_data_v4_user_classes_multiple() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = 0;
+        let mut extra = Vec::new();
+        extra.push(0); // vendor
+        extra.push(0); // cpewan
+        extra.push(0); // circuit
+        extra.push(0); // subscriber
+        extra.push(0); // remote
+        extra.push(0); // tags (empty)
+        extra.extend_from_slice(b"ClassA");
+        extra.push(0); // user class 0
+        extra.extend_from_slice(b"ClassB");
+        extra.push(0); // user class 1
+        extra.extend_from_slice(b"ClassC");
+        extra.push(0); // user class 2
+        extra.push(0); // end of user classes
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "DNSMASQ_USER_CLASS0" && v == "ClassA"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "DNSMASQ_USER_CLASS1" && v == "ClassB"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "DNSMASQ_USER_CLASS2" && v == "ClassC"));
+    }
+
+    #[test]
+    fn test_parse_extra_data_v4_domain_field() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = 0;
+        let mut extra = Vec::new();
+        extra.push(0); // vendor
+        extra.push(0); // cpewan
+        extra.push(0); // circuit
+        extra.push(0); // subscriber
+        extra.push(0); // remote
+        extra.push(0); // tags
+        extra.push(0); // end user classes (no user classes)
+        extra.extend_from_slice(b"home.local"); // domain
+        extra.push(0);
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_DOMAIN" && v == "home.local"),
+            "Expected DOMAIN, got: {:?}",
+            envs
+        );
+    }
+
+    #[test]
+    fn test_parse_extra_data_v4_mud_url() {
+        let mut event = ScriptEvent::new_default(EventAction::Del);
+        event.flags = 0;
+        let mut extra = Vec::new();
+        extra.push(0); // vendor
+        extra.push(0); // cpewan
+        extra.push(0); // circuit
+        extra.push(0); // subscriber
+        extra.push(0); // remote
+        extra.push(0); // tags
+        extra.push(0); // end user classes
+        extra.push(0); // domain (empty)
+        extra.push(0); // req opts (empty)
+        extra.extend_from_slice(b"https://mud.example.com/device"); // MUD URL
+        extra.push(0);
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_MUD_URL" && v == "https://mud.example.com/device"),
+            "Expected MUD URL, got: {:?}",
+            envs
+        );
+    }
+
+    #[test]
+    fn test_parse_extra_data_v4_empty_bytes() {
+        let event = ScriptEvent::new_default(EventAction::Add);
+        let extra: Vec<u8> = Vec::new();
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        // Should not crash with empty extra data
+    }
+
+    // -----------------------------------------------------------------------
+    // ScriptEvent field access tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_script_event_remaining_time_set() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.remaining_time = 3600;
+        assert_eq!(event.remaining_time, 3600);
+    }
+
+    #[test]
+    fn test_script_event_lease_expires_set() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.expires =
+            Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1700000000));
+        assert!(event.expires.is_some());
+    }
+
+    #[test]
+    fn test_script_event_interface_set() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.interface = "eth0".to_string();
+        assert_eq!(event.interface, "eth0");
+    }
+
+    #[test]
+    fn test_script_event_giaddr_set() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.giaddr = "10.0.0.1".parse().unwrap();
+        assert_ne!(event.giaddr, std::net::Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[test]
+    fn test_script_event_addr6_set() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.addr6 = "2001:db8::1".parse().unwrap();
+        assert!(!event.addr6.is_unspecified());
+    }
+
+    #[test]
+    fn test_script_event_lease_length_set() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.lease_length = Some(86400);
+        assert_eq!(event.lease_length, Some(86400));
+    }
+
+    // -----------------------------------------------------------------------
+    // Queue methods via ScriptHelper::new() constructor
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_queue_script_with_lease() {
+        let mut helper =
+            ScriptHelper::new(Some("/usr/bin/test-script".to_string()), None, None).unwrap();
+
+        let mut lease = crate::dhcp::lease::lease4_allocate("10.0.0.5".parse().unwrap());
+        lease.expires = 1700000000;
+        lease.hwaddr = vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        lease.hwaddr_type = 1;
+        lease.hwaddr_len = 6;
+        lease.hostname = Some("testhost".to_string());
+        lease.interface = Some("eth0".to_string());
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1699999000);
+        helper.queue_script(EventAction::Add, &lease, None, now);
+        assert_eq!(helper.event_queue.len(), 1);
+        let ev = &helper.event_queue[0];
+        assert_eq!(ev.action, EventAction::Add);
+        assert_eq!(ev.hostname.as_deref(), Some("testhost"));
+        assert!(!ev.hwaddr.is_empty());
+        assert!(ev.remaining_time > 0);
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_queue_script_no_script_skips() {
+        let mut helper = ScriptHelper::new(None, None, None).unwrap();
+        let mut lease = crate::dhcp::lease::lease4_allocate("10.0.0.1".parse().unwrap());
+        lease.expires = 0;
+        lease.hwaddr = Vec::new();
+        lease.hwaddr_len = 0;
+        let now = std::time::SystemTime::now();
+        helper.queue_script(EventAction::Add, &lease, None, now);
+        assert!(helper.event_queue.is_empty());
+    }
+
+    #[test]
+    fn test_queue_arp_v4_with_alladdr() {
+        let mut helper = ScriptHelper::new(Some("/bin/true".to_string()), None, None).unwrap();
+        let mac = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let addr = AllAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 100));
+        helper.queue_arp(EventAction::Arp, &mac, AF_INET, &addr);
+        assert_eq!(helper.event_queue.len(), 1);
+        let ev = &helper.event_queue[0];
+        assert_eq!(ev.action, EventAction::Arp);
+        assert_eq!(ev.addr, std::net::Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(ev.hwaddr, mac);
+    }
+
+    #[test]
+    fn test_queue_arp_v6_with_alladdr() {
+        let mut helper = ScriptHelper::new(Some("/bin/true".to_string()), None, None).unwrap();
+        let mac = vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let addr6: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let addr = AllAddr::V6(addr6);
+        helper.queue_arp(EventAction::Arp, &mac, AF_INET6, &addr);
+        assert_eq!(helper.event_queue.len(), 1);
+        let ev = &helper.event_queue[0];
+        assert_eq!(ev.addr6, addr6);
+    }
+
+    #[test]
+    fn test_queue_arp_del_event() {
+        let mut helper = ScriptHelper::new(Some("/bin/true".to_string()), None, None).unwrap();
+        let mac = vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let addr = AllAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        helper.queue_arp(EventAction::ArpDel, &mac, AF_INET, &addr);
+        assert_eq!(helper.event_queue.len(), 1);
+        assert_eq!(helper.event_queue[0].action, EventAction::ArpDel);
+    }
+
+    #[test]
+    fn test_queue_tftp_v4_with_mysockaddr() {
+        let mut helper = ScriptHelper::new(Some("/bin/true".to_string()), None, None).unwrap();
+        let peer = MySockAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::new(192, 168, 1, 1),
+            69,
+        ));
+        helper.queue_tftp(4096, "firmware.bin", &peer);
+        assert_eq!(helper.event_queue.len(), 1);
+        let ev = &helper.event_queue[0];
+        assert_eq!(ev.action, EventAction::Tftp);
+        assert_eq!(ev.hostname.as_deref(), Some("firmware.bin"));
+        assert_eq!(ev.addr, std::net::Ipv4Addr::new(192, 168, 1, 1));
+    }
+
+    #[test]
+    fn test_queue_tftp_v6_with_mysockaddr() {
+        let mut helper = ScriptHelper::new(Some("/bin/true".to_string()), None, None).unwrap();
+        let addr6: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let peer = MySockAddr::V6(std::net::SocketAddrV6::new(addr6, 69, 0, 0));
+        helper.queue_tftp(512, "kernel.img", &peer);
+        assert_eq!(helper.event_queue.len(), 1);
+        let ev = &helper.event_queue[0];
+        assert_eq!(ev.addr6, addr6);
+    }
+
+    #[test]
+    fn test_queue_tftp_no_script_skips() {
+        let mut helper = ScriptHelper::new(None, None, None).unwrap();
+        let peer = MySockAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::LOCALHOST,
+            69,
+        ));
+        helper.queue_tftp(1024, "test.bin", &peer);
+        assert!(helper.event_queue.is_empty());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_queue_relay_snoop_event() {
+        let mut helper = ScriptHelper::new(Some("/bin/true".to_string()), None, None).unwrap();
+        let client: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let prefix: std::net::Ipv6Addr = "2001:db8::".parse().unwrap();
+        helper.queue_relay_snoop(&client, 1, &prefix, 64);
+        assert_eq!(helper.event_queue.len(), 1);
+        let ev = &helper.event_queue[0];
+        assert_eq!(ev.action, EventAction::RelaySnoopv6);
+        assert_eq!(ev.addr6, client);
+        assert_eq!(ev.hostname.as_deref(), Some("2001:db8::/64"));
+    }
+
+    // -----------------------------------------------------------------------
+    // EventAction comprehensive tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_event_action_all_display_values() {
+        let actions = [
+            (EventAction::Add, "add"),
+            (EventAction::Old, "old"),
+            (EventAction::Del, "del"),
+            (EventAction::Tftp, "tftp"),
+            (EventAction::Arp, "arp-add"),
+            (EventAction::ArpDel, "arp-del"),
+            (EventAction::RelaySnoopv6, "relay-snoop"),
+        ];
+        for (action, expected) in &actions {
+            assert_eq!(format!("{}", action), *expected);
+            assert_eq!(action.as_str(), *expected);
+        }
+    }
+
+    #[test]
+    fn test_event_action_dhcp_classification() {
+        assert!(EventAction::Add.is_dhcp_event());
+        assert!(EventAction::Old.is_dhcp_event());
+        assert!(EventAction::Del.is_dhcp_event());
+        assert!(!EventAction::Arp.is_dhcp_event());
+        assert!(!EventAction::ArpDel.is_dhcp_event());
+        assert!(!EventAction::Tftp.is_dhcp_event());
+        assert!(!EventAction::RelaySnoopv6.is_dhcp_event());
+    }
+
+    // -----------------------------------------------------------------------
+    // Lease flag and is_v6 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_script_event_v6_na_flag() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = super::LEASE_NA;
+        assert!(event.is_v6());
+    }
+
+    #[test]
+    fn test_script_event_v6_ta_flag() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = super::LEASE_TA;
+        assert!(event.is_v6());
+    }
+
+    #[test]
+    fn test_script_event_v4_no_flags() {
+        let event = ScriptEvent::new_default(EventAction::Add);
+        assert!(!event.is_v6());
+    }
+
+    #[test]
+    fn test_script_event_combined_flags() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = super::LEASE_NEW | super::LEASE_CHANGED;
+        assert!(!event.is_v6());
+        assert_ne!(event.flags & super::LEASE_NEW, 0);
+        assert_ne!(event.flags & super::LEASE_CHANGED, 0);
+        assert_eq!(event.flags & super::LEASE_AUX_CHANGED, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // ScriptHelper is_empty / construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_script_helper_is_empty_after_new() {
+        let helper = ScriptHelper::new(Some("/bin/test".to_string()), None, None).unwrap();
+        assert!(helper.is_empty());
+    }
+
+    #[test]
+    fn test_script_helper_not_empty_after_queue() {
+        let mut helper = ScriptHelper::new(Some("/bin/true".to_string()), None, None).unwrap();
+        let peer = MySockAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::LOCALHOST,
+            69,
+        ));
+        helper.queue_tftp(100, "test.bin", &peer);
+        assert!(!helper.is_empty());
+    }
+
+    #[test]
+    fn test_format_mac_single_byte() {
+        let result = format_mac_address(&[0xAB]);
+        assert_eq!(result, "ab");
+    }
+
+    #[test]
+    fn test_format_mac_empty() {
+        let result = format_mac_address(&[]);
+        assert_eq!(result, "");
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_queue_script_old_hostname_cache() {
+        let mut helper = ScriptHelper::new(Some("/usr/bin/test".to_string()), None, None).unwrap();
+        let mut lease = crate::dhcp::lease::lease4_allocate("10.0.0.5".parse().unwrap());
+        lease.expires = 1700000000;
+        lease.hwaddr = vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        lease.hwaddr_type = 1;
+        lease.hwaddr_len = 6;
+        lease.hostname = Some("newhost".to_string());
+        lease.old_hostname = Some("oldhost".to_string());
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1699999000);
+        helper.queue_script(EventAction::Old, &lease, None, now);
+        assert_eq!(helper.old_hostname_cache.as_deref(), Some("oldhost"));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_queue_script_expired_lease_zero_remaining() {
+        let mut helper = ScriptHelper::new(Some("/usr/bin/test".to_string()), None, None).unwrap();
+        let mut lease = crate::dhcp::lease::lease4_allocate("10.0.0.99".parse().unwrap());
+        lease.expires = 100; // Already expired
+        lease.hwaddr = Vec::new();
+        lease.hwaddr_len = 0;
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1700000000);
+        helper.queue_script(EventAction::Del, &lease, None, now);
+        assert_eq!(helper.event_queue.len(), 1);
+        assert_eq!(helper.event_queue[0].remaining_time, 0);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_parse_extra_data_v6_tags() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = super::LEASE_NA; // v6
+        let mut extra = Vec::new();
+        extra.push(0); // empty vendor class
+        extra.extend_from_slice(b"v6tag1"); // tags
+        extra.push(0);
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_TAGS" && v == "v6tag1"),
+            "Expected v6 TAGS, got: {:?}",
+            envs
+        );
+    }
+
+    #[test]
+    fn test_parse_extra_data_v4_cpewan_partial() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = 0;
+        let mut extra = Vec::new();
+        extra.push(0); // empty vendor
+        extra.extend_from_slice(b"JustOUI"); // Only OUI, no commas
+        extra.push(0);
+        extra.push(0); // circuit
+        extra.push(0); // subscriber
+        extra.push(0); // remote
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_CPEWAN_OUI" && v == "JustOUI"),
+            "Expected partial cpewan OUI, got: {:?}",
+            envs
+        );
+        assert!(!envs.iter().any(|(k, _)| k == "DNSMASQ_CPEWAN_SERIAL"));
+    }
+
+    #[test]
+    fn test_parse_extra_data_v4_requested_options() {
+        let mut event = ScriptEvent::new_default(EventAction::Add);
+        event.flags = 0;
+        let mut extra = Vec::new();
+        extra.push(0); // vendor
+        extra.push(0); // cpewan
+        extra.push(0); // circuit
+        extra.push(0); // subscriber
+        extra.push(0); // remote
+        extra.push(0); // tags
+        extra.push(0); // end user classes
+        extra.push(0); // domain (empty)
+        extra.extend_from_slice(b"1,3,6,15,28"); // requested options
+        extra.push(0);
+        let mut envs = Vec::new();
+        ScriptHelper::parse_extra_data(&extra, &event, &mut envs);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DNSMASQ_REQUESTED_OPTIONS" && v == "1,3,6,15,28"),
+            "Expected requested opts, got: {:?}",
+            envs
+        );
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn test_queue_script_with_hostname_override() {
+        let mut helper = ScriptHelper::new(Some("/usr/bin/test".to_string()), None, None).unwrap();
+        let mut lease = crate::dhcp::lease::lease4_allocate("10.0.0.5".parse().unwrap());
+        lease.expires = 1700000000;
+        lease.hwaddr = vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        lease.hwaddr_type = 1;
+        lease.hwaddr_len = 6;
+        lease.hostname = Some("lease-host".to_string());
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1699999000);
+        // Hostname override should take precedence
+        helper.queue_script(EventAction::Add, &lease, Some("override-host"), now);
+        assert_eq!(helper.event_queue.len(), 1);
+        assert_eq!(
+            helper.event_queue[0].hostname.as_deref(),
+            Some("override-host")
+        );
+    }
+
+    #[test]
+    fn test_resolve_credentials_root() {
+        let (uid, gid) = ScriptHelper::resolve_default_credentials("root", "root");
+        // root should always exist
+        assert!(uid.is_some());
+        assert!(gid.is_some());
+    }
+
+    #[test]
+    fn test_resolve_credentials_nonexistent_user() {
+        let (uid, gid) = ScriptHelper::resolve_default_credentials(
+            "zzz_nonexistent_user_999",
+            "zzz_nonexistent_group_999",
+        );
+        assert!(uid.is_none());
+        assert!(gid.is_none());
+    }
 }

@@ -1807,4 +1807,229 @@ mod tests {
         assert_eq!(SERV_FROM_DBUS, 256);
         assert_eq!(SERV_MARK, 512);
     }
+
+    // -----------------------------------------------------------------------
+    // strip_hostname_nul tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_hostname_nul_clean() {
+        let data = b"hostname";
+        assert_eq!(strip_hostname_nul(data).unwrap(), "hostname");
+    }
+
+    #[test]
+    fn test_strip_hostname_nul_trailing_null() {
+        let data = b"hostname\0";
+        assert_eq!(strip_hostname_nul(data).unwrap(), "hostname");
+    }
+
+    #[test]
+    fn test_strip_hostname_nul_embedded_null() {
+        let data = b"host\0name";
+        assert!(strip_hostname_nul(data).is_err());
+    }
+
+    #[test]
+    fn test_strip_hostname_nul_empty() {
+        let data = b"";
+        assert_eq!(strip_hostname_nul(data).unwrap(), "");
+    }
+
+    #[test]
+    fn test_strip_hostname_nul_single_null() {
+        // Just a null terminator → empty string after stripping
+        let data = b"\0";
+        assert_eq!(strip_hostname_nul(data).unwrap(), "");
+    }
+
+    #[test]
+    fn test_strip_hostname_nul_only_nulls() {
+        // Multiple nulls → strip last, but embedded null found
+        let data = b"\0\0";
+        assert!(strip_hostname_nul(data).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // update_filter_rr additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_filter_rr_multiple_types() {
+        let mut filter = Vec::new();
+        update_filter_rr(&mut filter, T_A, true);
+        update_filter_rr(&mut filter, T_AAAA, true);
+        assert_eq!(filter, vec![T_A, T_AAAA]);
+    }
+
+    #[test]
+    fn test_update_filter_rr_remove_all() {
+        let mut filter = vec![T_A, T_AAAA];
+        update_filter_rr(&mut filter, T_A, false);
+        update_filter_rr(&mut filter, T_AAAA, false);
+        assert!(filter.is_empty());
+    }
+
+    #[test]
+    fn test_update_filter_rr_add_after_remove() {
+        let mut filter = vec![T_A];
+        update_filter_rr(&mut filter, T_A, false);
+        assert!(filter.is_empty());
+        update_filter_rr(&mut filter, T_A, true);
+        assert_eq!(filter, vec![T_A]);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_server_addr additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_server_addr_v4_large_port() {
+        let addr = parse_server_addr("1.2.3.4#65535").unwrap();
+        assert_eq!(addr.port(), 65535);
+    }
+
+    #[test]
+    fn test_parse_server_addr_loopback() {
+        let addr = parse_server_addr("127.0.0.1").unwrap();
+        assert_eq!(addr.ip(), Ipv4Addr::LOCALHOST);
+    }
+
+    #[test]
+    fn test_parse_server_addr_v6_full() {
+        let addr = parse_server_addr("2001:db8::1").unwrap();
+        assert!(addr.ip().is_ipv6());
+    }
+
+    #[test]
+    fn test_parse_server_addr_v6_bracketed_with_port() {
+        let addr = parse_server_addr("[2001:db8::1]#8053").unwrap();
+        assert_eq!(addr.port(), 8053);
+    }
+
+    #[test]
+    fn test_parse_server_addr_empty() {
+        assert!(parse_server_addr("").is_none());
+    }
+
+    #[test]
+    fn test_parse_server_addr_garbage() {
+        assert!(parse_server_addr("not.a.valid.address.really").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_ip additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_ip_v4_all_octets() {
+        let ip = parse_ip("255.255.255.255").unwrap();
+        assert_eq!(ip, std::net::IpAddr::V4(Ipv4Addr::BROADCAST));
+    }
+
+    #[test]
+    fn test_parse_ip_v6_loopback() {
+        let ip = parse_ip("::1").unwrap();
+        assert!(ip.is_loopback());
+    }
+
+    #[test]
+    fn test_parse_ip_v6_unspecified() {
+        let ip = parse_ip("::").unwrap();
+        assert!(ip.is_unspecified());
+    }
+
+    // -----------------------------------------------------------------------
+    // DbusError variant tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dbus_error_connection_failed() {
+        let err = DbusError::ConnectionFailed("test error".into());
+        let msg = format!("{}", err);
+        assert!(msg.contains("test error"));
+        assert!(msg.contains("connection") || msg.contains("Connection"));
+    }
+
+    #[test]
+    fn test_dbus_error_registration_failed() {
+        let err = DbusError::RegistrationFailed("denied".into());
+        let msg = format!("{}", err);
+        assert!(msg.contains("denied"));
+    }
+
+    #[test]
+    fn test_dbus_error_method_error() {
+        let err = DbusError::MethodError("bad args".into());
+        let msg = format!("{}", err);
+        assert!(msg.contains("bad args"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_introspection_xml comprehensive tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_introspection_xml_is_valid_xml() {
+        let xml = build_introspection_xml();
+        assert!(xml.starts_with("<!DOCTYPE"));
+        assert!(xml.contains("<node"));
+        assert!(xml.contains("</node>"));
+    }
+
+    #[test]
+    fn test_introspection_xml_contains_version_method() {
+        let xml = build_introspection_xml();
+        assert!(xml.contains("GetVersion"));
+    }
+
+    #[test]
+    fn test_introspection_xml_contains_metrics_methods() {
+        let xml = build_introspection_xml();
+        assert!(xml.contains("GetMetrics"));
+        assert!(xml.contains("GetServerMetrics"));
+        assert!(xml.contains("ClearMetrics"));
+    }
+
+    #[test]
+    fn test_introspection_xml_contains_set_methods() {
+        let xml = build_introspection_xml();
+        assert!(xml.contains("SetServers"));
+        assert!(xml.contains("SetServersEx"));
+        assert!(xml.contains("SetDomainServers"));
+    }
+
+    #[test]
+    fn test_introspection_xml_contains_filter_methods() {
+        let xml = build_introspection_xml();
+        assert!(xml.contains("SetFilterWin2KOption"));
+        assert!(xml.contains("SetBogusPrivOption"));
+        assert!(xml.contains("SetFilterA"));
+        assert!(xml.contains("SetFilterAAAA"));
+    }
+
+    #[test]
+    fn test_introspection_xml_interface_name() {
+        let xml = build_introspection_xml();
+        assert!(xml.contains(DBUS_INTERFACE));
+    }
+
+    // -----------------------------------------------------------------------
+    // Constant value relationship tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_serv_flags_distinct() {
+        assert_ne!(SERV_FROM_DBUS, SERV_MARK);
+        // They should be powers of 2 for bitmask usage
+        assert_eq!(SERV_FROM_DBUS.count_ones(), 1);
+        assert_eq!(SERV_MARK.count_ones(), 1);
+    }
+
+    #[test]
+    fn test_opt_indices_distinct() {
+        assert_ne!(OPT_BOGUSPRIV, OPT_FILTER);
+        assert_ne!(OPT_FILTER, OPT_LOCALISE);
+        assert_ne!(OPT_BOGUSPRIV, OPT_LOCALISE);
+    }
 }

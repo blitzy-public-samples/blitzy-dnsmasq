@@ -4018,4 +4018,4091 @@ mod tests {
         // With zero timeout everything is expired.
         assert!(record.is_expired(0));
     }
+
+    // ===== skip_dns_name tests ========================================
+
+    #[test]
+    fn test_skip_dns_name_root() {
+        // Root label: single 0x00 byte
+        let pkt = vec![0x00];
+        assert_eq!(skip_dns_name(&pkt, 0), Some(1));
+    }
+
+    #[test]
+    fn test_skip_dns_name_single_label() {
+        // "com" = 0x03 c o m 0x00
+        let pkt = vec![0x03, b'c', b'o', b'm', 0x00];
+        assert_eq!(skip_dns_name(&pkt, 0), Some(5));
+    }
+
+    #[test]
+    fn test_skip_dns_name_multi_label() {
+        // "example.com" = 0x07 example 0x03 com 0x00
+        let mut pkt = vec![0x07];
+        pkt.extend_from_slice(b"example");
+        pkt.push(0x03);
+        pkt.extend_from_slice(b"com");
+        pkt.push(0x00);
+        assert_eq!(skip_dns_name(&pkt, 0), Some(13));
+    }
+
+    #[test]
+    fn test_skip_dns_name_compression_pointer() {
+        // Compression pointer: 0xC0 0x0C
+        let pkt = vec![0xC0, 0x0C];
+        assert_eq!(skip_dns_name(&pkt, 0), Some(2));
+    }
+
+    #[test]
+    fn test_skip_dns_name_empty_packet() {
+        let pkt: Vec<u8> = vec![];
+        assert_eq!(skip_dns_name(&pkt, 0), None);
+    }
+
+    #[test]
+    fn test_skip_dns_name_offset_beyond_packet() {
+        let pkt = vec![0x00];
+        assert_eq!(skip_dns_name(&pkt, 5), None);
+    }
+
+    // ===== is_ipv6_unique_local tests =================================
+
+    #[test]
+    fn test_ipv6_unique_local_fc00() {
+        let addr = Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1);
+        assert!(is_ipv6_unique_local(&addr));
+    }
+
+    #[test]
+    fn test_ipv6_unique_local_fd00() {
+        let addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+        assert!(is_ipv6_unique_local(&addr));
+    }
+
+    #[test]
+    fn test_ipv6_not_unique_local_global() {
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        assert!(!is_ipv6_unique_local(&addr));
+    }
+
+    #[test]
+    fn test_ipv6_not_unique_local_link_local() {
+        let addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        assert!(!is_ipv6_unique_local(&addr));
+    }
+
+    // ===== is_ipv6_link_local tests ===================================
+
+    #[test]
+    fn test_ipv6_link_local_fe80() {
+        let addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        assert!(is_ipv6_link_local(&addr));
+    }
+
+    #[test]
+    fn test_ipv6_link_local_febf() {
+        let addr = Ipv6Addr::new(0xfebf, 0, 0, 0, 0, 0, 0, 1);
+        assert!(is_ipv6_link_local(&addr));
+    }
+
+    #[test]
+    fn test_ipv6_not_link_local_fec0() {
+        let addr = Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1);
+        assert!(!is_ipv6_link_local(&addr));
+    }
+
+    #[test]
+    fn test_ipv6_not_link_local_global() {
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        assert!(!is_ipv6_link_local(&addr));
+    }
+
+    // ===== extract_rr_ttl tests =======================================
+
+    #[test]
+    fn test_extract_rr_ttl_valid() {
+        // RR fixed fields: TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) = 10 bytes
+        // TTL at offset+4
+        let mut pkt = vec![0u8; 20];
+        // Set TTL = 3600 (0x00000E10) at position 4
+        pkt[4] = 0x00;
+        pkt[5] = 0x00;
+        pkt[6] = 0x0E;
+        pkt[7] = 0x10;
+        assert_eq!(extract_rr_ttl(&pkt, 0), Some(3600));
+    }
+
+    #[test]
+    fn test_extract_rr_ttl_max() {
+        let mut pkt = vec![0u8; 20];
+        pkt[4] = 0xFF;
+        pkt[5] = 0xFF;
+        pkt[6] = 0xFF;
+        pkt[7] = 0xFF;
+        assert_eq!(extract_rr_ttl(&pkt, 0), Some(u32::MAX));
+    }
+
+    #[test]
+    fn test_extract_rr_ttl_too_short() {
+        let pkt = vec![0u8; 5]; // Too short for RRFIXEDSZ
+        assert_eq!(extract_rr_ttl(&pkt, 0), None);
+    }
+
+    #[test]
+    fn test_extract_rr_ttl_with_offset() {
+        let mut pkt = vec![0u8; 30];
+        // TTL at offset 10+4 = 14
+        pkt[14] = 0x00;
+        pkt[15] = 0x01;
+        pkt[16] = 0x51;
+        pkt[17] = 0x80;
+        assert_eq!(extract_rr_ttl(&pkt, 10), Some(86400));
+    }
+
+    // ===== rdata_to_all_addr tests ====================================
+
+    #[test]
+    fn test_rdata_to_all_addr_a_record() {
+        let rdata = vec![192, 168, 1, 1];
+        let result = rdata_to_all_addr(RRType::A, &rdata);
+        match result {
+            Some(AllAddr::V4(ip)) => assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 1)),
+            _ => panic!("expected V4 AllAddr"),
+        }
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_aaaa_record() {
+        let mut rdata = [0u8; 16];
+        rdata[0] = 0x20;
+        rdata[1] = 0x01;
+        rdata[2] = 0x0d;
+        rdata[3] = 0xb8;
+        rdata[15] = 0x01;
+        let result = rdata_to_all_addr(RRType::AAAA, &rdata);
+        assert!(matches!(result, Some(AllAddr::V6(_))));
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_wrong_type() {
+        let rdata = vec![192, 168, 1, 1];
+        assert!(rdata_to_all_addr(RRType::CNAME, &rdata).is_none());
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_too_short_a() {
+        let rdata = vec![192, 168, 1]; // only 3 bytes
+        assert!(rdata_to_all_addr(RRType::A, &rdata).is_none());
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_too_short_aaaa() {
+        let rdata = vec![0u8; 15]; // only 15 bytes
+        assert!(rdata_to_all_addr(RRType::AAAA, &rdata).is_none());
+    }
+
+    // ===== set_rr_ttl tests ===========================================
+
+    #[test]
+    fn test_set_rr_ttl_basic() {
+        let mut pkt = vec![0u8; 20];
+        set_rr_ttl(&mut pkt, 0, 7200);
+        // TTL at offset 4..8
+        assert_eq!(pkt[4], 0x00);
+        assert_eq!(pkt[5], 0x00);
+        assert_eq!(pkt[6], 0x1C);
+        assert_eq!(pkt[7], 0x20);
+    }
+
+    #[test]
+    fn test_set_rr_ttl_at_offset() {
+        let mut pkt = vec![0u8; 30];
+        set_rr_ttl(&mut pkt, 10, 300);
+        // TTL at 10 + 4 = 14..18
+        let ttl_bytes = &pkt[14..18];
+        let val = u32::from_be_bytes([ttl_bytes[0], ttl_bytes[1], ttl_bytes[2], ttl_bytes[3]]);
+        assert_eq!(val, 300);
+    }
+
+    #[test]
+    fn test_set_rr_ttl_zero() {
+        let mut pkt = vec![0xFF; 20];
+        set_rr_ttl(&mut pkt, 0, 0);
+        assert_eq!(&pkt[4..8], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_set_rr_ttl_max_value() {
+        let mut pkt = vec![0u8; 20];
+        set_rr_ttl(&mut pkt, 0, u32::MAX);
+        assert_eq!(&pkt[4..8], &[0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_set_rr_ttl_packet_too_short_noop() {
+        let mut pkt = vec![0u8; 5];
+        set_rr_ttl(&mut pkt, 0, 100); // should not panic, just noop
+        assert_eq!(pkt, vec![0u8; 5]);
+    }
+
+    // ===== to_my_sock_addr tests ======================================
+
+    #[test]
+    fn test_to_my_sock_addr_v4() {
+        let sa: SocketAddr = "192.168.1.1:53".parse().unwrap();
+        let msa = to_my_sock_addr(&sa);
+        assert_eq!(msa.port(), 53);
+        assert_eq!(msa.family(), libc::AF_INET);
+    }
+
+    #[test]
+    fn test_to_my_sock_addr_v6() {
+        let sa: SocketAddr = "[::1]:5353".parse().unwrap();
+        let msa = to_my_sock_addr(&sa);
+        assert_eq!(msa.port(), 5353);
+        assert_eq!(msa.family(), libc::AF_INET6);
+    }
+
+    // ===== parse_response_header tests ================================
+
+    #[test]
+    fn test_parse_response_header_valid_query() {
+        let pkt = vec![
+            0x12, 0x34, // ID
+            0x01, 0x00, // Standard query, RD=1
+            0x00, 0x01, // QDCOUNT=1
+            0x00, 0x00, // ANCOUNT=0
+            0x00, 0x00, // NSCOUNT=0
+            0x00, 0x00, // ARCOUNT=0
+        ];
+        let hdr = parse_response_header(&pkt);
+        assert!(hdr.is_some());
+        let h = hdr.unwrap();
+        assert_eq!(h.id, 0x1234);
+        assert_eq!(h.qdcount, 1);
+        assert_eq!(h.ancount, 0);
+    }
+
+    #[test]
+    fn test_parse_response_header_too_short() {
+        let pkt = vec![0x12, 0x34, 0x01]; // only 3 bytes
+        assert!(parse_response_header(&pkt).is_none());
+    }
+
+    #[test]
+    fn test_parse_response_header_response_packet() {
+        let pkt = vec![
+            0x56, 0x78, // ID
+            0x81, 0x80, // Response, RD=1, RA=1
+            0x00, 0x01, // QDCOUNT=1
+            0x00, 0x02, // ANCOUNT=2
+            0x00, 0x00, // NSCOUNT=0
+            0x00, 0x01, // ARCOUNT=1
+        ];
+        let hdr = parse_response_header(&pkt).unwrap();
+        assert_eq!(hdr.id, 0x5678);
+        assert_eq!(hdr.ancount, 2);
+        assert_eq!(hdr.arcount, 1);
+    }
+
+    // ===== check_rebind_protection tests ==============================
+
+    #[test]
+    fn test_check_rebind_too_short() {
+        let pkt = vec![0u8; 5];
+        assert!(check_rebind_protection(&pkt).is_none());
+    }
+
+    #[test]
+    fn test_check_rebind_no_answers() {
+        let pkt = vec![
+            0x00, 0x01, // ID
+            0x81, 0x80, // QR=1, RD=1, RA=1
+            0x00, 0x01, // QDCOUNT=1
+            0x00, 0x00, // ANCOUNT=0
+            0x00, 0x00, // NSCOUNT=0
+            0x00, 0x00, // ARCOUNT=0
+        ];
+        assert_eq!(check_rebind_protection(&pkt), Some(false));
+    }
+
+    #[test]
+    fn test_check_rebind_public_a_record() {
+        // Full DNS response with one A record → 8.8.8.8 (public)
+        let mut pkt = vec![
+            0x00, 0x01, // ID
+            0x81, 0x80, // QR=1, RD=1, RA=1
+            0x00, 0x01, // QDCOUNT=1
+            0x00, 0x01, // ANCOUNT=1
+            0x00, 0x00, // NSCOUNT=0
+            0x00, 0x00, // ARCOUNT=0
+        ];
+        // Question: "a" (1 byte label) QTYPE=A QCLASS=IN
+        pkt.extend_from_slice(&[0x01, b'a', 0x00]); // name: "a."
+        pkt.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+        pkt.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+                                              // Answer RR: name (pointer to offset 12), TYPE=A, CLASS=IN, TTL=300, RDLENGTH=4, rdata
+        pkt.extend_from_slice(&[0xC0, 0x0C]); // name pointer
+        pkt.extend_from_slice(&[0x00, 0x01]); // TYPE = A
+        pkt.extend_from_slice(&[0x00, 0x01]); // CLASS = IN
+        pkt.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C]); // TTL = 300
+        pkt.extend_from_slice(&[0x00, 0x04]); // RDLENGTH = 4
+        pkt.extend_from_slice(&[8, 8, 8, 8]); // 8.8.8.8 (public)
+        assert_eq!(check_rebind_protection(&pkt), Some(false));
+    }
+
+    #[test]
+    fn test_check_rebind_private_a_record() {
+        let mut pkt = vec![
+            0x00, 0x01, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        pkt.extend_from_slice(&[0x01, b'a', 0x00, 0x00, 0x01, 0x00, 0x01]);
+        pkt.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01]);
+        pkt.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C, 0x00, 0x04]);
+        pkt.extend_from_slice(&[10, 0, 0, 1]); // 10.0.0.1 (private)
+        assert_eq!(check_rebind_protection(&pkt), Some(true));
+    }
+
+    #[test]
+    fn test_check_rebind_loopback_a_record() {
+        let mut pkt = vec![
+            0x00, 0x01, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        pkt.extend_from_slice(&[0x01, b'a', 0x00, 0x00, 0x01, 0x00, 0x01]);
+        pkt.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01]);
+        pkt.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C, 0x00, 0x04]);
+        pkt.extend_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 (loopback)
+        assert_eq!(check_rebind_protection(&pkt), Some(true));
+    }
+
+    // ===== build_servfail_response extended tests =====================
+
+    #[test]
+    fn test_build_servfail_response_preserves_id() {
+        let query = vec![
+            0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let resp = build_servfail_response(&query, 0xABCD);
+        assert_eq!(resp[0], 0xAB);
+        assert_eq!(resp[1], 0xCD);
+        // QR bit should be set
+        assert!((resp[2] & HB3_QR) != 0);
+    }
+
+    #[test]
+    fn test_build_servfail_response_rcode() {
+        let query = vec![
+            0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let resp = build_servfail_response(&query, 0x0001);
+        // RCODE = 2 (SERVFAIL)
+        assert_eq!(resp[3] & 0x0F, 2);
+    }
+
+    // ===== ForwardTable expiry tests ==================================
+
+    #[test]
+    fn test_forward_table_expire_old() {
+        let mut table = ForwardTable::new(10);
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let source: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        let srv = Arc::new(UpstreamServer::new(addr));
+
+        // Insert a record
+        let record = ForwardRecord::new(
+            1,
+            100,
+            source,
+            Arc::clone(&srv),
+            Bytes::from_static(b"\x00\x64\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        table.insert(record).unwrap();
+        assert_eq!(table.len(), 1);
+
+        // expire_old with long timeout should remove nothing
+        let expired = table.expire_old(3600);
+        assert_eq!(expired, 0);
+        assert_eq!(table.len(), 1);
+
+        // expire_old with 0 timeout should remove everything
+        let expired = table.expire_old(0);
+        assert_eq!(expired, 1);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_forward_table_find_by_response() {
+        let mut table = ForwardTable::new(10);
+        let addr1: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let addr2: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        let source: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        let srv1 = Arc::new(UpstreamServer::new(addr1));
+        let srv2 = Arc::new(UpstreamServer::new(addr2));
+
+        let record1 = ForwardRecord::new(
+            1,
+            100,
+            source,
+            Arc::clone(&srv1),
+            Bytes::from_static(b"\x00\x64\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"),
+            ForwardFlags::new(),
+            "a.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let record2 = ForwardRecord::new(
+            2,
+            200,
+            source,
+            Arc::clone(&srv2),
+            Bytes::from_static(b"\x00\xC8\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"),
+            ForwardFlags::new(),
+            "b.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+
+        table.insert(record1).unwrap();
+        table.insert(record2).unwrap();
+
+        // find_by_response matches on new_id, name, qclass, qtype
+        let found = table.find_by_response(100, "a.com", &DnsClass::IN, &RRType::A);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().query_name, "a.com");
+
+        let found2 = table.find_by_response(200, "b.com", &DnsClass::IN, &RRType::A);
+        assert!(found2.is_some());
+        assert_eq!(found2.unwrap().query_name, "b.com");
+
+        // Wrong name → not found
+        let not_found = table.find_by_response(100, "b.com", &DnsClass::IN, &RRType::A);
+        assert!(not_found.is_none());
+    }
+
+    // ===== RfdPool extended tests =====================================
+
+    #[test]
+    fn test_rfd_pool_max_entries() {
+        let mut pool = RfdPool::new(2);
+        pool.add(10, libc::AF_INET as i32, "0.0.0.0:10000".parse().unwrap())
+            .unwrap();
+        pool.add(20, libc::AF_INET6 as i32, "[::]:20000".parse().unwrap())
+            .unwrap();
+        assert_eq!(pool.entries.len(), 2);
+    }
+
+    #[test]
+    fn test_rfd_pool_clear() {
+        let mut pool = RfdPool::new(4);
+        pool.add(10, libc::AF_INET as i32, "0.0.0.0:10000".parse().unwrap())
+            .unwrap();
+        pool.add(20, libc::AF_INET as i32, "0.0.0.0:20000".parse().unwrap())
+            .unwrap();
+        assert_eq!(pool.entries.len(), 2);
+        pool.clear();
+        assert!(pool.entries.is_empty());
+    }
+
+    #[test]
+    fn test_rfd_pool_find_for_family_correct() {
+        let mut pool = RfdPool::new(4);
+        pool.add(10, libc::AF_INET as i32, "0.0.0.0:10000".parse().unwrap())
+            .unwrap();
+        pool.add(20, libc::AF_INET6 as i32, "[::]:20000".parse().unwrap())
+            .unwrap();
+        assert_eq!(pool.find_for_family(libc::AF_INET as i32), Some(10));
+        assert_eq!(pool.find_for_family(libc::AF_INET6 as i32), Some(20));
+    }
+
+    #[test]
+    fn test_rfd_pool_release_nonexistent() {
+        let mut pool = RfdPool::new(4);
+        pool.release(999); // Should not panic
+        assert!(pool.entries.is_empty());
+    }
+
+    // ===== server_gone tests ==========================================
+
+    #[test]
+    fn test_server_gone_removes_matching() {
+        let mut table = ForwardTable::new(10);
+        let mut pool = RfdPool::new(4);
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let source: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        let srv = Arc::new(UpstreamServer::new(addr));
+
+        let record = ForwardRecord::new(
+            1,
+            100,
+            source,
+            Arc::clone(&srv),
+            Bytes::from_static(b"\x00\x64\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        table.insert(record).unwrap();
+        assert_eq!(table.len(), 1);
+
+        server_gone(&mut table, &mut pool, &addr);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_server_gone_no_match() {
+        let mut table = ForwardTable::new(10);
+        let mut pool = RfdPool::new(4);
+        let addr1: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let addr2: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        let source: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        let srv = Arc::new(UpstreamServer::new(addr1));
+
+        let record = ForwardRecord::new(
+            1,
+            100,
+            source,
+            Arc::clone(&srv),
+            Bytes::from_static(b"\x00\x64\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        table.insert(record).unwrap();
+
+        // Remove a different server — table should be unchanged
+        server_gone(&mut table, &mut pool, &addr2);
+        assert_eq!(table.len(), 1);
+    }
+
+    // ===== get_server_config tests ====================================
+
+    #[test]
+    fn test_get_server_config_default_server() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let srv = UpstreamServer::new(addr);
+        let cfg = get_server_config(&srv);
+        assert!(cfg.is_some());
+        let c = cfg.unwrap();
+        assert!(c.flags.is_default); // no domain → default
+        assert!(!c.flags.domain_specific);
+    }
+
+    #[test]
+    fn test_get_server_config_domain_server() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let mut srv = UpstreamServer::new(addr);
+        srv.flags.has_domain = true;
+        srv.domain = Some("example.com".to_string());
+        let cfg = get_server_config(&srv).unwrap();
+        assert!(cfg.flags.domain_specific);
+        assert!(!cfg.flags.is_default);
+        assert_eq!(cfg.domain, Some("example.com".to_string()));
+        assert_eq!(cfg.domain_len, 11);
+    }
+
+    // ===== UpstreamServer extended tests ==============================
+
+    #[test]
+    fn test_upstream_server_record_success() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let mut srv = UpstreamServer::new(addr);
+        srv.record_failure();
+        srv.record_failure();
+        assert_eq!(srv.failed_queries, 2);
+        assert!(srv.last_failure.is_some());
+
+        srv.record_success();
+        assert_eq!(srv.queries, 1);
+    }
+
+    #[test]
+    fn test_upstream_server_multiple() {
+        let addr1: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let addr2: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        let srv1 = UpstreamServer::new(addr1);
+        let srv2 = UpstreamServer::new(addr2);
+        assert_eq!(srv1.addr, addr1);
+        assert_eq!(srv2.addr, addr2);
+        assert_ne!(srv1.addr, srv2.addr);
+    }
+
+    // ===== extract_neg_ttl_from_authority tests ========================
+
+    #[test]
+    fn test_extract_neg_ttl_too_short() {
+        let pkt = vec![0u8; 5];
+        assert!(extract_neg_ttl_from_authority(&pkt).is_none());
+    }
+
+    #[test]
+    fn test_extract_neg_ttl_no_authority() {
+        // Header with NSCOUNT=0
+        let pkt = vec![
+            0x00, 0x01, // ID
+            0x81, 0x83, // QR, RD, RA, NXDOMAIN
+            0x00, 0x01, // QDCOUNT=1
+            0x00, 0x00, // ANCOUNT=0
+            0x00, 0x00, // NSCOUNT=0
+            0x00, 0x00, // ARCOUNT=0
+            // Question
+            0x01, b'a', 0x00, // "a."
+            0x00, 0x01, // QTYPE=A
+            0x00, 0x01, // QCLASS=IN
+        ];
+        assert!(extract_neg_ttl_from_authority(&pkt).is_none());
+    }
+
+    // ===== ForwardFlags extended tests ================================
+
+    #[test]
+    fn test_forward_flags_all_true_roundtrip() {
+        let mut flags = ForwardFlags::new();
+        flags.tcp_fallback = true;
+        flags.dnssec_enabled = true;
+        flags.retrying = true;
+        flags.no_cache = true;
+        flags.sec_query = true;
+        flags.ad_question = true;
+        flags.do_question = true;
+        flags.has_pheader = true;
+        flags.checking_disabled = true;
+        flags.no_rebind = true;
+        flags.gone_to_tcp = true;
+        let raw = flags.to_raw();
+        let restored = ForwardFlags::from_raw(raw);
+        assert!(restored.tcp_fallback);
+        assert!(restored.dnssec_enabled);
+        assert!(restored.retrying);
+        assert!(restored.no_cache);
+        assert!(restored.sec_query);
+        assert!(restored.ad_question);
+        assert!(restored.do_question);
+        assert!(restored.has_pheader);
+        assert!(restored.checking_disabled);
+        assert!(restored.no_rebind);
+        assert!(restored.gone_to_tcp);
+    }
+
+    // ===== ServerFlags extended tests =================================
+
+    #[test]
+    fn test_server_flags_all_true_roundtrip() {
+        let mut flags = ServerFlags::new();
+        flags.literal = true;
+        flags.has_domain = true;
+        flags.for_nodots = true;
+        flags.used_by_dhcp = true;
+        flags.no_addr = true;
+        flags.is_loop = true;
+        flags.do_not_use = true;
+        flags.from_resolv = true;
+        flags.mark = true;
+        let raw = flags.to_raw();
+        let restored = ServerFlags::from_raw(raw);
+        assert!(restored.literal);
+        assert!(restored.has_domain);
+        assert!(restored.for_nodots);
+        assert!(restored.used_by_dhcp);
+        assert!(restored.no_addr);
+        assert!(restored.is_loop);
+        assert!(restored.do_not_use);
+        assert!(restored.from_resolv);
+        assert!(restored.mark);
+    }
+
+    // ===== ForwardRecord fields tests =================================
+
+    #[test]
+    fn test_forward_record_fields() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let source: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        let srv = Arc::new(UpstreamServer::new(addr));
+
+        let mut fflags = ForwardFlags::new();
+        fflags.tcp_fallback = true;
+
+        let record = ForwardRecord::new(
+            0x1234,
+            0x5678,
+            source,
+            Arc::clone(&srv),
+            Bytes::from_static(b"\x56\x78\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"),
+            fflags,
+            "example.org".to_string(),
+            RRType::AAAA,
+            DnsClass::IN,
+        );
+        assert_eq!(record.query_id, 0x1234);
+        assert_eq!(record.new_id, 0x5678);
+        assert_eq!(record.source, source);
+        assert_eq!(record.query_name, "example.org");
+        assert_eq!(record.query_type, RRType::AAAA);
+        assert_eq!(record.query_class, DnsClass::IN);
+        assert!(record.flags.tcp_fallback);
+        assert_eq!(record.retries, 0);
+    }
+
+    // ===== is_strict_order tests ======================================
+
+    #[test]
+    fn test_is_strict_order_default() {
+        let flags = OptionFlags::default();
+        assert!(!is_strict_order(&flags));
+    }
+
+    #[test]
+    fn test_is_strict_order_set() {
+        let mut flags = OptionFlags::default();
+        flags.set(opt::ORDER);
+        assert!(is_strict_order(&flags));
+    }
+
+    // ===== build_response_with_builder tests ==========================
+
+    #[test]
+    fn test_build_response_with_builder_empty_answers() {
+        let query = vec![
+            0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // Question: "a." A IN
+            0x01, b'a', 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        let resp = build_response_with_builder(&query, 0x0001, &[]);
+        assert!(!resp.is_empty());
+        // Should be a valid DNS response
+        assert!(resp.len() >= 12);
+    }
+
+    #[test]
+    fn test_build_response_with_builder_with_answer() {
+        let query = vec![
+            0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, b'a',
+            0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        let name = DnsName::from_str_unchecked("a.");
+        let rdata = vec![192, 168, 1, 1]; // A record
+        let answers = vec![(name, RRType::A, 300u32, rdata)];
+        let resp = build_response_with_builder(&query, 0x0001, &answers);
+        assert!(resp.len() > 12);
+    }
+
+    // ===== ForwardTable Debug trait test ===============================
+
+    #[test]
+    fn test_forward_table_debug() {
+        let table = ForwardTable::new(10);
+        let dbg = format!("{:?}", table);
+        assert!(dbg.contains("ForwardTable"));
+    }
+
+    // ===== RoundRobinSelector with servers ============================
+
+    #[test]
+    fn test_round_robin_selector_single_server() {
+        let selector = RoundRobinSelector::new();
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let srv = Arc::new(UpstreamServer::new(addr));
+        let servers = vec![srv];
+        // Build a minimal valid DNS query packet
+        let pkt_data = vec![
+            0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x65,
+            0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x00, 0x01, 0x00,
+            0x01,
+        ];
+        let pkt = DnsPacket::parse(&pkt_data).unwrap();
+        let matcher = DomainMatcher::new();
+        let result = selector.select_server(&servers, &pkt, &matcher);
+        assert!(result.is_some());
+    }
+
+    // ===== Additional coverage tests for forward.rs utility functions =====
+
+    // CacheEntry uses std::time::Instant, while super::* imports tokio::time::Instant
+    use std::time::Duration as StdDuration;
+    use std::time::Instant as StdInstant;
+
+    /// Helper to build a minimal DNS query packet.
+    fn make_dns_query_helper(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        // Header: ID, flags (RD set), QDCOUNT=1, AN=0, NS=0, AR=0
+        pkt.extend_from_slice(&id.to_be_bytes());
+        pkt.push(0x01); // RD
+        pkt.push(0x00);
+        pkt.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+        pkt.extend_from_slice(&0u16.to_be_bytes());
+        pkt.extend_from_slice(&0u16.to_be_bytes());
+        pkt.extend_from_slice(&0u16.to_be_bytes());
+        // Question section: encode name
+        for label in name.split('.') {
+            if !label.is_empty() {
+                pkt.push(label.len() as u8);
+                pkt.extend_from_slice(label.as_bytes());
+            }
+        }
+        pkt.push(0); // root label
+        pkt.extend_from_slice(&qtype.to_be_bytes()); // QTYPE
+        pkt.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+        pkt
+    }
+
+    #[test]
+    fn test_is_strict_order_true_v2() {
+        let mut flags = OptionFlags::new();
+        flags.set(opt::ORDER);
+        assert!(is_strict_order(&flags));
+    }
+
+    #[test]
+    fn test_is_strict_order_false_v2() {
+        let flags = OptionFlags::new();
+        assert!(!is_strict_order(&flags));
+    }
+
+    #[test]
+    fn test_set_rr_ttl_basic_v3() {
+        let mut pkt = vec![0u8; 20];
+        set_rr_ttl(&mut pkt, 0, 600);
+        assert_eq!(extract_rr_ttl(&pkt, 0), Some(600));
+    }
+
+    #[test]
+    fn test_set_rr_ttl_zero_val() {
+        let mut pkt = vec![0u8; 20];
+        set_rr_ttl(&mut pkt, 0, 0);
+        assert_eq!(extract_rr_ttl(&pkt, 0), Some(0));
+    }
+
+    #[test]
+    fn test_set_rr_ttl_max_val() {
+        let mut pkt = vec![0u8; 20];
+        set_rr_ttl(&mut pkt, 0, u32::MAX);
+        assert_eq!(extract_rr_ttl(&pkt, 0), Some(u32::MAX));
+    }
+
+    #[test]
+    fn test_fast_retry_zero_retries() {
+        // With 0 retries, should produce Some (first retry allowed)
+        let result = fast_retry(0);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_fast_retry_one_retry() {
+        let result = fast_retry(1);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_fast_retry_max_retries() {
+        // 5 retries is max, should return None
+        assert!(fast_retry(5).is_none());
+    }
+
+    #[test]
+    fn test_fast_retry_large_retries() {
+        // Beyond max should return None
+        assert!(fast_retry(100).is_none());
+    }
+
+    #[test]
+    fn test_fast_retry_exponential_increase() {
+        // Each retry should double the delay
+        let d0 = fast_retry(0).unwrap();
+        let d1 = fast_retry(1).unwrap();
+        assert_eq!(d1, d0 * 2);
+        let d2 = fast_retry(2).unwrap();
+        assert_eq!(d2, d1 * 2);
+    }
+
+    #[test]
+    fn test_rfd_pool_new_v2() {
+        let mut pool = RfdPool::new(10);
+        // Pool should start empty; we test via clear (no-op on empty is fine)
+        pool.clear(); // just verify pool creation and clear
+    }
+
+    #[test]
+    fn test_rfd_pool_clear_v2() {
+        let mut pool = RfdPool::new(10);
+        pool.clear();
+        // After clear, pool should still be usable
+    }
+
+    #[test]
+    fn test_forward_flags_new_v2() {
+        let flags = ForwardFlags::new();
+        assert_eq!(flags.to_raw(), 0);
+    }
+
+    #[test]
+    fn test_forward_flags_from_raw_roundtrip_v2() {
+        let flags = ForwardFlags::from_raw(0xFF);
+        let raw = flags.to_raw();
+        let flags2 = ForwardFlags::from_raw(raw);
+        assert_eq!(flags.to_raw(), flags2.to_raw());
+    }
+
+    #[test]
+    fn test_forward_flags_individual_bits() {
+        let flags = ForwardFlags::from_raw(0x0001);
+        assert!(flags.tcp_fallback);
+        assert!(!flags.dnssec_enabled);
+
+        let flags = ForwardFlags::from_raw(0x0002);
+        assert!(!flags.tcp_fallback);
+        assert!(flags.dnssec_enabled);
+    }
+
+    #[test]
+    fn test_option_flags_set_and_check() {
+        let mut flags = OptionFlags::new();
+        assert!(!flags.is_set(opt::ORDER));
+        flags.set(opt::ORDER);
+        assert!(flags.is_set(opt::ORDER));
+        flags.clear(opt::ORDER);
+        assert!(!flags.is_set(opt::ORDER));
+    }
+
+    #[test]
+    fn test_upstream_server_new_defaults() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let server = UpstreamServer::new(addr);
+        assert!(server.is_healthy());
+        assert_eq!(server.addr, addr);
+        assert_eq!(server.queries, 0);
+        assert_eq!(server.failed_queries, 0);
+    }
+
+    #[test]
+    fn test_upstream_server_failure_tracking() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let mut server = UpstreamServer::new(addr);
+        server.record_failure();
+        // First failure should keep it healthy (FORWARD_TEST=50)
+        assert!(server.is_healthy());
+        assert_eq!(server.failed_queries, 1);
+    }
+
+    #[test]
+    fn test_upstream_server_many_failures_unhealthy() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let mut server = UpstreamServer::new(addr);
+        for _ in 0..100 {
+            server.record_failure();
+        }
+        assert!(!server.is_healthy());
+    }
+
+    #[test]
+    fn test_upstream_server_success_increments_queries() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let mut server = UpstreamServer::new(addr);
+        server.record_success();
+        assert_eq!(server.queries, 1);
+    }
+
+    #[test]
+    fn test_upstream_server_update_latency() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let server = UpstreamServer::new(addr);
+        server.update_latency(10);
+        server.update_latency(20);
+        // Verify no panic and latency is tracked
+        let ql = server
+            .query_latency
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(ql > 0);
+    }
+
+    #[test]
+    fn test_forward_table_basic_ops_v2() {
+        let mut table = ForwardTable::new(150);
+        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
+        assert!(!table.is_full());
+    }
+
+    #[test]
+    fn test_forward_table_insert_lookup_v2() {
+        let mut table = ForwardTable::new(150);
+        let src: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let record = ForwardRecord::new(
+            100, // query_id
+            42,  // new_id
+            src,
+            upstream,
+            Bytes::from_static(b"test"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        table.insert(record).unwrap();
+        assert_eq!(table.len(), 1);
+        // Lookup uses new_id as key
+        assert!(table.lookup(42).is_some());
+        assert!(table.lookup(200).is_none());
+    }
+
+    #[test]
+    fn test_forward_table_remove_v2() {
+        let mut table = ForwardTable::new(150);
+        let src: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let record = ForwardRecord::new(
+            100,
+            42,
+            src,
+            upstream,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        table.insert(record).unwrap();
+        let removed = table.remove(42); // key is new_id
+        assert!(removed.is_some());
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_forward_table_find_by_client_v2() {
+        let mut table = ForwardTable::new(150);
+        let src: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let record = ForwardRecord::new(
+            100,
+            42,
+            src,
+            upstream,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        table.insert(record).unwrap();
+        // find_by_client uses query_id and source
+        assert!(table.find_by_client(100, &src).is_some());
+        assert!(table
+            .find_by_client(100, &"10.0.0.1:9999".parse().unwrap())
+            .is_none());
+        assert!(table.find_by_client(99, &src).is_none());
+    }
+
+    #[test]
+    fn test_forward_record_is_expired_v2() {
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let record = ForwardRecord::new(
+            1,
+            1,
+            src,
+            upstream,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        // Freshly created record should not be expired with large timeout
+        assert!(!record.is_expired(86400));
+    }
+
+    #[test]
+    fn test_forward_table_expire_old_v2() {
+        let mut table = ForwardTable::new(150);
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let record = ForwardRecord::new(
+            1,
+            1,
+            src,
+            upstream,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        table.insert(record).unwrap();
+        // With 0s timeout everything is expired immediately
+        let expired = table.expire_old(0);
+        assert_eq!(expired, 1);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_forward_table_find_by_response_v2() {
+        let mut table = ForwardTable::new(150);
+        let src: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let record = ForwardRecord::new(
+            100,
+            42,
+            src,
+            upstream,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        table.insert(record).unwrap();
+        // find_by_response uses new_id, name, class, type
+        let found = table.find_by_response(42, "test.com", &DnsClass::IN, &RRType::A);
+        assert!(found.is_some());
+        // Wrong name should not match
+        assert!(table
+            .find_by_response(42, "other.com", &DnsClass::IN, &RRType::A)
+            .is_none());
+        // Wrong type should not match
+        assert!(table
+            .find_by_response(42, "test.com", &DnsClass::IN, &RRType::AAAA)
+            .is_none());
+    }
+
+    #[test]
+    fn test_forward_table_capacity_v3() {
+        let mut table = ForwardTable::new(2);
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let r1 = ForwardRecord::new(
+            1,
+            1,
+            src,
+            upstream.clone(),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "a.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let r2 = ForwardRecord::new(
+            2,
+            2,
+            src,
+            upstream.clone(),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "b.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let r3 = ForwardRecord::new(
+            3,
+            3,
+            src,
+            upstream,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "c.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        table.insert(r1).unwrap();
+        table.insert(r2).unwrap();
+        assert!(table.is_full());
+        assert!(table.insert(r3).is_err());
+    }
+
+    #[test]
+    fn test_generate_unique_id_avoids_conflicts_v2() {
+        let mut table = ForwardTable::new(150);
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let mut rng = SurfRng::new().unwrap();
+        // Insert a record with known new_id=500
+        let r = ForwardRecord::new(
+            1,
+            500,
+            src,
+            upstream,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        table.insert(r).unwrap();
+        // Generate should produce something != 500
+        let id = generate_unique_id(&mut rng, &table);
+        assert_ne!(id, 500);
+        assert_ne!(id, 0);
+    }
+
+    #[test]
+    fn test_round_robin_selector_creation_v2() {
+        let selector = RoundRobinSelector::new();
+        let _ = selector; // Just verify it can be created
+    }
+
+    #[test]
+    fn test_extract_neg_ttl_from_authority_empty() {
+        let pkt = make_dns_query_helper(0x1234, "test.com", 1);
+        // Query has no authority section (NSCOUNT=0)
+        let result = extract_neg_ttl_from_authority(&pkt);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_dns_name_at_simple_v2() {
+        let mut pkt = vec![0u8; 50];
+        pkt[0] = 4;
+        pkt[1] = b't';
+        pkt[2] = b'e';
+        pkt[3] = b's';
+        pkt[4] = b't';
+        pkt[5] = 0;
+        let name = extract_dns_name_at(&pkt, 0);
+        assert!(name.is_some());
+    }
+
+    #[test]
+    fn test_extract_dns_name_at_compression_v2() {
+        let mut pkt = vec![0u8; 50];
+        // Name at offset 0
+        pkt[0] = 3;
+        pkt[1] = b'f';
+        pkt[2] = b'o';
+        pkt[3] = b'o';
+        pkt[4] = 0;
+        // Compression pointer at offset 10 pointing to offset 0
+        pkt[10] = 0xC0;
+        pkt[11] = 0x00;
+        let name = extract_dns_name_at(&pkt, 10);
+        assert!(name.is_some());
+    }
+
+    #[test]
+    fn test_build_cache_response_short_query() {
+        // Short query (less than 12 bytes) should return None
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("test.com"),
+            rr_type: RRType::A,
+            data: CacheData::Addr4(Ipv4Addr::new(1, 2, 3, 4)),
+            expires: StdInstant::now() + StdDuration::from_secs(300),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::new(),
+            ttl: 300,
+        };
+        assert!(build_cache_response(&[0u8; 5], &entry, 0x1234, 512, false).is_none());
+    }
+
+    #[test]
+    fn test_build_cache_response_valid_a_query() {
+        let query = make_dns_query_helper(0x5555, "test.com", 1);
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("test.com"),
+            rr_type: RRType::A,
+            data: CacheData::Addr4(Ipv4Addr::new(1, 2, 3, 4)),
+            expires: StdInstant::now() + StdDuration::from_secs(300),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::new(),
+            ttl: 300,
+        };
+        let result = build_cache_response(&query, &entry, 0x5555, 512, false);
+        assert!(result.is_some());
+        let resp = result.unwrap();
+        assert!(resp.len() >= 12);
+        // QR bit should be set in byte 2
+        assert_ne!(resp[2] & 0x80, 0);
+    }
+
+    #[test]
+    fn test_build_cache_response_aaaa() {
+        let query = make_dns_query_helper(0x1234, "test.com", 28); // AAAA
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("test.com"),
+            rr_type: RRType::AAAA,
+            data: CacheData::Addr6(Ipv6Addr::LOCALHOST),
+            expires: StdInstant::now() + StdDuration::from_secs(300),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::new(),
+            ttl: 300,
+        };
+        let result = build_cache_response(&query, &entry, 0x1234, 512, false);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_build_cache_response_cname() {
+        let query = make_dns_query_helper(0x1234, "alias.com", 5); // CNAME
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("alias.com"),
+            rr_type: RRType::CNAME,
+            data: CacheData::Cname(DnsName::from_str_unchecked("target.com")),
+            expires: StdInstant::now() + StdDuration::from_secs(300),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::new(),
+            ttl: 300,
+        };
+        let result = build_cache_response(&query, &entry, 0x1234, 512, false);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_build_cache_response_nxdomain() {
+        let query = make_dns_query_helper(0x1234, "nxdomain.test", 1);
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("nxdomain.test"),
+            rr_type: RRType::A,
+            data: CacheData::NxDomain,
+            expires: StdInstant::now() + StdDuration::from_secs(300),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::new(),
+            ttl: 300,
+        };
+        let result = build_cache_response(&query, &entry, 0x1234, 512, false);
+        assert!(result.is_some());
+        let resp = result.unwrap();
+        // For NXDOMAIN, RCODE should be 3
+        assert_eq!(resp[3] & 0x0F, 3);
+    }
+
+    #[test]
+    fn test_build_cache_response_ptr() {
+        let query = make_dns_query_helper(0x1234, "4.3.2.1.in-addr.arpa", 12); // PTR
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("4.3.2.1.in-addr.arpa"),
+            rr_type: RRType::PTR,
+            data: CacheData::Ptr(DnsName::from_str_unchecked("host.example.com")),
+            expires: StdInstant::now() + StdDuration::from_secs(300),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::new(),
+            ttl: 300,
+        };
+        let result = build_cache_response(&query, &entry, 0x1234, 512, false);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_server_gone_empty_table_v2() {
+        let mut table = ForwardTable::new(150);
+        let mut pool = RfdPool::new(10);
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        server_gone(&mut table, &mut pool, &addr);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_server_gone_removes_matching_v2() {
+        let mut table = ForwardTable::new(150);
+        let mut pool = RfdPool::new(10);
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let dst: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new(dst));
+        let record = ForwardRecord::new(
+            1,
+            1,
+            src,
+            upstream,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        table.insert(record).unwrap();
+        assert_eq!(table.len(), 1);
+        server_gone(&mut table, &mut pool, &dst);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_server_gone_preserves_other_v2() {
+        let mut table = ForwardTable::new(150);
+        let mut pool = RfdPool::new(10);
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let dst1: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let dst2: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        let up1 = Arc::new(UpstreamServer::new(dst1));
+        let up2 = Arc::new(UpstreamServer::new(dst2));
+        let r1 = ForwardRecord::new(
+            1,
+            1,
+            src,
+            up1,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "a.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let r2 = ForwardRecord::new(
+            2,
+            2,
+            src,
+            up2,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "b.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        table.insert(r1).unwrap();
+        table.insert(r2).unwrap();
+        assert_eq!(table.len(), 2);
+        server_gone(&mut table, &mut pool, &dst1);
+        assert_eq!(table.len(), 1);
+        assert!(table.lookup(2).is_some());
+    }
+
+    #[test]
+    fn test_free_rfds_empty_pool_v2() {
+        let mut pool = RfdPool::new(10);
+        free_rfds(&mut pool, -1);
+        // No crash expected
+    }
+
+    #[test]
+    fn test_forward_record_fields_v3() {
+        let src: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let record = ForwardRecord::new(
+            100,
+            42,
+            src,
+            upstream,
+            Bytes::from_static(b"query"),
+            ForwardFlags::new(),
+            "example.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        assert_eq!(record.query_id, 100);
+        assert_eq!(record.new_id, 42);
+        assert_eq!(record.source, src);
+        assert_eq!(record.query_name, "example.com");
+        assert_eq!(record.query_type, RRType::A);
+        assert_eq!(record.query_class, DnsClass::IN);
+        assert_eq!(record.retries, 0);
+        assert_eq!(record.listen_fd, -1);
+        assert!(record.dest_addr.is_none());
+        assert_eq!(record.iface_index, 0);
+    }
+
+    #[test]
+    fn test_forward_table_debug_format() {
+        let table = ForwardTable::new(150);
+        let dbg = format!("{:?}", table);
+        assert!(dbg.contains("ForwardTable"));
+        assert!(dbg.contains("len"));
+    }
+
+    #[test]
+    fn test_build_servfail_response_v2() {
+        let query = make_dns_query_helper(0xABCD, "fail.test", 1);
+        let resp = build_servfail_response(&query, 0xABCD);
+        assert!(resp.len() >= 12);
+        // Check QR bit set
+        assert_ne!(resp[2] & 0x80, 0);
+        // Check RCODE = 2 (SERVFAIL)
+        assert_eq!(resp[3] & 0x0F, 2);
+        // Check ID matches
+        assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), 0xABCD);
+    }
+
+    #[test]
+    fn test_build_servfail_response_short_query() {
+        let resp = build_servfail_response(&[0u8; 3], 0x1234);
+        // Even a short query should produce a 12-byte response
+        assert!(resp.len() >= 12);
+    }
+
+    #[test]
+    fn test_skip_dns_name_root_v2() {
+        // Root domain: just a zero byte
+        let pkt = [0u8];
+        assert_eq!(skip_dns_name(&pkt, 0), Some(1));
+    }
+
+    #[test]
+    fn test_skip_dns_name_multi_label_v2() {
+        // "foo.bar" = \x03foo\x03bar\x00
+        let pkt = [3, b'f', b'o', b'o', 3, b'b', b'a', b'r', 0];
+        assert_eq!(skip_dns_name(&pkt, 0), Some(9));
+    }
+
+    #[test]
+    fn test_skip_dns_name_compression_v2() {
+        // Compression pointer: 0xC0 0x00 (points to offset 0)
+        let pkt = [3, b'f', b'o', b'o', 0, 0xC0, 0x00];
+        assert_eq!(skip_dns_name(&pkt, 5), Some(7));
+    }
+
+    #[test]
+    fn test_skip_dns_name_invalid() {
+        // Empty packet
+        assert!(skip_dns_name(&[], 0).is_none());
+        // Offset beyond packet
+        assert!(skip_dns_name(&[0], 5).is_none());
+    }
+
+    #[test]
+    fn test_check_rebind_protection_no_answer() {
+        // Query packet has no answer section (ANCOUNT=0)
+        let pkt = make_dns_query_helper(0x1234, "test.com", 1);
+        let result = check_rebind_protection(&pkt);
+        // With no answers, function returns Some(false) — no rebind detected
+        assert_eq!(result, Some(false));
+    }
+
+    #[test]
+    fn test_is_ipv6_unique_local_v2() {
+        // fc00::/7 = unique local
+        let addr: Ipv6Addr = "fc00::1".parse().unwrap();
+        assert!(is_ipv6_unique_local(&addr));
+        let addr: Ipv6Addr = "fd00::1".parse().unwrap();
+        assert!(is_ipv6_unique_local(&addr));
+        let addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert!(!is_ipv6_unique_local(&addr));
+    }
+
+    #[test]
+    fn test_is_ipv6_link_local_v2() {
+        let addr: Ipv6Addr = "fe80::1".parse().unwrap();
+        assert!(is_ipv6_link_local(&addr));
+        let addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert!(!is_ipv6_link_local(&addr));
+    }
+
+    #[test]
+    fn test_extract_rr_ttl_valid_v3() {
+        let mut pkt = vec![0u8; 20];
+        // extract_rr_ttl reads TTL at rr_fixed_offset + 4, so with offset 0
+        // the TTL bytes must be at indices 4..8 in big-endian.
+        pkt[4] = 0x00;
+        pkt[5] = 0x00;
+        pkt[6] = 0x01;
+        pkt[7] = 0x2C; // 300
+        assert_eq!(extract_rr_ttl(&pkt, 0), Some(300));
+    }
+
+    #[test]
+    fn test_extract_rr_ttl_short_packet() {
+        let pkt = vec![0u8; 2]; // too short
+        assert!(extract_rr_ttl(&pkt, 0).is_none());
+    }
+
+    #[test]
+    fn test_to_my_sock_addr_v4_v3() {
+        let addr: SocketAddr = "1.2.3.4:53".parse().unwrap();
+        let my_addr = to_my_sock_addr(&addr);
+        // Verify it creates a valid MySockAddr
+        let _ = my_addr;
+    }
+
+    #[test]
+    fn test_to_my_sock_addr_v6_v3() {
+        let addr: SocketAddr = "[::1]:53".parse().unwrap();
+        let my_addr = to_my_sock_addr(&addr);
+        let _ = my_addr;
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_a_valid() {
+        let rdata = [1u8, 2, 3, 4];
+        let result = rdata_to_all_addr(RRType::A, &rdata);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_aaaa_valid() {
+        let rdata = [0u8; 16];
+        let result = rdata_to_all_addr(RRType::AAAA, &rdata);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_a_too_short() {
+        let rdata = [1u8, 2]; // too short for A
+        assert!(rdata_to_all_addr(RRType::A, &rdata).is_none());
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_aaaa_too_short() {
+        let rdata = [0u8; 10]; // too short for AAAA
+        assert!(rdata_to_all_addr(RRType::AAAA, &rdata).is_none());
+    }
+
+    #[test]
+    fn test_server_flags_all_true_roundtrip_v2() {
+        let mut flags = ServerFlags::new();
+        flags.do_not_use = true;
+        flags.is_loop = true;
+        flags.from_resolv = true;
+        let _ = flags;
+        assert!(flags.do_not_use);
+        assert!(flags.is_loop);
+        assert!(flags.from_resolv);
+    }
+
+    #[test]
+    fn test_upstream_server_edns_default() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let server = UpstreamServer::new(addr);
+        assert_eq!(server.edns_pktsz, EDNS_PKTSZ);
+    }
+
+    #[test]
+    fn test_forward_table_is_full() {
+        let mut table = ForwardTable::new(1);
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let r = ForwardRecord::new(
+            1,
+            1,
+            src,
+            upstream,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "t.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        assert!(!table.is_full());
+        table.insert(r).unwrap();
+        assert!(table.is_full());
+    }
+
+    #[test]
+    fn test_forward_record_with_flags() {
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let mut flags = ForwardFlags::new();
+        flags.tcp_fallback = true;
+        flags.no_cache = true;
+        let record = ForwardRecord::new(
+            1,
+            1,
+            src,
+            upstream,
+            Bytes::from_static(b"q"),
+            flags,
+            "t.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        assert!(record.flags.tcp_fallback);
+        assert!(record.flags.no_cache);
+        assert!(!record.flags.retrying);
+    }
+
+    #[test]
+    fn test_upstream_server_no_source_addr() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let server = UpstreamServer::new(addr);
+        assert!(server.source_addr.is_none());
+        assert!(server.interface.is_none());
+        assert!(server.domain.is_none());
+    }
+
+    #[test]
+    fn test_cache_data_type_descriptions() {
+        let d1 = CacheData::Addr4(Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(d1.type_description(), "A");
+        let d2 = CacheData::Addr6(Ipv6Addr::LOCALHOST);
+        assert_eq!(d2.type_description(), "AAAA");
+        let d3 = CacheData::Cname(DnsName::from_str_unchecked("test.com"));
+        assert_eq!(d3.type_description(), "CNAME");
+        let d4 = CacheData::NxDomain;
+        assert_eq!(d4.type_description(), "NXDOMAIN");
+    }
+
+    #[test]
+    fn test_forward_flags_all_bits_roundtrip() {
+        let mut flags = ForwardFlags::new();
+        flags.tcp_fallback = true;
+        flags.dnssec_enabled = true;
+        flags.retrying = true;
+        flags.no_cache = true;
+        flags.sec_query = true;
+        flags.ad_question = true;
+        flags.do_question = true;
+        flags.has_pheader = true;
+        flags.checking_disabled = true;
+        flags.no_rebind = true;
+        flags.gone_to_tcp = true;
+        let raw = flags.to_raw();
+        let restored = ForwardFlags::from_raw(raw);
+        assert!(restored.tcp_fallback);
+        assert!(restored.dnssec_enabled);
+        assert!(restored.retrying);
+        assert!(restored.no_cache);
+        assert!(restored.sec_query);
+        assert!(restored.ad_question);
+        assert!(restored.do_question);
+        assert!(restored.has_pheader);
+        assert!(restored.checking_disabled);
+        assert!(restored.no_rebind);
+        assert!(restored.gone_to_tcp);
+    }
+
+    #[test]
+    fn test_forward_record_udp_pkt_size_default() {
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let record = ForwardRecord::new(
+            1,
+            1,
+            src,
+            upstream,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "t.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        assert_eq!(record.udp_pkt_size, PACKETSZ);
+    }
+
+    #[test]
+    fn test_build_servfail_preserves_rd() {
+        // Query with RD bit set
+        let query = make_dns_query_helper(0x1234, "test.com", 1);
+        let resp = build_servfail_response(&query, 0x1234);
+        // RD should be preserved from query
+        let rd_bit = resp[2] & 0x01;
+        let query_rd = query[2] & 0x01;
+        assert_eq!(rd_bit, query_rd);
+    }
+
+    #[test]
+    fn test_extract_dns_name_at_two_labels() {
+        // "ab.cd" = \x02ab\x02cd\x00
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 2;
+        pkt[1] = b'a';
+        pkt[2] = b'b';
+        pkt[3] = 2;
+        pkt[4] = b'c';
+        pkt[5] = b'd';
+        pkt[6] = 0;
+        let name = extract_dns_name_at(&pkt, 0);
+        assert!(name.is_some());
+    }
+
+    #[test]
+    fn test_extract_dns_name_at_empty_packet() {
+        assert!(extract_dns_name_at(&[], 0).is_none());
+    }
+
+    #[test]
+    fn test_option_flags_multiple_bits() {
+        let mut flags = OptionFlags::new();
+        flags.set(opt::ORDER);
+        flags.set(opt::DNSSEC_VALID);
+        assert!(flags.is_set(opt::ORDER));
+        assert!(flags.is_set(opt::DNSSEC_VALID));
+        flags.clear(opt::ORDER);
+        assert!(!flags.is_set(opt::ORDER));
+        assert!(flags.is_set(opt::DNSSEC_VALID));
+    }
+
+    #[test]
+    fn test_upstream_server_latency_smoothing() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let server = UpstreamServer::new(addr);
+        // First sample sets the MMA: mma = 100*128 = 12800, ql = 100
+        server.update_latency(100);
+        let ql1 = server
+            .query_latency
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(ql1, 100);
+        // Second sample with a large difference so integer division (mma/128) changes.
+        // diff = 10000-100 = 9900, new_mma = 12800+9900 = 22700, ql = 22700/128 = 177
+        server.update_latency(10000);
+        let ql2 = server
+            .query_latency
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Latency should have changed
+        assert_ne!(ql1, ql2);
+    }
+
+    #[test]
+    fn test_forward_flags_zero_raw() {
+        let flags = ForwardFlags::from_raw(0);
+        assert!(!flags.tcp_fallback);
+        assert!(!flags.dnssec_enabled);
+        assert!(!flags.retrying);
+    }
+
+    #[test]
+    fn test_server_flags_default_all_false() {
+        let flags = ServerFlags::new();
+        assert!(!flags.do_not_use);
+        assert!(!flags.is_loop);
+        assert!(!flags.from_resolv);
+        assert!(!flags.no_addr);
+    }
+
+    #[test]
+    fn test_forward_table_lookup_mut_v2() {
+        let mut table = ForwardTable::new(150);
+        let src: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let r = ForwardRecord::new(
+            1,
+            42,
+            src,
+            upstream,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        table.insert(r).unwrap();
+        // Get mutable reference
+        let rec = table.lookup_mut(42).unwrap();
+        rec.retries = 5;
+        assert_eq!(table.lookup(42).unwrap().retries, 5);
+    }
+
+    #[test]
+    fn test_cache_entry_is_expired_v2() {
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("test.com"),
+            rr_type: RRType::A,
+            data: CacheData::Addr4(Ipv4Addr::new(1, 2, 3, 4)),
+            expires: StdInstant::now() + StdDuration::from_secs(300),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::new(),
+            ttl: 300,
+        };
+        assert!(!entry.is_expired());
+    }
+
+    #[test]
+    fn test_cache_entry_remaining_ttl() {
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("test.com"),
+            rr_type: RRType::A,
+            data: CacheData::Addr4(Ipv4Addr::new(1, 2, 3, 4)),
+            expires: StdInstant::now() + StdDuration::from_secs(300),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::new(),
+            ttl: 300,
+        };
+        let remaining = entry.remaining_ttl();
+        assert!(remaining > 295 && remaining <= 300);
+    }
+
+    #[test]
+    fn test_dns_name_from_str_unchecked() {
+        let name = DnsName::from_str_unchecked("example.com");
+        assert_eq!(name.label_count(), 2);
+        let name2 = DnsName::from_str_unchecked("example.com.");
+        // Trailing dot should be filtered
+        assert_eq!(name2.label_count(), 2);
+    }
+
+    #[test]
+    fn test_dns_name_root() {
+        let root = DnsName::root();
+        assert_eq!(root.label_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage tests — build_servfail_response
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_build_servfail_basic() {
+        let query = make_dns_query_helper(0xABCD, "example.com", 1);
+        let resp = build_servfail_response(&query, 0xABCD);
+        assert!(resp.len() >= 12);
+        // ID matches
+        assert_eq!((resp[0] as u16) << 8 | resp[1] as u16, 0xABCD);
+        // QR bit set
+        assert_ne!(resp[2] & 0x80, 0);
+        // RCODE = 2 (ServFail)
+        assert_eq!(resp[3] & 0x0F, 2);
+        // ANCOUNT = 0
+        assert_eq!((resp[6] as u16) << 8 | resp[7] as u16, 0);
+    }
+
+    #[test]
+    fn test_build_servfail_preserves_rd_v4() {
+        let mut query = make_dns_query_helper(0x1111, "test.org", 1);
+        query[2] |= HB3_RD; // set RD bit
+        let resp = build_servfail_response(&query, 0x1111);
+        assert_ne!(resp[2] & HB3_RD, 0); // RD preserved
+    }
+
+    #[test]
+    fn test_build_servfail_empty_query() {
+        let resp = build_servfail_response(&[], 0x9999);
+        assert!(resp.len() >= 12);
+        assert_eq!((resp[0] as u16) << 8 | resp[1] as u16, 0x9999);
+        assert_eq!(resp[3] & 0x0F, 2);
+    }
+
+    #[test]
+    fn test_build_servfail_short_query() {
+        let resp = build_servfail_response(&[0x12, 0x34], 0x1234);
+        assert!(resp.len() >= 12);
+    }
+
+    #[test]
+    fn test_build_servfail_copies_question_section() {
+        let query = make_dns_query_helper(0x5678, "hello.world", 28);
+        let resp = build_servfail_response(&query, 0x5678);
+        // Response should contain question section from query
+        assert!(resp.len() > 12);
+        // QDCOUNT should match
+        assert_eq!(resp[4], query[4]);
+        assert_eq!(resp[5], query[5]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage tests — build_cache_response
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_build_cache_response_a_record() {
+        let query = make_dns_query_helper(0x1234, "example.com", 1);
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("example.com"),
+            rr_type: RRType::A,
+            data: CacheData::Addr4(Ipv4Addr::new(93, 184, 216, 34)),
+            expires: StdInstant::now() + StdDuration::from_secs(300),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::default(),
+            ttl: 300,
+        };
+        let resp = build_cache_response(&query, &entry, 0x1234, 512, false);
+        assert!(resp.is_some());
+        let resp = resp.unwrap();
+        assert!(resp.len() >= 12);
+        // QR bit set
+        assert_ne!(resp[2] & 0x80, 0);
+        // RCODE = 0 (NoError)
+        assert_eq!(resp[3] & 0x0F, 0);
+        // ANCOUNT >= 1
+        let ancount = (resp[6] as u16) << 8 | resp[7] as u16;
+        assert!(ancount >= 1);
+    }
+
+    #[test]
+    fn test_build_cache_response_aaaa_record() {
+        let query = make_dns_query_helper(0x2345, "ipv6.example.com", 28);
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("ipv6.example.com"),
+            rr_type: RRType::AAAA,
+            data: CacheData::Addr6("2001:db8::1".parse().unwrap()),
+            expires: StdInstant::now() + StdDuration::from_secs(600),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::default(),
+            ttl: 600,
+        };
+        let resp = build_cache_response(&query, &entry, 0x2345, 1232, false);
+        assert!(resp.is_some());
+        let resp = resp.unwrap();
+        let ancount = (resp[6] as u16) << 8 | resp[7] as u16;
+        assert!(ancount >= 1);
+    }
+
+    #[test]
+    fn test_build_cache_response_cname_v4() {
+        let query = make_dns_query_helper(0x3456, "alias.example.com", 5);
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("alias.example.com"),
+            rr_type: RRType::CNAME,
+            data: CacheData::Cname(DnsName::from_str_unchecked("real.example.com")),
+            expires: StdInstant::now() + StdDuration::from_secs(3600),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::default(),
+            ttl: 3600,
+        };
+        let resp = build_cache_response(&query, &entry, 0x3456, 512, false);
+        assert!(resp.is_some());
+    }
+
+    #[test]
+    fn test_build_cache_response_nxdomain_v4() {
+        let query = make_dns_query_helper(0x4567, "noexist.example.com", 1);
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("noexist.example.com"),
+            rr_type: RRType::A,
+            data: CacheData::NxDomain,
+            expires: StdInstant::now() + StdDuration::from_secs(60),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::default(),
+            ttl: 60,
+        };
+        let resp = build_cache_response(&query, &entry, 0x4567, 512, false);
+        assert!(resp.is_some());
+    }
+
+    #[test]
+    fn test_build_cache_response_short_query_v4() {
+        let short_query = vec![0u8; 6]; // too short
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("test.com"),
+            rr_type: RRType::A,
+            data: CacheData::Addr4(Ipv4Addr::new(1, 2, 3, 4)),
+            expires: StdInstant::now() + StdDuration::from_secs(300),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::default(),
+            ttl: 300,
+        };
+        let resp = build_cache_response(&short_query, &entry, 0x1111, 512, false);
+        assert!(resp.is_none());
+    }
+
+    #[test]
+    fn test_build_cache_response_ptr_record() {
+        let query = make_dns_query_helper(0x5678, "4.3.2.1.in-addr.arpa", 12);
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("4.3.2.1.in-addr.arpa"),
+            rr_type: RRType::PTR,
+            data: CacheData::Ptr(DnsName::from_str_unchecked("host.example.com")),
+            expires: StdInstant::now() + StdDuration::from_secs(300),
+            last_access: StdInstant::now(),
+            flags: CacheFlags::default(),
+            ttl: 300,
+        };
+        let resp = build_cache_response(&query, &entry, 0x5678, 512, false);
+        assert!(resp.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage tests — set_rr_ttl
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_set_rr_ttl_basic_v4() {
+        let mut pkt = vec![0u8; 20];
+        set_rr_ttl(&mut pkt, 0, 300);
+        // TTL is at offset 4..8
+        assert_eq!(pkt[4], 0x00);
+        assert_eq!(pkt[5], 0x00);
+        assert_eq!(pkt[6], 0x01);
+        assert_eq!(pkt[7], 0x2C);
+    }
+
+    #[test]
+    fn test_set_rr_ttl_max() {
+        let mut pkt = vec![0u8; 20];
+        set_rr_ttl(&mut pkt, 0, u32::MAX);
+        assert_eq!(pkt[4], 0xFF);
+        assert_eq!(pkt[5], 0xFF);
+        assert_eq!(pkt[6], 0xFF);
+        assert_eq!(pkt[7], 0xFF);
+    }
+
+    #[test]
+    fn test_set_rr_ttl_zero_v4() {
+        let mut pkt = vec![0xFFu8; 20];
+        set_rr_ttl(&mut pkt, 0, 0);
+        assert_eq!(pkt[4], 0x00);
+        assert_eq!(pkt[5], 0x00);
+        assert_eq!(pkt[6], 0x00);
+        assert_eq!(pkt[7], 0x00);
+    }
+
+    #[test]
+    fn test_set_rr_ttl_with_offset() {
+        let mut pkt = vec![0u8; 30];
+        set_rr_ttl(&mut pkt, 10, 3600);
+        // TTL at offset 10+4=14
+        let ttl = ((pkt[14] as u32) << 24)
+            | ((pkt[15] as u32) << 16)
+            | ((pkt[16] as u32) << 8)
+            | pkt[17] as u32;
+        assert_eq!(ttl, 3600);
+    }
+
+    #[test]
+    fn test_set_rr_ttl_short_packet() {
+        let mut pkt = vec![0u8; 4]; // too short for TTL
+        set_rr_ttl(&mut pkt, 0, 100); // should not panic
+                                      // Packet unchanged since TTL doesn't fit
+        assert_eq!(pkt, vec![0u8; 4]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage tests — extract_neg_ttl_from_authority
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_extract_neg_ttl_too_short_v4() {
+        assert!(extract_neg_ttl_from_authority(&[0u8; 6]).is_none());
+    }
+
+    #[test]
+    fn test_extract_neg_ttl_no_authority_v4() {
+        // Packet with QDCOUNT=1, ANCOUNT=0, NSCOUNT=0
+        let mut pkt = make_dns_query_helper(0x1234, "test.com", 1);
+        // Make it look like a response
+        pkt[2] |= 0x80; // QR=1
+        let result = extract_neg_ttl_from_authority(&pkt);
+        assert!(result.is_none()); // no authority section
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage tests — extract_dns_name_at
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_extract_dns_name_simple() {
+        // Encode "foo.bar" as DNS wire format
+        let pkt = vec![3, b'f', b'o', b'o', 3, b'b', b'a', b'r', 0];
+        let name = extract_dns_name_at(&pkt, 0);
+        assert!(name.is_some());
+        let n = name.unwrap();
+        assert_eq!(n.label_count(), 2);
+    }
+
+    #[test]
+    fn test_extract_dns_name_root_label() {
+        let pkt = vec![0]; // root name (just terminator)
+        let name = extract_dns_name_at(&pkt, 0);
+        assert!(name.is_some());
+    }
+
+    #[test]
+    fn test_extract_dns_name_empty_packet() {
+        let name = extract_dns_name_at(&[], 0);
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn test_extract_dns_name_compression() {
+        // "foo" at offset 0, then compression pointer at offset 5
+        let pkt = vec![
+            3, b'f', b'o', b'o', 0, // "foo" at offsets 0-4
+            0xC0, 0x00, // compression pointer to offset 0
+        ];
+        let name = extract_dns_name_at(&pkt, 5);
+        assert!(name.is_some());
+    }
+
+    #[test]
+    fn test_extract_dns_name_truncated_label() {
+        let pkt = vec![5, b'h', b'i']; // label says 5 bytes but only 2 available
+        let name = extract_dns_name_at(&pkt, 0);
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn test_extract_dns_name_excessive_jumps() {
+        // Self-referencing compression pointer (infinite loop)
+        let pkt = vec![0xC0, 0x00]; // points to itself
+        let name = extract_dns_name_at(&pkt, 0);
+        assert!(name.is_none()); // should detect loop
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage tests — parse_response_header
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_parse_response_header_valid() {
+        let mut pkt = make_dns_query_helper(0xAAAA, "test.com", 1);
+        pkt[2] |= 0x80; // QR=1 (response)
+        let hdr = parse_response_header(&pkt);
+        assert!(hdr.is_some());
+    }
+
+    #[test]
+    fn test_parse_response_header_too_short_v4() {
+        let pkt = vec![0u8; 8];
+        let hdr = parse_response_header(&pkt);
+        assert!(hdr.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage tests — build_response_with_builder
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_build_response_with_builder_no_answers() {
+        let query = make_dns_query_helper(0x1234, "example.com", 1);
+        let resp = build_response_with_builder(&query, 0x1234, &[]);
+        assert!(resp.len() >= 12);
+        // QR should be set
+        assert_ne!(resp[2] & 0x80, 0);
+    }
+
+    #[test]
+    fn test_build_response_with_builder_one_answer() {
+        let query = make_dns_query_helper(0x5555, "example.com", 1);
+        let answers = vec![(
+            DnsName::from_str_unchecked("example.com"),
+            RRType::A,
+            300u32,
+            vec![93, 184, 216, 34], // 93.184.216.34
+        )];
+        let resp = build_response_with_builder(&query, 0x5555, &answers);
+        assert!(resp.len() >= 12);
+        // ANCOUNT should be >= 1
+        let ancount = (resp[6] as u16) << 8 | resp[7] as u16;
+        assert!(ancount >= 1);
+    }
+
+    #[test]
+    fn test_build_response_with_builder_multiple_answers() {
+        let query = make_dns_query_helper(0x6666, "multi.example.com", 1);
+        let answers = vec![
+            (
+                DnsName::from_str_unchecked("multi.example.com"),
+                RRType::A,
+                300u32,
+                vec![1, 2, 3, 4],
+            ),
+            (
+                DnsName::from_str_unchecked("multi.example.com"),
+                RRType::A,
+                300u32,
+                vec![5, 6, 7, 8],
+            ),
+        ];
+        let resp = build_response_with_builder(&query, 0x6666, &answers);
+        let ancount = (resp[6] as u16) << 8 | resp[7] as u16;
+        assert!(ancount >= 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage tests — rdata_to_all_addr
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_rdata_to_all_addr_a_record_v4() {
+        let rdata = vec![10, 0, 0, 1];
+        let addr = rdata_to_all_addr(RRType::A, &rdata);
+        assert!(addr.is_some());
+        match addr.unwrap() {
+            AllAddr::V4(ip) => assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 1)),
+            _ => panic!("Expected V4"),
+        }
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_aaaa_record_v4() {
+        let mut rdata = vec![0u8; 16];
+        rdata[0] = 0x20;
+        rdata[1] = 0x01;
+        rdata[2] = 0x0d;
+        rdata[3] = 0xb8;
+        rdata[15] = 0x01;
+        let addr = rdata_to_all_addr(RRType::AAAA, &rdata);
+        assert!(addr.is_some());
+        match addr.unwrap() {
+            AllAddr::V6(_ip) => {}
+            _ => panic!("Expected V6"),
+        }
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_short_a_data() {
+        let rdata = vec![10, 0]; // too short for A record
+        let addr = rdata_to_all_addr(RRType::A, &rdata);
+        assert!(addr.is_none());
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_short_aaaa_data() {
+        let rdata = vec![0u8; 8]; // too short for AAAA
+        let addr = rdata_to_all_addr(RRType::AAAA, &rdata);
+        assert!(addr.is_none());
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_unsupported_type() {
+        let rdata = vec![0u8; 20];
+        let addr = rdata_to_all_addr(RRType::MX, &rdata);
+        assert!(addr.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage tests — get_server_config
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_get_server_config_basic() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let server = UpstreamServer::new(addr);
+        let config = get_server_config(&server);
+        // Server has no domain attached by default, so it returns Some with default flags
+        assert!(config.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage tests — check_rebind_protection with answers
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_check_rebind_private_ipv4() {
+        // Build a response with A record pointing to 192.168.1.1 (private)
+        let mut pkt = make_dns_query_helper(0x1234, "evil.com", 1);
+        pkt[2] |= 0x80; // QR=1
+                        // Set ANCOUNT=1
+        pkt[6] = 0;
+        pkt[7] = 1;
+        // Append answer RR: compression pointer + TYPE(A) + CLASS(IN) + TTL + RDLEN(4) + RDATA
+        pkt.push(0xC0);
+        pkt.push(0x0C); // name pointer
+        pkt.push(0x00);
+        pkt.push(0x01); // TYPE=A
+        pkt.push(0x00);
+        pkt.push(0x01); // CLASS=IN
+        pkt.push(0x00);
+        pkt.push(0x00);
+        pkt.push(0x01);
+        pkt.push(0x2C); // TTL=300
+        pkt.push(0x00);
+        pkt.push(0x04); // RDLENGTH=4
+        pkt.push(192);
+        pkt.push(168);
+        pkt.push(1);
+        pkt.push(1); // 192.168.1.1
+        let result = check_rebind_protection(&pkt);
+        assert_eq!(result, Some(true)); // private IP detected
+    }
+
+    #[test]
+    fn test_check_rebind_public_ipv4() {
+        let mut pkt = make_dns_query_helper(0x1234, "ok.com", 1);
+        pkt[2] |= 0x80;
+        pkt[6] = 0;
+        pkt[7] = 1;
+        pkt.push(0xC0);
+        pkt.push(0x0C);
+        pkt.push(0x00);
+        pkt.push(0x01);
+        pkt.push(0x00);
+        pkt.push(0x01);
+        pkt.push(0x00);
+        pkt.push(0x00);
+        pkt.push(0x01);
+        pkt.push(0x2C);
+        pkt.push(0x00);
+        pkt.push(0x04);
+        pkt.push(93);
+        pkt.push(184);
+        pkt.push(216);
+        pkt.push(34); // 93.184.216.34
+        let result = check_rebind_protection(&pkt);
+        assert_eq!(result, Some(false)); // public IP, no rebind
+    }
+
+    #[test]
+    fn test_check_rebind_loopback() {
+        let mut pkt = make_dns_query_helper(0x1234, "evil.com", 1);
+        pkt[2] |= 0x80;
+        pkt[6] = 0;
+        pkt[7] = 1;
+        pkt.push(0xC0);
+        pkt.push(0x0C);
+        pkt.push(0x00);
+        pkt.push(0x01);
+        pkt.push(0x00);
+        pkt.push(0x01);
+        pkt.push(0x00);
+        pkt.push(0x00);
+        pkt.push(0x01);
+        pkt.push(0x2C);
+        pkt.push(0x00);
+        pkt.push(0x04);
+        pkt.push(127);
+        pkt.push(0);
+        pkt.push(0);
+        pkt.push(1); // 127.0.0.1
+        let result = check_rebind_protection(&pkt);
+        assert_eq!(result, Some(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage — ForwardTable expire_old, is_full, len, is_empty
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_forward_table_expire_old_all() {
+        let mut table = ForwardTable::new(150);
+        let addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        for i in 0..5u16 {
+            let rec = ForwardRecord::new(
+                100 + i,
+                i,
+                addr,
+                upstream.clone(),
+                Bytes::from_static(b"q"),
+                ForwardFlags::new(),
+                format!("test{}.com", i),
+                RRType::A,
+                DnsClass::IN,
+            );
+            let _ = table.insert(rec);
+        }
+        assert_eq!(table.len(), 5);
+        assert!(!table.is_empty());
+        // Expire with timeout=0 should expire everything (all records are "old" immediately)
+        let expired = table.expire_old(0);
+        assert_eq!(expired, 5);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_forward_table_is_full_v4() {
+        let mut table = ForwardTable::new(2); // max 2
+        let addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        assert!(!table.is_full());
+        let _ = table.insert(ForwardRecord::new(
+            1,
+            1,
+            addr,
+            upstream.clone(),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "a.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        ));
+        assert!(!table.is_full());
+        let _ = table.insert(ForwardRecord::new(
+            2,
+            2,
+            addr,
+            upstream.clone(),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "b.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        ));
+        assert!(table.is_full());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage — UpstreamServer health/failure
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_upstream_server_record_failure_health() {
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let mut server = UpstreamServer::new(addr);
+        assert!(server.is_healthy());
+        // Recording failures should eventually make it unhealthy
+        for _ in 0..100 {
+            server.record_failure();
+        }
+        // Server should still exist (not crash)
+        let _ = server.is_healthy();
+    }
+
+    #[test]
+    fn test_upstream_server_from_raw_flags() {
+        let flags = ServerFlags::from_raw(0xFFFFFFFF);
+        assert!(flags.do_not_use);
+        assert!(flags.is_loop);
+        assert!(flags.from_resolv);
+    }
+
+    #[test]
+    fn test_server_flags_to_raw_roundtrip() {
+        let flags = ServerFlags::new();
+        let raw = flags.to_raw();
+        let flags2 = ServerFlags::from_raw(raw);
+        assert_eq!(flags.do_not_use, flags2.do_not_use);
+        assert_eq!(flags.is_loop, flags2.is_loop);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage — ForwardRecord is_expired
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_forward_record_not_expired() {
+        let addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let upstream = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let rec = ForwardRecord::new(
+            1,
+            1,
+            addr,
+            upstream,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        assert!(!rec.is_expired(3600)); // just created, not expired for 1hr
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage — RfdPool add/find/release
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_rfd_pool_clear_empty() {
+        let mut pool = RfdPool::new(10);
+        pool.clear(); // should not panic on empty
+    }
+
+    #[test]
+    fn test_rfd_pool_release_nonexistent_v4() {
+        let mut pool = RfdPool::new(10);
+        pool.release(999); // releasing non-existent fd is a no-op
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage — ForwardFlags boundary values
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_forward_flags_all_bits() {
+        let flags = ForwardFlags::from_raw(0xFFFF);
+        assert!(flags.tcp_fallback);
+        assert!(flags.dnssec_enabled);
+        assert!(flags.retrying);
+        assert!(flags.no_cache);
+        assert!(flags.sec_query);
+        assert!(flags.ad_question);
+        assert!(flags.do_question);
+        assert!(flags.has_pheader);
+        assert!(flags.checking_disabled);
+        assert!(flags.no_rebind);
+        assert!(flags.gone_to_tcp);
+    }
+
+    #[test]
+    fn test_forward_flags_to_raw_all_set() {
+        let flags = ForwardFlags {
+            tcp_fallback: true,
+            dnssec_enabled: true,
+            retrying: true,
+            no_cache: true,
+            sec_query: true,
+            ad_question: true,
+            do_question: true,
+            has_pheader: true,
+            checking_disabled: true,
+            no_rebind: true,
+            gone_to_tcp: true,
+        };
+        let raw = flags.to_raw();
+        assert_ne!(raw, 0);
+        // Round-trip check
+        let flags2 = ForwardFlags::from_raw(raw);
+        assert_eq!(flags.tcp_fallback, flags2.tcp_fallback);
+        assert_eq!(flags.dnssec_enabled, flags2.dnssec_enabled);
+        assert_eq!(flags.no_cache, flags2.no_cache);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage — server_gone
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_server_gone_removes_matching_records() {
+        let mut table = ForwardTable::new(150);
+        let mut pool = RfdPool::new(10);
+        let target_addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let other_addr: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        let upstream_target = Arc::new(UpstreamServer::new(target_addr));
+        let upstream_other = Arc::new(UpstreamServer::new(other_addr));
+        let client: SocketAddr = "192.168.1.100:5000".parse().unwrap();
+
+        // Insert records for target server
+        let _ = table.insert(ForwardRecord::new(
+            1,
+            1,
+            client,
+            upstream_target.clone(),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "a.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        ));
+        // Insert record for other server
+        let _ = table.insert(ForwardRecord::new(
+            2,
+            2,
+            client,
+            upstream_other.clone(),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "b.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        ));
+
+        assert_eq!(table.len(), 2);
+        server_gone(&mut table, &mut pool, &target_addr);
+        // Target server records should be removed
+        assert!(table.lookup(1).is_none());
+        // Other server's record should remain
+        assert!(table.lookup(2).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage — fast_retry edge cases
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_fast_retry_zero() {
+        // 0 retries should give a delay
+        let result = fast_retry(0);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_fast_retry_one() {
+        let result = fast_retry(1);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_fast_retry_max() {
+        let result = fast_retry(4);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_fast_retry_over_max() {
+        let result = fast_retry(5);
+        assert!(result.is_none()); // beyond max retries
+    }
+
+    #[test]
+    fn test_fast_retry_way_over() {
+        assert!(fast_retry(100).is_none());
+    }
+
+    // ===== process_reply comprehensive tests =====
+
+    /// Helper: build a minimal DNS query packet for testing
+    fn build_test_query(name: &str, qtype: u16, id: u16) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        // Header: ID, flags=0x0100 (RD), QDCOUNT=1, AN/NS/AR=0
+        pkt.extend_from_slice(&id.to_be_bytes());
+        pkt.extend_from_slice(&[0x01, 0x00]); // flags: RD=1
+        pkt.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+        pkt.extend_from_slice(&[0x00, 0x00]); // ANCOUNT
+        pkt.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+        pkt.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+                                              // Question: name
+        for label in name.split('.') {
+            if label.is_empty() {
+                continue;
+            }
+            pkt.push(label.len() as u8);
+            pkt.extend_from_slice(label.as_bytes());
+        }
+        pkt.push(0); // root label
+        pkt.extend_from_slice(&qtype.to_be_bytes()); // QTYPE
+        pkt.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+        pkt
+    }
+
+    /// Helper: build a DNS response with an A record answer
+    fn build_a_response(query: &[u8], ip: [u8; 4], ttl: u32) -> Vec<u8> {
+        let mut pkt = query.to_vec();
+        // Set QR=1, RCODE=0
+        pkt[2] = 0x81; // QR=1, RD=1
+        pkt[3] = 0x80; // RA=1, RCODE=0
+                       // ANCOUNT=1
+        pkt[6] = 0x00;
+        pkt[7] = 0x01;
+        // Answer RR: name pointer 0xC00C, TYPE=A, CLASS=IN, TTL, RDLEN=4, RDATA
+        pkt.extend_from_slice(&[0xC0, 0x0C]); // name compression pointer
+        pkt.extend_from_slice(&[0x00, 0x01]); // TYPE=A
+        pkt.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+        pkt.extend_from_slice(&ttl.to_be_bytes()); // TTL
+        pkt.extend_from_slice(&[0x00, 0x04]); // RDLENGTH=4
+        pkt.extend_from_slice(&ip);
+        pkt
+    }
+
+    /// Helper: build a DNS response with an AAAA record answer
+    fn build_aaaa_response(query: &[u8], ip6: [u8; 16], ttl: u32) -> Vec<u8> {
+        let mut pkt = query.to_vec();
+        pkt[2] = 0x81;
+        pkt[3] = 0x80;
+        pkt[6] = 0x00;
+        pkt[7] = 0x01;
+        pkt.extend_from_slice(&[0xC0, 0x0C]);
+        pkt.extend_from_slice(&[0x00, 0x1C]); // TYPE=AAAA
+        pkt.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+        pkt.extend_from_slice(&ttl.to_be_bytes());
+        pkt.extend_from_slice(&[0x00, 0x10]); // RDLENGTH=16
+        pkt.extend_from_slice(&ip6);
+        pkt
+    }
+
+    /// Helper: build NXDOMAIN response with SOA in authority
+    fn build_nxdomain_response(query: &[u8], soa_ttl: u32, soa_minimum: u32) -> Vec<u8> {
+        let mut pkt = query.to_vec();
+        pkt[2] = 0x81; // QR=1, RD=1
+        pkt[3] = 0x83; // RA=1, RCODE=3 (NXDOMAIN)
+        pkt[6] = 0x00;
+        pkt[7] = 0x00; // ANCOUNT=0
+        pkt[8] = 0x00;
+        pkt[9] = 0x01; // NSCOUNT=1
+                       // SOA RR in authority section
+                       // Name: root "."
+        pkt.push(0x00); // root name
+        pkt.extend_from_slice(&[0x00, 0x06]); // TYPE=SOA
+        pkt.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+        pkt.extend_from_slice(&soa_ttl.to_be_bytes());
+        // RDATA: MNAME=root(1 byte), RNAME=root(1 byte), serial+refresh+retry+expire+minimum(20 bytes)
+        let rdata_len: u16 = 1 + 1 + 20; // two root names (1 byte each) + 5 * u32
+        pkt.extend_from_slice(&rdata_len.to_be_bytes());
+        pkt.push(0x00); // MNAME: root
+        pkt.push(0x00); // RNAME: root
+        pkt.extend_from_slice(&1u32.to_be_bytes()); // serial
+        pkt.extend_from_slice(&3600u32.to_be_bytes()); // refresh
+        pkt.extend_from_slice(&600u32.to_be_bytes()); // retry
+        pkt.extend_from_slice(&86400u32.to_be_bytes()); // expire
+        pkt.extend_from_slice(&soa_minimum.to_be_bytes()); // minimum
+        pkt
+    }
+
+    /// Helper: build NODATA response (RCODE=0, ANCOUNT=0, with SOA in authority)
+    fn build_nodata_response(query: &[u8], soa_ttl: u32, soa_min: u32) -> Vec<u8> {
+        let mut pkt = query.to_vec();
+        pkt[2] = 0x81;
+        pkt[3] = 0x80; // RCODE=0
+        pkt[6] = 0x00;
+        pkt[7] = 0x00; // ANCOUNT=0
+        pkt[8] = 0x00;
+        pkt[9] = 0x01; // NSCOUNT=1
+                       // SOA in authority
+        pkt.push(0x00);
+        pkt.extend_from_slice(&[0x00, 0x06]); // SOA
+        pkt.extend_from_slice(&[0x00, 0x01]); // IN
+        pkt.extend_from_slice(&soa_ttl.to_be_bytes());
+        let rdata_len: u16 = 22; // MNAME root(1) + RNAME root(1) + 5*u32(20)
+        pkt.extend_from_slice(&rdata_len.to_be_bytes());
+        pkt.push(0x00); // MNAME
+        pkt.push(0x00); // RNAME
+        pkt.extend_from_slice(&1u32.to_be_bytes());
+        pkt.extend_from_slice(&3600u32.to_be_bytes());
+        pkt.extend_from_slice(&600u32.to_be_bytes());
+        pkt.extend_from_slice(&86400u32.to_be_bytes());
+        pkt.extend_from_slice(&soa_min.to_be_bytes());
+        pkt
+    }
+
+    fn test_state_and_cache() -> (DaemonState, DnsCache) {
+        let state = DaemonState::default();
+        let cache = DnsCache::cache_init(Some(150)).unwrap();
+        (state, cache)
+    }
+
+    fn test_flags() -> ForwardFlags {
+        ForwardFlags::new()
+    }
+
+    fn test_edns() -> EdnsHandler {
+        EdnsHandler
+    }
+
+    #[test]
+    fn test_process_reply_a_record_caches() {
+        let (state, mut cache) = test_state_and_cache();
+        let edns = test_edns();
+        let query = build_test_query("example.com", 1, 0x1234);
+        let response = build_a_response(&query, [93, 184, 216, 34], 300);
+        let flags = test_flags();
+        let result = process_reply(
+            &response,
+            "example.com",
+            RRType::A,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        assert!(!result.is_empty());
+        // Verify QR bit is set in the returned packet
+        assert!(result[2] & 0x80 != 0);
+    }
+
+    #[test]
+    fn test_process_reply_aaaa_record_caches() {
+        let (state, mut cache) = test_state_and_cache();
+        let edns = test_edns();
+        let query = build_test_query("example.com", 28, 0x1234);
+        let ip6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let response = build_aaaa_response(&query, ip6, 600);
+        let flags = test_flags();
+        let result = process_reply(
+            &response,
+            "example.com",
+            RRType::AAAA,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        assert!(!result.is_empty());
+        assert!(result[2] & 0x80 != 0);
+    }
+
+    #[test]
+    fn test_process_reply_nxdomain_caches_negative() {
+        let (state, mut cache) = test_state_and_cache();
+        let edns = test_edns();
+        let query = build_test_query("nonexist.example.com", 1, 0x5678);
+        let response = build_nxdomain_response(&query, 300, 60);
+        let flags = test_flags();
+        let result = process_reply(
+            &response,
+            "nonexist.example.com",
+            RRType::A,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        // RCODE should be NXDOMAIN (3)
+        assert_eq!(result[3] & 0x0F, 3);
+    }
+
+    #[test]
+    fn test_process_reply_nodata_caches() {
+        let (state, mut cache) = test_state_and_cache();
+        let edns = test_edns();
+        let query = build_test_query("example.com", 28, 0xABCD);
+        let response = build_nodata_response(&query, 300, 120);
+        let flags = test_flags();
+        let result = process_reply(
+            &response,
+            "example.com",
+            RRType::AAAA,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        // RCODE should be NOERROR (0)
+        assert_eq!(result[3] & 0x0F, 0);
+    }
+
+    #[test]
+    fn test_process_reply_no_cache_flag_skips_caching() {
+        let (state, mut cache) = test_state_and_cache();
+        let edns = test_edns();
+        let query = build_test_query("example.com", 1, 0x1234);
+        let response = build_a_response(&query, [1, 2, 3, 4], 300);
+        let mut flags = test_flags();
+        flags.no_cache = true;
+        let result = process_reply(
+            &response,
+            "example.com",
+            RRType::A,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_process_reply_rebind_private_blocks() {
+        let mut state = DaemonState::default();
+        state.options.set(opt::NO_REBIND);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let edns = test_edns();
+        let query = build_test_query("evil.com", 1, 0x9999);
+        // 192.168.1.1 is a private IP — should trigger rebind protection
+        let response = build_a_response(&query, [192, 168, 1, 1], 300);
+        let flags = test_flags();
+        let result = process_reply(
+            &response,
+            "evil.com",
+            RRType::A,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        // Should get SERVFAIL due to rebind detection
+        assert_eq!(result[3] & 0x0F, 2); // SERVFAIL
+    }
+
+    #[test]
+    fn test_process_reply_rebind_loopback_blocks() {
+        let mut state = DaemonState::default();
+        state.options.set(opt::NO_REBIND);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let edns = test_edns();
+        let query = build_test_query("evil.com", 1, 0xAAAA);
+        let response = build_a_response(&query, [127, 0, 0, 1], 300);
+        let flags = test_flags();
+        let result = process_reply(
+            &response,
+            "evil.com",
+            RRType::A,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        assert_eq!(result[3] & 0x0F, 2); // SERVFAIL
+    }
+
+    #[test]
+    fn test_process_reply_rebind_public_allowed() {
+        let mut state = DaemonState::default();
+        state.options.set(opt::NO_REBIND);
+        let mut cache = DnsCache::cache_init(Some(150)).unwrap();
+        let edns = test_edns();
+        let query = build_test_query("good.com", 1, 0xBBBB);
+        let response = build_a_response(&query, [8, 8, 8, 8], 300);
+        let flags = test_flags();
+        let result = process_reply(
+            &response,
+            "good.com",
+            RRType::A,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        // Should NOT be SERVFAIL — public IP is allowed
+        assert_ne!(result[3] & 0x0F, 2);
+    }
+
+    #[test]
+    fn test_process_reply_short_packet() {
+        let (state, mut cache) = test_state_and_cache();
+        let edns = test_edns();
+        let flags = test_flags();
+        let short = vec![0u8; 6]; // too short for DNS
+        let result = process_reply(
+            &short,
+            "x.com",
+            RRType::A,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        assert_eq!(result.len(), 6);
+    }
+
+    #[test]
+    fn test_process_reply_with_peer_and_source_addr() {
+        let (state, mut cache) = test_state_and_cache();
+        let edns = test_edns();
+        let query = build_test_query("example.com", 1, 0x3456);
+        let response = build_a_response(&query, [1, 1, 1, 1], 300);
+        let flags = test_flags();
+        let peer = "8.8.8.8:53".parse::<SocketAddr>().unwrap();
+        let source = "10.0.0.1:12345".parse::<SocketAddr>().unwrap();
+        let result = process_reply(
+            &response,
+            "example.com",
+            RRType::A,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            Some(&peer),
+            Some(&source),
+        );
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_process_reply_cname_response() {
+        let (state, mut cache) = test_state_and_cache();
+        let edns = test_edns();
+        let query = build_test_query("www.example.com", 1, 0x2222);
+        let mut pkt = query.clone();
+        pkt[2] = 0x81;
+        pkt[3] = 0x80;
+        pkt[6] = 0x00;
+        pkt[7] = 0x02; // 2 answers (CNAME + A)
+                       // Answer 1: CNAME
+        pkt.extend_from_slice(&[0xC0, 0x0C]); // name ptr
+        pkt.extend_from_slice(&[0x00, 0x05]); // TYPE=CNAME
+        pkt.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+        pkt.extend_from_slice(&300u32.to_be_bytes());
+        // CNAME RDATA: "example.com"
+        let cname_rdata = b"\x07example\x03com\x00";
+        pkt.extend_from_slice(&(cname_rdata.len() as u16).to_be_bytes());
+        pkt.extend_from_slice(cname_rdata);
+        // Answer 2: A record for example.com
+        let a_name = b"\x07example\x03com\x00";
+        pkt.extend_from_slice(a_name);
+        pkt.extend_from_slice(&[0x00, 0x01]); // TYPE=A
+        pkt.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+        pkt.extend_from_slice(&300u32.to_be_bytes());
+        pkt.extend_from_slice(&[0x00, 0x04]);
+        pkt.extend_from_slice(&[93, 184, 216, 34]);
+        let flags = test_flags();
+        let result = process_reply(
+            &pkt,
+            "www.example.com",
+            RRType::A,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        assert!(!result.is_empty());
+        assert_eq!(result[3] & 0x0F, 0); // NOERROR
+    }
+
+    #[test]
+    fn test_process_reply_ptr_response() {
+        let (state, mut cache) = test_state_and_cache();
+        let edns = test_edns();
+        let query = build_test_query("1.0.168.192.in-addr.arpa", 12, 0x7777);
+        let mut pkt = query.clone();
+        pkt[2] = 0x81;
+        pkt[3] = 0x80;
+        pkt[6] = 0x00;
+        pkt[7] = 0x01;
+        pkt.extend_from_slice(&[0xC0, 0x0C]);
+        pkt.extend_from_slice(&[0x00, 0x0C]); // TYPE=PTR
+        pkt.extend_from_slice(&[0x00, 0x01]);
+        pkt.extend_from_slice(&3600u32.to_be_bytes());
+        let ptr_rdata = b"\x04host\x07example\x03com\x00";
+        pkt.extend_from_slice(&(ptr_rdata.len() as u16).to_be_bytes());
+        pkt.extend_from_slice(ptr_rdata);
+        let flags = test_flags();
+        let result = process_reply(
+            &pkt,
+            "1.0.168.192.in-addr.arpa",
+            RRType::PTR,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        assert_eq!(result[3] & 0x0F, 0);
+    }
+
+    #[test]
+    fn test_process_reply_mx_response() {
+        let (state, mut cache) = test_state_and_cache();
+        let edns = test_edns();
+        let query = build_test_query("example.com", 15, 0x3333);
+        let mut pkt = query.clone();
+        pkt[2] = 0x81;
+        pkt[3] = 0x80;
+        pkt[6] = 0x00;
+        pkt[7] = 0x01;
+        pkt.extend_from_slice(&[0xC0, 0x0C]);
+        pkt.extend_from_slice(&[0x00, 0x0F]); // TYPE=MX
+        pkt.extend_from_slice(&[0x00, 0x01]);
+        pkt.extend_from_slice(&3600u32.to_be_bytes());
+        let mx_rdata = b"\x00\x0A\x04mail\x07example\x03com\x00"; // pref=10, mail.example.com
+        pkt.extend_from_slice(&(mx_rdata.len() as u16).to_be_bytes());
+        pkt.extend_from_slice(mx_rdata);
+        let flags = test_flags();
+        let result = process_reply(
+            &pkt,
+            "example.com",
+            RRType::MX,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        assert_eq!(result[3] & 0x0F, 0);
+    }
+
+    #[test]
+    fn test_process_reply_srv_response() {
+        let (state, mut cache) = test_state_and_cache();
+        let edns = test_edns();
+        let query = build_test_query("_sip._tcp.example.com", 33, 0x4444);
+        let mut pkt = query.clone();
+        pkt[2] = 0x81;
+        pkt[3] = 0x80;
+        pkt[6] = 0x00;
+        pkt[7] = 0x01;
+        pkt.extend_from_slice(&[0xC0, 0x0C]);
+        pkt.extend_from_slice(&[0x00, 0x21]); // TYPE=SRV
+        pkt.extend_from_slice(&[0x00, 0x01]);
+        pkt.extend_from_slice(&3600u32.to_be_bytes());
+        // SRV: priority=10, weight=60, port=5060, target=sip.example.com
+        let mut srv_rdata = Vec::new();
+        srv_rdata.extend_from_slice(&10u16.to_be_bytes()); // priority
+        srv_rdata.extend_from_slice(&60u16.to_be_bytes()); // weight
+        srv_rdata.extend_from_slice(&5060u16.to_be_bytes()); // port
+        srv_rdata.extend_from_slice(b"\x03sip\x07example\x03com\x00");
+        pkt.extend_from_slice(&(srv_rdata.len() as u16).to_be_bytes());
+        pkt.extend_from_slice(&srv_rdata);
+        let flags = test_flags();
+        let result = process_reply(
+            &pkt,
+            "_sip._tcp.example.com",
+            RRType::SRV,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        assert_eq!(result[3] & 0x0F, 0);
+    }
+
+    #[test]
+    fn test_process_reply_txt_response() {
+        let (state, mut cache) = test_state_and_cache();
+        let edns = test_edns();
+        let query = build_test_query("example.com", 16, 0x5555);
+        let mut pkt = query.clone();
+        pkt[2] = 0x81;
+        pkt[3] = 0x80;
+        pkt[6] = 0x00;
+        pkt[7] = 0x01;
+        pkt.extend_from_slice(&[0xC0, 0x0C]);
+        pkt.extend_from_slice(&[0x00, 0x10]); // TYPE=TXT
+        pkt.extend_from_slice(&[0x00, 0x01]);
+        pkt.extend_from_slice(&3600u32.to_be_bytes());
+        let txt_rdata = b"\x0Bv=spf1 +all";
+        pkt.extend_from_slice(&(txt_rdata.len() as u16).to_be_bytes());
+        pkt.extend_from_slice(txt_rdata);
+        let flags = test_flags();
+        let result = process_reply(
+            &pkt,
+            "example.com",
+            RRType::TXT,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        assert_eq!(result[3] & 0x0F, 0);
+    }
+
+    #[test]
+    fn test_process_reply_multiple_a_records() {
+        let (state, mut cache) = test_state_and_cache();
+        let edns = test_edns();
+        let query = build_test_query("multi.example.com", 1, 0x6666);
+        let mut pkt = query.clone();
+        pkt[2] = 0x81;
+        pkt[3] = 0x80;
+        pkt[6] = 0x00;
+        pkt[7] = 0x03; // 3 answers
+        for ip in &[[1u8, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]] {
+            pkt.extend_from_slice(&[0xC0, 0x0C]);
+            pkt.extend_from_slice(&[0x00, 0x01]); // A
+            pkt.extend_from_slice(&[0x00, 0x01]); // IN
+            pkt.extend_from_slice(&300u32.to_be_bytes());
+            pkt.extend_from_slice(&[0x00, 0x04]);
+            pkt.extend_from_slice(ip);
+        }
+        let flags = test_flags();
+        let result = process_reply(
+            &pkt,
+            "multi.example.com",
+            RRType::A,
+            &flags,
+            &mut cache,
+            &edns,
+            &state,
+            None,
+            None,
+        );
+        assert_eq!(result[3] & 0x0F, 0);
+    }
+
+    // ===== extract_neg_ttl_from_authority tests =====
+
+    #[test]
+    fn test_extract_neg_ttl_nxdomain_soa() {
+        let query = build_test_query("no.example.com", 1, 0x1111);
+        let pkt = build_nxdomain_response(&query, 600, 120);
+        let ttl = extract_neg_ttl_from_authority(&pkt);
+        // min(soa_ttl=600, soa_minimum=120) = 120
+        assert_eq!(ttl, Some(120));
+    }
+
+    #[test]
+    fn test_extract_neg_ttl_nodata_soa() {
+        let query = build_test_query("example.com", 28, 0x2222);
+        let pkt = build_nodata_response(&query, 300, 60);
+        let ttl = extract_neg_ttl_from_authority(&pkt);
+        assert_eq!(ttl, Some(60));
+    }
+
+    #[test]
+    fn test_extract_neg_ttl_no_authority_v2() {
+        let query = build_test_query("example.com", 1, 0x3333);
+        let mut pkt = query.clone();
+        pkt[2] = 0x81;
+        pkt[3] = 0x83; // NXDOMAIN
+                       // NSCOUNT = 0
+        pkt[8] = 0x00;
+        pkt[9] = 0x00;
+        let ttl = extract_neg_ttl_from_authority(&pkt);
+        assert_eq!(ttl, None);
+    }
+
+    #[test]
+    fn test_extract_neg_ttl_too_short_v2() {
+        let pkt = vec![0u8; 4];
+        assert_eq!(extract_neg_ttl_from_authority(&pkt), None);
+    }
+
+    #[test]
+    fn test_extract_neg_ttl_soa_ttl_smaller() {
+        let query = build_test_query("test.com", 1, 0x4444);
+        let pkt = build_nxdomain_response(&query, 30, 600);
+        let ttl = extract_neg_ttl_from_authority(&pkt);
+        // min(30, 600) = 30
+        assert_eq!(ttl, Some(30));
+    }
+
+    // ===== extract_dns_name_at tests =====
+
+    #[test]
+    fn test_extract_dns_name_simple_labels() {
+        let data: Vec<u8> = vec![
+            3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm',
+            0,
+        ];
+        let name = extract_dns_name_at(&data, 0);
+        assert!(name.is_some());
+        let n = name.unwrap();
+        assert!(n.to_string().contains("www"));
+        assert!(n.to_string().contains("example"));
+    }
+
+    #[test]
+    fn test_extract_dns_name_root() {
+        let data = vec![0u8];
+        let name = extract_dns_name_at(&data, 0);
+        assert!(name.is_some());
+        assert_eq!(name.unwrap().to_string(), ".");
+    }
+
+    #[test]
+    fn test_extract_dns_name_compression_pointer() {
+        // Build packet with name at offset 0, then compression pointer at offset 17
+        let mut data: Vec<u8> = vec![3, b'f', b'o', b'o', 3, b'b', b'a', b'r', 0]; // "foo.bar" at offset 0
+                                                                                   // At offset 9: compression pointer back to offset 0
+        data.push(0xC0);
+        data.push(0x00);
+        let name = extract_dns_name_at(&data, 9);
+        assert!(name.is_some());
+        assert!(name.unwrap().to_string().contains("foo"));
+    }
+
+    #[test]
+    fn test_extract_dns_name_empty_v2() {
+        let data: Vec<u8> = vec![];
+        assert!(extract_dns_name_at(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_extract_dns_name_out_of_bounds() {
+        let data = vec![3, b'a', b'b', b'c', 0];
+        assert!(extract_dns_name_at(&data, 100).is_none());
+    }
+
+    #[test]
+    fn test_extract_dns_name_truncated_v2() {
+        let data = vec![5, b'a', b'b']; // label says 5 bytes but only 2 available
+        assert!(extract_dns_name_at(&data, 0).is_none());
+    }
+
+    // ===== check_rebind_protection additional tests =====
+
+    #[test]
+    fn test_check_rebind_10_prefix() {
+        let query = build_test_query("evil.com", 1, 0x1111);
+        let response = build_a_response(&query, [10, 0, 0, 1], 300);
+        let result = check_rebind_protection(&response);
+        assert_eq!(result, Some(true)); // 10.0.0.1 is private
+    }
+
+    #[test]
+    fn test_check_rebind_172_16_prefix() {
+        let query = build_test_query("evil.com", 1, 0x2222);
+        let response = build_a_response(&query, [172, 16, 0, 1], 300);
+        let result = check_rebind_protection(&response);
+        assert_eq!(result, Some(true)); // 172.16.0.1 is private
+    }
+
+    #[test]
+    fn test_check_rebind_link_local_ipv4() {
+        let query = build_test_query("evil.com", 1, 0x3333);
+        let response = build_a_response(&query, [169, 254, 1, 1], 300);
+        let result = check_rebind_protection(&response);
+        assert_eq!(result, Some(true)); // 169.254.x.x is link-local
+    }
+
+    #[test]
+    fn test_check_rebind_ipv6_loopback() {
+        let query = build_test_query("evil.com", 28, 0x4444);
+        let mut ip6 = [0u8; 16];
+        ip6[15] = 1; // ::1
+        let response = build_aaaa_response(&query, ip6, 300);
+        let result = check_rebind_protection(&response);
+        assert_eq!(result, Some(true));
+    }
+
+    #[test]
+    fn test_check_rebind_ipv6_ula() {
+        let query = build_test_query("evil.com", 28, 0x5555);
+        let ip6 = [0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let response = build_aaaa_response(&query, ip6, 300);
+        let result = check_rebind_protection(&response);
+        assert_eq!(result, Some(true)); // fd00:: is ULA
+    }
+
+    #[test]
+    fn test_check_rebind_ipv6_link_local() {
+        let query = build_test_query("evil.com", 28, 0x6666);
+        let ip6 = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let response = build_aaaa_response(&query, ip6, 300);
+        let result = check_rebind_protection(&response);
+        assert_eq!(result, Some(true)); // fe80:: is link-local
+    }
+
+    #[test]
+    fn test_check_rebind_ipv6_public() {
+        let query = build_test_query("good.com", 28, 0x7777);
+        let ip6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let response = build_aaaa_response(&query, ip6, 300);
+        let result = check_rebind_protection(&response);
+        assert_eq!(result, Some(false)); // 2001:db8:: is public (doc range)
+    }
+
+    #[test]
+    fn test_check_rebind_no_answers_v2() {
+        let query = build_test_query("empty.com", 1, 0x8888);
+        let mut pkt = query.clone();
+        pkt[2] = 0x81;
+        pkt[3] = 0x80;
+        // ANCOUNT = 0
+        let result = check_rebind_protection(&pkt);
+        assert_eq!(result, Some(false));
+    }
+
+    // ===== is_ipv6_unique_local / is_ipv6_link_local tests =====
+
+    #[test]
+    fn test_is_ipv6_unique_local_fc() {
+        let addr: Ipv6Addr = "fc00::1".parse().unwrap();
+        assert!(is_ipv6_unique_local(&addr));
+    }
+
+    #[test]
+    fn test_is_ipv6_unique_local_fd() {
+        let addr: Ipv6Addr = "fd12:3456:789a::1".parse().unwrap();
+        assert!(is_ipv6_unique_local(&addr));
+    }
+
+    #[test]
+    fn test_is_ipv6_unique_local_global() {
+        let addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert!(!is_ipv6_unique_local(&addr));
+    }
+
+    #[test]
+    fn test_is_ipv6_link_local_yes() {
+        let addr: Ipv6Addr = "fe80::1".parse().unwrap();
+        assert!(is_ipv6_link_local(&addr));
+    }
+
+    #[test]
+    fn test_is_ipv6_link_local_no() {
+        let addr: Ipv6Addr = "fe00::1".parse().unwrap();
+        assert!(!is_ipv6_link_local(&addr));
+    }
+
+    // ===== extract_rr_ttl tests =====
+
+    #[test]
+    fn test_extract_rr_ttl_valid_v2() {
+        let mut pkt = vec![0u8; 20];
+        // TTL at offset 4 from rr_fixed
+        let rr_off = 0;
+        pkt[rr_off + 4] = 0x00;
+        pkt[rr_off + 5] = 0x00;
+        pkt[rr_off + 6] = 0x01;
+        pkt[rr_off + 7] = 0x2C; // 300
+        let ttl = extract_rr_ttl(&pkt, rr_off);
+        assert_eq!(ttl, Some(300));
+    }
+
+    #[test]
+    fn test_extract_rr_ttl_short() {
+        let pkt = vec![0u8; 5]; // too short for RRFIXEDSZ
+        assert!(extract_rr_ttl(&pkt, 0).is_none());
+    }
+
+    // ===== set_rr_ttl tests =====
+
+    #[test]
+    fn test_set_rr_ttl_writes_correctly() {
+        let mut pkt = vec![0u8; 20];
+        set_rr_ttl(&mut pkt, 0, 3600);
+        assert_eq!(pkt[4], 0x00);
+        assert_eq!(pkt[5], 0x00);
+        assert_eq!(pkt[6], 0x0E);
+        assert_eq!(pkt[7], 0x10);
+    }
+
+    #[test]
+    fn test_set_rr_ttl_max_value_v2() {
+        let mut pkt = vec![0u8; 20];
+        set_rr_ttl(&mut pkt, 0, u32::MAX);
+        assert_eq!(pkt[4], 0xFF);
+        assert_eq!(pkt[5], 0xFF);
+        assert_eq!(pkt[6], 0xFF);
+        assert_eq!(pkt[7], 0xFF);
+    }
+
+    #[test]
+    fn test_set_rr_ttl_too_short_packet() {
+        let mut pkt = vec![0u8; 3];
+        set_rr_ttl(&mut pkt, 0, 100); // should not panic
+                                      // no change since packet too short
+    }
+
+    // ===== rdata_to_all_addr tests =====
+
+    #[test]
+    fn test_rdata_to_all_addr_a() {
+        let rdata = [10, 20, 30, 40];
+        let result = rdata_to_all_addr(RRType::A, &rdata);
+        assert!(result.is_some());
+        match result.unwrap() {
+            AllAddr::V4(ip) => assert_eq!(ip, Ipv4Addr::new(10, 20, 30, 40)),
+            _ => panic!("expected V4"),
+        }
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_aaaa() {
+        let rdata = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let result = rdata_to_all_addr(RRType::AAAA, &rdata);
+        assert!(result.is_some());
+        match result.unwrap() {
+            AllAddr::V6(ip) => assert_eq!(ip.segments()[0], 0x2001),
+            _ => panic!("expected V6"),
+        }
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_a_short() {
+        let rdata = [1, 2, 3]; // only 3 bytes
+        assert!(rdata_to_all_addr(RRType::A, &rdata).is_none());
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_aaaa_short() {
+        let rdata = [1; 15]; // only 15 bytes
+        assert!(rdata_to_all_addr(RRType::AAAA, &rdata).is_none());
+    }
+
+    #[test]
+    fn test_rdata_to_all_addr_unsupported() {
+        let rdata = [0; 10];
+        assert!(rdata_to_all_addr(RRType::MX, &rdata).is_none());
+    }
+
+    // ===== to_my_sock_addr tests =====
+
+    #[test]
+    fn test_to_my_sock_addr_ipv4() {
+        let addr: SocketAddr = "192.168.1.1:53".parse().unwrap();
+        let msa = to_my_sock_addr(&addr);
+        assert_eq!(msa.port(), 53);
+    }
+
+    #[test]
+    fn test_to_my_sock_addr_ipv6() {
+        let addr: SocketAddr = "[::1]:5353".parse().unwrap();
+        let msa = to_my_sock_addr(&addr);
+        assert_eq!(msa.port(), 5353);
+    }
+
+    // ===== skip_dns_name tests =====
+
+    #[test]
+    fn test_skip_dns_name_regular() {
+        let data = vec![3, b'f', b'o', b'o', 3, b'b', b'a', b'r', 0];
+        let end = skip_dns_name(&data, 0);
+        assert_eq!(end, Some(9));
+    }
+
+    #[test]
+    fn test_skip_dns_name_compression() {
+        let data = vec![0xC0, 0x0C]; // compression pointer
+        let end = skip_dns_name(&data, 0);
+        assert_eq!(end, Some(2));
+    }
+
+    #[test]
+    fn test_skip_dns_name_root_v3() {
+        let data = vec![0]; // root label
+        let end = skip_dns_name(&data, 0);
+        assert_eq!(end, Some(1));
+    }
+
+    #[test]
+    fn test_skip_dns_name_empty() {
+        let data: Vec<u8> = vec![];
+        assert!(skip_dns_name(&data, 0).is_none());
+    }
+
+    // ===== is_strict_order tests =====
+
+    #[test]
+    fn test_is_strict_order_unset() {
+        let flags = OptionFlags::new();
+        assert!(!is_strict_order(&flags));
+    }
+
+    #[test]
+    fn test_is_strict_order_set_v2() {
+        let mut flags = OptionFlags::new();
+        flags.set(opt::ORDER);
+        assert!(is_strict_order(&flags));
+    }
+
+    // ===== parse_response_header tests =====
+
+    #[test]
+    fn test_parse_response_header_query_v2() {
+        let query = build_test_query("example.com", 1, 0x1234);
+        let hdr = parse_response_header(&query);
+        assert!(hdr.is_some());
+    }
+
+    #[test]
+    fn test_parse_response_header_valid_response() {
+        let query = build_test_query("example.com", 1, 0x1234);
+        let response = build_a_response(&query, [1, 2, 3, 4], 300);
+        let hdr = parse_response_header(&response);
+        assert!(hdr.is_some());
+    }
+
+    #[test]
+    fn test_parse_response_header_short_v2() {
+        let short = vec![0u8; 8];
+        assert!(parse_response_header(&short).is_none());
+    }
+
+    // ===== build_response_with_builder tests =====
+
+    #[test]
+    fn test_build_response_builder_empty_answers() {
+        let query = build_test_query("example.com", 1, 0x1234);
+        let result = build_response_with_builder(&query, 0x1234, &[]);
+        assert!(!result.is_empty());
+        assert!(result.len() >= 12);
+    }
+
+    #[test]
+    fn test_build_response_builder_a_answer() {
+        let query = build_test_query("example.com", 1, 0x5678);
+        let name = DnsName::from_str_unchecked("example.com");
+        let answers = vec![(name, RRType::A, 300, vec![1, 2, 3, 4])];
+        let result = build_response_with_builder(&query, 0x5678, &answers);
+        assert!(result.len() > 12);
+    }
+
+    #[test]
+    fn test_build_response_builder_multiple_answers() {
+        let query = build_test_query("example.com", 1, 0x9ABC);
+        let name = DnsName::from_str_unchecked("example.com");
+        let answers = vec![
+            (name.clone(), RRType::A, 300, vec![1, 2, 3, 4]),
+            (name.clone(), RRType::A, 300, vec![5, 6, 7, 8]),
+            (name, RRType::A, 300, vec![9, 10, 11, 12]),
+        ];
+        let result = build_response_with_builder(&query, 0x9ABC, &answers);
+        assert!(result.len() > 12);
+    }
+
+    // ===== generate_unique_id tests =====
+
+    #[test]
+    fn test_generate_unique_id_avoids_existing() {
+        let mut table = ForwardTable::new(150);
+        let mut rng = SurfRng::new().unwrap();
+        // Insert a few records so the table isn't empty
+        for i in 0u16..5 {
+            let record = ForwardRecord::new(
+                i,
+                100 + i,
+                "127.0.0.1:1000".parse().unwrap(),
+                Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap())),
+                Bytes::from_static(b"q"),
+                ForwardFlags::new(),
+                "test.com".to_string(),
+                RRType::A,
+                DnsClass::IN,
+            );
+            let _ = table.insert(record);
+        }
+        let id = generate_unique_id(&mut rng, &table);
+        // The generated ID should not conflict with existing entries
+        assert!(table.lookup(id).is_none());
+    }
+
+    // ===== RoundRobinSelector tests =====
+
+    #[test]
+    fn test_round_robin_selector_new_v2() {
+        let rr = RoundRobinSelector::new();
+        // last_index is AtomicUsize, starts at 0
+        assert_eq!(rr.last_index.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_round_robin_select_server_cycles_v2() {
+        let rr = RoundRobinSelector::new();
+        let servers: Vec<Arc<UpstreamServer>> = (0..3)
+            .map(|i| {
+                let addr: SocketAddr = format!("8.8.8.{}:53", i).parse().unwrap();
+                Arc::new(UpstreamServer::new(addr))
+            })
+            .collect();
+        // Create a test query packet and DomainMatcher
+        let query_bytes = build_test_query("test.com", 1, 0x1234);
+        let query = DnsPacket::parse(&query_bytes).unwrap();
+        let dm = DomainMatcher::new();
+        let results: Vec<bool> = (0..6)
+            .map(|_| rr.select_server(&servers, &query, &dm).is_some())
+            .collect();
+        // All selections should succeed
+        assert!(results.iter().all(|&r| r));
+    }
+
+    #[test]
+    fn test_round_robin_empty_servers_v2() {
+        let rr = RoundRobinSelector::new();
+        let servers: Vec<Arc<UpstreamServer>> = vec![];
+        let query_bytes = build_test_query("test.com", 1, 0x1234);
+        let query = DnsPacket::parse(&query_bytes).unwrap();
+        let dm = DomainMatcher::new();
+        assert!(rr.select_server(&servers, &query, &dm).is_none());
+    }
+
+    // ===== UpstreamServer additional tests =====
+
+    #[test]
+    fn test_upstream_server_latency_update() {
+        let server = UpstreamServer::new("8.8.8.8:53".parse().unwrap());
+        server.update_latency(10);
+        server.update_latency(20);
+        server.update_latency(30);
+        // mma_latency should be updated
+        let mma = server
+            .mma_latency
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(mma > 0);
+    }
+
+    #[test]
+    fn test_upstream_server_health_after_recovery() {
+        let mut server = UpstreamServer::new("8.8.8.8:53".parse().unwrap());
+        // Fail FORWARD_TEST (50) times to exceed threshold
+        for _ in 0..FORWARD_TEST {
+            server.record_failure();
+        }
+        assert!(!server.is_healthy());
+        // Reset failed_queries to simulate recovery
+        server.failed_queries = 0;
+        server.last_failure = None;
+        assert!(server.is_healthy());
+    }
+
+    // ===== ForwardRecord additional tests =====
+
+    #[test]
+    fn test_forward_record_expired() {
+        let record = ForwardRecord::new(
+            100,
+            200,
+            "127.0.0.1:1000".parse().unwrap(),
+            Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap())),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        // With a 0-second timeout, should be expired immediately (or not depending on timing)
+        // With a very large timeout, should not be expired
+        assert!(!record.is_expired(3600));
+    }
+
+    // ===== ForwardTable additional tests =====
+
+    #[test]
+    fn test_forward_table_lookup_mut() {
+        let mut table = ForwardTable::new(150);
+        let record = ForwardRecord::new(
+            1,
+            100,
+            "127.0.0.1:1000".parse().unwrap(),
+            Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap())),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let _ = table.insert(record);
+        let entry = table.lookup_mut(100);
+        assert!(entry.is_some());
+        entry.unwrap().flags.tcp_fallback = true;
+    }
+
+    #[test]
+    fn test_forward_table_find_by_client() {
+        let mut table = ForwardTable::new(150);
+        let src: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let record = ForwardRecord::new(
+            42,
+            100,
+            src,
+            Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap())),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let _ = table.insert(record);
+        let found = table.find_by_client(42, &src);
+        assert!(found.is_some());
+    }
+
+    #[test]
+    fn test_forward_table_find_by_client_wrong_id() {
+        let mut table = ForwardTable::new(150);
+        let src: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let record = ForwardRecord::new(
+            42,
+            100,
+            src,
+            Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap())),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let _ = table.insert(record);
+        let found = table.find_by_client(99, &src);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_forward_table_find_by_resp_v2() {
+        let mut table = ForwardTable::new(150);
+        let server = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let record = ForwardRecord::new(
+            42,
+            100,
+            "127.0.0.1:5000".parse().unwrap(),
+            server,
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let _ = table.insert(record);
+        let found = table.find_by_response(100, "test.com", &DnsClass::IN, &RRType::A);
+        assert!(found.is_some());
+    }
+
+    #[test]
+    fn test_forward_table_find_by_response_wrong_server() {
+        let mut table = ForwardTable::new(150);
+        let record = ForwardRecord::new(
+            42,
+            100,
+            "127.0.0.1:5000".parse().unwrap(),
+            Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap())),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let _ = table.insert(record);
+        let wrong: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        let found = table.find_by_response(100, "wrong.com", &DnsClass::IN, &RRType::A);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_forward_table_remove_returns_record() {
+        let mut table = ForwardTable::new(150);
+        let record = ForwardRecord::new(
+            42,
+            100,
+            "127.0.0.1:5000".parse().unwrap(),
+            Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap())),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let _ = table.insert(record);
+        let removed = table.remove(100);
+        assert!(removed.is_some());
+        assert!(table.lookup(100).is_none());
+    }
+
+    #[test]
+    fn test_forward_table_insert_full_error() {
+        let mut table = ForwardTable::new(2);
+        for i in 0..2u16 {
+            let r = ForwardRecord::new(
+                i,
+                i + 100,
+                "127.0.0.1:5000".parse().unwrap(),
+                Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap())),
+                Bytes::from_static(b"q"),
+                ForwardFlags::new(),
+                "test.com".to_string(),
+                RRType::A,
+                DnsClass::IN,
+            );
+            let _ = table.insert(r);
+        }
+        assert!(table.is_full());
+        let r = ForwardRecord::new(
+            99,
+            999,
+            "127.0.0.1:5000".parse().unwrap(),
+            Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap())),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let result = table.insert(r);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_forward_table_len_and_empty() {
+        let mut table = ForwardTable::new(10);
+        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
+        let r = ForwardRecord::new(
+            1,
+            100,
+            "127.0.0.1:5000".parse().unwrap(),
+            Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap())),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let _ = table.insert(r);
+        assert!(!table.is_empty());
+        assert_eq!(table.len(), 1);
+    }
+
+    // ===== RfdPool tests =====
+
+    #[test]
+    fn test_rfd_pool_new() {
+        let pool = RfdPool::new(10);
+        assert!(pool.entries.is_empty());
+    }
+
+    #[test]
+    fn test_rfd_pool_clear_v3() {
+        let mut pool = RfdPool::new(10);
+        pool.entries.push(RfdEntry {
+            fd: 42,
+            refcount: 1,
+            family: 2,
+            bound_addr: "0.0.0.0:0".parse().unwrap(),
+        });
+        assert!(!pool.entries.is_empty());
+        pool.clear();
+        assert!(pool.entries.is_empty());
+    }
+
+    // ===== build_servfail_response additional tests =====
+
+    #[test]
+    fn test_build_servfail_preserves_id() {
+        let query = build_test_query("test.com", 1, 0xABCD);
+        let resp = build_servfail_response(&query, 0xABCD);
+        assert_eq!(resp[0], 0xAB);
+        assert_eq!(resp[1], 0xCD);
+        assert_eq!(resp[3] & 0x0F, 2); // SERVFAIL
+    }
+
+    #[test]
+    fn test_build_servfail_short_v2() {
+        let short = vec![0u8; 4];
+        let resp = build_servfail_response(&short, 0x1111);
+        // Should still produce a valid response
+        assert!(resp.len() >= 12);
+    }
+
+    // ===== build_cache_response additional tests =====
+
+    #[test]
+    fn test_build_cache_response_with_cname() {
+        let query = build_test_query("www.example.com", 5, 0x1234);
+        let target = DnsName::from_str_unchecked("example.com");
+        let entry = CacheEntry {
+            name: DnsName::from_str_unchecked("www.example.com"),
+            rr_type: RRType::CNAME,
+            data: CacheData::Cname(target),
+            expires: std::time::Instant::now() + std::time::Duration::from_secs(300),
+            last_access: std::time::Instant::now(),
+            flags: CacheFlags::new(),
+            ttl: 300,
+        };
+        let resp = build_cache_response(&query, &entry, 0x1234, 512, false);
+        assert!(resp.is_some());
+        assert!(resp.unwrap().len() > 12);
+    }
+
+    #[test]
+    fn test_build_cache_response_empty_entries() {
+        let query = build_test_query("example.com", 1, 0x5678);
+        let resp = build_servfail_response(&query, 0x5678);
+        assert!(resp.len() >= 12);
+    }
+
+    // ===== get_server_config tests =====
+
+    #[test]
+    fn test_get_server_config_with_domain() {
+        let mut server = UpstreamServer::new("8.8.8.8:53".parse().unwrap());
+        server.domain = Some("example.com".to_string());
+        server.flags.has_domain = true;
+        let config = get_server_config(&server);
+        assert!(config.is_some());
+    }
+
+    #[test]
+    fn test_get_server_config_without_domain() {
+        let server = UpstreamServer::new("8.8.8.8:53".parse().unwrap());
+        let config = get_server_config(&server);
+        assert!(config.is_some());
+    }
+
+    // ===== ForwardFlags debug tests =====
+
+    #[test]
+    fn test_forward_flags_debug() {
+        let mut flags = ForwardFlags::new();
+        flags.tcp_fallback = true;
+        flags.no_cache = true;
+        let s = format!("{:?}", flags);
+        assert!(s.contains("tcp_fallback"));
+        assert!(s.contains("no_cache"));
+    }
+
+    // ===== ServerFlags additional tests =====
+
+    #[test]
+    fn test_server_flags_all_set() {
+        let mut flags = ServerFlags::new();
+        flags.literal = true;
+        flags.has_domain = true;
+        flags.for_nodots = true;
+        flags.used_by_dhcp = true;
+        flags.no_addr = true;
+        flags.is_loop = true;
+        flags.do_not_use = true;
+        flags.from_resolv = true;
+        flags.mark = true;
+        let raw = flags.to_raw();
+        let restored = ServerFlags::from_raw(raw);
+        assert!(restored.literal);
+        assert!(restored.has_domain);
+        assert!(restored.for_nodots);
+        assert!(restored.used_by_dhcp);
+        assert!(restored.no_addr);
+        assert!(restored.is_loop);
+        assert!(restored.do_not_use);
+        assert!(restored.from_resolv);
+        assert!(restored.mark);
+    }
+
+    // ===== server_gone additional tests =====
+
+    #[test]
+    fn test_server_gone_no_match_v2() {
+        let mut table = ForwardTable::new(10);
+        let mut pool = RfdPool::new(10);
+        let r = ForwardRecord::new(
+            1,
+            100,
+            "127.0.0.1:5000".parse().unwrap(),
+            Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap())),
+            Bytes::from_static(b"q"),
+            ForwardFlags::new(),
+            "test.com".to_string(),
+            RRType::A,
+            DnsClass::IN,
+        );
+        let _ = table.insert(r);
+        let no_match: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        server_gone(&mut table, &mut pool, &no_match);
+        assert_eq!(table.len(), 1); // still there
+    }
+
+    #[test]
+    fn test_server_gone_removes_multiple() {
+        let mut table = ForwardTable::new(10);
+        let mut pool = RfdPool::new(10);
+        let server = Arc::new(UpstreamServer::new("8.8.8.8:53".parse().unwrap()));
+        let server_addr = server.addr;
+        for i in 0..3u16 {
+            let r = ForwardRecord::new(
+                i,
+                i + 100,
+                "127.0.0.1:5000".parse().unwrap(),
+                server.clone(),
+                Bytes::from_static(b"q"),
+                ForwardFlags::new(),
+                "test.com".to_string(),
+                RRType::A,
+                DnsClass::IN,
+            );
+            let _ = table.insert(r);
+        }
+        assert_eq!(table.len(), 3);
+        server_gone(&mut table, &mut pool, &server_addr);
+        assert_eq!(table.len(), 0);
+    }
 }

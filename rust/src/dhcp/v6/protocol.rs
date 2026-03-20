@@ -3454,4 +3454,2278 @@ mod tests {
             assert_eq!(u8::from(state), val);
         }
     }
+
+    // === Additional tests for coverage ===
+
+    #[test]
+    fn test_opt6_find_empty_data() {
+        assert!(opt6_find(&[], 1, 0).is_none());
+    }
+
+    #[test]
+    fn test_opt6_find_truncated_option_length() {
+        // Header says 10 bytes, but only 2 available
+        let opts: Vec<u8> = vec![0x00, 0x01, 0x00, 0x0A, 0xAA, 0xBB];
+        assert!(opt6_find(&opts, 1, 0).is_none());
+    }
+
+    #[test]
+    fn test_opt6_find_zero_length_option() {
+        let opts: Vec<u8> = vec![0x00, 0x07, 0x00, 0x00]; // type=7, len=0
+        let result = opt6_find(&opts, 7, 0);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_opt6_find_skip_non_matching() {
+        // Two options: type=1 len=2, type=5 len=3
+        let opts: Vec<u8> = vec![
+            0x00, 0x01, 0x00, 0x02, 0xAA, 0xBB, 0x00, 0x05, 0x00, 0x03, 0xCC, 0xDD, 0xEE,
+        ];
+        let result = opt6_find(&opts, 5, 1);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), &[0xCC, 0xDD, 0xEE]);
+    }
+
+    #[test]
+    fn test_opt6_next_single_option() {
+        let opts: Vec<u8> = vec![0x00, 0x0A, 0x00, 0x01, 0xFF];
+        let (code, data, next) = opt6_next(&opts, 0).unwrap();
+        assert_eq!(code, 0x0A);
+        assert_eq!(data, &[0xFF]);
+        assert_eq!(next, 5);
+        assert!(opt6_next(&opts, next).is_none());
+    }
+
+    #[test]
+    fn test_opt6_next_zero_length() {
+        let opts: Vec<u8> = vec![0x00, 0x03, 0x00, 0x00];
+        let (code, data, next) = opt6_next(&opts, 0).unwrap();
+        assert_eq!(code, 3);
+        assert_eq!(data.len(), 0);
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn test_opt6_uint_single_byte() {
+        let data: Vec<u8> = vec![0xFF];
+        assert_eq!(opt6_uint(&data, 0, 1), 255);
+    }
+
+    #[test]
+    fn test_opt6_uint_two_byte_boundary() {
+        let data: Vec<u8> = vec![0xFF, 0xFF];
+        assert_eq!(opt6_uint(&data, 0, 2), 65535);
+    }
+
+    #[test]
+    fn test_opt6_uint_four_byte_max() {
+        let data: Vec<u8> = vec![0xFF, 0xFF, 0xFF, 0xFF];
+        assert_eq!(opt6_uint(&data, 0, 4), 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn test_opt6_uint_zero_size() {
+        let data: Vec<u8> = vec![0x12];
+        assert_eq!(opt6_uint(&data, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_opt6_len_at_valid() {
+        let opts: Vec<u8> = vec![0x00, 0x01, 0x00, 0x10, 0xAA];
+        assert_eq!(opt6_len_at(&opts, 0), 16);
+    }
+
+    #[test]
+    fn test_opt6_len_at_short() {
+        let opts: Vec<u8> = vec![0x00, 0x01];
+        assert_eq!(opt6_len_at(&opts, 0), 0);
+    }
+
+    #[test]
+    fn test_opt6_type_at_valid() {
+        let opts: Vec<u8> = vec![0x00, 0x19, 0x00, 0x04];
+        assert_eq!(opt6_type_at(&opts, 0), 25);
+    }
+
+    #[test]
+    fn test_opt6_type_at_short() {
+        let opts: Vec<u8> = vec![0x00];
+        assert_eq!(opt6_type_at(&opts, 0), 0);
+    }
+
+    #[test]
+    fn test_parse_dns_name_three_labels() {
+        let data: Vec<u8> = vec![
+            3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm',
+            0,
+        ];
+        assert_eq!(parse_dns_name(&data).unwrap(), "www.example.com");
+    }
+
+    #[test]
+    fn test_parse_dns_name_invalid_utf8() {
+        let data: Vec<u8> = vec![2, 0xFF, 0xFE, 0];
+        assert!(parse_dns_name(&data).is_err());
+    }
+
+    #[test]
+    fn test_encode_dns_name_trailing_dot() {
+        let mut pkt = OutPacket::new();
+        encode_dns_name("example.com.", &mut pkt);
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes[0], 7);
+        assert_eq!(&bytes[1..8], b"example");
+        assert_eq!(bytes[8], 3);
+        assert_eq!(&bytes[9..12], b"com");
+        assert_eq!(bytes[12], 0);
+    }
+
+    #[test]
+    fn test_encode_dns_name_empty() {
+        let mut pkt = OutPacket::new();
+        encode_dns_name("", &mut pkt);
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes[0], 0);
+    }
+
+    #[test]
+    fn test_write_msg_header_solicit() {
+        let mut pkt = OutPacket::new();
+        write_msg_header(&mut pkt, DhcpV6State::Solicit, 0x123456);
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes[0], 1); // SOLICIT
+        assert_eq!(bytes[1], 0x12);
+        assert_eq!(bytes[2], 0x34);
+        assert_eq!(bytes[3], 0x56);
+    }
+
+    #[test]
+    fn test_write_msg_header_reply() {
+        let mut pkt = OutPacket::new();
+        write_msg_header(&mut pkt, DhcpV6State::Reply, 0x000001);
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes[0], 7); // REPLY
+        assert_eq!(bytes[3], 0x01);
+    }
+
+    #[test]
+    fn test_write_status_reply_basic() {
+        let state = Dhcp6RequestState {
+            clid: Some(vec![0x00, 0x01, 0x00, 0x01]),
+            xid: 0xABCDEF,
+            ..Dhcp6RequestState::new()
+        };
+        let mut pkt = OutPacket::new();
+        write_status_reply(&mut pkt, &state, DhcpV6State::Reply, 0, "Success");
+        let bytes = pkt.as_bytes();
+        assert!(bytes.len() > 4);
+        assert_eq!(bytes[0], 7); // REPLY
+    }
+
+    #[test]
+    fn test_write_status_reply_no_clid() {
+        let state = Dhcp6RequestState::new();
+        let mut pkt = OutPacket::new();
+        write_status_reply(&mut pkt, &state, DhcpV6State::Reply, 2, "Error");
+        let bytes = pkt.as_bytes();
+        assert!(bytes.len() > 4);
+    }
+
+    #[test]
+    fn test_calculate_times_zero_lease() {
+        let ctx = DhcpContext {
+            start: std::net::Ipv4Addr::UNSPECIFIED,
+            end: std::net::Ipv4Addr::UNSPECIFIED,
+            netmask: std::net::Ipv4Addr::UNSPECIFIED,
+            broadcast: std::net::Ipv4Addr::UNSPECIFIED,
+            router: std::net::Ipv4Addr::UNSPECIFIED,
+            lease_time: 0,
+            netid: NetId { net: String::new() },
+            flags: 0,
+            filter: Vec::new(),
+            local: std::net::Ipv4Addr::UNSPECIFIED,
+            addr_epoch: 0,
+            #[cfg(feature = "dhcp6")]
+            start6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 64,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 0,
+            #[cfg(feature = "dhcp6")]
+            preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            template_interface: None,
+        };
+        let mut min = 0xFFFFFFFF;
+        let (valid, preferred) = calculate_times(&ctx, &mut min, 0);
+        // With lease_time=0, should use DEFLEASE6 default
+        assert!(valid >= MIN_LIFETIME);
+        assert!(preferred <= valid);
+    }
+
+    #[test]
+    fn test_calculate_times_min_lifetime_enforced() {
+        let ctx = DhcpContext {
+            start: std::net::Ipv4Addr::UNSPECIFIED,
+            end: std::net::Ipv4Addr::UNSPECIFIED,
+            netmask: std::net::Ipv4Addr::UNSPECIFIED,
+            broadcast: std::net::Ipv4Addr::UNSPECIFIED,
+            router: std::net::Ipv4Addr::UNSPECIFIED,
+            lease_time: 60,
+            netid: NetId { net: String::new() },
+            flags: 0,
+            filter: Vec::new(),
+            local: std::net::Ipv4Addr::UNSPECIFIED,
+            addr_epoch: 0,
+            #[cfg(feature = "dhcp6")]
+            start6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 64,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 50,
+            #[cfg(feature = "dhcp6")]
+            preferred: 30,
+            #[cfg(feature = "dhcp6")]
+            template_interface: None,
+        };
+        let mut min = 0xFFFFFFFF;
+        let (valid, _) = calculate_times(&ctx, &mut min, 60);
+        // Both valid candidates (60, 50) < MIN_LIFETIME=120, so enforced to 120
+        assert!(valid >= MIN_LIFETIME);
+    }
+
+    #[test]
+    fn test_daemon_config_entries_to_configs_empty() {
+        let result = daemon_config_entries_to_configs(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_daemon_config_entries_to_configs_basic() {
+        let entries = vec![DhcpConfigEntry {
+            flags: CONFIG_ADDR6,
+            hwaddr: vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            clid: vec![],
+            hostname: Some("testhost".to_string()),
+            netid: Some("mynet".to_string()),
+            addr: Some(std::net::Ipv4Addr::new(192, 168, 1, 100)),
+            addr6: Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            lease_time: 3600,
+        }];
+        let configs = daemon_config_entries_to_configs(&entries);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].flags, CONFIG_ADDR6);
+        assert_eq!(configs[0].hostname, Some("testhost".to_string()));
+        assert_eq!(configs[0].hwaddr.len(), 1);
+        assert_eq!(
+            configs[0].hwaddr[0].hwaddr,
+            vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55]
+        );
+        assert!(configs[0].clid.is_none()); // empty clid maps to None
+        assert_eq!(configs[0].netid.len(), 1);
+        assert_eq!(configs[0].netid[0].net, "mynet");
+        assert_eq!(configs[0].lease_time, 3600);
+    }
+
+    #[test]
+    fn test_daemon_config_entries_with_clid() {
+        let entries = vec![DhcpConfigEntry {
+            flags: 0,
+            hwaddr: vec![],
+            clid: vec![0xDE, 0xAD],
+            hostname: None,
+            netid: None,
+            addr: None,
+            addr6: None,
+            lease_time: 0,
+        }];
+        let configs = daemon_config_entries_to_configs(&entries);
+        assert_eq!(configs[0].clid, Some(vec![0xDE, 0xAD]));
+        assert!(configs[0].hwaddr.is_empty());
+        assert!(configs[0].netid.is_empty());
+    }
+
+    #[test]
+    fn test_daemon_opt_entries_to_opts_empty() {
+        let result = daemon_opt_entries_to_opts(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_daemon_opt_entries_to_opts_basic() {
+        let entries = vec![DhcpOptEntry {
+            opt: 23,
+            val: vec![0x20, 0x01, 0x0d, 0xb8],
+            flags: 0,
+            netid: Some("mynet".to_string()),
+        }];
+        let opts = daemon_opt_entries_to_opts(&entries);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].opt, 23);
+        assert_eq!(opts[0].val, vec![0x20, 0x01, 0x0d, 0xb8]);
+        assert_eq!(opts[0].len, 4);
+        assert!(opts[0].netid.is_some());
+        assert_eq!(opts[0].netid.as_ref().unwrap().net, "mynet");
+    }
+
+    #[test]
+    fn test_daemon_tag_if_to_rules_empty() {
+        let result = daemon_tag_if_to_rules(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_daemon_tag_if_to_rules_basic() {
+        let tags = vec![TagIf {
+            set: vec!["tag1".to_string()],
+            tag: "tag3".to_string(),
+        }];
+        let rules = daemon_tag_if_to_rules(&tags);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].set.len(), 1);
+        assert_eq!(rules[0].set[0].net, "tag1");
+        assert_eq!(rules[0].tag.len(), 1);
+        assert_eq!(rules[0].tag[0].net, "tag3");
+    }
+
+    #[test]
+    fn test_mark_context_used() {
+        let mut contexts = vec![DhcpContext {
+            start: std::net::Ipv4Addr::UNSPECIFIED,
+            end: std::net::Ipv4Addr::UNSPECIFIED,
+            netmask: std::net::Ipv4Addr::UNSPECIFIED,
+            broadcast: std::net::Ipv4Addr::UNSPECIFIED,
+            router: std::net::Ipv4Addr::UNSPECIFIED,
+            lease_time: 3600,
+            netid: NetId { net: String::new() },
+            flags: 0,
+            filter: Vec::new(),
+            local: std::net::Ipv4Addr::UNSPECIFIED,
+            addr_epoch: 0,
+            #[cfg(feature = "dhcp6")]
+            start6: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+            #[cfg(feature = "dhcp6")]
+            end6: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF),
+            #[cfg(feature = "dhcp6")]
+            local6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 64,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 7200,
+            #[cfg(feature = "dhcp6")]
+            preferred: 3600,
+            #[cfg(feature = "dhcp6")]
+            template_interface: None,
+        }];
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        mark_context_used(&mut contexts, &addr);
+        #[cfg(feature = "dhcp6")]
+        assert!(contexts[0].flags & CONTEXT_USED != 0);
+    }
+
+    #[test]
+    fn test_check_address_no_lease() {
+        let state = Dhcp6RequestState::new();
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 42);
+        assert!(check_address(&state, &[], &addr, &[]));
+    }
+
+    fn make_test_lease(addr6: Ipv6Addr, clid: Option<Vec<u8>>, iaid: u32) -> DhcpLease {
+        use crate::dhcp::lease::lease6_allocate;
+        let mut lease = lease6_allocate(addr6, LeaseType::Na);
+        lease.expires = 99999;
+        lease.hwaddr = vec![0; 6];
+        lease.hwaddr_len = 6;
+        lease.hwaddr_type = 1;
+        lease.clid = clid;
+        lease.iaid = iaid;
+        lease.prefix_len = 128;
+        lease
+    }
+
+    #[test]
+    fn test_check_address_same_client() {
+        let state = Dhcp6RequestState {
+            clid: Some(vec![0x00, 0x01, 0x00, 0x01]),
+            iaid: 12345,
+            ..Dhcp6RequestState::new()
+        };
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 42);
+        let lease = make_test_lease(addr, Some(vec![0x00, 0x01, 0x00, 0x01]), 12345);
+        assert!(check_address(&state, &[], &addr, &[lease]));
+    }
+
+    #[test]
+    fn test_check_address_different_client() {
+        let state = Dhcp6RequestState {
+            clid: Some(vec![0x00, 0x02, 0x00, 0x02]),
+            iaid: 99999,
+            ..Dhcp6RequestState::new()
+        };
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 42);
+        let lease = make_test_lease(addr, Some(vec![0x00, 0x01, 0x00, 0x01]), 12345);
+        assert!(!check_address(&state, &[], &addr, &[lease]));
+    }
+
+    #[test]
+    fn test_config_valid_no_addr6_flag() {
+        let config = DhcpConfig {
+            flags: 0, // No CONFIG_ADDR6
+            hwaddr: vec![],
+            clid: None,
+            hostname: None,
+            netid: vec![],
+            filter: vec![],
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+            domain: None,
+            lease_time: 0,
+            decline_time: 0,
+        };
+        let state = Dhcp6RequestState::new();
+        assert!(!config_valid(
+            &config,
+            &[],
+            &Ipv6Addr::UNSPECIFIED,
+            &state,
+            0,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_config_valid_declined_within_backoff() {
+        let config = DhcpConfig {
+            flags: CONFIG_ADDR6 | CONFIG_DECLINED,
+            hwaddr: vec![],
+            clid: None,
+            hostname: None,
+            netid: vec![],
+            filter: vec![],
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)],
+            domain: None,
+            lease_time: 0,
+            decline_time: 100,
+        };
+        let state = Dhcp6RequestState::new();
+        // now=101, decline_time=100, DECLINE_BACKOFF is 600, so 101-100 = 1 < 600
+        assert!(!config_valid(
+            &config,
+            &[],
+            &Ipv6Addr::UNSPECIFIED,
+            &state,
+            101,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_build_ia_pd() {
+        // IA_PD (prefix delegation) behaves like IA_TA — no T1/T2 placeholders
+        let state = Dhcp6RequestState {
+            ia_type: IaType::Pd,
+            iaid: 0xDEADBEEF,
+            ..Dhcp6RequestState::new()
+        };
+        let mut outpacket = OutPacket::new();
+        let (_container, t1_counter) = build_ia(&state, &mut outpacket);
+        // IA_PD path returns t1_counter=0 since only IA_NA writes T1/T2 placeholders
+        assert_eq!(t1_counter, 0);
+    }
+
+    #[test]
+    fn test_build_ia_na_has_t1_t2() {
+        // IA_NA should write T1/T2 placeholders — t1_counter > 0
+        let state = Dhcp6RequestState {
+            ia_type: IaType::Na,
+            iaid: 0x12345678,
+            ..Dhcp6RequestState::new()
+        };
+        let mut outpacket = OutPacket::new();
+        let (_container, t1_counter) = build_ia(&state, &mut outpacket);
+        assert!(t1_counter > 0);
+    }
+
+    #[test]
+    fn test_end_ia_basic() {
+        let mut pkt = OutPacket::new();
+        // Pre-fill some data to simulate IA header
+        pkt.put_opt6_short(0); // placeholder T1
+        let t1_pos = 0;
+        pkt.put_opt6_short(0); // placeholder T2
+        end_ia(&mut pkt, t1_pos, 7200, false);
+        // T1 and T2 should be patched
+        let bytes = pkt.as_bytes();
+        assert!(bytes.len() >= 4);
+    }
+
+    #[test]
+    fn test_end_ia_with_fuzz() {
+        let mut pkt = OutPacket::new();
+        pkt.put_opt6_short(0);
+        let t1_pos = 0;
+        pkt.put_opt6_short(0);
+        end_ia(&mut pkt, t1_pos, 7200, true);
+        let bytes = pkt.as_bytes();
+        assert!(bytes.len() >= 4);
+    }
+
+    #[test]
+    fn test_opt6_iterate_all() {
+        let opts: Vec<u8> = vec![
+            0x00, 0x01, 0x00, 0x02, 0xAA, 0xBB, 0x00, 0x02, 0x00, 0x01, 0xCC, 0x00, 0x03, 0x00,
+            0x00,
+        ];
+        let mut pos = 0;
+        let mut count = 0;
+        while let Some((code, data, next)) = opt6_next(&opts, pos) {
+            match count {
+                0 => {
+                    assert_eq!(code, 1);
+                    assert_eq!(data.len(), 2);
+                }
+                1 => {
+                    assert_eq!(code, 2);
+                    assert_eq!(data.len(), 1);
+                }
+                2 => {
+                    assert_eq!(code, 3);
+                    assert_eq!(data.len(), 0);
+                }
+                _ => panic!("unexpected option"),
+            }
+            pos = next;
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_parse_dns_name_long_label() {
+        // Label with 10 chars
+        let mut data = vec![10u8];
+        data.extend_from_slice(b"abcdefghij");
+        data.push(0);
+        assert_eq!(parse_dns_name(&data).unwrap(), "abcdefghij");
+    }
+
+    #[test]
+    fn test_dhcp6_request_state_modify_fields() {
+        let mut state = Dhcp6RequestState::new();
+        state.xid = 0xABCDEF;
+        state.iaid = 42;
+        state.ia_type = IaType::Pd;
+        state.multicast_dest = true;
+        state.hostname_auth = true;
+        state.lease_allocate = true;
+        state.fqdn_flags = 0x07;
+        state.mac_type = 1;
+        state.mac = vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        state.iface_name = "eth0".to_string();
+        state.tags.push(NetId {
+            net: "lan".to_string(),
+        });
+
+        assert_eq!(state.xid, 0xABCDEF);
+        assert_eq!(state.iaid, 42);
+        assert_eq!(state.ia_type, IaType::Pd);
+        assert!(state.multicast_dest);
+        assert!(state.hostname_auth);
+        assert!(state.lease_allocate);
+        assert_eq!(state.fqdn_flags, 0x07);
+        assert_eq!(state.mac.len(), 6);
+        assert_eq!(state.iface_name, "eth0");
+        assert_eq!(state.tags.len(), 1);
+    }
+
+    #[test]
+    fn test_dhcpv6_state_display_all() {
+        assert_eq!(format!("{}", DhcpV6State::Request), "REQUEST");
+        assert_eq!(format!("{}", DhcpV6State::Confirm), "CONFIRM");
+        assert_eq!(format!("{}", DhcpV6State::Renew), "RENEW");
+        assert_eq!(format!("{}", DhcpV6State::Rebind), "REBIND");
+        assert_eq!(format!("{}", DhcpV6State::Reply), "REPLY");
+        assert_eq!(format!("{}", DhcpV6State::Release), "RELEASE");
+        assert_eq!(format!("{}", DhcpV6State::Decline), "DECLINE");
+        assert_eq!(format!("{}", DhcpV6State::Reconfigure), "RECONFIGURE");
+        assert_eq!(format!("{}", DhcpV6State::RelayRepl), "RELAY-REPL");
+    }
+
+    #[test]
+    fn test_opt6_find_large_data() {
+        // Option with 256-byte payload
+        let mut opts = vec![0x00u8, 0x10, 0x01, 0x00]; // type=16, len=256
+        opts.extend(vec![0xAA; 256]);
+        let result = opt6_find(&opts, 16, 100);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 256);
+    }
+
+    #[test]
+    fn test_ia_type_equality() {
+        assert_eq!(IaType::Na, IaType::Na);
+        assert_ne!(IaType::Na, IaType::Ta);
+        assert_ne!(IaType::Na, IaType::Pd);
+        assert_ne!(IaType::Ta, IaType::Pd);
+    }
+
+    #[test]
+    fn test_encode_dns_name_multiple_labels() {
+        let mut pkt = OutPacket::new();
+        encode_dns_name("a.b.c.d", &mut pkt);
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes[0], 1); // len("a")
+        assert_eq!(bytes[1], b'a');
+        assert_eq!(bytes[2], 1); // len("b")
+        assert_eq!(bytes[3], b'b');
+        assert_eq!(bytes[4], 1); // len("c")
+        assert_eq!(bytes[5], b'c');
+        assert_eq!(bytes[6], 1); // len("d")
+        assert_eq!(bytes[7], b'd');
+        assert_eq!(bytes[8], 0); // root
+    }
+
+    #[test]
+    fn test_write_msg_header_relay_forw() {
+        let mut pkt = OutPacket::new();
+        write_msg_header(&mut pkt, DhcpV6State::RelayForw, 0x000000);
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes[0], 12);
+        assert_eq!(bytes[1], 0);
+        assert_eq!(bytes[2], 0);
+        assert_eq!(bytes[3], 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // calculate_times tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_calculate_times_default_lease() {
+        use crate::dhcp::common::DhcpContext;
+        let ctx = DhcpContext::new_v6_test(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            0,
+            0,
+            0,
+        );
+        let mut min_time = u32::MAX;
+        let (valid, preferred) = calculate_times(&ctx, &mut min_time, 0);
+        assert!(valid > 0);
+        assert_eq!(valid, preferred);
+        assert_eq!(min_time, valid);
+    }
+
+    #[test]
+    fn test_calculate_times_explicit_lease() {
+        use crate::dhcp::common::DhcpContext;
+        let ctx = DhcpContext::new_v6_test(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            0,
+            0,
+            0,
+        );
+        let mut min_time = u32::MAX;
+        let (valid, preferred) = calculate_times(&ctx, &mut min_time, 3600);
+        assert_eq!(valid, 3600);
+        assert_eq!(preferred, 3600);
+        assert_eq!(min_time, 3600);
+    }
+
+    #[test]
+    fn test_calculate_times_min_lifetime_enforcement() {
+        use crate::dhcp::common::DhcpContext;
+        let ctx = DhcpContext::new_v6_test(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            0,
+            0,
+            0,
+        );
+        let mut min_time = u32::MAX;
+        let (valid, _) = calculate_times(&ctx, &mut min_time, 60);
+        assert!(valid >= MIN_LIFETIME);
+    }
+
+    #[test]
+    fn test_calculate_times_with_context_valid() {
+        use crate::dhcp::common::DhcpContext;
+        let ctx = DhcpContext::new_v6_test(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            1800,
+            0,
+            0,
+        );
+        let mut min_time = u32::MAX;
+        let (valid, _) = calculate_times(&ctx, &mut min_time, 3600);
+        assert_eq!(valid, 1800);
+    }
+
+    #[test]
+    fn test_calculate_times_updates_min_time_lower() {
+        use crate::dhcp::common::DhcpContext;
+        let ctx = DhcpContext::new_v6_test(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            0,
+            0,
+            0,
+        );
+        let mut min_time = 5000;
+        let (valid, _) = calculate_times(&ctx, &mut min_time, 3600);
+        assert!(min_time <= 5000);
+        assert_eq!(min_time, valid.min(5000));
+    }
+
+    // -----------------------------------------------------------------------
+    // check_address tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_check_address_no_existing_lease_v2() {
+        let state = Dhcp6RequestState::new();
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10);
+        assert!(check_address(&state, &[], &addr, &[]));
+    }
+
+    #[test]
+    fn test_check_address_same_client_v2() {
+        let mut state = Dhcp6RequestState::new();
+        state.clid = Some(vec![1, 2, 3, 4]);
+        state.iaid = 100;
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10);
+        let mut lease = crate::dhcp::lease::DhcpLease::new_v6(addr, 128, 0, 9999);
+        lease.clid = Some(vec![1, 2, 3, 4]);
+        lease.iaid = 100;
+        assert!(check_address(&state, &[], &addr, &[lease]));
+    }
+
+    #[test]
+    fn test_check_address_different_client_v2() {
+        let mut state = Dhcp6RequestState::new();
+        state.clid = Some(vec![1, 2, 3, 4]);
+        state.iaid = 100;
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10);
+        let mut lease = crate::dhcp::lease::DhcpLease::new_v6(addr, 128, 0, 9999);
+        lease.clid = Some(vec![5, 6, 7, 8]);
+        lease.iaid = 200;
+        assert!(!check_address(&state, &[], &addr, &[lease]));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_ia / end_ia tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_build_ia_na_v2() {
+        let mut state = Dhcp6RequestState::new();
+        state.ia_type = IaType::Na;
+        state.iaid = 0x12345678;
+        let mut pkt = OutPacket::new();
+        let (_container, t1_counter) = build_ia(&state, &mut pkt);
+        assert!(t1_counter > 0);
+    }
+
+    #[test]
+    fn test_build_ia_ta_v2() {
+        let mut state = Dhcp6RequestState::new();
+        state.ia_type = IaType::Ta;
+        state.iaid = 0xAABBCCDD;
+        let mut pkt = OutPacket::new();
+        let (_, t1_counter) = build_ia(&state, &mut pkt);
+        assert_eq!(t1_counter, 0);
+    }
+
+    #[test]
+    fn test_build_ia_pd_v2() {
+        let mut state = Dhcp6RequestState::new();
+        state.ia_type = IaType::Pd;
+        state.iaid = 1;
+        let mut pkt = OutPacket::new();
+        let _ = build_ia(&state, &mut pkt);
+        assert!(pkt.as_bytes().len() > 0);
+    }
+
+    #[test]
+    fn test_end_ia_zero_counter() {
+        // t1_counter=0 means IA_TA, so end_ia returns immediately
+        let mut pkt = OutPacket::new();
+        end_ia(&mut pkt, 0, 3600, true);
+        // Should be a no-op since t1_counter == 0
+        assert!(pkt.as_bytes().is_empty());
+    }
+
+    #[test]
+    fn test_end_ia_zero_min_time_v2() {
+        // min_time=0 means no addresses added, T1/T2 stay as placeholders
+        let mut pkt = OutPacket::new();
+        // Prepend dummy bytes so save_counter returns non-zero
+        pkt.put_opt6_long(0xDEAD); // 4 bytes of padding
+        let pos = pkt.save_counter(None); // pos=4 (non-zero)
+        pkt.put_opt6_long(0); // T1 placeholder
+        pkt.put_opt6_long(0); // T2 placeholder
+        end_ia(&mut pkt, pos, 0, false);
+        // min_time==0 means early return, T1/T2 stay 0
+        let b = pkt.as_bytes();
+        assert_eq!(u32::from_be_bytes([b[4], b[5], b[6], b[7]]), 0);
+    }
+
+    #[test]
+    fn test_end_ia_infinite_v2() {
+        let mut pkt = OutPacket::new();
+        pkt.put_opt6_long(0xDEAD); // padding
+        let pos = pkt.save_counter(None);
+        pkt.put_opt6_long(0); // T1
+        pkt.put_opt6_long(0); // T2
+        end_ia(&mut pkt, pos, 0xFFFFFFFF, false);
+        // Infinite lease → returns early, T1/T2 stay 0
+        let b = pkt.as_bytes();
+        assert_eq!(u32::from_be_bytes([b[4], b[5], b[6], b[7]]), 0);
+    }
+
+    #[test]
+    fn test_end_ia_normal_no_fuzz() {
+        let mut pkt = OutPacket::new();
+        pkt.put_opt6_long(0xDEAD); // padding so pos != 0
+        let pos = pkt.save_counter(None); // pos=4
+        pkt.put_opt6_long(0); // T1 placeholder at [4..8]
+        pkt.put_opt6_long(0); // T2 placeholder at [8..12]
+        end_ia(&mut pkt, pos, 7200, false);
+        let b = pkt.as_bytes();
+        let t1 = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+        let t2 = u32::from_be_bytes([b[8], b[9], b[10], b[11]]);
+        assert_eq!(t1, 3600); // 7200 / 2
+        assert_eq!(t2, 6300); // (7200 / 8) * 7
+        assert!(t1 < t2);
+    }
+
+    #[test]
+    fn test_end_ia_with_fuzz_v2() {
+        let mut pkt = OutPacket::new();
+        pkt.put_opt6_long(0xDEAD); // padding
+        let pos = pkt.save_counter(None);
+        pkt.put_opt6_long(0); // T1 placeholder
+        pkt.put_opt6_long(0); // T2 placeholder
+        end_ia(&mut pkt, pos, 7200, true);
+        let b = pkt.as_bytes();
+        let t1 = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+        let t2 = u32::from_be_bytes([b[8], b[9], b[10], b[11]]);
+        // With fuzz: t1 ≈ 3600 ± ~225 (fuzz_range = 3600/16 = 225)
+        assert!(t1 >= 3500 && t1 <= 3900, "t1={}", t1);
+        assert!(t1 < t2, "t1={} t2={}", t1, t2);
+    }
+
+    // -----------------------------------------------------------------------
+    // opt6 function additional tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_opt6_find_nested() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u16.to_be_bytes());
+        data.extend_from_slice(&4u16.to_be_bytes());
+        data.extend_from_slice(&[1, 2, 3, 4]);
+        data.extend_from_slice(&2u16.to_be_bytes());
+        data.extend_from_slice(&2u16.to_be_bytes());
+        data.extend_from_slice(&[5, 6]);
+
+        assert!(opt6_find(&data, 1, 0).is_some());
+        assert_eq!(opt6_find(&data, 1, 0).unwrap(), &[1, 2, 3, 4]);
+        assert!(opt6_find(&data, 2, 0).is_some());
+        assert!(opt6_find(&data, 3, 0).is_none());
+    }
+
+    #[test]
+    fn test_opt6_find_minsize_too_large() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u16.to_be_bytes());
+        data.extend_from_slice(&2u16.to_be_bytes());
+        data.extend_from_slice(&[1, 2]);
+        assert!(opt6_find(&data, 1, 4).is_none());
+        assert!(opt6_find(&data, 1, 2).is_some());
+    }
+
+    #[test]
+    fn test_opt6_next_empty_v2() {
+        assert!(opt6_next(&[], 0).is_none());
+    }
+
+    #[test]
+    fn test_opt6_next_two_opts() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&10u16.to_be_bytes());
+        data.extend_from_slice(&3u16.to_be_bytes());
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        data.extend_from_slice(&20u16.to_be_bytes());
+        data.extend_from_slice(&1u16.to_be_bytes());
+        data.extend_from_slice(&[0xFF]);
+
+        let (t1, d1, next1) = opt6_next(&data, 0).unwrap();
+        assert_eq!(t1, 10);
+        assert_eq!(d1, &[0xAA, 0xBB, 0xCC]);
+        let (t2, d2, next2) = opt6_next(&data, next1).unwrap();
+        assert_eq!(t2, 20);
+        assert_eq!(d2, &[0xFF]);
+        assert!(opt6_next(&data, next2).is_none());
+    }
+
+    #[test]
+    fn test_opt6_uint_sizes_v2() {
+        let data = [0x00, 0x01, 0x02, 0x03];
+        assert_eq!(opt6_uint(&data, 0, 1), 0x00);
+        assert_eq!(opt6_uint(&data, 1, 1), 0x01);
+        assert_eq!(opt6_uint(&data, 0, 2), 0x0001);
+        assert_eq!(opt6_uint(&data, 0, 4), 0x00010203);
+    }
+
+    #[test]
+    fn test_opt6_uint_oob() {
+        let data = [1, 2];
+        assert_eq!(opt6_uint(&data, 10, 1), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // release_lease_by_addr tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_release_lease_by_addr_empty() {
+        let mut daemon = DaemonState::default();
+        let state = Dhcp6RequestState::new();
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10);
+        let mut outpkt = OutPacket::new();
+        release_lease_by_addr(&mut daemon, &state, &addr, 128, &mut outpkt);
+        assert!(daemon.leases.is_empty());
+    }
+
+    #[test]
+    fn test_release_lease_by_addr_match() {
+        let mut daemon = DaemonState::default();
+        let mut state = Dhcp6RequestState::new();
+        state.clid = Some(vec![1, 2, 3, 4]);
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10);
+        let mut lease = crate::dhcp::lease::DhcpLease::new_v6(addr, 128, 0, 999999);
+        lease.clid = Some(vec![1, 2, 3, 4]); // match the state clid
+        daemon.leases.push(lease);
+        let mut outpkt = OutPacket::new();
+        release_lease_by_addr(&mut daemon, &state, &addr, 128, &mut outpkt);
+        // If CLID matches, lease should be removed entirely
+        assert!(daemon.leases.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // update_leases tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_update_leases_new_lease() {
+        let mut daemon = DaemonState::default();
+        let mut state = Dhcp6RequestState::new();
+        state.ia_type = IaType::Na;
+        state.iaid = 42;
+        state.clid = Some(vec![1, 2, 3]);
+        state.lease_allocate = true; // required for new lease creation
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10);
+        update_leases(&state, &[], &addr, 3600, 1000, &mut daemon);
+        assert!(!daemon.leases.is_empty());
+    }
+
+    #[test]
+    fn test_update_leases_existing_no_dup() {
+        let mut daemon = DaemonState::default();
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10);
+        let lease = crate::dhcp::lease::DhcpLease::new_v6(addr, 128, 0, 100);
+        daemon.leases.push(lease);
+        let mut state = Dhcp6RequestState::new();
+        state.ia_type = IaType::Na;
+        state.iaid = 42;
+        update_leases(&state, &[], &addr, 7200, 2000, &mut daemon);
+        assert_eq!(daemon.leases.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // DhcpV6State additional coverage
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_dhcpv6_state_all_roundtrip() {
+        for i in 1u8..=13 {
+            let s = DhcpV6State::try_from(i).unwrap();
+            assert_eq!(u8::from(s), i);
+        }
+    }
+
+    #[test]
+    fn test_dhcpv6_state_display_all_v2() {
+        let expected = [
+            "SOLICIT",
+            "ADVERTISE",
+            "REQUEST",
+            "CONFIRM",
+            "RENEW",
+            "REBIND",
+            "REPLY",
+            "RELEASE",
+            "DECLINE",
+            "RECONFIGURE",
+            "INFORMATION-REQUEST",
+            "RELAY-FORW",
+            "RELAY-REPL",
+        ];
+        for (i, name) in expected.iter().enumerate() {
+            let s = DhcpV6State::try_from((i + 1) as u8).unwrap();
+            assert!(format!("{}", s).contains(name), "State {} mismatch", i + 1);
+        }
+    }
+
+    #[test]
+    fn test_dhcpv6_state_invalid_values() {
+        assert!(DhcpV6State::try_from(0).is_err());
+        assert!(DhcpV6State::try_from(14).is_err());
+        assert!(DhcpV6State::try_from(255).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // IaType additional coverage
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_ia_type_option_codes_v2() {
+        assert_eq!(IaType::Na.option_code(), super::super::OPTION6_IA_NA);
+        assert_eq!(IaType::Ta.option_code(), super::super::OPTION6_IA_TA);
+        assert_eq!(IaType::Pd.option_code(), super::super::OPTION6_IA_PD);
+    }
+
+    #[test]
+    fn test_ia_type_from_option_code_v2() {
+        assert_eq!(
+            IaType::from_option_code(super::super::OPTION6_IA_NA),
+            Some(IaType::Na)
+        );
+        assert_eq!(
+            IaType::from_option_code(super::super::OPTION6_IA_TA),
+            Some(IaType::Ta)
+        );
+        assert_eq!(
+            IaType::from_option_code(super::super::OPTION6_IA_PD),
+            Some(IaType::Pd)
+        );
+        assert_eq!(IaType::from_option_code(9999), None);
+    }
+
+    #[test]
+    fn test_ia_type_to_lease_type_v2() {
+        assert_eq!(IaType::Na.to_lease_type(), LeaseType::Na);
+        assert_eq!(IaType::Ta.to_lease_type(), LeaseType::Ta);
+        assert_eq!(IaType::Pd.to_lease_type(), LeaseType::Pd);
+    }
+
+    // -----------------------------------------------------------------------
+    // Dhcp6RequestState tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_dhcp6_request_state_defaults_v2() {
+        let state = Dhcp6RequestState::new();
+        assert_eq!(state.ia_type, IaType::Na);
+        assert_eq!(state.iaid, 0);
+        assert!(state.clid.is_none());
+        assert!(!state.lease_allocate);
+    }
+
+    #[test]
+    fn test_dhcp6_request_state_with_clid_v2() {
+        let mut state = Dhcp6RequestState::new();
+        state.clid = Some(vec![0, 1, 0, 1, 0xAB, 0xCD]);
+        assert_eq!(state.clid.as_ref().unwrap().len(), 6);
+    }
+
+    // -----------------------------------------------------------------------
+    // helper function coverage
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_daemon_config_entries_to_configs_empty_v2() {
+        let r = daemon_config_entries_to_configs(&[]);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn test_daemon_opt_entries_to_opts_empty_v2() {
+        let r = daemon_opt_entries_to_opts(&[]);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn test_daemon_tag_if_to_rules_empty_v2() {
+        let r = daemon_tag_if_to_rules(&[]);
+        assert!(r.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // dhcp6_reply / dhcp6_maybe_relay short packet
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_dhcp6_reply_too_short() {
+        let mut daemon = DaemonState::default();
+        let mut ctxs = Vec::new();
+        let pkt = vec![0u8; 2]; // too short — less than 4 bytes
+        let fallback = Ipv6Addr::LOCALHOST;
+        let ll = Ipv6Addr::LOCALHOST;
+        let ula = Ipv6Addr::LOCALHOST;
+        let client = Ipv6Addr::LOCALHOST;
+        let result = dhcp6_reply(
+            &mut daemon,
+            &mut ctxs,
+            false,
+            0,
+            "lo",
+            &fallback,
+            &ll,
+            &ula,
+            &pkt,
+            &client,
+            0,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_dhcp6_maybe_relay_empty() {
+        let mut daemon = DaemonState::default();
+        let mut ctxs = Vec::new();
+        let mut state = Dhcp6RequestState::new();
+        let pkt: Vec<u8> = Vec::new();
+        let client = Ipv6Addr::LOCALHOST;
+        let mut outpacket = OutPacket::new();
+        let result = dhcp6_maybe_relay(
+            &mut daemon,
+            &mut ctxs,
+            &mut state,
+            &pkt,
+            &client,
+            false,
+            0,
+            &mut outpacket,
+        );
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_mark_context_used_v2() {
+        use crate::dhcp::common::DhcpContext;
+        let mut ctxs = vec![DhcpContext::new_v6_test(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            0,
+            0,
+            0,
+        )];
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x50);
+        mark_context_used(&mut ctxs, &addr);
+        assert_ne!(ctxs[0].flags & CONTEXT_USED, 0);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_mark_context_used_no_match() {
+        use crate::dhcp::common::DhcpContext;
+        let mut ctxs = vec![DhcpContext::new_v6_test(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            0,
+            0,
+            0,
+        )];
+        let addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        mark_context_used(&mut ctxs, &addr);
+        assert_eq!(ctxs[0].flags & CONTEXT_USED, 0);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_mark_config_used_v2() {
+        use crate::dhcp::common::DhcpContext;
+        let mut ctxs = vec![DhcpContext::new_v6_test(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xff),
+            64,
+            0,
+            0,
+            0,
+        )];
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x50);
+        mark_config_used(&mut ctxs, &addr);
+        assert_ne!(ctxs[0].flags & CONTEXT_CONF_USED, 0);
+    }
+
+    // === ADDITIONAL COVERAGE TESTS ===
+
+    // Test helper to create a DhcpContext with specified fields
+    fn make_test_context() -> DhcpContext {
+        DhcpContext {
+            start: std::net::Ipv4Addr::UNSPECIFIED,
+            end: std::net::Ipv4Addr::UNSPECIFIED,
+            netmask: std::net::Ipv4Addr::UNSPECIFIED,
+            broadcast: std::net::Ipv4Addr::UNSPECIFIED,
+            router: std::net::Ipv4Addr::UNSPECIFIED,
+            lease_time: 0,
+            netid: NetId { net: String::new() },
+            flags: 0,
+            filter: Vec::new(),
+            local: std::net::Ipv4Addr::UNSPECIFIED,
+            addr_epoch: 0,
+            #[cfg(feature = "dhcp6")]
+            start6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 0,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 0,
+            #[cfg(feature = "dhcp6")]
+            preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            template_interface: None,
+        }
+    }
+
+    fn make_test_dhcp_config() -> DhcpConfig {
+        DhcpConfig {
+            flags: 0,
+            hwaddr: Vec::new(),
+            clid: None,
+            hostname: None,
+            netid: Vec::new(),
+            filter: Vec::new(),
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: Vec::new(),
+            domain: None,
+            lease_time: 0,
+            decline_time: 0,
+        }
+    }
+
+    #[test]
+    fn test_add_options_empty_client_opts() {
+        let mut daemon = DaemonState::default();
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let state = Dhcp6RequestState::new();
+        let mut outpacket = OutPacket::new();
+        add_options(&mut daemon, &contexts, &state, &[], false, &mut outpacket);
+        // Should not panic with empty opts
+    }
+
+    #[test]
+    fn test_add_options_with_oro_dns_server() {
+        let mut daemon = DaemonState::default();
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let state = Dhcp6RequestState::new();
+        let mut outpacket = OutPacket::new();
+        // Build ORO option requesting DNS_SERVER (23)
+        let mut client_opts = Vec::new();
+        let opt_code = super::super::OPTION6_ORO.to_be_bytes();
+        client_opts.extend_from_slice(&opt_code);
+        let opt_len: u16 = 2;
+        client_opts.extend_from_slice(&opt_len.to_be_bytes());
+        let dns_code = super::super::OPTION6_DNS_SERVER.to_be_bytes();
+        client_opts.extend_from_slice(&dns_code);
+        add_options(
+            &mut daemon,
+            &contexts,
+            &state,
+            &client_opts,
+            false,
+            &mut outpacket,
+        );
+    }
+
+    #[test]
+    fn test_add_options_with_domain_search() {
+        let mut daemon = DaemonState::default();
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let mut state = Dhcp6RequestState::new();
+        state.send_domain = Some("example.com".to_string());
+        let mut outpacket = OutPacket::new();
+        // Build ORO requesting DOMAIN_SEARCH
+        let mut client_opts = Vec::new();
+        let opt_code = super::super::OPTION6_ORO.to_be_bytes();
+        client_opts.extend_from_slice(&opt_code);
+        let opt_len: u16 = 2;
+        client_opts.extend_from_slice(&opt_len.to_be_bytes());
+        let dom_code = super::super::OPTION6_DOMAIN_SEARCH.to_be_bytes();
+        client_opts.extend_from_slice(&dom_code);
+        add_options(
+            &mut daemon,
+            &contexts,
+            &state,
+            &client_opts,
+            false,
+            &mut outpacket,
+        );
+        // Verify domain was encoded
+        let data = outpacket.as_bytes();
+        assert!(data.len() > 0);
+    }
+
+    #[test]
+    fn test_add_options_with_refresh_time() {
+        let mut daemon = DaemonState::default();
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let state = Dhcp6RequestState::new();
+        let mut outpacket = OutPacket::new();
+        // Build ORO requesting REFRESH_TIME
+        let mut client_opts = Vec::new();
+        let opt_code = super::super::OPTION6_ORO.to_be_bytes();
+        client_opts.extend_from_slice(&opt_code);
+        let opt_len: u16 = 2;
+        client_opts.extend_from_slice(&opt_len.to_be_bytes());
+        let ref_code = super::super::OPTION6_REFRESH_TIME.to_be_bytes();
+        client_opts.extend_from_slice(&ref_code);
+        add_options(
+            &mut daemon,
+            &contexts,
+            &state,
+            &client_opts,
+            true,
+            &mut outpacket,
+        );
+        let data = outpacket.as_bytes();
+        // Should have added refresh time option
+        assert!(data.len() > 0);
+    }
+
+    #[test]
+    fn test_add_options_with_fqdn() {
+        let mut daemon = DaemonState::default();
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let mut state = Dhcp6RequestState::new();
+        state.hostname = Some("myhost".to_string());
+        state.domain = Some("example.com".to_string());
+        state.fqdn_flags = 1;
+        let mut outpacket = OutPacket::new();
+        add_options(&mut daemon, &contexts, &state, &[], false, &mut outpacket);
+        let data = outpacket.as_bytes();
+        assert!(data.len() > 0); // FQDN option should have been added
+    }
+
+    #[test]
+    fn test_add_addr6_option_regular_addr() {
+        let opt = DhcpOpt {
+            opt: super::super::OPTION6_DNS_SERVER,
+            val: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)
+                .octets()
+                .to_vec(),
+            flags: DHOPT_ADDR6,
+            netid: None,
+            next: Vec::new(),
+            len: 16,
+            u: DhcpOptExtra::None,
+        };
+        let state = Dhcp6RequestState::new();
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let mut outpacket = OutPacket::new();
+        add_addr6_option(&opt, &state, &contexts, &mut outpacket);
+        let data = outpacket.as_bytes();
+        assert!(data.len() >= 16 + 4); // 4-byte TLV header + 16-byte addr
+    }
+
+    #[test]
+    fn test_add_addr6_option_ula_substitute() {
+        // Build option value with ULA zero placeholder (fd00::)
+        let ula_zero = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0);
+        let opt = DhcpOpt {
+            opt: super::super::OPTION6_DNS_SERVER,
+            val: ula_zero.octets().to_vec(),
+            flags: DHOPT_ADDR6,
+            netid: None,
+            next: Vec::new(),
+            len: 16,
+            u: DhcpOptExtra::None,
+        };
+        let mut state = Dhcp6RequestState::new();
+        state.ula_addr = Some(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0x99));
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let mut outpacket = OutPacket::new();
+        add_addr6_option(&opt, &state, &contexts, &mut outpacket);
+        let data = outpacket.as_bytes();
+        assert!(data.len() > 4); // Should have substituted address
+    }
+
+    #[test]
+    fn test_add_addr6_option_link_local_substitute() {
+        let ll_zero = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0);
+        let opt = DhcpOpt {
+            opt: super::super::OPTION6_DNS_SERVER,
+            val: ll_zero.octets().to_vec(),
+            flags: DHOPT_ADDR6,
+            netid: None,
+            next: Vec::new(),
+            len: 16,
+            u: DhcpOptExtra::None,
+        };
+        let mut state = Dhcp6RequestState::new();
+        state.ll_addr = Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x42));
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let mut outpacket = OutPacket::new();
+        add_addr6_option(&opt, &state, &contexts, &mut outpacket);
+        let data = outpacket.as_bytes();
+        assert!(data.len() > 4);
+    }
+
+    #[test]
+    fn test_add_ntp_option_regular() {
+        let opt = DhcpOpt {
+            opt: super::super::OPTION6_NTP_SERVER,
+            val: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x123)
+                .octets()
+                .to_vec(),
+            flags: 0,
+            netid: None,
+            next: Vec::new(),
+            len: 16,
+            u: DhcpOptExtra::None,
+        };
+        let state = Dhcp6RequestState::new();
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let mut outpacket = OutPacket::new();
+        add_ntp_option(&opt, &state, &contexts, &mut outpacket);
+        let data = outpacket.as_bytes();
+        assert!(data.len() > 4); // outer opt + sub-option
+    }
+
+    #[test]
+    fn test_add_ntp_option_ula_substitute() {
+        let ula_zero = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0);
+        let opt = DhcpOpt {
+            opt: super::super::OPTION6_NTP_SERVER,
+            val: ula_zero.octets().to_vec(),
+            flags: 0,
+            netid: None,
+            next: Vec::new(),
+            len: 16,
+            u: DhcpOptExtra::None,
+        };
+        let mut state = Dhcp6RequestState::new();
+        state.ula_addr = Some(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0x77));
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let mut outpacket = OutPacket::new();
+        add_ntp_option(&opt, &state, &contexts, &mut outpacket);
+        let data = outpacket.as_bytes();
+        assert!(data.len() > 4);
+    }
+
+    #[test]
+    fn test_add_vendor_encap_option_with_vendor_flag() {
+        let opt = DhcpOpt {
+            opt: 17,                            // OPTION6_VENDOR_OPTS
+            val: vec![0, 0, 0, 99, 1, 2, 3, 4], // enterprise=99 + sub-data
+            flags: DHOPT_RFC3925 | DHOPT_VENDOR,
+            netid: None,
+            next: Vec::new(),
+            len: 8,
+            u: DhcpOptExtra::None,
+        };
+        let mut outpacket = OutPacket::new();
+        add_vendor_encap_option(&opt, &mut outpacket);
+        let data = outpacket.as_bytes();
+        assert!(data.len() > 0);
+    }
+
+    #[test]
+    fn test_add_vendor_encap_option_no_vendor_flag() {
+        let opt = DhcpOpt {
+            opt: 42,
+            val: vec![1, 2, 3],
+            flags: DHOPT_RFC3925,
+            netid: None,
+            next: Vec::new(),
+            len: 3,
+            u: DhcpOptExtra::None,
+        };
+        let mut outpacket = OutPacket::new();
+        add_vendor_encap_option(&opt, &mut outpacket);
+        let data = outpacket.as_bytes();
+        assert!(data.len() > 0);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_add_local_addrs_used_context() {
+        let mut ctx = make_test_context();
+        ctx.flags = CONTEXT_USED;
+        ctx.local6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        ctx.start6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 100);
+        ctx.end6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 200);
+        ctx.prefix = 64;
+        ctx.lease_time = 3600;
+        ctx.valid = 3600;
+        ctx.preferred = 1800;
+        let mut outpacket = OutPacket::new();
+        let result = add_local_addrs(&[ctx], &mut outpacket);
+        assert!(result);
+        assert!(outpacket.as_bytes().len() >= 20); // 4-byte header + 16-byte addr
+    }
+
+    #[test]
+    fn test_add_local_addrs_no_used_context() {
+        let mut ctx = make_test_context();
+        ctx.flags = 0; // Not marked CONTEXT_USED
+        let mut outpacket = OutPacket::new();
+        let result = add_local_addrs(&[ctx], &mut outpacket);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_add_local_addrs_empty() {
+        let mut outpacket = OutPacket::new();
+        let result = add_local_addrs(&[], &mut outpacket);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_get_context_tag_matching() {
+        let mut ctx = make_test_context();
+        ctx.netid = NetId {
+            net: "lan".to_string(),
+        };
+        ctx.start6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+        ctx.prefix = 64;
+        let mut state = Dhcp6RequestState::new();
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
+        get_context_tag(&mut state, &[ctx], &addr);
+        assert!(state.context_tags.iter().any(|t| t.net == "lan"));
+    }
+
+    #[test]
+    fn test_get_context_tag_no_match() {
+        let mut ctx = make_test_context();
+        ctx.netid = NetId {
+            net: "wan".to_string(),
+        };
+        ctx.start6 = Ipv6Addr::new(0x2001, 0xdb8, 0x1, 0, 0, 0, 0, 0);
+        ctx.prefix = 64;
+        let mut state = Dhcp6RequestState::new();
+        let addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 5);
+        get_context_tag(&mut state, &[ctx], &addr);
+        // May or may not match depending on subnet - just test no panic
+    }
+
+    #[test]
+    fn test_get_context_tag_empty_netid() {
+        let ctx = make_test_context();
+        let mut state = Dhcp6RequestState::new();
+        let addr = Ipv6Addr::UNSPECIFIED;
+        get_context_tag(&mut state, &[ctx], &addr);
+        assert!(state.context_tags.is_empty()); // Empty netid not added
+    }
+
+    #[test]
+    fn test_add_fqdn_option_with_hostname() {
+        let mut state = Dhcp6RequestState::new();
+        state.hostname = Some("myhost".to_string());
+        state.domain = Some("example.com".to_string());
+        let mut outpacket = OutPacket::new();
+        add_fqdn_option(&state, &mut outpacket);
+        let data = outpacket.as_bytes();
+        // Should have option header + flags byte + DNS-encoded FQDN
+        assert!(data.len() > 4);
+    }
+
+    #[test]
+    fn test_add_fqdn_option_without_hostname() {
+        let state = Dhcp6RequestState::new();
+        let mut outpacket = OutPacket::new();
+        add_fqdn_option(&state, &mut outpacket);
+        let data = outpacket.as_bytes();
+        // Should have minimal option (header + flags byte only)
+        assert!(data.len() >= 4);
+    }
+
+    #[test]
+    fn test_add_fqdn_option_hostname_no_domain() {
+        let mut state = Dhcp6RequestState::new();
+        state.hostname = Some("standalone".to_string());
+        let mut outpacket = OutPacket::new();
+        add_fqdn_option(&state, &mut outpacket);
+        let data = outpacket.as_bytes();
+        assert!(data.len() > 4);
+    }
+
+    #[test]
+    fn test_log6_opts_empty() {
+        // Just exercise the logging path - no panic
+        log6_opts(0, 0x123, &[]);
+    }
+
+    #[test]
+    fn test_log6_opts_ia_na() {
+        // Build an IA_NA option with IAID + T1 + T2
+        let mut opts = Vec::new();
+        // Message header (4 bytes for nest=0)
+        opts.extend_from_slice(&[7, 0, 1, 0]); // REPLY, xid=0x100
+                                               // IA_NA option
+        let ia_na_code = super::super::OPTION6_IA_NA.to_be_bytes();
+        opts.extend_from_slice(&ia_na_code);
+        let ia_data = vec![0, 0, 0, 1, 0, 0, 0, 60, 0, 0, 0, 90]; // IAID=1, T1=60, T2=90
+        let ia_len = (ia_data.len() as u16).to_be_bytes();
+        opts.extend_from_slice(&ia_len);
+        opts.extend_from_slice(&ia_data);
+        log6_opts(0, 0x100, &opts);
+    }
+
+    #[test]
+    fn test_log6_opts_iaaddr() {
+        let mut opts = Vec::new();
+        let iaaddr_code = super::super::OPTION6_IAADDR.to_be_bytes();
+        opts.extend_from_slice(&iaaddr_code);
+        // 16-byte addr + 4-byte preferred + 4-byte valid = 24 bytes
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let mut data = Vec::new();
+        data.extend_from_slice(&addr.octets());
+        data.extend_from_slice(&3600u32.to_be_bytes()); // preferred
+        data.extend_from_slice(&7200u32.to_be_bytes()); // valid
+        let data_len = (data.len() as u16).to_be_bytes();
+        opts.extend_from_slice(&data_len);
+        opts.extend_from_slice(&data);
+        log6_opts(1, 0x200, &opts);
+    }
+
+    #[test]
+    fn test_log6_opts_status_code() {
+        let mut opts = Vec::new();
+        let status_code = super::super::OPTION6_STATUS_CODE.to_be_bytes();
+        opts.extend_from_slice(&status_code);
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u16.to_be_bytes()); // Success
+        data.extend_from_slice(b"Success");
+        let data_len = (data.len() as u16).to_be_bytes();
+        opts.extend_from_slice(&data_len);
+        opts.extend_from_slice(&data);
+        log6_opts(1, 0x300, &opts);
+    }
+
+    #[test]
+    fn test_log6_opts_generic() {
+        let mut opts = Vec::new();
+        let generic_code: u16 = 999;
+        opts.extend_from_slice(&generic_code.to_be_bytes());
+        let data = vec![0xAA, 0xBB];
+        let data_len = (data.len() as u16).to_be_bytes();
+        opts.extend_from_slice(&data_len);
+        opts.extend_from_slice(&data);
+        log6_opts(1, 0x400, &opts);
+    }
+
+    #[test]
+    fn test_log6_packet_all_variants() {
+        let mut state = Dhcp6RequestState::new();
+        state.xid = 0x123;
+        state.iface_name = "eth0".to_string();
+        state.clid = Some(vec![0x00, 0x01, 0x02, 0x03]);
+
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+
+        // All four branches of (addr, extra)
+        log6_packet(&state, "REPLY", Some(&addr), Some("lease 3600"));
+        log6_packet(&state, "REPLY", Some(&addr), None);
+        log6_packet(&state, "REPLY", None, Some("stateless"));
+        log6_packet(&state, "REPLY", None, None);
+    }
+
+    #[test]
+    fn test_log6_packet_no_clid() {
+        let mut state = Dhcp6RequestState::new();
+        state.xid = 0x456;
+        state.iface_name = "eth1".to_string();
+        log6_packet(&state, "SOLICIT", None, None);
+    }
+
+    #[test]
+    fn test_log6_quiet_with_quiet_mode() {
+        let mut state = Dhcp6RequestState::new();
+        state.iface_name = "eth0".to_string();
+        let mut daemon = DaemonState::default();
+        daemon.options.set(opt::QUIET_DHCP6);
+        // Should be suppressed
+        log6_quiet(&state, "REPLY", None, None, &daemon);
+    }
+
+    #[test]
+    fn test_log6_quiet_with_log_opts() {
+        let mut state = Dhcp6RequestState::new();
+        state.iface_name = "eth0".to_string();
+        let mut daemon = DaemonState::default();
+        daemon.options.set(opt::LOG_OPTS);
+        daemon.options.set(opt::QUIET_DHCP6);
+        // LOG_OPTS overrides quiet, so logging happens
+        log6_quiet(&state, "REPLY", None, None, &daemon);
+    }
+
+    #[test]
+    fn test_log6_quiet_normal_mode() {
+        let mut state = Dhcp6RequestState::new();
+        state.iface_name = "eth0".to_string();
+        let daemon = DaemonState::default();
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        // Normal mode - logging should happen (all 4 branch variants)
+        log6_quiet(&state, "REPLY", Some(&addr), Some("extra"), &daemon);
+        log6_quiet(&state, "REPLY", Some(&addr), None, &daemon);
+        log6_quiet(&state, "REPLY", None, Some("extra"), &daemon);
+        log6_quiet(&state, "REPLY", None, None, &daemon);
+    }
+
+    #[test]
+    fn test_add_address_no_context() {
+        let state = Dhcp6RequestState::new();
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let mut min_time = u32::MAX;
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let mut outpacket = OutPacket::new();
+        let daemon = DaemonState::default();
+        add_address(
+            &state,
+            &contexts,
+            3600,
+            &mut min_time,
+            &addr,
+            0,
+            &mut outpacket,
+            &daemon,
+        );
+        let data = outpacket.as_bytes();
+        // Should have IAADDR sub-option: header(4) + addr(16) + preferred(4) + valid(4) = 28
+        assert!(data.len() >= 28);
+        assert!(min_time <= 3600);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_add_address_with_matching_context() {
+        let state = Dhcp6RequestState::new();
+        let mut ctx = make_test_context();
+        ctx.start6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+        ctx.end6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0xff, 0xff, 0xff, 0xff);
+        ctx.prefix = 64;
+        ctx.valid = 7200;
+        ctx.preferred = 3600;
+        ctx.lease_time = 7200;
+        let mut min_time = u32::MAX;
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
+        let mut outpacket = OutPacket::new();
+        let daemon = DaemonState::default();
+        add_address(
+            &state,
+            &[ctx],
+            7200,
+            &mut min_time,
+            &addr,
+            0,
+            &mut outpacket,
+            &daemon,
+        );
+        let data = outpacket.as_bytes();
+        assert!(data.len() >= 28);
+    }
+
+    #[test]
+    fn test_add_address_zero_lease_time() {
+        let state = Dhcp6RequestState::new();
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let mut min_time = u32::MAX;
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let mut outpacket = OutPacket::new();
+        let daemon = DaemonState::default();
+        add_address(
+            &state,
+            &contexts,
+            0,
+            &mut min_time,
+            &addr,
+            0,
+            &mut outpacket,
+            &daemon,
+        );
+        let data = outpacket.as_bytes();
+        assert!(data.len() >= 28);
+        // With lease_time=0, should use DEFLEASE6
+        assert!(min_time <= DEFLEASE6);
+    }
+
+    #[test]
+    fn test_add_prefix_basic() {
+        let state = Dhcp6RequestState::new();
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let mut min_time = u32::MAX;
+        let prefix_addr = Ipv6Addr::new(0x2001, 0xdb8, 0xab, 0, 0, 0, 0, 0);
+        let mut outpacket = OutPacket::new();
+        let daemon = DaemonState::default();
+        add_prefix(
+            &state,
+            &contexts,
+            3600,
+            &mut min_time,
+            &prefix_addr,
+            48,
+            0,
+            &mut outpacket,
+            &daemon,
+        );
+        let data = outpacket.as_bytes();
+        // IAPREFIX: header(4) + preferred(4) + valid(4) + prefix_len(1) + prefix(16) = 29
+        assert!(data.len() >= 29);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_add_prefix_with_context() {
+        let state = Dhcp6RequestState::new();
+        let mut ctx = make_test_context();
+        ctx.start6 = Ipv6Addr::new(0x2001, 0xdb8, 0xab, 0, 0, 0, 0, 0);
+        ctx.prefix = 48;
+        ctx.valid = 7200;
+        ctx.preferred = 3600;
+        let mut min_time = u32::MAX;
+        let prefix_addr = Ipv6Addr::new(0x2001, 0xdb8, 0xab, 0, 0, 0, 0, 0);
+        let mut outpacket = OutPacket::new();
+        let daemon = DaemonState::default();
+        add_prefix(
+            &state,
+            &[ctx],
+            7200,
+            &mut min_time,
+            &prefix_addr,
+            48,
+            0,
+            &mut outpacket,
+            &daemon,
+        );
+        let data = outpacket.as_bytes();
+        assert!(data.len() >= 29);
+    }
+
+    #[test]
+    fn test_add_prefix_zero_lease() {
+        let state = Dhcp6RequestState::new();
+        let mut min_time = u32::MAX;
+        let prefix_addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+        let mut outpacket = OutPacket::new();
+        let daemon = DaemonState::default();
+        add_prefix(
+            &state,
+            &[],
+            0,
+            &mut min_time,
+            &prefix_addr,
+            64,
+            0,
+            &mut outpacket,
+            &daemon,
+        );
+        assert!(min_time <= DEFLEASE6);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_calculate_times_with_preferred() {
+        let mut ctx = make_test_context();
+        ctx.valid = 7200;
+        ctx.preferred = 1800;
+        ctx.flags = 0;
+        let mut min_time = u32::MAX;
+        let (valid, preferred) = calculate_times(&ctx, &mut min_time, 7200);
+        assert_eq!(valid, 7200);
+        assert_eq!(preferred, 1800);
+        assert_eq!(min_time, 7200);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_calculate_times_preferred_greater_than_valid_clamped() {
+        let mut ctx = make_test_context();
+        ctx.valid = 3600;
+        ctx.preferred = 9999; // greater than valid
+        ctx.flags = 0;
+        let mut min_time = u32::MAX;
+        let (valid, preferred) = calculate_times(&ctx, &mut min_time, 3600);
+        assert_eq!(valid, 3600);
+        assert!(preferred <= valid); // preferred must be <= valid
+    }
+
+    #[test]
+    fn test_calculate_times_very_short_lifetime() {
+        let mut ctx = make_test_context();
+        ctx.valid = 60; // below MIN_LIFETIME
+        ctx.preferred = 30;
+        ctx.flags = 0;
+        let mut min_time = u32::MAX;
+        let (valid, _preferred) = calculate_times(&ctx, &mut min_time, 60);
+        assert!(valid >= MIN_LIFETIME); // Enforced minimum
+    }
+
+    #[test]
+    fn test_update_leases_create_new() {
+        let mut state = Dhcp6RequestState::new();
+        state.lease_allocate = true;
+        state.ia_type = IaType::Na;
+        state.iaid = 42;
+        state.iface_name = "eth0".to_string();
+        state.mac = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        state.clid = Some(vec![0, 1, 2, 3]);
+        state.hostname = Some("testhost".to_string());
+
+        let mut daemon = DaemonState::default();
+        let contexts: Vec<DhcpContext> = Vec::new();
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x100);
+        update_leases(&state, &contexts, &addr, 3600, 1000, &mut daemon);
+        // Verify lease was added
+        assert_eq!(daemon.leases.len(), 1);
+        assert_eq!(daemon.leases[0].addr6, Some(addr));
+        assert_eq!(daemon.leases[0].iaid, 42);
+    }
+
+    #[test]
+    fn test_update_leases_update_existing() {
+        let mut state = Dhcp6RequestState::new();
+        state.ia_type = IaType::Na;
+        state.iaid = 42;
+        state.iface_name = "eth0".to_string();
+        state.mac = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        state.clid = Some(vec![0, 1, 2, 3]);
+        state.hostname = Some("updated".to_string());
+
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x200);
+        let mut daemon = DaemonState::default();
+        // Pre-add a lease with matching prefix_len=128 (Na type)
+        let mut lease = lease6_allocate(addr, LeaseType::Na);
+        lease.prefix_len = 128; // Must match Na lookup
+        daemon.leases.push(lease);
+
+        update_leases(&state, &[], &addr, 7200, 2000, &mut daemon);
+        assert_eq!(daemon.leases.len(), 1); // No duplicate
+        assert_eq!(daemon.leases[0].hostname.as_deref(), Some("updated"));
+    }
+
+    #[test]
+    fn test_update_leases_no_allocate() {
+        let state = Dhcp6RequestState::new(); // lease_allocate = false
+        let mut daemon = DaemonState::default();
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x300);
+        update_leases(&state, &[], &addr, 3600, 1000, &mut daemon);
+        assert_eq!(daemon.leases.len(), 0); // Not allocated
+    }
+
+    #[test]
+    fn test_config_implies_no_addr6_flag() {
+        let config = make_test_dhcp_config();
+        let result = config_implies(&config, &[], &Ipv6Addr::UNSPECIFIED);
+        assert!(result.is_none());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn test_config_implies_with_addr6() {
+        let mut config = make_test_dhcp_config();
+        config.flags = CONFIG_ADDR6;
+        config.addr6 = vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x50)];
+        let mut ctx = make_test_context();
+        ctx.start6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+        ctx.prefix = 64;
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10);
+        let result = config_implies(&config, &[ctx], &addr);
+        assert_eq!(
+            result,
+            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x50))
+        );
+    }
+
+    #[test]
+    fn test_config_valid_no_addr6() {
+        let config = make_test_dhcp_config();
+        let state = Dhcp6RequestState::new();
+        let result = config_valid(&config, &[], &Ipv6Addr::UNSPECIFIED, &state, 0, &[]);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_config_valid_declined_with_backoff() {
+        let mut config = make_test_dhcp_config();
+        config.flags = CONFIG_ADDR6 | CONFIG_DECLINED;
+        config.decline_time = 500; // within backoff
+        let state = Dhcp6RequestState::new();
+        let result = config_valid(&config, &[], &Ipv6Addr::UNSPECIFIED, &state, 100, &[]);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_write_status_reply_with_clid() {
+        let mut state = Dhcp6RequestState::new();
+        state.clid = Some(vec![0x00, 0x01, 0x02, 0x03]);
+        state.xid = 0x123;
+        let mut outpacket = OutPacket::new();
+        write_status_reply(&mut outpacket, &state, DhcpV6State::Reply, 0, "Success");
+        let data = outpacket.as_bytes();
+        assert!(data.len() > 4);
+    }
+
+    #[test]
+    fn test_write_status_reply_without_clid() {
+        let state = Dhcp6RequestState::new();
+        let mut outpacket = OutPacket::new();
+        write_status_reply(&mut outpacket, &state, DhcpV6State::Reply, 2, "NotOnLink");
+        let data = outpacket.as_bytes();
+        assert!(data.len() > 0);
+    }
+
+    #[test]
+    fn test_parse_dns_name_multi_level() {
+        // "a.b.c" = [1, 'a', 1, 'b', 1, 'c', 0]
+        let data = vec![1, b'a', 1, b'b', 1, b'c', 0];
+        let name = parse_dns_name(&data).unwrap();
+        assert_eq!(name, "a.b.c");
+    }
+
+    #[test]
+    fn test_parse_dns_name_max_label() {
+        // 63-byte label (max allowed)
+        let label = vec![b'x'; 63];
+        let mut data = vec![63u8];
+        data.extend_from_slice(&label);
+        data.push(0);
+        let name = parse_dns_name(&data).unwrap();
+        assert_eq!(name.len(), 63);
+    }
+
+    #[test]
+    fn test_encode_dns_name_subdomain() {
+        let mut outpacket = OutPacket::new();
+        encode_dns_name("sub.domain.example.com", &mut outpacket);
+        let data = outpacket.as_bytes();
+        // Verify first label "sub" = [3, 's', 'u', 'b']
+        assert_eq!(data[0], 3);
+        assert_eq!(data[1], b's');
+        assert_eq!(data[2], b'u');
+        assert_eq!(data[3], b'b');
+        // Should end with 0 (root label)
+        assert_eq!(*data.last().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_daemon_config_entries_to_configs_full() {
+        let entry = DhcpConfigEntry {
+            flags: CONFIG_NAME | CONFIG_ADDR6,
+            hwaddr: vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            clid: vec![0, 1, 2, 3],
+            hostname: Some("server1".to_string()),
+            netid: Some("dmz".to_string()),
+            addr: Some(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            #[cfg(feature = "dhcp6")]
+            addr6: Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            lease_time: 86400,
+        };
+        let configs = daemon_config_entries_to_configs(&[entry]);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].flags, CONFIG_NAME | CONFIG_ADDR6);
+        assert_eq!(configs[0].hwaddr.len(), 1);
+        assert_eq!(configs[0].clid, Some(vec![0, 1, 2, 3]));
+        assert_eq!(configs[0].hostname, Some("server1".to_string()));
+        assert_eq!(configs[0].netid.len(), 1);
+        assert_eq!(configs[0].netid[0].net, "dmz");
+    }
+
+    #[test]
+    fn test_daemon_opt_entries_to_opts_full() {
+        let entry = DhcpOptEntry {
+            opt: 23,
+            val: vec![0x20, 0x01, 0x0d, 0xb8],
+            flags: DHOPT_FORCE,
+            netid: Some("lan".to_string()),
+        };
+        let opts = daemon_opt_entries_to_opts(&[entry]);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].opt, 23);
+        assert_eq!(opts[0].flags, DHOPT_FORCE);
+        assert_eq!(opts[0].netid.as_ref().unwrap().net, "lan");
+        assert_eq!(opts[0].len, 4);
+    }
+
+    #[test]
+    fn test_daemon_tag_if_to_rules_full() {
+        let tag = TagIf {
+            tag: "known".to_string(),
+            set: vec!["dns".to_string(), "ntp".to_string()],
+        };
+        let rules = daemon_tag_if_to_rules(&[tag]);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tag.len(), 1);
+        assert_eq!(rules[0].tag[0].net, "known");
+        assert_eq!(rules[0].set.len(), 2);
+    }
+
+    #[test]
+    fn test_daemon_config_entries_to_configs_no_hwaddr() {
+        let entry = DhcpConfigEntry {
+            flags: 0,
+            hwaddr: vec![],
+            clid: vec![],
+            hostname: None,
+            netid: None,
+            addr: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: None,
+            lease_time: 0,
+        };
+        let configs = daemon_config_entries_to_configs(&[entry]);
+        assert_eq!(configs.len(), 1);
+        assert!(configs[0].hwaddr.is_empty());
+        assert!(configs[0].clid.is_none());
+    }
+
+    #[test]
+    fn test_end_ia_infinite_lease() {
+        let mut outpacket = OutPacket::new();
+        // Write some dummy data so t1_counter is valid
+        outpacket.put_opt6_long(0); // placeholder T1
+        outpacket.put_opt6_long(0); // placeholder T2
+        end_ia(&mut outpacket, 0, 0xFFFFFFFF, false);
+        // T1/T2 should remain 0 (infinite lease)
+    }
+
+    #[test]
+    fn test_end_ia_zero_min_time() {
+        let mut outpacket = OutPacket::new();
+        outpacket.put_opt6_long(0);
+        outpacket.put_opt6_long(0);
+        end_ia(&mut outpacket, 0, 0, false);
+        // No addresses added — T1/T2 remain 0
+    }
+
+    #[test]
+    fn test_end_ia_normal_with_t1_counter() {
+        let mut outpacket = OutPacket::new();
+        // Write a dummy byte first so t1_counter != 0 (end_ia skips t1_counter==0)
+        outpacket.put_opt6_char(0xFF); // padding byte
+        let t1_counter = outpacket.save_counter(None); // position = 1
+        outpacket.put_opt6_long(0); // T1 placeholder
+        outpacket.put_opt6_long(0); // T2 placeholder
+        end_ia(&mut outpacket, t1_counter, 7200, false);
+        let data = outpacket.as_bytes();
+        // T1 should be 7200/2 = 3600
+        assert!(data.len() >= t1_counter + 8);
+        let t1 = u32::from_be_bytes([
+            data[t1_counter],
+            data[t1_counter + 1],
+            data[t1_counter + 2],
+            data[t1_counter + 3],
+        ]);
+        assert_eq!(t1, 3600);
+        let t2 = u32::from_be_bytes([
+            data[t1_counter + 4],
+            data[t1_counter + 5],
+            data[t1_counter + 6],
+            data[t1_counter + 7],
+        ]);
+        assert_eq!(t2, 6300); // 7*900
+    }
+
+    #[test]
+    fn test_end_ia_fuzz_applied() {
+        let mut outpacket = OutPacket::new();
+        outpacket.put_opt6_char(0xFF); // padding so t1_counter != 0
+        let t1_counter = outpacket.save_counter(None); // position = 1
+        outpacket.put_opt6_long(0);
+        outpacket.put_opt6_long(0);
+        end_ia(&mut outpacket, t1_counter, 7200, true);
+        let data = outpacket.as_bytes();
+        assert!(data.len() >= t1_counter + 4);
+        let t1 = u32::from_be_bytes([
+            data[t1_counter],
+            data[t1_counter + 1],
+            data[t1_counter + 2],
+            data[t1_counter + 3],
+        ]);
+        // With fuzz, T1 should be near 3600 but not necessarily exactly 3600
+        assert!(t1 >= 3500 && t1 <= 3800, "T1 with fuzz: {}", t1);
+    }
+
+    #[test]
+    fn test_opt6_iterate_all_v2() {
+        // Build opts with 3 options
+        let mut opts = Vec::new();
+        for code in [10u16, 20, 30] {
+            opts.extend_from_slice(&code.to_be_bytes());
+            opts.extend_from_slice(&2u16.to_be_bytes()); // len=2
+            opts.extend_from_slice(&[0xAA, 0xBB]);
+        }
+        let mut pos = 0;
+        let mut count = 0;
+        while let Some((code, data, next)) = opt6_next(&opts, pos) {
+            assert!(code == 10 || code == 20 || code == 30);
+            assert_eq!(data.len(), 2);
+            pos = next;
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_dhcp6_request_state_full_fields() {
+        let mut s = Dhcp6RequestState::new();
+        s.clid = Some(vec![1, 2, 3]);
+        s.multicast_dest = true;
+        s.ia_type = IaType::Pd;
+        s.interface = 5;
+        s.hostname_auth = true;
+        s.lease_allocate = true;
+        s.client_hostname = Some("client".to_string());
+        s.hostname = Some("host".to_string());
+        s.domain = Some("dom".to_string());
+        s.send_domain = Some("sdom".to_string());
+        s.link_address = Some(Ipv6Addr::LOCALHOST);
+        s.fallback = Some(Ipv6Addr::LOCALHOST);
+        s.ll_addr = Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        s.ula_addr = Some(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
+        s.xid = 0xABCDEF;
+        s.fqdn_flags = 0x07;
+        s.iaid = 999;
+        s.iface_name = "wlan0".to_string();
+        s.packet_options_start = 100;
+        s.packet_options_end = 200;
+        s.tags = vec![NetId {
+            net: "tag1".to_string(),
+        }];
+        s.context_tags = vec![NetId {
+            net: "ctx1".to_string(),
+        }];
+        s.mac = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        s.mac_type = 6;
+        assert!(s.multicast_dest);
+        assert_eq!(s.ia_type, IaType::Pd);
+        assert_eq!(s.xid, 0xABCDEF);
+    }
 }

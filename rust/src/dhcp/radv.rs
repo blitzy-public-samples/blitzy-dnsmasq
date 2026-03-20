@@ -2055,4 +2055,1436 @@ mod tests {
         assert!(!parm.found_prefix);
         assert!(!parm.found_context);
     }
+
+    // -----------------------------------------------------------------------
+    // Additional calc_interval edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_calc_interval_zero_means_default() {
+        let ra = RaInterface {
+            name: "eth0".into(),
+            interval: 0,
+            lifetime: 0,
+            prio: 0,
+            mtu_name: String::new(),
+        };
+        assert_eq!(calc_interval(Some(&ra)), DEFAULT_RA_INTERVAL);
+    }
+
+    #[test]
+    fn test_calc_interval_exactly_min() {
+        let ra = RaInterface {
+            name: "eth0".into(),
+            interval: MIN_RA_INTERVAL,
+            lifetime: 0,
+            prio: 0,
+            mtu_name: String::new(),
+        };
+        assert_eq!(calc_interval(Some(&ra)), MIN_RA_INTERVAL);
+    }
+
+    #[test]
+    fn test_calc_interval_exactly_max() {
+        let ra = RaInterface {
+            name: "eth0".into(),
+            interval: MAX_RA_INTERVAL,
+            lifetime: 0,
+            prio: 0,
+            mtu_name: String::new(),
+        };
+        assert_eq!(calc_interval(Some(&ra)), MAX_RA_INTERVAL);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional calc_lifetime edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_calc_lifetime_default_calc() {
+        // Default = interval * 3
+        assert_eq!(calc_lifetime(None), DEFAULT_RA_INTERVAL * 3);
+    }
+
+    #[test]
+    fn test_calc_lifetime_zero_means_default() {
+        let ra = RaInterface {
+            name: "eth0".into(),
+            interval: 100,
+            lifetime: 0,
+            prio: 0,
+            mtu_name: String::new(),
+        };
+        // lifetime 0 → use default: interval * 3
+        assert_eq!(calc_lifetime(Some(&ra)), 300);
+    }
+
+    #[test]
+    fn test_calc_lifetime_exactly_max() {
+        let ra = RaInterface {
+            name: "eth0".into(),
+            interval: 100,
+            lifetime: MAX_RA_LIFETIME,
+            prio: 0,
+            mtu_name: String::new(),
+        };
+        assert_eq!(calc_lifetime(Some(&ra)), MAX_RA_LIFETIME);
+    }
+
+    // -----------------------------------------------------------------------
+    // calc_prio additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_calc_prio_low() {
+        let ra = RaInterface {
+            name: "eth0".into(),
+            interval: 0,
+            lifetime: 0,
+            prio: RA_PRIO_LOW,
+            mtu_name: String::new(),
+        };
+        assert_eq!(calc_prio(Some(&ra)), RA_PRIO_LOW);
+    }
+
+    #[test]
+    fn test_calc_prio_medium_explicit() {
+        let ra = RaInterface {
+            name: "eth0".into(),
+            interval: 0,
+            lifetime: 0,
+            prio: 0, // medium
+            mtu_name: String::new(),
+        };
+        assert_eq!(calc_prio(Some(&ra)), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // prefix_from_netmask6 edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prefix_from_netmask6_zero() {
+        let mask = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0);
+        assert_eq!(prefix_from_netmask6(&mask), 0);
+    }
+
+    #[test]
+    fn test_prefix_from_netmask6_single_bit() {
+        let mask = Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0);
+        assert_eq!(prefix_from_netmask6(&mask), 1);
+    }
+
+    #[test]
+    fn test_prefix_from_netmask6_96() {
+        let mask = Ipv6Addr::new(0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0);
+        assert_eq!(prefix_from_netmask6(&mask), 96);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_mac_address edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_mac_address_all_zeros() {
+        let mac = parse_mac_address("00:00:00:00:00:00");
+        assert_eq!(mac, Some(vec![0, 0, 0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn test_parse_mac_address_all_ff() {
+        let mac = parse_mac_address("ff:ff:ff:ff:ff:ff");
+        assert_eq!(mac, Some(vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+    }
+
+    #[test]
+    fn test_parse_mac_address_empty() {
+        assert!(parse_mac_address("").is_none());
+    }
+
+    #[test]
+    fn test_parse_mac_address_too_many_octets() {
+        assert!(parse_mac_address("aa:bb:cc:dd:ee:ff:00").is_none());
+    }
+
+    #[test]
+    fn test_parse_mac_address_uppercase() {
+        let mac = parse_mac_address("AA:BB:CC:DD:EE:FF");
+        assert_eq!(mac, Some(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
+    }
+
+    #[test]
+    fn test_parse_mac_address_mixed_case() {
+        let mac = parse_mac_address("aA:Bb:cC:dD:eE:fF");
+        assert_eq!(mac, Some(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_source_lla additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_source_lla_multiple_options() {
+        // MTU option first, then Source LLA
+        let mut options = vec![
+            5, 1, 0, 0, 0, 0, 0x05, 0xDC, // MTU option: type=5, len=1 (8 bytes)
+            1, 1, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, // Source LLA: type=1, len=1 (8 bytes)
+        ];
+        let lla = extract_source_lla(&options);
+        assert_eq!(lla, Some(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]));
+    }
+
+    #[test]
+    fn test_extract_source_lla_zero_length_stops() {
+        // Zero-length option should stop parsing
+        let options = vec![1, 0, 0xDE, 0xAD]; // len=0 → break
+        let lla = extract_source_lla(&options);
+        assert!(lla.is_none());
+    }
+
+    #[test]
+    fn test_extract_source_lla_empty() {
+        let lla = extract_source_lla(&[]);
+        assert!(lla.is_none());
+    }
+
+    #[test]
+    fn test_extract_source_lla_truncated() {
+        // Single byte — not enough for type+len
+        let lla = extract_source_lla(&[1]);
+        assert!(lla.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // encode_dns_name edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_encode_dns_name_root() {
+        let mut buf = Vec::new();
+        encode_dns_name("", &mut buf);
+        assert_eq!(buf, vec![0]); // Just terminator
+    }
+
+    #[test]
+    fn test_encode_dns_name_trailing_dot() {
+        let mut buf = Vec::new();
+        encode_dns_name("example.com.", &mut buf);
+        // Trailing dot → empty label → skipped; result same as without trailing dot
+        assert_eq!(
+            buf,
+            vec![7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0]
+        );
+    }
+
+    #[test]
+    fn test_encode_dns_name_single_label() {
+        let mut buf = Vec::new();
+        encode_dns_name("localhost", &mut buf);
+        assert_eq!(
+            buf,
+            vec![9, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't', 0]
+        );
+    }
+
+    #[test]
+    fn test_encode_dns_name_long_label() {
+        // Label > 63 chars → skip entire name
+        let long_label = "a".repeat(64);
+        let name = format!("{}.com", long_label);
+        let mut buf = Vec::new();
+        encode_dns_name(&name, &mut buf);
+        // Label too long returns early, only gets the terminator from before the skip
+        // Actually the function returns before appending anything if the label is too long
+        assert!(buf.is_empty() || buf == vec![0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_dns_domain_list edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_dns_domain_list_empty() {
+        let domains = parse_dns_domain_list(&[]);
+        assert!(domains.is_empty());
+    }
+
+    #[test]
+    fn test_parse_dns_domain_list_single() {
+        let data = vec![3, b'c', b'o', b'm', 0];
+        let domains = parse_dns_domain_list(&data);
+        assert_eq!(domains, vec!["com"]);
+    }
+
+    #[test]
+    fn test_parse_dns_domain_list_root_only() {
+        let data = vec![0]; // Just root label
+        let domains = parse_dns_domain_list(&data);
+        assert!(domains.is_empty()); // No labels in the name
+    }
+
+    #[test]
+    fn test_parse_dns_domain_list_truncated() {
+        let data = vec![5, b'h', b'e']; // Label says 5 bytes but only 2 available
+        let domains = parse_dns_domain_list(&data);
+        assert!(domains.is_empty()); // Incomplete
+    }
+
+    // -----------------------------------------------------------------------
+    // write_prefix_option additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_prefix_option_no_flags() {
+        let mut pkt = OutPacket::new();
+        let addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0);
+        write_prefix_option(&mut pkt, 48, 0, 7200, 3600, &addr);
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[0], ND_OPT_PREFIX);
+        assert_eq!(bytes[1], 4);
+        assert_eq!(bytes[2], 48);
+        assert_eq!(bytes[3], 0); // no flags
+    }
+
+    #[test]
+    fn test_write_prefix_option_128() {
+        let mut pkt = OutPacket::new();
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        write_prefix_option(
+            &mut pkt,
+            128,
+            ND_OPT_PI_FLAG_ONLINK | ND_OPT_PI_FLAG_AUTO,
+            3600,
+            1800,
+            &addr,
+        );
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes[2], 128);
+    }
+
+    // -----------------------------------------------------------------------
+    // IcmpFilter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_icmp6_filter_all_blocked_then_selective_pass() {
+        let mut filter = Icmp6Filter::new_block_all();
+        // All blocked = all bits set to 1
+        for &word in &filter.data {
+            assert_eq!(word, 0xFFFF_FFFF);
+        }
+
+        filter.set_pass(ICMP6_ROUTER_SOLICIT);
+        filter.set_pass(ICMP6_ECHO_REPLY);
+
+        // Some bits should now be cleared
+        assert!(filter.data.iter().any(|&x| x != 0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn test_icmp6_filter_set_pass_all_types() {
+        let mut filter = Icmp6Filter::new_block_all();
+        for t in 0..=255u8 {
+            filter.set_pass(t);
+        }
+        // All bits cleared → all u32 words should be 0
+        for &word in &filter.data {
+            assert_eq!(word, 0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // RaPacket structure tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ra_packet_fields() {
+        let pkt = RaPacket {
+            icmp_type: ICMP6_ROUTER_ADVERT,
+            icmp_code: 0,
+            checksum: 0,
+            hop_limit: 64,
+            flags: ND_RA_FLAG_MANAGED | ND_RA_FLAG_OTHER,
+            lifetime: 1800u16.to_be(),
+            reachable_time: 0,
+            retrans_timer: 0,
+        };
+        assert_eq!(pkt.icmp_type, 134);
+        assert_eq!(pkt.flags & ND_RA_FLAG_MANAGED, ND_RA_FLAG_MANAGED);
+        assert_eq!(pkt.flags & ND_RA_FLAG_OTHER, ND_RA_FLAG_OTHER);
+    }
+
+    #[test]
+    fn test_ra_packet_prio_bits() {
+        let pkt = RaPacket {
+            icmp_type: ICMP6_ROUTER_ADVERT,
+            icmp_code: 0,
+            checksum: 0,
+            hop_limit: 64,
+            flags: RA_PRIO_HIGH,
+            lifetime: 0,
+            reachable_time: 0,
+            retrans_timer: 0,
+        };
+        // Priority bits are in positions 4-3
+        assert_eq!(pkt.flags & 0x18, RA_PRIO_HIGH);
+    }
+
+    // -----------------------------------------------------------------------
+    // PrefixOpt structure tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prefix_opt_fields() {
+        let po = PrefixOpt {
+            opt_type: ND_OPT_PREFIX,
+            len: 4,
+            prefix_len: 64,
+            flags: ND_OPT_PI_FLAG_ONLINK | ND_OPT_PI_FLAG_AUTO,
+            valid_lifetime: 3600u32.to_be(),
+            preferred_lifetime: 1800u32.to_be(),
+            reserved: 0,
+            prefix: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(po.opt_type, 3);
+        assert_eq!(po.len, 4);
+        assert_eq!(po.prefix_len, 64);
+        assert_eq!(po.flags, 0xC0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Protocol constant verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_icmpv6_constants_comprehensive() {
+        assert_eq!(ICMP6_ROUTER_SOLICIT, 133);
+        assert_eq!(ICMP6_ROUTER_ADVERT, 134);
+        assert_eq!(ICMP6_NEIGHBOUR_SOLICIT, 135);
+        assert_eq!(ICMP6_NEIGHBOUR_ADVERT, 136);
+        assert_eq!(ICMP6_ECHO_REPLY, 129);
+    }
+
+    #[test]
+    fn test_nd_opt_constants() {
+        assert_eq!(ND_OPT_SOURCE_LLA, 1);
+        assert_eq!(ND_OPT_PREFIX, 3);
+        assert_eq!(ND_OPT_MTU, 5);
+        assert_eq!(ND_OPT_ADV_INTERVAL, 7);
+        assert_eq!(ND_OPT_RDNSS, 25);
+        assert_eq!(ND_OPT_DNSSL, 31);
+    }
+
+    #[test]
+    fn test_ra_flag_constants() {
+        assert_eq!(ND_RA_FLAG_MANAGED, 0x80);
+        assert_eq!(ND_RA_FLAG_OTHER, 0x40);
+        assert_eq!(ND_OPT_PI_FLAG_ONLINK, 0x80);
+        assert_eq!(ND_OPT_PI_FLAG_AUTO, 0x40);
+    }
+
+    #[test]
+    fn test_timing_constants() {
+        assert_eq!(DEFAULT_RA_INTERVAL, 600);
+        assert_eq!(MIN_RA_INTERVAL, 4);
+        assert_eq!(MAX_RA_INTERVAL, 1800);
+        assert_eq!(MAX_RA_LIFETIME, 9000);
+        assert_eq!(RA_SHORT_PERIOD_DURATION, 60);
+        assert_eq!(RA_SHORT_MIN_INTERVAL, 5);
+        assert_eq!(RA_SHORT_MAX_INTERVAL, 20);
+    }
+
+    #[test]
+    fn test_multicast_addresses() {
+        assert_eq!(ALL_NODES, Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1));
+        assert_eq!(ALL_ROUTERS, Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2));
+    }
+
+    // -----------------------------------------------------------------------
+    // RaParam additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ra_param_managed_and_other() {
+        let parm = RaParam {
+            iface: "br0".into(),
+            if_index: 5,
+            managed: true,
+            other: true,
+            adv_interval: 200,
+            adv_lifetime: 3600,
+            prio: RA_PRIO_LOW,
+            found_prefix: true,
+            found_context: true,
+        };
+        assert!(parm.managed);
+        assert!(parm.other);
+        assert!(parm.found_prefix);
+        assert!(parm.found_context);
+        assert_eq!(parm.prio, RA_PRIO_LOW);
+    }
+
+    // -----------------------------------------------------------------------
+    // RaInterface structure tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ra_interface_fields() {
+        let ri = RaInterface {
+            name: "wlan0".into(),
+            interval: 400,
+            lifetime: 1200,
+            prio: RA_PRIO_HIGH,
+            mtu_name: "eth0".into(),
+        };
+        assert_eq!(ri.name, "wlan0");
+        assert_eq!(ri.interval, 400);
+        assert_eq!(ri.lifetime, 1200);
+        assert_eq!(ri.prio, RA_PRIO_HIGH);
+        assert_eq!(ri.mtu_name, "eth0");
+    }
+
+    // -----------------------------------------------------------------------
+    // find_iface_param tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_iface_param_not_found() {
+        let state = DaemonState::new();
+        assert!(find_iface_param("eth0", &state).is_none());
+    }
+
+    #[test]
+    fn test_find_iface_param_exact_match() {
+        let mut state = DaemonState::new();
+        state.ra_interfaces.push(crate::core::types::RaInterface {
+            name: "eth0".into(),
+            interval: 300,
+            lifetime: 900,
+            priority: 8,
+            mtu: 0,
+            mtu_name: String::new(),
+        });
+        let result = find_iface_param("eth0", &state);
+        assert!(result.is_some());
+        let ri = result.unwrap();
+        assert_eq!(ri.interval, 300);
+        assert_eq!(ri.lifetime, 900);
+    }
+
+    #[test]
+    fn test_find_iface_param_no_match() {
+        let mut state = DaemonState::new();
+        state.ra_interfaces.push(crate::core::types::RaInterface {
+            name: "eth0".into(),
+            interval: 300,
+            lifetime: 900,
+            priority: 8,
+            mtu: 0,
+            mtu_name: String::new(),
+        });
+        assert!(find_iface_param("eth1", &state).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // add_adv_interval_option tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_adv_interval_option_basic() {
+        let mut pkt = OutPacket::new();
+        add_adv_interval_option(&mut pkt, 600);
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes.len(), 8); // 1 unit = 8 bytes
+        assert_eq!(bytes[0], ND_OPT_ADV_INTERVAL); // type = 7
+        assert_eq!(bytes[1], 1); // length = 1 unit
+                                 // reserved = 0
+        assert_eq!(bytes[2], 0);
+        assert_eq!(bytes[3], 0);
+        // interval_ms = 600 * 1000 = 600000 = 0x000927C0
+        let ms = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(ms, 600_000);
+    }
+
+    #[test]
+    fn test_add_adv_interval_option_zero() {
+        let mut pkt = OutPacket::new();
+        add_adv_interval_option(&mut pkt, 0);
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes.len(), 8);
+        let ms = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(ms, 0);
+    }
+
+    #[test]
+    fn test_add_adv_interval_option_max() {
+        let mut pkt = OutPacket::new();
+        add_adv_interval_option(&mut pkt, MAX_RA_INTERVAL);
+        let bytes = pkt.as_bytes();
+        let ms = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(ms, MAX_RA_INTERVAL * 1000);
+    }
+
+    #[test]
+    fn test_add_adv_interval_option_saturating() {
+        let mut pkt = OutPacket::new();
+        // u32::MAX / 1000 would overflow when multiplied
+        add_adv_interval_option(&mut pkt, u32::MAX);
+        let bytes = pkt.as_bytes();
+        let ms = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(ms, u32::MAX); // saturating_mul caps at u32::MAX
+    }
+
+    // -----------------------------------------------------------------------
+    // add_rdnss_option tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_rdnss_option_empty_opts() {
+        let state = DaemonState::new();
+        let mut pkt = OutPacket::new();
+        add_rdnss_option(&state, &mut pkt, 3600, &None, &None, &None, 0, 0, 0);
+        // No DNS server options → packet should be empty
+        assert_eq!(pkt.as_bytes().len(), 0);
+    }
+
+    #[test]
+    fn test_add_rdnss_option_single_dns_server() {
+        let mut state = DaemonState::new();
+        // Add DNS server option 23 with one IPv6 address
+        let addr = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        state.dhcp_opts6.push(crate::core::types::DhcpOptEntry {
+            opt: OPTION6_DNS_SERVER,
+            val: addr.octets().to_vec(),
+            flags: 0,
+            netid: None,
+        });
+        let mut pkt = OutPacket::new();
+        add_rdnss_option(&state, &mut pkt, 3600, &None, &None, &None, 0, 0, 0);
+        let bytes = pkt.as_bytes();
+        // RDNSS: type(1) + len(1) + reserved(2) + lifetime(4) + addr(16) = 24 bytes
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(bytes[0], ND_OPT_RDNSS); // type = 25
+        assert_eq!(bytes[1], 3); // len = 1 + 2*1 = 3 units
+        let lifetime = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(lifetime, 3600);
+    }
+
+    #[test]
+    fn test_add_rdnss_option_two_dns_servers() {
+        let mut state = DaemonState::new();
+        let addr1 = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        let addr2 = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8844);
+        let mut val = addr1.octets().to_vec();
+        val.extend_from_slice(&addr2.octets());
+        state.dhcp_opts6.push(crate::core::types::DhcpOptEntry {
+            opt: OPTION6_DNS_SERVER,
+            val,
+            flags: 0,
+            netid: None,
+        });
+        let mut pkt = OutPacket::new();
+        add_rdnss_option(&state, &mut pkt, 7200, &None, &None, &None, 0, 0, 0);
+        let bytes = pkt.as_bytes();
+        // RDNSS: 8 + 16*2 = 40 bytes
+        assert_eq!(bytes.len(), 40);
+        assert_eq!(bytes[1], 5); // len = 1 + 2*2 = 5 units
+    }
+
+    #[test]
+    fn test_add_rdnss_option_sentinel_unspecified_resolved() {
+        let mut state = DaemonState::new();
+        // Add :: (unspecified) sentinel
+        let sentinel = Ipv6Addr::UNSPECIFIED;
+        state.dhcp_opts6.push(crate::core::types::DhcpOptEntry {
+            opt: OPTION6_DNS_SERVER,
+            val: sentinel.octets().to_vec(),
+            flags: 0,
+            netid: None,
+        });
+        let global = Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let mut pkt = OutPacket::new();
+        add_rdnss_option(&state, &mut pkt, 3600, &None, &global, &None, 3600, 0, 0);
+        let bytes = pkt.as_bytes();
+        // Sentinel resolved to global address → should have RDNSS option
+        assert_eq!(bytes.len(), 24);
+        // Verify the address in the packet is the global address
+        let mut addr_bytes = [0u8; 16];
+        addr_bytes.copy_from_slice(&bytes[8..24]);
+        let resolved = Ipv6Addr::from(addr_bytes);
+        assert_eq!(resolved, Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+    }
+
+    #[test]
+    fn test_add_rdnss_option_sentinel_unspecified_no_global() {
+        let mut state = DaemonState::new();
+        let sentinel = Ipv6Addr::UNSPECIFIED;
+        state.dhcp_opts6.push(crate::core::types::DhcpOptEntry {
+            opt: OPTION6_DNS_SERVER,
+            val: sentinel.octets().to_vec(),
+            flags: 0,
+            netid: None,
+        });
+        let mut pkt = OutPacket::new();
+        // No global address available → sentinel can't be resolved
+        add_rdnss_option(&state, &mut pkt, 3600, &None, &None, &None, 0, 0, 0);
+        assert_eq!(pkt.as_bytes().len(), 0); // No RDNSS emitted
+    }
+
+    #[test]
+    fn test_add_rdnss_option_sentinel_link_local_resolved() {
+        let mut state = DaemonState::new();
+        // fe80:: sentinel
+        let sentinel = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0);
+        state.dhcp_opts6.push(crate::core::types::DhcpOptEntry {
+            opt: OPTION6_DNS_SERVER,
+            val: sentinel.octets().to_vec(),
+            flags: 0,
+            netid: None,
+        });
+        let ll = Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0xdead, 0xbeef, 0, 1));
+        let mut pkt = OutPacket::new();
+        add_rdnss_option(&state, &mut pkt, 3600, &ll, &None, &None, 0, 3600, 0);
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes.len(), 24);
+        let mut addr_bytes = [0u8; 16];
+        addr_bytes.copy_from_slice(&bytes[8..24]);
+        let resolved = Ipv6Addr::from(addr_bytes);
+        assert_eq!(
+            resolved,
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0xdead, 0xbeef, 0, 1)
+        );
+    }
+
+    #[test]
+    fn test_add_rdnss_option_sentinel_ula_resolved() {
+        let mut state = DaemonState::new();
+        // fd00:: sentinel (ULA zero)
+        let sentinel = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0);
+        state.dhcp_opts6.push(crate::core::types::DhcpOptEntry {
+            opt: OPTION6_DNS_SERVER,
+            val: sentinel.octets().to_vec(),
+            flags: 0,
+            netid: None,
+        });
+        let ula = Some(Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, 0x53));
+        let mut pkt = OutPacket::new();
+        add_rdnss_option(&state, &mut pkt, 1800, &None, &None, &ula, 0, 0, 1800);
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes.len(), 24);
+    }
+
+    #[test]
+    fn test_add_rdnss_option_mixed_sentinel_and_real() {
+        let mut state = DaemonState::new();
+        let real = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        let sentinel = Ipv6Addr::UNSPECIFIED;
+        let mut val = real.octets().to_vec();
+        val.extend_from_slice(&sentinel.octets());
+        state.dhcp_opts6.push(crate::core::types::DhcpOptEntry {
+            opt: OPTION6_DNS_SERVER,
+            val,
+            flags: 0,
+            netid: None,
+        });
+        let mut pkt = OutPacket::new();
+        // No global address → sentinel skipped, only real address emitted
+        add_rdnss_option(&state, &mut pkt, 3600, &None, &None, &None, 0, 0, 0);
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes.len(), 24); // Only 1 address (real one)
+    }
+
+    #[test]
+    fn test_add_rdnss_option_wrong_opt_number() {
+        let mut state = DaemonState::new();
+        // Add option with wrong number (not 23)
+        state.dhcp_opts6.push(crate::core::types::DhcpOptEntry {
+            opt: 99,
+            val: Ipv6Addr::LOCALHOST.octets().to_vec(),
+            flags: 0,
+            netid: None,
+        });
+        let mut pkt = OutPacket::new();
+        add_rdnss_option(&state, &mut pkt, 3600, &None, &None, &None, 0, 0, 0);
+        assert_eq!(pkt.as_bytes().len(), 0);
+    }
+
+    #[test]
+    fn test_add_rdnss_option_short_val() {
+        let mut state = DaemonState::new();
+        // Value too short (< 16 bytes)
+        state.dhcp_opts6.push(crate::core::types::DhcpOptEntry {
+            opt: OPTION6_DNS_SERVER,
+            val: vec![1, 2, 3, 4],
+            flags: 0,
+            netid: None,
+        });
+        let mut pkt = OutPacket::new();
+        add_rdnss_option(&state, &mut pkt, 3600, &None, &None, &None, 0, 0, 0);
+        assert_eq!(pkt.as_bytes().len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // add_dnssl_option tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_dnssl_option_empty() {
+        let state = DaemonState::new();
+        let mut pkt = OutPacket::new();
+        add_dnssl_option(&state, &mut pkt, 3600);
+        assert_eq!(pkt.as_bytes().len(), 0);
+    }
+
+    #[test]
+    fn test_add_dnssl_option_single_domain() {
+        let mut state = DaemonState::new();
+        // Encode "example.com" in DNS wire format
+        let mut encoded = Vec::new();
+        encode_dns_name("example.com", &mut encoded);
+        state.dhcp_opts6.push(crate::core::types::DhcpOptEntry {
+            opt: OPTION6_DOMAIN_SEARCH,
+            val: encoded,
+            flags: 0,
+            netid: None,
+        });
+        let mut pkt = OutPacket::new();
+        add_dnssl_option(&state, &mut pkt, 3600);
+        let bytes = pkt.as_bytes();
+        assert!(bytes.len() > 8); // header(8) + encoded domain
+        assert_eq!(bytes[0], ND_OPT_DNSSL); // type = 31
+                                            // Length must be in 8-byte units
+        assert_eq!(bytes.len() % 8, 0);
+    }
+
+    #[test]
+    fn test_add_dnssl_option_two_domains() {
+        let mut state = DaemonState::new();
+        let mut encoded = Vec::new();
+        encode_dns_name("example.com", &mut encoded);
+        encode_dns_name("test.org", &mut encoded);
+        state.dhcp_opts6.push(crate::core::types::DhcpOptEntry {
+            opt: OPTION6_DOMAIN_SEARCH,
+            val: encoded,
+            flags: 0,
+            netid: None,
+        });
+        let mut pkt = OutPacket::new();
+        add_dnssl_option(&state, &mut pkt, 7200);
+        let bytes = pkt.as_bytes();
+        assert!(bytes.len() >= 8);
+        assert_eq!(bytes[0], ND_OPT_DNSSL);
+        let lifetime = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(lifetime, 7200);
+    }
+
+    #[test]
+    fn test_add_dnssl_option_wrong_opt_type() {
+        let mut state = DaemonState::new();
+        state.dhcp_opts6.push(crate::core::types::DhcpOptEntry {
+            opt: 99, // not OPTION6_DOMAIN_SEARCH
+            val: vec![
+                7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+            ],
+            flags: 0,
+            netid: None,
+        });
+        let mut pkt = OutPacket::new();
+        add_dnssl_option(&state, &mut pkt, 3600);
+        assert_eq!(pkt.as_bytes().len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // add_prefixes_for_iface tests
+    // -----------------------------------------------------------------------
+
+    fn make_test_parm(iface: &str, if_index: i32) -> RaParam {
+        RaParam {
+            iface: iface.into(),
+            if_index,
+            managed: false,
+            other: false,
+            adv_interval: 600,
+            adv_lifetime: 1800,
+            prio: 0,
+            found_prefix: false,
+            found_context: false,
+        }
+    }
+
+    #[test]
+    fn test_add_prefixes_no_interfaces() {
+        let mut state = DaemonState::new();
+        let mut pkt = OutPacket::new();
+        let mut parm = make_test_parm("eth0", 2);
+        let mut ll = None;
+        let mut lg = None;
+        let mut ula = None;
+        let mut gpt = 0u32;
+        let mut lpt = 0u32;
+        let mut upt = 0u32;
+        add_prefixes_for_iface(
+            &mut state, &mut pkt, &mut parm, &mut ll, &mut lg, &mut ula, &mut gpt, &mut lpt,
+            &mut upt,
+        );
+        assert!(!parm.found_prefix);
+        assert!(!parm.found_context);
+        assert_eq!(pkt.as_bytes().len(), 0);
+    }
+
+    #[test]
+    fn test_add_prefixes_link_local_only() {
+        let mut state = DaemonState::new();
+        // Add a link-local interface address
+        state.interfaces.push(crate::core::types::InterfaceRecord {
+            addr: std::net::IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 1, 2, 3, 4)),
+            netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+            ))),
+            name: "eth0".into(),
+            index: 2,
+            label: 0,
+            flags: 0,
+        });
+        let mut pkt = OutPacket::new();
+        let mut parm = make_test_parm("eth0", 2);
+        let mut ll = None;
+        let mut lg = None;
+        let mut ula = None;
+        let mut gpt = 0u32;
+        let mut lpt = 0u32;
+        let mut upt = 0u32;
+        add_prefixes_for_iface(
+            &mut state, &mut pkt, &mut parm, &mut ll, &mut lg, &mut ula, &mut gpt, &mut lpt,
+            &mut upt,
+        );
+        // Link-local should be tracked but no PIO emitted
+        assert!(ll.is_some());
+        assert_eq!(ll.unwrap(), Ipv6Addr::new(0xfe80, 0, 0, 0, 1, 2, 3, 4));
+        assert!(!parm.found_prefix); // No PIO for link-local
+    }
+
+    #[test]
+    fn test_add_prefixes_global_no_context_with_ra_opt() {
+        let mut state = DaemonState::new();
+        // Add a global unicast address
+        state.interfaces.push(crate::core::types::InterfaceRecord {
+            addr: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+            ))),
+            name: "eth0".into(),
+            index: 2,
+            label: 0,
+            flags: 0,
+        });
+        // Enable OPT_RA to trigger default PIO
+        state.options.set(opt::RA);
+        let mut pkt = OutPacket::new();
+        let mut parm = make_test_parm("eth0", 2);
+        let mut ll = None;
+        let mut lg = None;
+        let mut ula = None;
+        let mut gpt = 0u32;
+        let mut lpt = 0u32;
+        let mut upt = 0u32;
+        add_prefixes_for_iface(
+            &mut state, &mut pkt, &mut parm, &mut ll, &mut lg, &mut ula, &mut gpt, &mut lpt,
+            &mut upt,
+        );
+        // Global address tracked
+        assert!(lg.is_some());
+        assert_eq!(lg.unwrap(), Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        // Default PIO emitted (no context match but OPT_RA set)
+        assert!(parm.found_prefix);
+        assert_eq!(pkt.as_bytes().len(), 32); // One PIO = 32 bytes
+    }
+
+    #[test]
+    fn test_add_prefixes_ula_address_tracked() {
+        let mut state = DaemonState::new();
+        state.interfaces.push(crate::core::types::InterfaceRecord {
+            addr: std::net::IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, 1)),
+            netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+            ))),
+            name: "eth0".into(),
+            index: 2,
+            label: 0,
+            flags: 0,
+        });
+        state.options.set(opt::RA);
+        let mut pkt = OutPacket::new();
+        let mut parm = make_test_parm("eth0", 2);
+        let mut ll = None;
+        let mut lg = None;
+        let mut ula = None;
+        let mut gpt = 0u32;
+        let mut lpt = 0u32;
+        let mut upt = 0u32;
+        add_prefixes_for_iface(
+            &mut state, &mut pkt, &mut parm, &mut ll, &mut lg, &mut ula, &mut gpt, &mut lpt,
+            &mut upt,
+        );
+        assert!(ula.is_some());
+        assert_eq!(ula.unwrap(), Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, 1));
+    }
+
+    #[test]
+    fn test_add_prefixes_with_matching_context() {
+        use crate::dhcp::common::CONTEXT_RA;
+        let mut state = DaemonState::new();
+        // Add a global interface address
+        state.interfaces.push(crate::core::types::InterfaceRecord {
+            addr: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1)),
+            netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+            ))),
+            name: "eth0".into(),
+            index: 2,
+            label: 0,
+            flags: 0,
+        });
+        // Add matching context
+        state
+            .dhcp6_contexts
+            .push(crate::core::types::DhcpContextEntry {
+                start: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 0)),
+                end: std::net::IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0xdb8, 0, 1, 0xff, 0xff, 0xff, 0xff,
+                )),
+                netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                    0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+                ))),
+                lease_time: 3600,
+                flags: CONTEXT_RA,
+                netid: None,
+            });
+        let mut pkt = OutPacket::new();
+        let mut parm = make_test_parm("eth0", 2);
+        let mut ll = None;
+        let mut lg = None;
+        let mut ula = None;
+        let mut gpt = 0u32;
+        let mut lpt = 0u32;
+        let mut upt = 0u32;
+        add_prefixes_for_iface(
+            &mut state, &mut pkt, &mut parm, &mut ll, &mut lg, &mut ula, &mut gpt, &mut lpt,
+            &mut upt,
+        );
+        assert!(parm.found_prefix);
+        assert!(parm.found_context);
+        assert_eq!(pkt.as_bytes().len(), 32); // One PIO
+    }
+
+    #[test]
+    fn test_add_prefixes_context_with_deprecate_flag() {
+        let mut state = DaemonState::new();
+        state.interfaces.push(crate::core::types::InterfaceRecord {
+            addr: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 1)),
+            netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+            ))),
+            name: "eth0".into(),
+            index: 2,
+            label: 0,
+            flags: 0,
+        });
+        state
+            .dhcp6_contexts
+            .push(crate::core::types::DhcpContextEntry {
+                start: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 0)),
+                end: std::net::IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0xdb8, 0, 2, 0xff, 0xff, 0xff, 0xff,
+                )),
+                netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                    0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+                ))),
+                lease_time: 3600,
+                flags: CONTEXT_RA | CONTEXT_DEPRECATE,
+                netid: None,
+            });
+        let mut pkt = OutPacket::new();
+        let mut parm = make_test_parm("eth0", 2);
+        let mut ll = None;
+        let mut lg = None;
+        let mut ula = None;
+        let mut gpt = 0u32;
+        let mut lpt = 0u32;
+        let mut upt = 0u32;
+        add_prefixes_for_iface(
+            &mut state, &mut pkt, &mut parm, &mut ll, &mut lg, &mut ula, &mut gpt, &mut lpt,
+            &mut upt,
+        );
+        assert!(parm.found_prefix);
+        // Check PIO has preferred_lifetime=0 due to CONTEXT_DEPRECATE
+        let bytes = pkt.as_bytes();
+        assert_eq!(bytes.len(), 32);
+        let pref_lt = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        assert_eq!(pref_lt, 0);
+    }
+
+    #[test]
+    fn test_add_prefixes_context_managed_and_other() {
+        let mut state = DaemonState::new();
+        state.interfaces.push(crate::core::types::InterfaceRecord {
+            addr: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 3, 0, 0, 0, 1)),
+            netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+            ))),
+            name: "eth0".into(),
+            index: 2,
+            label: 0,
+            flags: 0,
+        });
+        // Context with CONTEXT_RA + CONTEXT_DHCP but not CONTEXT_RA_STATELESS → managed=true
+        state
+            .dhcp6_contexts
+            .push(crate::core::types::DhcpContextEntry {
+                start: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 3, 0, 0, 0, 0)),
+                end: std::net::IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0xdb8, 0, 3, 0xff, 0xff, 0xff, 0xff,
+                )),
+                netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                    0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+                ))),
+                lease_time: 3600,
+                flags: CONTEXT_RA | CONTEXT_DHCP,
+                netid: None,
+            });
+        let mut pkt = OutPacket::new();
+        let mut parm = make_test_parm("eth0", 2);
+        let mut ll = None;
+        let mut lg = None;
+        let mut ula = None;
+        let mut gpt = 0u32;
+        let mut lpt = 0u32;
+        let mut upt = 0u32;
+        add_prefixes_for_iface(
+            &mut state, &mut pkt, &mut parm, &mut ll, &mut lg, &mut ula, &mut gpt, &mut lpt,
+            &mut upt,
+        );
+        assert!(parm.managed);
+        assert!(parm.other);
+    }
+
+    #[test]
+    fn test_add_prefixes_context_ra_stateless() {
+        let mut state = DaemonState::new();
+        state.interfaces.push(crate::core::types::InterfaceRecord {
+            addr: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 4, 0, 0, 0, 1)),
+            netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+            ))),
+            name: "eth0".into(),
+            index: 2,
+            label: 0,
+            flags: 0,
+        });
+        state
+            .dhcp6_contexts
+            .push(crate::core::types::DhcpContextEntry {
+                start: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 4, 0, 0, 0, 0)),
+                end: std::net::IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0xdb8, 0, 4, 0xff, 0xff, 0xff, 0xff,
+                )),
+                netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                    0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+                ))),
+                lease_time: 3600,
+                flags: CONTEXT_RA | CONTEXT_DHCP | CONTEXT_RA_STATELESS,
+                netid: None,
+            });
+        let mut pkt = OutPacket::new();
+        let mut parm = make_test_parm("eth0", 2);
+        let mut ll = None;
+        let mut lg = None;
+        let mut ula = None;
+        let mut gpt = 0u32;
+        let mut lpt = 0u32;
+        let mut upt = 0u32;
+        add_prefixes_for_iface(
+            &mut state, &mut pkt, &mut parm, &mut ll, &mut lg, &mut ula, &mut gpt, &mut lpt,
+            &mut upt,
+        );
+        // RA_STATELESS means other=true but managed=false
+        assert!(!parm.managed);
+        assert!(parm.other);
+    }
+
+    #[test]
+    fn test_add_prefixes_template_context_skipped() {
+        let mut state = DaemonState::new();
+        state.interfaces.push(crate::core::types::InterfaceRecord {
+            addr: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 5, 0, 0, 0, 1)),
+            netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+            ))),
+            name: "eth0".into(),
+            index: 2,
+            label: 0,
+            flags: 0,
+        });
+        state
+            .dhcp6_contexts
+            .push(crate::core::types::DhcpContextEntry {
+                start: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 5, 0, 0, 0, 0)),
+                end: std::net::IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0xdb8, 0, 5, 0xff, 0xff, 0xff, 0xff,
+                )),
+                netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                    0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+                ))),
+                lease_time: 3600,
+                flags: CONTEXT_RA | CONTEXT_TEMPLATE,
+                netid: None,
+            });
+        let mut pkt = OutPacket::new();
+        let mut parm = make_test_parm("eth0", 2);
+        let mut ll = None;
+        let mut lg = None;
+        let mut ula = None;
+        let mut gpt = 0u32;
+        let mut lpt = 0u32;
+        let mut upt = 0u32;
+        add_prefixes_for_iface(
+            &mut state, &mut pkt, &mut parm, &mut ll, &mut lg, &mut ula, &mut gpt, &mut lpt,
+            &mut upt,
+        );
+        assert!(parm.found_context); // Context matched
+        assert!(!parm.found_prefix); // But no PIO emitted (template)
+        assert_eq!(pkt.as_bytes().len(), 0);
+    }
+
+    #[test]
+    fn test_add_prefixes_multiple_addresses() {
+        let mut state = DaemonState::new();
+        // Link-local + global + ULA
+        state.interfaces.push(crate::core::types::InterfaceRecord {
+            addr: std::net::IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 1, 2, 3, 4)),
+            netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+            ))),
+            name: "eth0".into(),
+            index: 2,
+            label: 0,
+            flags: 0,
+        });
+        state.interfaces.push(crate::core::types::InterfaceRecord {
+            addr: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1)),
+            netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+            ))),
+            name: "eth0".into(),
+            index: 2,
+            label: 0,
+            flags: 0,
+        });
+        state.interfaces.push(crate::core::types::InterfaceRecord {
+            addr: std::net::IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, 5)),
+            netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+            ))),
+            name: "eth0".into(),
+            index: 2,
+            label: 0,
+            flags: 0,
+        });
+        state.options.set(opt::RA);
+        let mut pkt = OutPacket::new();
+        let mut parm = make_test_parm("eth0", 2);
+        let mut ll = None;
+        let mut lg = None;
+        let mut ula = None;
+        let mut gpt = 0u32;
+        let mut lpt = 0u32;
+        let mut upt = 0u32;
+        add_prefixes_for_iface(
+            &mut state, &mut pkt, &mut parm, &mut ll, &mut lg, &mut ula, &mut gpt, &mut lpt,
+            &mut upt,
+        );
+        assert!(ll.is_some()); // link-local tracked
+        assert!(lg.is_some()); // global tracked
+        assert!(ula.is_some()); // ULA tracked
+                                // 2 PIOs: global + ULA (link-local is skipped for PIOs)
+        assert_eq!(pkt.as_bytes().len(), 64); // 2 × 32 bytes
+    }
+
+    #[test]
+    fn test_add_prefixes_v4_interface_ignored() {
+        let mut state = DaemonState::new();
+        state.interfaces.push(crate::core::types::InterfaceRecord {
+            addr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+            netmask: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                255, 255, 255, 0,
+            ))),
+            name: "eth0".into(),
+            index: 2,
+            label: 0,
+            flags: 0,
+        });
+        let mut pkt = OutPacket::new();
+        let mut parm = make_test_parm("eth0", 2);
+        let mut ll = None;
+        let mut lg = None;
+        let mut ula = None;
+        let mut gpt = 0u32;
+        let mut lpt = 0u32;
+        let mut upt = 0u32;
+        add_prefixes_for_iface(
+            &mut state, &mut pkt, &mut parm, &mut ll, &mut lg, &mut ula, &mut gpt, &mut lpt,
+            &mut upt,
+        );
+        assert!(ll.is_none());
+        assert!(lg.is_none());
+        assert!(ula.is_none());
+        assert!(!parm.found_prefix);
+    }
+
+    #[test]
+    fn test_add_prefixes_wrong_interface_index() {
+        let mut state = DaemonState::new();
+        state.interfaces.push(crate::core::types::InterfaceRecord {
+            addr: std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1)),
+            netmask: Some(std::net::IpAddr::V6(Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0,
+            ))),
+            name: "eth1".into(),
+            index: 3, // Different index from parm
+            label: 0,
+            flags: 0,
+        });
+        state.options.set(opt::RA);
+        let mut pkt = OutPacket::new();
+        let mut parm = make_test_parm("eth0", 2);
+        let mut ll = None;
+        let mut lg = None;
+        let mut ula = None;
+        let mut gpt = 0u32;
+        let mut lpt = 0u32;
+        let mut upt = 0u32;
+        add_prefixes_for_iface(
+            &mut state, &mut pkt, &mut parm, &mut ll, &mut lg, &mut ula, &mut gpt, &mut lpt,
+            &mut upt,
+        );
+        assert!(!parm.found_prefix);
+        assert_eq!(pkt.as_bytes().len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // new_timeout tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_new_timeout_normal_mode() {
+        let state = DaemonState::new();
+        let timeout = new_timeout(1000, "eth0", &state, 0);
+        // Normal mode: 0.75 to 1.0 × DEFAULT_RA_INTERVAL (600)
+        // So timeout should be between 450 and 600
+        assert!(timeout >= 450, "timeout {} should be >= 450", timeout);
+        assert!(timeout <= 600, "timeout {} should be <= 600", timeout);
+    }
+
+    #[test]
+    fn test_new_timeout_short_period() {
+        let state = DaemonState::new();
+        let now = 100i64;
+        let ra_short_start = 80i64; // 20 seconds ago, within 60s window
+        let timeout = new_timeout(now, "eth0", &state, ra_short_start);
+        // Short period: between 5 and 20 seconds
+        assert!(timeout >= 5, "timeout {} should be >= 5", timeout);
+        assert!(timeout <= 20, "timeout {} should be <= 20", timeout);
+    }
+
+    #[test]
+    fn test_new_timeout_short_period_expired() {
+        let state = DaemonState::new();
+        let now = 200i64;
+        let ra_short_start = 100i64; // 100 seconds ago, past 60s window
+        let timeout = new_timeout(now, "eth0", &state, ra_short_start);
+        // Normal mode (short period expired)
+        assert!(timeout >= 450);
+        assert!(timeout <= 600);
+    }
+
+    #[test]
+    fn test_new_timeout_with_configured_interval() {
+        let mut state = DaemonState::new();
+        state.ra_interfaces.push(crate::core::types::RaInterface {
+            name: "eth0".into(),
+            interval: 100,
+            lifetime: 0,
+            priority: 0,
+            mtu: 0,
+            mtu_name: String::new(),
+        });
+        let timeout = new_timeout(1000, "eth0", &state, 0);
+        // Normal mode: 0.75 to 1.0 × 100
+        assert!(timeout >= 75, "timeout {} should be >= 75", timeout);
+        assert!(timeout <= 100, "timeout {} should be <= 100", timeout);
+    }
+
+    // -----------------------------------------------------------------------
+    // find_iface_param with glob pattern
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_iface_param_glob_match() {
+        let mut state = DaemonState::new();
+        state.ra_interfaces.push(crate::core::types::RaInterface {
+            name: "eth*".into(),
+            interval: 200,
+            lifetime: 600,
+            priority: 0,
+            mtu: 0,
+            mtu_name: String::new(),
+        });
+        let result = find_iface_param("eth0", &state);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().interval, 200);
+    }
+
+    #[test]
+    fn test_find_iface_param_glob_no_match() {
+        let mut state = DaemonState::new();
+        state.ra_interfaces.push(crate::core::types::RaInterface {
+            name: "wlan*".into(),
+            interval: 200,
+            lifetime: 600,
+            priority: 0,
+            mtu: 0,
+            mtu_name: String::new(),
+        });
+        assert!(find_iface_param("eth0", &state).is_none());
+    }
+
+    #[test]
+    fn test_find_iface_param_priority_mapping() {
+        let mut state = DaemonState::new();
+        state.ra_interfaces.push(crate::core::types::RaInterface {
+            name: "eth0".into(),
+            interval: 100,
+            lifetime: 300,
+            priority: RA_PRIO_HIGH as u32,
+            mtu: 0,
+            mtu_name: "br0".into(),
+        });
+        let result = find_iface_param("eth0", &state).unwrap();
+        assert_eq!(result.prio, RA_PRIO_HIGH);
+        assert_eq!(result.mtu_name, "br0");
+    }
+
+    // -----------------------------------------------------------------------
+    // DaemonState::new() helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_daemon_state_ra_fields_empty() {
+        let state = DaemonState::new();
+        assert!(state.ra_interfaces.is_empty());
+        assert!(state.dhcp6_contexts.is_empty());
+        assert!(state.interfaces.is_empty());
+        assert!(state.dhcp_opts6.is_empty());
+    }
 }

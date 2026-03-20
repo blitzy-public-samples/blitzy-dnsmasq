@@ -1326,4 +1326,124 @@ mod tests {
     fn test_idn_encode_disabled() {
         assert_eq!(idn_encode("anything"), None);
     }
+
+    // ================================================================
+    // legal_hostname tests
+    // ================================================================
+
+    #[test]
+    fn test_legal_hostname_simple() {
+        assert!(legal_hostname("example"));
+    }
+
+    #[test]
+    fn test_legal_hostname_dotted() {
+        assert!(legal_hostname("host.example.com"));
+    }
+
+    #[test]
+    fn test_legal_hostname_trailing_dot() {
+        assert!(legal_hostname("host.example.com."));
+    }
+
+    #[test]
+    fn test_legal_hostname_empty() {
+        assert!(!legal_hostname(""));
+    }
+
+    #[test]
+    fn test_legal_hostname_too_long() {
+        let long_name = "a".repeat(254);
+        assert!(!legal_hostname(&long_name));
+    }
+
+    #[test]
+    fn test_legal_hostname_max_length() {
+        // 253 chars with valid labels
+        let label = "a".repeat(63);
+        let name = format!("{}.{}.{}.{}", label, label, label, &label[..60]);
+        assert!(name.len() <= 253);
+        assert!(legal_hostname(&name));
+    }
+
+    #[test]
+    fn test_legal_hostname_label_too_long() {
+        let long_label = "a".repeat(64);
+        assert!(!legal_hostname(&long_label));
+    }
+
+    #[test]
+    fn test_legal_hostname_hyphen_start() {
+        assert!(!legal_hostname("-host"));
+    }
+
+    #[test]
+    fn test_legal_hostname_hyphen_end() {
+        assert!(!legal_hostname("host-"));
+    }
+
+    #[test]
+    fn test_legal_hostname_hyphen_middle() {
+        assert!(legal_hostname("my-host"));
+    }
+
+    #[test]
+    fn test_legal_hostname_underscore() {
+        assert!(!legal_hostname("my_host"));
+    }
+
+    #[test]
+    fn test_legal_hostname_space() {
+        assert!(!legal_hostname("my host"));
+    }
+
+    #[test]
+    fn test_legal_hostname_numeric() {
+        assert!(legal_hostname("123"));
+    }
+
+    #[test]
+    fn test_legal_hostname_starts_nonalpha() {
+        assert!(!legal_hostname("!host"));
+    }
+
+    #[test]
+    fn test_legal_hostname_empty_label() {
+        assert!(!legal_hostname("host..com"));
+    }
+
+    #[test]
+    fn test_legal_hostname_only_dot() {
+        assert!(!legal_hostname("."));
+    }
+
+    #[test]
+    fn test_legal_hostname_dot_prefix() {
+        assert!(!legal_hostname(".host"));
+    }
+
+    #[test]
+    fn test_legal_hostname_single_char() {
+        assert!(legal_hostname("a"));
+    }
+
+    #[test]
+    fn test_legal_hostname_alphanumeric_mixed() {
+        assert!(legal_hostname("host1.sub2.example3"));
+    }
+
+    #[test]
+    fn test_legal_hostname_all_numeric_labels() {
+        assert!(legal_hostname("1.2.3.4.example.com"));
+    }
+
+    // ================================================================
+    // close_fds tests
+    // ================================================================
+
+    // Note: close_fds tests are intentionally omitted because the function
+    // closes real file descriptors, which conflicts with instrumented coverage
+    // tools (llvm-cov / tarpaulin) that use FDs for profraw output.  The
+    // function is a thin wrapper around libc::close and is tested implicitly
+    // via integration tests.
 }
