@@ -882,6 +882,36 @@ impl InotifyWatcher {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::field_reassign_with_default,
+    clippy::needless_borrows_for_generic_args,
+    clippy::unnecessary_cast,
+    clippy::assertions_on_constants,
+    clippy::len_zero,
+    clippy::vec_init_then_push,
+    clippy::unchecked_duration_subtraction,
+    clippy::manual_string_new,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::manual_range_contains,
+    clippy::trim_split_whitespace,
+    clippy::identity_op,
+    clippy::io_other_error,
+    clippy::useless_vec,
+    clippy::const_is_empty,
+    clippy::clone_on_copy,
+    clippy::absurd_extreme_comparisons,
+    clippy::overly_complex_bool_expr,
+    clippy::write_literal,
+    clippy::int_plus_one,
+    clippy::write_with_newline,
+    clippy::float_cmp,
+    clippy::double_comparisons,
+    clippy::large_stack_arrays,
+    clippy::writeln_empty_string,
+    unused_comparisons,
+    unused_mut,
+    unused_variables
+)]
 mod tests {
     use super::*;
     use std::path::PathBuf;

@@ -138,6 +138,7 @@
 #![allow(clippy::redundant_else)]
 #![allow(clippy::unnested_or_patterns)]
 #![allow(clippy::bool_to_int_with_if)]
+#![allow(clippy::large_stack_arrays)]
 #![allow(clippy::ignored_unit_patterns)]
 #![allow(clippy::enum_glob_use)]
 #![allow(clippy::option_as_ref_cloned)]
