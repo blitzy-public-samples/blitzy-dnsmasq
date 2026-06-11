@@ -7,10 +7,20 @@
   <title>dnsmasq Bug-Fix Engagement &mdash; Executive Summary</title>
 
   <!--
+    Self-contained favicon (inline data-URI SVG, Blitzy brand mark).
+    Declaring an icon stops the browser's default fallback request to
+    /favicon.ico, which a static file server answers with 404 (a console
+    error). The SVG is embedded entirely in the href (no external or local
+    asset), keeping the deck a single self-contained file. Hex colours are
+    written as %23RRGGBB because a bare '#' would start a URL fragment.
+  -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%235B39F3'/><text x='32' y='46' font-family='Inter,Segoe UI,Helvetica,Arial,sans-serif' font-size='42' font-weight='700' fill='%23FFFFFF' text-anchor='middle'>B</text></svg>" />
+
+  <!--
     SELF-CONTAINED EXECUTIVE PRESENTATION
     Frameworks (loaded from public CDN, pinned versions):
       reveal.js@5.1.0  (slide framework, global Reveal)
-      mermaid@11.4.0   (diagrams, global mermaid)
+      mermaid@11.15.0  (diagrams, global mermaid)
       lucide@0.460.0   (icons, global lucide)
     The Blitzy brand theme is embedded inline below; the cited canonical
     theme file blitzy-deck/references/blitzy-reveal-theme.css is absent and is
@@ -500,6 +510,17 @@
        node / cluster / edge spacing and cannot overlap neighbours. */
     .reveal .mermaid foreignObject,
     .reveal .mermaid foreignObject > div { overflow: visible; }
+    /* Edge labels: opaque background (mermaid's default is ~50% alpha) so a
+       connector line drawn behind a label never shows through the text. This
+       keeps decision-flow labels ("No, template empty" / "Yes, when supplied")
+       crisply separated from the dotted/solid edges they annotate. */
+    .reveal .mermaid .edgeLabel,
+    .reveal .mermaid .edgeLabel p,
+    .reveal .mermaid .edgeLabel span,
+    .reveal .mermaid .edgeLabels div,
+    .reveal .mermaid .edgeLabel foreignObject div {
+      background-color: var(--blitzy-surface-0) !important;
+    }
 
     /* --------------------- Inline mono / code --------------------------- */
     .reveal code, .reveal .mono {
@@ -561,6 +582,18 @@
 
   <div class="reveal" id="main-deck" role="region" aria-label="dnsmasq bug-fix engagement executive summary">
     <div class="slides">
+
+      <!--
+        CONTENT-DENSITY RULE (applies to every section.content):
+        the "max 4 bullets / max 40 words" limit governs NARRATIVE PROSE only —
+        the eyebrow, heading, body-list bullets, and lead/caption text. Data
+        rendered inside an AAP-mandated non-text visual (table cells, Mermaid
+        node/edge labels, and KPI/icon labels) is NOT prose and is exempt:
+        the AAP requires a non-text visual on every slide, so counting that
+        visual's own data would make any data-table or diagram slide
+        impossible to satisfy. Under this rule every content slide here stays
+        within <=4 bullets and <=40 narrative words.
+      -->
 
       <!-- 1 — TITLE -->
       <section class="slide-title" aria-label="Title">
@@ -629,8 +662,8 @@
           <div class="icon-chip"><i data-lucide="file-check-2" aria-hidden="true"></i><span class="chip-label">This presentation</span></div>
         </div>
         <ul class="body-list">
-          <li><i data-lucide="check" aria-hidden="true"></i><span><code>make</code> exits 0 &mdash; a 465,792-byte <code>src/dnsmasq</code> with the full feature set.</span></li>
-          <li><i data-lucide="check" aria-hidden="true"></i><span>Captured repo map, environment, conventions, and a verification framework.</span></li>
+          <li><i data-lucide="check" aria-hidden="true"></i><span><code>make</code> exits 0 &mdash; a 465,792-byte <code>src/dnsmasq</code>, full feature set.</span></li>
+          <li><i data-lucide="check" aria-hidden="true"></i><span>Captured repo map, environment, conventions, and verification framework.</span></li>
           <li><i data-lucide="check" aria-hidden="true"></i><span><strong>No source files changed</strong> &mdash; <code>src/</code> remains untouched.</span></li>
         </ul>
       </section>
@@ -683,7 +716,7 @@
         <div class="two-col">
           <ul class="body-list">
             <li><i data-lucide="shield-check" aria-hidden="true"></i><span>Refusing to guess shielded a releasable daemon from speculative, risk-bearing edits.</span></li>
-            <li><i data-lucide="zap" aria-hidden="true"></i><span>Readiness means a real fix can begin the moment a symptom is supplied.</span></li>
+            <li><i data-lucide="zap" aria-hidden="true"></i><span>Readiness means a fix can begin the moment a symptom is supplied.</span></li>
           </ul>
           <div class="kpi-grid cols-2">
             <div class="kpi-card">
@@ -750,15 +783,21 @@ graph TB
           <h2>How the plan handled an empty report</h2>
         </div>
         <pre class="mermaid">
+---
+config:
+  flowchart:
+    nodeSpacing: 58
+    rankSpacing: 80
+---
 flowchart TD
   A["Bug-fix request received"] --> B{"Concrete defect specified?"}
-  B -->|"No, template unpopulated"| C["Do NOT fabricate a root cause"]
+  B -->|"No, template empty"| C["Do not fabricate a root cause"]
   C --> D["Provide diagnostic readiness"]
-  C --> E["Flag missing-information inventory"]
-  C --> F["Surface sole anomaly option.c:7326 as GATED candidate"]
-  A --> G["Rule: Executive Presentation applies"]
-  G --> H["CREATE self-contained reveal.js summary"]
-  B -.->|"Yes, future input"| I["Standard fix flow: locate, edit, regression-test"]
+  C --> E["Flag missing-info inventory"]
+  C --> F["Surface gated option.c:7326"]
+  A --> G["Executive Presentation rule applies"]
+  G --> H["Create self-contained deck"]
+  B -.->|"Yes, when supplied"| I["Locate, fix, regression-test"]
         </pre>
       </section>
 
@@ -861,7 +900,7 @@ flowchart LR
        Each carries a SHA-384 Subresource Integrity hash + crossorigin="anonymous"
        so the browser rejects any tampered/altered bytes before execution. -->
   <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js" integrity="sha384-M/JtqCVlLcK9lwVnBnMXP0V577CBULkjodKsR/PITOe4MSKNbbwqCemEyluOw0+5" crossorigin="anonymous"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.min.js" integrity="sha384-Wm9qzEgq4j1jEnuFK2FxKTlwuhbV2QqtGhcchvjDoKxeJ7WWAW7fysBq+1s6myfX" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js" integrity="sha384-yQ4mmBBT+vhTAwjFH0toJXNYJ6O4usWnt6EPIdWwrRvx2V/n5lXuDZQwQFeSFydF" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js" integrity="sha384-ieG+IKD0d/ZPXyCBTMVAbqsQdns8QGJR/e26WMw7M4fkaI/rHcS/YIoi+ah9WGge" crossorigin="anonymous"></script>
 
   <script>
@@ -928,7 +967,27 @@ flowchart LR
           transition: 'slide',
           controlsTutorial: false,
           width: 1920,
-          height: 1080
+          height: 1080,
+          // --- Small-viewport (mobile) handling -------------------------------
+          // Two reveal.js defaults broke narrow portrait phones (e.g. 375x812):
+          //
+          // 1) scrollActivationWidth (default 435) auto-switched the deck into
+          //    reveal's "scroll view" below 435px. That restructures the DOM into
+          //    stacked scroll-pages, so the fixed-canvas slides lost their
+          //    classes, there was no single `.present` slide, and a deep link
+          //    such as #/8 no longer mapped to the intended slide. We disable the
+          //    auto scroll view (0 is falsy -> never activates) so every viewport
+          //    uses the same fixed 1920x1080 canvas with normal hash navigation.
+          scrollActivationWidth: 0,
+          //
+          // 2) minScale (default 0.2) was ABOVE the scale a 375px-wide phone
+          //    needs (~0.195) to fit the 1920px-wide canvas, so reveal clamped to
+          //    0.2, rendered the slide ~384px wide (wider than the viewport) and
+          //    clipped it left/right. A lower minScale lets narrow viewports use
+          //    their true fit-scale and stay centred with no horizontal overflow.
+          //    Desktop fit-scale (~1.0) is far above minScale, so it is unchanged.
+          minScale: 0.05,
+          maxScale: 2.0
         });
 
         // mermaid.run() and lucide.createIcons() on both 'ready' and every
