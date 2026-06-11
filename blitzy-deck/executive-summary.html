@@ -22,8 +22,9 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
 
-  <!-- reveal.js 5.1.0 core stylesheet (layout/scaling); Blitzy theme is inlined, no base theme loaded -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <!-- reveal.js 5.1.0 core stylesheet (layout/scaling); Blitzy theme is inlined, no base theme loaded.
+       Subresource Integrity (SRI) pins the exact bytes; crossorigin enables the integrity check. -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" integrity="sha384-YgvgKeZJykuztG+iQPoZHNZENTFZvOcOJ/uRzmJTje6GHYN9zAw+y5rx/L8MQKA/" crossorigin="anonymous" />
 
   <style>
     /* =====================================================================
@@ -71,6 +72,11 @@
       --blitzy-overlay-22: rgba(255,255,255,0.22);
       --blitzy-teal-soft: rgba(148,250,213,0.16);
       --blitzy-ink-soft: rgba(26,16,95,0.06);
+      /* Accessible muted text: a darker variant of --blitzy-text-muted for
+         normal-size labels/captions on light surfaces, meeting WCAG 2.1 AA
+         contrast (>=4.5:1; measured >=5:1 on every light surface token). The
+         original --blitzy-text-muted is retained unchanged for the palette. */
+      --blitzy-text-muted-accessible: #666666;
     }
 
     /* ---------------------------- Reset --------------------------------- */
@@ -274,7 +280,7 @@
       flex: none;
     }
     .reveal .caption {
-      color: var(--blitzy-text-muted);
+      color: var(--blitzy-text-muted-accessible);
       font-size: 0.66em;
       margin-block-start: 0.9em;
       font-style: normal;
@@ -330,7 +336,7 @@
     .kpi-card.on-dark .kpi-value { color: var(--blitzy-text-invert); }
     .kpi-label {
       font-size: 0.62em;
-      color: var(--blitzy-text-muted);
+      color: var(--blitzy-text-muted-accessible);
       line-height: 1.3;
       letter-spacing: 0.01em;
     }
@@ -455,8 +461,8 @@
       white-space: nowrap;
     }
     .reveal .status-pill svg { width: 1em; height: 1em; color: var(--blitzy-primary); }
-    .reveal .status-pill.muted { color: var(--blitzy-text-muted); }
-    .reveal .status-pill.muted svg { color: var(--blitzy-text-muted); }
+    .reveal .status-pill.muted { color: var(--blitzy-text-muted-accessible); }
+    .reveal .status-pill.muted svg { color: var(--blitzy-text-muted-accessible); }
 
     /* --------------------- Component: mermaid --------------------------- */
     .reveal .mermaid {
@@ -845,50 +851,20 @@ flowchart LR
     </div>
   </div>
 
-  <!-- Frameworks loaded from public CDN (pinned, UMD/global builds) -->
-  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+  <!-- Frameworks loaded from public CDN (pinned versions, UMD/global builds).
+       Each carries a SHA-384 Subresource Integrity hash + crossorigin="anonymous"
+       so the browser rejects any tampered/altered bytes before execution. -->
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js" integrity="sha384-M/JtqCVlLcK9lwVnBnMXP0V577CBULkjodKsR/PITOe4MSKNbbwqCemEyluOw0+5" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.min.js" integrity="sha384-Wm9qzEgq4j1jEnuFK2FxKTlwuhbV2QqtGhcchvjDoKxeJ7WWAW7fysBq+1s6myfX" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js" integrity="sha384-ieG+IKD0d/ZPXyCBTMVAbqsQdns8QGJR/e26WMw7M4fkaI/rHcS/YIoi+ah9WGge" crossorigin="anonymous"></script>
 
   <script>
     (function () {
-      // Re-draw Mermaid diagrams and Lucide icons. mermaid.run() is idempotent —
-      // it skips nodes already carrying data-processed — so calling it on every
-      // slide change is safe; lucide.createIcons() is likewise idempotent.
-      function renderVisuals() {
-        // Render Mermaid diagrams lazily, scoped to the currently visible slide.
-        // reveal.js hides off-screen slides (display:none), which collapses a
-        // diagram's SVG to zero size if it is processed while hidden. Restricting
-        // mermaid.run() to the visible slide's not-yet-processed nodes guarantees
-        // each diagram is measured while displayed and sized correctly. The call
-        // is invoked on both 'ready' and 'slidechanged', so every diagram draws
-        // the first time its slide is shown.
-        try {
-          if (window.mermaid) {
-            var scope = (window.Reveal && Reveal.getCurrentSlide && Reveal.getCurrentSlide()) || document;
-            var nodes = Array.prototype.slice.call(
-              scope.querySelectorAll('pre.mermaid:not([data-processed="true"])')
-            );
-            if (nodes.length) {
-              // mermaid.run() over just the visible, unprocessed diagram nodes.
-              var pending = mermaid.run({ nodes: nodes });
-              if (pending && typeof pending.catch === 'function') { pending.catch(function () {}); }
-            }
-          }
-        } catch (err) { /* diagram already drawn */ }
-        try { if (window.lucide) { lucide.createIcons(); } } catch (err) { /* icons already drawn */ }
-      }
-
-      // Mermaid: manual rendering, themed with the Blitzy palette.
+      // Mermaid theme: exact Blitzy themeVariables, manual rendering.
       if (window.mermaid) {
         mermaid.initialize({
           startOnLoad: false,
           theme: 'base',
-          // Use a consistently-available font so label width measurement matches
-          // the rendered glyphs (prevents right-edge text clipping), and render
-          // labels as HTML for accurate auto-sizing.
-          fontFamily: 'Inter, system-ui, Arial, sans-serif',
-          flowchart: { htmlLabels: true, padding: 14, nodeSpacing: 44, rankSpacing: 56, wrappingWidth: 520, useMaxWidth: true },
           themeVariables: {
             primaryColor: '#F2F0FE',
             primaryTextColor: '#333333',
@@ -899,25 +875,61 @@ flowchart LR
         });
       }
 
-      // reveal.js initialization (exact config keys).
-      Reveal.initialize({
-        hash: true,
-        transition: 'slide',
-        controlsTutorial: false,
-        width: 1920,
-        height: 1080
-      });
-
-      // Draw on first ready and after every slide change.
-      Reveal.on('ready', renderVisuals);
-      Reveal.on('slidechanged', renderVisuals);
-
-      // Fallback initial paint so icons appear even before the first 'ready'.
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', renderVisuals);
-      } else {
-        renderVisuals();
+      // Re-draw Mermaid diagrams and Lucide icons. Wired to reveal.js 'ready'
+      // and every 'slidechanged'. No-argument mermaid.run() scans all
+      // unprocessed pre.mermaid nodes and is idempotent (it skips nodes already
+      // marked data-processed); lucide.createIcons() is likewise idempotent. The
+      // returned promise is caught so a benign re-invocation with nothing left
+      // to draw never surfaces an "uncaught (in promise)" console message.
+      function renderVisuals() {
+        if (window.mermaid) {
+          var drawn = mermaid.run();
+          if (drawn && typeof drawn.catch === 'function') { drawn.catch(function () {}); }
+        }
+        if (window.lucide) { lucide.createIcons(); }
       }
+
+      // One-time eager pre-render of every diagram BEFORE reveal.js takes over.
+      // reveal.js hides off-slide <section>s with display:none, and Mermaid
+      // cannot measure label text inside a zero-width hidden node, so a diagram
+      // drawn while its slide is hidden collapses to a tiny viewBox. We give
+      // every section layout just for this initial mermaid.run() while keeping
+      // the deck visually hidden (no flash), then hand off to reveal.js; each
+      // diagram keeps its correctly-sized SVG when its slide is later shown.
+      function preRenderDiagrams() {
+        if (!window.mermaid) { return Promise.resolve(); }
+        var probe = document.createElement('style');
+        probe.textContent =
+          '.reveal{visibility:hidden!important}' +
+          '.reveal .slides>section{display:block!important;position:static!important}';
+        document.head.appendChild(probe);
+        var settle = function () {
+          if (probe.parentNode) { probe.parentNode.removeChild(probe); }
+          if (window.lucide) { lucide.createIcons(); }
+        };
+        var drawn;
+        try { drawn = mermaid.run(); } catch (e) { drawn = null; }
+        if (drawn && typeof drawn.then === 'function') { return drawn.then(settle, settle); }
+        settle();
+        return Promise.resolve();
+      }
+
+      // Render diagrams first, then start reveal.js and keep visuals refreshed.
+      preRenderDiagrams().then(function () {
+        // reveal.js initialization (exact config keys).
+        Reveal.initialize({
+          hash: true,
+          transition: 'slide',
+          controlsTutorial: false,
+          width: 1920,
+          height: 1080
+        });
+
+        // mermaid.run() and lucide.createIcons() on both 'ready' and every
+        // 'slidechanged'.
+        Reveal.on('ready', renderVisuals);
+        Reveal.on('slidechanged', renderVisuals);
+      });
     })();
   </script>
 </body>
