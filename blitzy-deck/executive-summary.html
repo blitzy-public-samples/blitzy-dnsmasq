@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Executive summary for the dnsmasq bug-fix engagement: diagnostic readiness delivered with integrity. Self-contained reveal.js presentation." />
+  <title>dnsmasq Bug-Fix Engagement &mdash; Executive Summary</title>
+
+  <!--
+    SELF-CONTAINED EXECUTIVE PRESENTATION
+    Frameworks (loaded from public CDN, pinned versions):
+      reveal.js@5.1.0  (slide framework, global Reveal)
+      mermaid@11.4.0   (diagrams, global mermaid)
+      lucide@0.460.0   (icons, global lucide)
+    The Blitzy brand theme is embedded inline below; the cited canonical
+    theme file blitzy-deck/references/blitzy-reveal-theme.css is absent and is
+    substituted by this inline :root specification. No build step, no npm.
+  -->
+
+  <!-- Google Fonts: Inter (body), Space Grotesk (display), Fira Code (mono/eyebrow) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
+
+  <!-- reveal.js 5.1.0 core stylesheet (layout/scaling); Blitzy theme is inlined, no base theme loaded -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+
+  <style>
+    /* =====================================================================
+       BLITZY BRAND THEME (inline) — single token definition site.
+       All literal color values live INSIDE this :root block (and the
+       Mermaid themeVariables object in the init script). Everywhere else,
+       colors are referenced exclusively through var(--token).
+       ===================================================================== */
+    :root {
+      /* Brand purples */
+      --blitzy-primary: #5B39F3;
+      --blitzy-primary-dark: #2D1C77;
+      --blitzy-primary-navy: #1A105F;
+      --blitzy-primary-light: #7A6DEC;
+      --blitzy-primary-deep: #4101DB;
+      /* Accent */
+      --blitzy-accent-teal: #94FAD5;
+      /* Surfaces */
+      --blitzy-surface-0: #FFFFFF;
+      --blitzy-surface-1: #F4EFF6;
+      --blitzy-surface-2: #F2F0FE;
+      --blitzy-surface-3: #F5F5F5;
+      /* Borders */
+      --blitzy-border: #D9D9D9;
+      --blitzy-border-soft: rgba(91,57,243,0.18);
+      /* Text */
+      --blitzy-text: #333333;
+      --blitzy-text-muted: #999999;
+      --blitzy-text-invert: #FFFFFF;
+      /* Type families */
+      --ff-body: 'Inter', system-ui, sans-serif;
+      --ff-display: 'Space Grotesk', 'Inter', sans-serif;
+      --ff-mono: 'Fira Code', ui-monospace, monospace;
+      /* Gradients */
+      --gradient-hero: linear-gradient(68deg, #7A6DEC 15.56%, #5B39F3 62.74%, #4101DB 84.44%);
+      --gradient-divider: linear-gradient(135deg, #2D1C77, #5B39F3);
+      --gradient-accent-bar: linear-gradient(90deg, #5B39F3, #94FAD5);
+
+      /* ---- Derived helper tokens (kept INSIDE :root to preserve token
+         discipline — these are the only additional literals, all here). ---- */
+      --blitzy-shadow-card: 0 18px 40px -18px rgba(45,28,119,0.45);
+      --blitzy-shadow-soft: 0 8px 24px -12px rgba(26,16,95,0.30);
+      --blitzy-overlay-08: rgba(255,255,255,0.08);
+      --blitzy-overlay-14: rgba(255,255,255,0.14);
+      --blitzy-overlay-22: rgba(255,255,255,0.22);
+      --blitzy-teal-soft: rgba(148,250,213,0.16);
+      --blitzy-ink-soft: rgba(26,16,95,0.06);
+    }
+
+    /* ---------------------------- Reset --------------------------------- */
+    *, *::before, *::after { box-sizing: border-box; }
+
+    html { background: var(--blitzy-primary-navy); }
+
+    /* Visually-hidden skip link for keyboard/screen-reader users */
+    .skip-link {
+      position: absolute;
+      inset-block-start: -100px;
+      inset-inline-start: 1rem;
+      z-index: 1000;
+      padding: 0.6rem 1rem;
+      background: var(--blitzy-surface-0);
+      color: var(--blitzy-primary-deep);
+      font-family: var(--ff-body);
+      font-weight: 600;
+      border-radius: 8px;
+      text-decoration: none;
+      transition: inset-block-start 160ms ease-out;
+    }
+    .skip-link:focus-visible { inset-block-start: 1rem; }
+    @media (prefers-reduced-motion: reduce) {
+      .skip-link { transition: none; }
+    }
+
+    /* ----------------------- Base typography ---------------------------- */
+    .reveal {
+      font-family: var(--ff-body);
+      font-size: 30px;
+      font-weight: 400;
+      color: var(--blitzy-text);
+      letter-spacing: 0.005em;
+      -webkit-font-smoothing: antialiased;
+    }
+    .reveal .slides { text-align: left; }
+
+    .reveal h1, .reveal h2, .reveal h3, .reveal h4 {
+      font-family: var(--ff-display);
+      color: var(--blitzy-text);
+      font-weight: 700;
+      line-height: 1.08;
+      letter-spacing: -0.015em;
+      text-transform: none;
+      margin: 0 0 0.4em 0;
+    }
+    .reveal p { line-height: 1.45; margin: 0 0 0.6em 0; }
+    .reveal strong { font-weight: 700; color: var(--blitzy-primary-deep); }
+    .reveal a { color: var(--blitzy-primary); }
+
+    /* Each slide fills the 1920x1080 logical canvas with consistent padding */
+    .reveal .slides > section,
+    .reveal .slides > section > section {
+      width: 100%;
+      height: 100%;
+      padding: 84px 104px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      background: var(--blitzy-surface-0);
+      overflow: hidden;
+    }
+
+    /* Content slides: anchor content from the top for a clean reading order */
+    .reveal section.content {
+      justify-content: flex-start;
+      background: var(--blitzy-surface-2);
+    }
+    .reveal section.content > .slide-head { margin-block-end: 0.5em; }
+    .reveal section.content .eyebrow.kicker { color: var(--blitzy-primary); }
+    .reveal section.content h2 { font-size: 2.0em; }
+
+    /* Section "kicker" label above content headings */
+    .eyebrow {
+      font-family: var(--ff-mono);
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.22em;
+      font-size: 0.66em;
+      margin: 0 0 0.7em 0;
+      display: inline-block;
+    }
+
+    /* ----------------------- Slide: TITLE ------------------------------- */
+    .reveal section.slide-title {
+      background: var(--gradient-hero);
+      color: var(--blitzy-text-invert);
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+    }
+    .reveal section.slide-title .eyebrow { color: var(--blitzy-accent-teal); }
+    .reveal section.slide-title h1 {
+      color: var(--blitzy-text-invert);
+      font-size: 3.15em;
+      max-width: 22ch;
+      margin: 0.1em 0 0.35em 0;
+    }
+    .reveal section.slide-title .subtitle {
+      color: var(--blitzy-text-invert);
+      font-size: 1.02em;
+      font-weight: 400;
+      max-width: 46ch;
+      opacity: 0.96;
+      margin: 0 auto 0.9em auto;
+    }
+    .reveal section.slide-title .hero-icon { color: var(--blitzy-accent-teal); }
+    .reveal section.slide-title .title-meta {
+      margin-block-start: 1.1em;
+      font-family: var(--ff-mono);
+      font-size: 0.6em;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--blitzy-text-invert);
+      opacity: 0.85;
+    }
+
+    /* ----------------------- Slide: DIVIDER ----------------------------- */
+    .reveal section.slide-divider {
+      background: var(--gradient-divider);
+      color: var(--blitzy-text-invert);
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+    }
+    .reveal section.slide-divider .eyebrow { color: var(--blitzy-accent-teal); }
+    .reveal section.slide-divider h2 {
+      color: var(--blitzy-text-invert);
+      font-size: 2.7em;
+      max-width: 20ch;
+    }
+    .reveal section.slide-divider .hero-icon { color: var(--blitzy-accent-teal); }
+    .reveal section.slide-divider .divider-index {
+      font-family: var(--ff-mono);
+      font-size: 0.62em;
+      letter-spacing: 0.18em;
+      color: var(--blitzy-text-invert);
+      opacity: 0.8;
+      margin-block-start: 0.8em;
+    }
+
+    /* ----------------------- Slide: CLOSING ----------------------------- */
+    .reveal section.slide-closing {
+      background: var(--blitzy-primary-navy);
+      color: var(--blitzy-text-invert);
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+    }
+    .reveal section.slide-closing .eyebrow { color: var(--blitzy-accent-teal); }
+    .reveal section.slide-closing h2 {
+      color: var(--blitzy-text-invert);
+      font-size: 2.85em;
+      max-width: 18ch;
+      margin-block-end: 0.5em;
+    }
+    .reveal section.slide-closing .next-steps {
+      list-style: none;
+      margin: 0.3em auto 1.1em auto;
+      padding: 0;
+      max-width: 40ch;
+    }
+    .reveal section.slide-closing .next-steps li {
+      position: relative;
+      padding-block: 0.32em;
+      padding-inline-start: 2.1em;
+      color: var(--blitzy-text-invert);
+      font-size: 0.92em;
+      opacity: 0.95;
+    }
+    .reveal section.slide-closing .next-steps li svg {
+      position: absolute;
+      inset-inline-start: 0;
+      inset-block-start: 0.46em;
+      width: 1.25em;
+      height: 1.25em;
+      color: var(--blitzy-accent-teal);
+    }
+
+    /* --------------------- Component: headings/lists -------------------- */
+    .slide-head { display: flex; flex-direction: column; }
+    .reveal .body-list {
+      list-style: none;
+      margin: 0.2em 0 0 0;
+      padding: 0;
+    }
+    .reveal .body-list li {
+      position: relative;
+      padding-block: 0.34em;
+      padding-inline-start: 2em;
+      line-height: 1.4;
+    }
+    .reveal .body-list li svg {
+      position: absolute;
+      inset-inline-start: 0;
+      inset-block-start: 0.45em;
+      width: 1.15em;
+      height: 1.15em;
+      color: var(--blitzy-primary);
+      flex: none;
+    }
+    .reveal .caption {
+      color: var(--blitzy-text-muted);
+      font-size: 0.66em;
+      margin-block-start: 0.9em;
+      font-style: normal;
+    }
+
+    /* layout helpers */
+    .two-col {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 48px;
+      align-items: center;
+    }
+    .stack-gap > * + * { margin-block-start: 0.7em; }
+
+    /* --------------------- Component: KPI grid -------------------------- */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 28px;
+      margin-block-start: 0.4em;
+    }
+    .kpi-grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .kpi-grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .kpi-card {
+      background: var(--blitzy-surface-0);
+      border: 1px solid var(--blitzy-border-soft);
+      border-radius: 18px;
+      padding: 30px 28px;
+      box-shadow: var(--blitzy-shadow-soft);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .kpi-card.on-dark {
+      background: var(--blitzy-overlay-08);
+      border-color: var(--blitzy-overlay-22);
+    }
+    .kpi-icon {
+      width: 46px;
+      height: 46px;
+      color: var(--blitzy-primary);
+      margin-block-end: 4px;
+    }
+    .kpi-card.on-dark .kpi-icon { color: var(--blitzy-accent-teal); }
+    .kpi-value {
+      font-family: var(--ff-display);
+      font-weight: 700;
+      font-size: 2.25em;
+      line-height: 1;
+      color: var(--blitzy-primary-deep);
+      letter-spacing: -0.02em;
+    }
+    .kpi-card.on-dark .kpi-value { color: var(--blitzy-text-invert); }
+    .kpi-label {
+      font-size: 0.62em;
+      color: var(--blitzy-text-muted);
+      line-height: 1.3;
+      letter-spacing: 0.01em;
+    }
+    .kpi-card.on-dark .kpi-label { color: var(--blitzy-accent-teal); opacity: 0.92; }
+
+    /* --------------------- Component: icon row -------------------------- */
+    .icon-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 26px;
+      margin-block: 0.3em 0.2em;
+    }
+    .icon-row .icon-chip {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      flex: 1 1 0;
+      min-width: 180px;
+      background: var(--blitzy-surface-0);
+      border: 1px solid var(--blitzy-border-soft);
+      border-radius: 16px;
+      padding: 26px 18px;
+      box-shadow: var(--blitzy-shadow-soft);
+      text-align: center;
+    }
+    .icon-row .icon-chip svg {
+      width: 52px;
+      height: 52px;
+      color: var(--blitzy-primary);
+    }
+    .icon-row .icon-chip .chip-label {
+      font-size: 0.6em;
+      font-weight: 600;
+      color: var(--blitzy-text);
+      line-height: 1.3;
+    }
+
+    /* --------------------- Component: hero icon ------------------------- */
+    .hero-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 112px;
+      height: 112px;
+      border-radius: 28px;
+      background: var(--blitzy-overlay-14);
+      border: 1px solid var(--blitzy-overlay-22);
+      margin: 0 auto 0.2em auto;
+    }
+    .hero-icon svg { width: 60px; height: 60px; }
+    .reveal section.slide-divider .hero-icon { background: var(--blitzy-overlay-14); }
+
+    /* --------------------- Component: accent bar ------------------------ */
+    .accent-bar {
+      height: 8px;
+      width: 168px;
+      border-radius: 99px;
+      background: var(--gradient-accent-bar);
+      margin: 0.6em auto 0 auto;
+    }
+    .accent-bar.left { margin-inline: 0; }
+
+    /* --------------------- Component: brand lockup ---------------------- */
+    .brand-lockup {
+      display: inline-flex;
+      align-items: center;
+      gap: 14px;
+      font-family: var(--ff-display);
+      font-weight: 700;
+      font-size: 1.15em;
+      letter-spacing: 0.01em;
+      color: var(--blitzy-text-invert);
+      margin-block-start: 0.4em;
+    }
+    .brand-lockup svg { width: 34px; height: 34px; color: var(--blitzy-accent-teal); }
+
+    /* --------------------- Component: tables ---------------------------- */
+    .reveal table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--ff-body);
+      font-size: 0.74em;
+      margin-block-start: 0.4em;
+      background: var(--blitzy-surface-0);
+      border: 1px solid var(--blitzy-border);
+      border-radius: 14px;
+      overflow: hidden;
+      box-shadow: var(--blitzy-shadow-soft);
+    }
+    .reveal thead th {
+      background: var(--blitzy-surface-2);
+      color: var(--blitzy-primary-dark);
+      font-family: var(--ff-display);
+      font-weight: 600;
+      text-align: start;
+      padding: 18px 22px;
+      border-block-end: 2px solid var(--blitzy-border-soft);
+      letter-spacing: 0.01em;
+    }
+    .reveal tbody td {
+      padding: 16px 22px;
+      border-block-end: 1px solid var(--blitzy-border);
+      color: var(--blitzy-text);
+      vertical-align: top;
+      line-height: 1.4;
+    }
+    .reveal tbody tr:last-child td { border-block-end: none; }
+    .reveal tbody tr:nth-child(even) td { background: var(--blitzy-surface-3); }
+    .reveal td .status-pill, .reveal .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--ff-mono);
+      font-size: 0.84em;
+      font-weight: 500;
+      color: var(--blitzy-primary-deep);
+      background: var(--blitzy-surface-2);
+      border: 1px solid var(--blitzy-border-soft);
+      border-radius: 99px;
+      padding: 5px 14px;
+      white-space: nowrap;
+    }
+    .reveal .status-pill svg { width: 1em; height: 1em; color: var(--blitzy-primary); }
+    .reveal .status-pill.muted { color: var(--blitzy-text-muted); }
+    .reveal .status-pill.muted svg { color: var(--blitzy-text-muted); }
+
+    /* --------------------- Component: mermaid --------------------------- */
+    .reveal .mermaid {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--blitzy-surface-0);
+      border: 1px solid var(--blitzy-border-soft);
+      border-radius: 16px;
+      padding: 22px 18px;
+      margin-block-start: 0.3em;
+      box-shadow: var(--blitzy-shadow-soft);
+      min-height: 0;
+    }
+    .reveal .mermaid svg {
+      max-width: 100%;
+      height: auto;
+      max-height: 600px;
+    }
+    .reveal .mermaid.tall svg { max-height: 660px; }
+    /* Mermaid measures every htmlLabel with a temporary span and sizes its
+       foreignObject a few sub-pixels narrower than the browser then lays the
+       text out (a consistent ~2-4% under-measure), so the final glyph clips at
+       the foreignObject's right edge -- visible on node boxes, subgraph
+       (cluster) titles, and edge labels alike. With wrappingWidth raised, every
+       box is sized to (near) its full single-line width, leaving only that tiny
+       sliver of overflow; letting all label foreignObjects render it is safe
+       because the residual overhang (<=~9px per side) is far smaller than the
+       node / cluster / edge spacing and cannot overlap neighbours. */
+    .reveal .mermaid foreignObject,
+    .reveal .mermaid foreignObject > div { overflow: visible; }
+
+    /* --------------------- Inline mono / code --------------------------- */
+    .reveal code, .reveal .mono {
+      font-family: var(--ff-mono);
+      font-size: 0.86em;
+      background: var(--blitzy-surface-1);
+      color: var(--blitzy-primary-deep);
+      border: 1px solid var(--blitzy-border-soft);
+      border-radius: 6px;
+      padding: 1px 8px;
+      white-space: nowrap;
+    }
+    .reveal section.slide-closing code,
+    .reveal section.slide-closing .mono {
+      background: var(--blitzy-overlay-08);
+      border-color: var(--blitzy-overlay-22);
+      color: var(--blitzy-accent-teal);
+    }
+    /* wrapping variant for long literal strings (e.g. the feature-flag list) */
+    .reveal .mono.wrap { white-space: normal; word-break: break-word; line-height: 1.6; }
+
+    /* small callout used on content slides */
+    .callout {
+      background: var(--blitzy-surface-0);
+      border-inline-start: 5px solid var(--blitzy-primary);
+      border-radius: 12px;
+      padding: 18px 24px;
+      box-shadow: var(--blitzy-shadow-soft);
+      font-size: 0.82em;
+      line-height: 1.45;
+      color: var(--blitzy-text);
+    }
+    .callout.teal { border-inline-start-color: var(--blitzy-accent-teal); }
+
+    /* Subtle lift on cards for pointer users only, motion-safe */
+    @media (hover: hover) and (prefers-reduced-motion: no-preference) {
+      .kpi-card, .icon-row .icon-chip {
+        transition: transform 200ms ease-out, box-shadow 200ms ease-out;
+      }
+      .kpi-card:hover, .icon-row .icon-chip:hover {
+        transform: translateY(-4px);
+        box-shadow: var(--blitzy-shadow-card);
+      }
+    }
+
+    /* Keyboard focus visibility */
+    .reveal a:focus-visible,
+    .reveal button:focus-visible {
+      outline: 3px solid var(--blitzy-accent-teal);
+      outline-offset: 3px;
+    }
+
+    /* Defensive: never overflow long literals in cells */
+    .reveal td, .reveal .kpi-label { overflow-wrap: break-word; }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main-deck">Skip to presentation</a>
+
+  <div class="reveal" id="main-deck" role="region" aria-label="dnsmasq bug-fix engagement executive summary">
+    <div class="slides">
+
+      <!-- 1 — TITLE -->
+      <section class="slide-title" aria-label="Title">
+        <span class="hero-icon"><i data-lucide="search-check" aria-hidden="true"></i></span>
+        <span class="eyebrow">DNSMASQ &middot; BUG-FIX ENGAGEMENT</span>
+        <h1>Diagnostic Readiness, Delivered with Integrity</h1>
+        <p class="subtitle">An empty bug report met an honest response: a verified build baseline and a clear path forward, with zero speculative code changes.</p>
+        <div class="accent-bar"></div>
+        <p class="title-meta">dnsmasq 2.92 &middot; Executive Summary</p>
+      </section>
+
+      <!-- 2 — CONTENT: engagement at a glance (KPI grid) -->
+      <section class="content" aria-label="Engagement at a glance">
+        <div class="slide-head">
+          <span class="eyebrow kicker">Engagement at a Glance</span>
+          <h2>A clean, releasable baseline</h2>
+        </div>
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <i data-lucide="files" class="kpi-icon" aria-hidden="true"></i>
+            <span class="kpi-value">50</span>
+            <span class="kpi-label">source files (.c + .h)</span>
+          </div>
+          <div class="kpi-card">
+            <i data-lucide="circle-check" class="kpi-icon" aria-hidden="true"></i>
+            <span class="kpi-value">0</span>
+            <span class="kpi-label">compilation errors</span>
+          </div>
+          <div class="kpi-card">
+            <i data-lucide="triangle-alert" class="kpi-icon" aria-hidden="true"></i>
+            <span class="kpi-value">1</span>
+            <span class="kpi-label">benign warning (gated, not applied)</span>
+          </div>
+          <div class="kpi-card">
+            <i data-lucide="binary" class="kpi-icon" aria-hidden="true"></i>
+            <span class="kpi-value">465,792</span>
+            <span class="kpi-label">binary bytes at src/dnsmasq</span>
+          </div>
+          <div class="kpi-card">
+            <i data-lucide="terminal" class="kpi-icon" aria-hidden="true"></i>
+            <span class="kpi-value">0</span>
+            <span class="kpi-label">make exit code</span>
+          </div>
+        </div>
+        <p class="caption">Compile-time feature set &mdash; <span class="mono wrap">IPv6 GNU-getopt no-DBus no-UBus DHCP DHCPv6 TFTP ipset auth loop-detect inotify dumpfile</span></p>
+      </section>
+
+      <!-- 3 — DIVIDER: What We Did -->
+      <section class="slide-divider" aria-label="Section: What We Did">
+        <span class="hero-icon"><i data-lucide="clipboard-check" aria-hidden="true"></i></span>
+        <span class="eyebrow">Section 01</span>
+        <h2>What We Did</h2>
+        <p class="divider-index">Scope &amp; deliverables</p>
+      </section>
+
+      <!-- 4 — CONTENT: diagnostic readiness established (icon row + bullets) -->
+      <section class="content" aria-label="Diagnostic readiness established">
+        <div class="slide-head">
+          <span class="eyebrow kicker">What We Did</span>
+          <h2>Diagnostic readiness established</h2>
+        </div>
+        <div class="icon-row">
+          <div class="icon-chip"><i data-lucide="hammer" aria-hidden="true"></i><span class="chip-label">Verified clean build</span></div>
+          <div class="icon-chip"><i data-lucide="package-check" aria-hidden="true"></i><span class="chip-label">Working binary, full feature set</span></div>
+          <div class="icon-chip"><i data-lucide="map" aria-hidden="true"></i><span class="chip-label">Action Plan &amp; repo map</span></div>
+          <div class="icon-chip"><i data-lucide="file-check-2" aria-hidden="true"></i><span class="chip-label">This presentation</span></div>
+        </div>
+        <ul class="body-list">
+          <li><i data-lucide="check" aria-hidden="true"></i><span><code>make</code> exits 0 &mdash; a 465,792-byte <code>src/dnsmasq</code> with the full feature set.</span></li>
+          <li><i data-lucide="check" aria-hidden="true"></i><span>Captured repo map, environment, conventions, and a verification framework.</span></li>
+          <li><i data-lucide="check" aria-hidden="true"></i><span><strong>No source files changed</strong> &mdash; <code>src/</code> remains untouched.</span></li>
+        </ul>
+      </section>
+
+      <!-- 5 — CONTENT: central finding (intake status table) -->
+      <section class="content" aria-label="Central finding">
+        <div class="slide-head">
+          <span class="eyebrow kicker">Central Finding</span>
+          <h2>Empty bug report &mdash; no fabricated root cause</h2>
+        </div>
+        <table>
+          <thead>
+            <tr><th>Bug-intake group</th><th>Required input</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Problem Statement</td>
+              <td>What the bug is; when it occurs; expected vs. actual; frequency</td>
+              <td><span class="status-pill muted"><i data-lucide="circle-slash" aria-hidden="true"></i>Not provided</span></td>
+            </tr>
+            <tr>
+              <td>Reproduction &amp; Evidence</td>
+              <td>Errors, logs, stack traces; suspect files; triggering input; recent changes</td>
+              <td><span class="status-pill muted"><i data-lucide="circle-slash" aria-hidden="true"></i>Not provided</span></td>
+            </tr>
+            <tr>
+              <td>System Boundaries</td>
+              <td>What must stay untouched; interfaces and contracts; areas to avoid</td>
+              <td><span class="status-pill muted"><i data-lucide="circle-slash" aria-hidden="true"></i>Not provided</span></td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="caption">The intake template arrived unpopulated, so the platform documented readiness rather than inventing a defect.</p>
+      </section>
+
+      <!-- 6 — DIVIDER: Why It Matters -->
+      <section class="slide-divider" aria-label="Section: Why It Matters">
+        <span class="hero-icon"><i data-lucide="trending-up" aria-hidden="true"></i></span>
+        <span class="eyebrow">Section 02</span>
+        <h2>Why It Matters</h2>
+        <p class="divider-index">Business value</p>
+      </section>
+
+      <!-- 7 — CONTENT: business value (bullets + KPI) -->
+      <section class="content" aria-label="Business value">
+        <div class="slide-head">
+          <span class="eyebrow kicker">Why It Matters</span>
+          <h2>Integrity protects a production-grade daemon</h2>
+        </div>
+        <div class="two-col">
+          <ul class="body-list">
+            <li><i data-lucide="shield-check" aria-hidden="true"></i><span>Refusing to guess shielded a releasable daemon from speculative, risk-bearing edits.</span></li>
+            <li><i data-lucide="zap" aria-hidden="true"></i><span>Readiness means a real fix can begin the moment a symptom is supplied.</span></li>
+          </ul>
+          <div class="kpi-grid cols-2">
+            <div class="kpi-card">
+              <i data-lucide="git-pull-request-closed" class="kpi-icon" aria-hidden="true"></i>
+              <span class="kpi-value">0</span>
+              <span class="kpi-label">speculative source edits</span>
+            </div>
+            <div class="kpi-card">
+              <i data-lucide="badge-check" class="kpi-icon" aria-hidden="true"></i>
+              <span class="kpi-value">100%</span>
+              <span class="kpi-label">build integrity preserved</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 8 — DIVIDER: Architecture & Codebase -->
+      <section class="slide-divider" aria-label="Section: Architecture and Codebase">
+        <span class="hero-icon"><i data-lucide="network" aria-hidden="true"></i></span>
+        <span class="eyebrow">Section 03</span>
+        <h2>Architecture &amp; Codebase</h2>
+        <p class="divider-index">Existing system map</p>
+      </section>
+
+      <!-- 9 — CONTENT: subsystem component map (Mermaid graph TB) -->
+      <section class="content" aria-label="Subsystem component map">
+        <div class="slide-head">
+          <span class="eyebrow kicker">Architecture &amp; Codebase</span>
+          <h2>Subsystem component map</h2>
+        </div>
+        <pre class="mermaid">
+graph TB
+  subgraph CORE["Core Runtime"]
+    direction LR
+    A1["dnsmasq.c"] ~~~ A2["poll.c"] ~~~ A3["option.c"]
+    A4["network.c"] ~~~ A5["util.c"] ~~~ A6["dnsmasq.h"]
+  end
+  subgraph DNS["DNS"]
+    direction LR
+    B1["forward.c"] ~~~ B2["cache.c"]
+    B3["rfc1035.c"] ~~~ B4["dnssec.c"]
+  end
+  subgraph DHCP["DHCP"]
+    direction LR
+    C1["dhcp.c"] ~~~ C2["rfc2131.c"] ~~~ C3["dhcp6.c"]
+    C4["rfc3315.c"] ~~~ C5["lease.c"]
+  end
+  subgraph INTG["Integration"]
+    direction LR
+    D1["dbus.c"] ~~~ D2["ubus.c"]
+    D3["tftp.c"] ~~~ D4["ipset.c"]
+  end
+  CORE --> DNS
+  CORE --> DHCP
+  CORE --> INTG
+        </pre>
+        <p class="caption">This map conveys the existing architecture for orientation only; no code was changed in this engagement.</p>
+      </section>
+
+      <!-- 10 — CONTENT: decision logic flowchart (Mermaid flowchart TD) -->
+      <section class="content" aria-label="Decision logic flowchart">
+        <div class="slide-head">
+          <span class="eyebrow kicker">Decision Logic</span>
+          <h2>How the plan handled an empty report</h2>
+        </div>
+        <pre class="mermaid">
+flowchart TD
+  A["Bug-fix request received"] --> B{"Concrete defect specified?"}
+  B -->|"No, template unpopulated"| C["Do NOT fabricate a root cause"]
+  C --> D["Provide diagnostic readiness"]
+  C --> E["Flag missing-information inventory"]
+  C --> F["Surface sole anomaly option.c:7326 as GATED candidate"]
+  A --> G["Rule: Executive Presentation applies"]
+  G --> H["CREATE self-contained reveal.js summary"]
+  B -.->|"Yes, future input"| I["Standard fix flow: locate, edit, regression-test"]
+        </pre>
+      </section>
+
+      <!-- 11 — DIVIDER: Risks & Mitigations -->
+      <section class="slide-divider" aria-label="Section: Risks and Mitigations">
+        <span class="hero-icon"><i data-lucide="shield-alert" aria-hidden="true"></i></span>
+        <span class="eyebrow">Section 04</span>
+        <h2>Risks &amp; Mitigations</h2>
+        <p class="divider-index">Guardrails in place</p>
+      </section>
+
+      <!-- 12 — CONTENT: risk = unspecified-defect ambiguity (table) -->
+      <section class="content" aria-label="Risks and mitigations">
+        <div class="slide-head">
+          <span class="eyebrow kicker">Risks &amp; Mitigations</span>
+          <h2>The central risk is ambiguity</h2>
+        </div>
+        <table>
+          <thead>
+            <tr><th>Risk</th><th>Mitigation</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Unspecified-defect ambiguity (bug template submitted empty)</td>
+              <td>Diagnostic readiness already in place, plus a precise clarification request &mdash; the missing-information inventory.</td>
+            </tr>
+            <tr>
+              <td>Gated comment warning mistaken for the bug</td>
+              <td>Held as a candidate only; applied solely on user confirmation, with zero runtime impact.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- 13 — CONTENT: sole verifiable anomaly (table + status pill) -->
+      <section class="content" aria-label="Sole verifiable anomaly">
+        <div class="slide-head">
+          <span class="eyebrow kicker">For Completeness</span>
+          <h2>Sole verifiable anomaly &mdash; gated, not applied</h2>
+        </div>
+        <table>
+          <thead>
+            <tr><th>Attribute</th><th>Value</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Location</td><td><code>src/option.c:7326</code></td></tr>
+            <tr><td>Type</td><td><code>-Wcomment</code> &mdash; <span class="mono">"/*"</span> within comment</td></tr>
+            <tr><td>Severity</td><td>Low</td></tr>
+            <tr><td>Runtime / ABI impact</td><td>None &mdash; comment-only</td></tr>
+            <tr><td>Status</td><td><span class="status-pill"><i data-lucide="lock" aria-hidden="true"></i>Gated / not applied</span></td></tr>
+          </tbody>
+        </table>
+        <p class="caption">This is not the reported bug; it is shown for completeness and would be touched only on user confirmation.</p>
+      </section>
+
+      <!-- 14 — DIVIDER: Onboarding & Continuation -->
+      <section class="slide-divider" aria-label="Section: Onboarding and Continuation">
+        <span class="hero-icon"><i data-lucide="rocket" aria-hidden="true"></i></span>
+        <span class="eyebrow">Section 05</span>
+        <h2>Onboarding &amp; Continuation</h2>
+        <p class="divider-index">Build, verify, continue</p>
+      </section>
+
+      <!-- 15 — CONTENT: build / verify / continue (Mermaid flowchart LR + bullets) -->
+      <section class="content" aria-label="Build, verify, continue">
+        <div class="slide-head">
+          <span class="eyebrow kicker">Onboarding &amp; Continuation</span>
+          <h2>Build, verify, continue</h2>
+        </div>
+        <pre class="mermaid">
+flowchart LR
+  M["make (exits 0)"] --> T["autopkgtest scenarios"]
+  T --> V["add verify-fix-to-bug-NNNNNN"]
+  V --> G["functional checks + Valgrind / GDB"]
+        </pre>
+        <ul class="body-list">
+          <li><i data-lucide="check" aria-hidden="true"></i><span>Build with <code>make</code> &mdash; ISO C99, <code>-Wall -W -O2</code>, warnings non-blocking.</span></li>
+          <li><i data-lucide="check" aria-hidden="true"></i><span>No <code>make test</code>; verify via Debian autopkgtest under <code>submodules/dnsmasq-debian/debian/tests/</code>.</span></li>
+          <li><i data-lucide="check" aria-hidden="true"></i><span>Each future fix adds a <code>verify-fix-to-bug-NNNNNN</code> scenario.</span></li>
+        </ul>
+      </section>
+
+      <!-- 16 — CLOSING -->
+      <section class="slide-closing" aria-label="Closing">
+        <span class="eyebrow">Awaiting Your Input</span>
+        <h2>Ready. Honest. Awaiting Your Symptom.</h2>
+        <ul class="next-steps">
+          <li><i data-lucide="message-square-text" aria-hidden="true"></i><span>Supply the problem statement, reproduction, and boundaries.</span></li>
+          <li><i data-lucide="wrench" aria-hidden="true"></i><span>We localize, fix, and regression-test the defect.</span></li>
+          <li><i data-lucide="lock" aria-hidden="true"></i><span>Optional: confirm the gated comment warning.</span></li>
+        </ul>
+        <div class="accent-bar"></div>
+        <div class="brand-lockup"><i data-lucide="zap" aria-hidden="true"></i><span>Blitzy</span></div>
+      </section>
+
+    </div>
+  </div>
+
+  <!-- Frameworks loaded from public CDN (pinned, UMD/global builds) -->
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+
+  <script>
+    (function () {
+      // Re-draw Mermaid diagrams and Lucide icons. mermaid.run() is idempotent —
+      // it skips nodes already carrying data-processed — so calling it on every
+      // slide change is safe; lucide.createIcons() is likewise idempotent.
+      function renderVisuals() {
+        // Render Mermaid diagrams lazily, scoped to the currently visible slide.
+        // reveal.js hides off-screen slides (display:none), which collapses a
+        // diagram's SVG to zero size if it is processed while hidden. Restricting
+        // mermaid.run() to the visible slide's not-yet-processed nodes guarantees
+        // each diagram is measured while displayed and sized correctly. The call
+        // is invoked on both 'ready' and 'slidechanged', so every diagram draws
+        // the first time its slide is shown.
+        try {
+          if (window.mermaid) {
+            var scope = (window.Reveal && Reveal.getCurrentSlide && Reveal.getCurrentSlide()) || document;
+            var nodes = Array.prototype.slice.call(
+              scope.querySelectorAll('pre.mermaid:not([data-processed="true"])')
+            );
+            if (nodes.length) {
+              // mermaid.run() over just the visible, unprocessed diagram nodes.
+              var pending = mermaid.run({ nodes: nodes });
+              if (pending && typeof pending.catch === 'function') { pending.catch(function () {}); }
+            }
+          }
+        } catch (err) { /* diagram already drawn */ }
+        try { if (window.lucide) { lucide.createIcons(); } } catch (err) { /* icons already drawn */ }
+      }
+
+      // Mermaid: manual rendering, themed with the Blitzy palette.
+      if (window.mermaid) {
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: 'base',
+          // Use a consistently-available font so label width measurement matches
+          // the rendered glyphs (prevents right-edge text clipping), and render
+          // labels as HTML for accurate auto-sizing.
+          fontFamily: 'Inter, system-ui, Arial, sans-serif',
+          flowchart: { htmlLabels: true, padding: 14, nodeSpacing: 44, rankSpacing: 56, wrappingWidth: 520, useMaxWidth: true },
+          themeVariables: {
+            primaryColor: '#F2F0FE',
+            primaryTextColor: '#333333',
+            primaryBorderColor: '#5B39F3',
+            lineColor: '#999999',
+            secondaryColor: '#F4EFF6'
+          }
+        });
+      }
+
+      // reveal.js initialization (exact config keys).
+      Reveal.initialize({
+        hash: true,
+        transition: 'slide',
+        controlsTutorial: false,
+        width: 1920,
+        height: 1080
+      });
+
+      // Draw on first ready and after every slide change.
+      Reveal.on('ready', renderVisuals);
+      Reveal.on('slidechanged', renderVisuals);
+
+      // Fallback initial paint so icons appear even before the first 'ready'.
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', renderVisuals);
+      } else {
+        renderVisuals();
+      }
+    })();
+  </script>
+</body>
+</html>
