@@ -174,7 +174,9 @@
       color: var(--blitzy-text-invert);
       font-size: 3.15em;
       max-width: 22ch;
-      margin: 0.1em 0 0.35em 0;
+      /* auto inline margins center the max-width box on the slide's center
+         axis; text-align:center alone only centers text WITHIN the box. */
+      margin: 0.1em auto 0.35em auto;
     }
     .reveal section.slide-title .subtitle {
       color: var(--blitzy-text-invert);
@@ -208,6 +210,8 @@
       color: var(--blitzy-text-invert);
       font-size: 2.7em;
       max-width: 20ch;
+      /* center the constrained heading box on the slide center axis */
+      margin-inline: auto;
     }
     .reveal section.slide-divider .hero-icon { color: var(--blitzy-accent-teal); }
     .reveal section.slide-divider .divider-index {
@@ -233,6 +237,8 @@
       font-size: 2.85em;
       max-width: 18ch;
       margin-block-end: 0.5em;
+      /* center the constrained heading box on the slide center axis */
+      margin-inline: auto;
     }
     .reveal section.slide-closing .next-steps {
       list-style: none;
