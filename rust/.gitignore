@@ -1,0 +1,10 @@
+# Cargo build output (mirrors the default `cargo new` .gitignore).
+# The target/ directory holds compiled artifacts and can grow to several GB;
+# it must never be committed.
+/target
+
+# Code coverage output produced by the CI `coverage` job
+# (cargo-tarpaulin --output-dir coverage/, see .github/workflows/rust.yml).
+/coverage
+
+# Cargo.lock IS intentionally tracked for this binary crate and is NOT ignored.
