@@ -7323,7 +7323,7 @@ static void clear_dynamic_opt(void)
  * 
  * FILE LIST EXPANSION:
  * Supports wildcard patterns and directory traversal:
- * - dhcp-hostsfile=/etc/dnsmasq.d/hosts/*.conf (all .conf files in directory)
+ * - dhcp-hostsfile=/etc/dnsmasq.d/hosts/ with a '*.conf' glob (all .conf files in directory)
  * - dhcp-hostsdir=/etc/dnsmasq.d/hosts (all files in directory, non-recursive)
  * - Multiple file specifications accumulate; all matching files processed in order
  * 
